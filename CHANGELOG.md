@@ -2,6 +2,39 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
+## v0.1.1 — 2026-11-21
+
+**可用性边界未变**：`qjs` 仍不能执行 JavaScript，任何需要求值的命令依旧以
+`not implemented yet` 退出。这个版本扩大的是一条已经跑通的编译链路的覆盖面，
+不是可用性 —— 按本项目的版本规则，这正是不该抬到 `0.2.0` 的理由。
+
+抬到 `0.2.0` 的时刻是 **M3 让 `qjs` 跑起来**。
+
+### 编译器新增
+
+- **`try`/`catch`/`finally`** — 异常表与 `catch_offset`、`gosub`/`ret` 让三个出口
+  共享一份 finalizer、空 `finally` 被消除、catch 参数与 block/handler 三个独立作用域。
+- **跨 `try` 边界的 `return`/`break`/`continue`** — 逐层展开 finally，`nip_catch`
+  与 `gosub` 的顺序、以及「值已在栈上」时不再补 `undefined`。
+- **`for`/`in` 与 `for`/`of`** — 枚举记录随循环留在值栈上；`for`/`of` 在退出时
+  `iterator_close`，`for`/`in` 只 `drop`。`break` 落到唯一的清理指令上，因此循环内的
+  `break` 自身不发指令，只有*穿越*整个循环的跳转会为它的记录付费。`return` 出
+  `for`/`of` 时按 `nip_catch` → `rot3r` → `undefined` → `iterator_close` 收尾。
+
+### 修正
+
+- 循环变量的绑定 opcode 区分「初始化」与「赋值」：声明式用不带检查的 `put_loc`
+  （这正是把 `let` 带出 TDZ 的动作），赋给已有绑定才用 `put_loc_check`。
+- 循环变量绑定与循环体之间保留参考实现的 `label_body` 标签。少了它，
+  `put_loc v; get_loc v` 会被折叠成 `set_loc v`，循环体首个读取消失。
+
+### 测试
+
+155 个测试，23 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
+
+字节码逐 opcode 差分从 138 条用例增至 **236 条**，新增的部分全部逐字节一致：
+`try/catch/finally` 25 条、`for`/`in`/`of` 20 条，以及跨 try 转移与标签组合。
+
 ## v0.1.0 — 2026-06-04
 
 第一个版本：**解析器与字节码编译器可用，运行期尚未开始**。

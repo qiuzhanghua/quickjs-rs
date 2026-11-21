@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.1.0** —— 解析器与字节码编译器可用，**运行期尚未开始**（`qjs` 还不能执行 JS）
+- 📌 当前版本：**v0.1.1** —— 解析器与字节码编译器可用，**运行期尚未开始**（`qjs` 还不能执行 JS）
 - 🚧 当前进度：**M2 进行中**（字节码编译器核心已通过逐 opcode 差分），M0/M1 已完成
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
@@ -64,33 +64,18 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + 55 无效 + 39 模块用例一致 |
 | 声明冲突 | 同上 | 41 个作用域冲突用例一致 |
 | 上游语料 | 同上 | `tests/` + `examples/` 全部 `.js` 一致 |
-| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 138 条用例逐字节一致 |
+| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 236 条用例逐字节一致 |
 | TDZ/作用域 | 同上 + 14 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
-| break/continue/标签 | 同上 | 24 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
-| switch | 同上 | 20 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
+| break/continue/标签 | 同上 | 21 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
+| switch | 同上 | 18 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
 | try/catch/finally | 同上 | 25 条用例一致；异常链、三个作用域、空 finally 消除、跨 try 的 return/break/continue 全对 |
 | for-in / for-of | 同上 | 20 条用例一致；迭代器关闭、穿越循环时的记录释放、跨层 break/continue 全对 |
 
-### M2 已知差距
+### M2 尚未实现
 
-编译器目前覆盖：字面量、算术/比较/逻辑/位运算、变量读写（含 `var`/`let`/`const` 的全局与局部差异）、
-`if`/`while`/`do`/`for`、函数声明与表达式、闭包、调用、成员访问、`return`、`typeof`/`void`/`!`/`~`、
-自增自减、复合赋值、条件与逗号表达式。反汇编与参考实现**逐字节一致**。
-
-当前已覆盖 `break`/`continue` 与标签（含多层标签链、跨层 `break outer`）、`switch`
-（fallthrough、`default` 写在任意位置、空 `case` 链、`break`）、`try`/`catch`/`finally`
-（异常边、`gosub`/`ret` 共享 finally、catch 参数与三个独立作用域、跨 try 边界的
-`return`/`break`/`continue` 逐层展开 finally）、`for`/`in` 与 `for`/`of`
-（迭代器关闭、早退时释放枚举记录），以及 TDZ 与作用域链：`let`/`const` 在作用域入口被标记未初始化（`set_loc_uninitialized`），
-读取走 `get_loc_check`、写入走 `put_loc_check`/`set_loc_check`，捕获的绑定分配引用格并在
-离开块时 `close_loc`，函数声明在作用域入口实例化，`global` 访问通过 `global_ref` 逐层转发，
-`return` 之后的死代码不编译。
-
-尚未实现（都返回明确的 `SyntaxError`，不会静默生成错误字节码）：
-解构、类、生成器与 async（需要状态机）、`for await`、
-`with`、模块、可选链、数组字面量与对象字面量、`??`。
-
-
+以下语法都返回明确的 `SyntaxError`，不会静默生成错误字节码：
+解构、类、生成器与 async（需要状态机）、`for await`、`with`、模块、
+可选链、数组与对象字面量、`??`。
 
 ### 已知优化差距
 
