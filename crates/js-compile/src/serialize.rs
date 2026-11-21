@@ -36,7 +36,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +105,7 @@ fn write_var(out: &mut Vec<u8>, var: &VarDef) {
     }
     out.push(flags);
     out.push(var_kind_tag(var.kind));
+    out.extend_from_slice(&var.scope_level.to_be_bytes());
     match var.scope_next {
         Some(next) => {
             out.push(1);
@@ -246,6 +247,7 @@ fn read_var(reader: &mut Reader<'_>) -> Result<VarDef, DecodeError> {
     let name = reader.string()?;
     let flags = reader.u8()?;
     let kind = var_kind_from_tag(reader.u8()?)?;
+    let scope_level = reader.u32()?;
     let scope_next = match reader.u8()? {
         0 => None,
         1 => Some(reader.i32()?),
@@ -257,6 +259,7 @@ fn read_var(reader: &mut Reader<'_>) -> Result<VarDef, DecodeError> {
         is_lexical: flags & 2 != 0,
         is_captured: flags & 4 != 0,
         kind,
+        scope_level,
         scope_next,
     })
 }

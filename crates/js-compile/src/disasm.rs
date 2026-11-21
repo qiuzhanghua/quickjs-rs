@@ -23,7 +23,14 @@ pub fn disassemble_function(out: &mut String, function: &Function) {
     } else {
         ""
     };
-    let _ = writeln!(out, "function: {star}{}", function.name);
+    // An anonymous function has no name atom, which the reference prints as
+    // `<null>`.
+    let name = if function.name.is_empty() {
+        "<null>"
+    } else {
+        function.name.as_str()
+    };
+    let _ = writeln!(out, "function: {star}{name}");
     if function.strict {
         let _ = writeln!(out, "  mode: strict");
     }
@@ -35,10 +42,11 @@ pub fn disassemble_function(out: &mut String, function: &Function) {
         let _ = writeln!(out, "  locals:");
         for (index, var) in function.vars.iter().enumerate() {
             let _ = write!(out, "{index:5}: {} {}", var.label(), var.name);
-            // The scope chain is only printed for block-scoped variables, where
-            // the runtime needs it to resolve `let`/`const` at a given point.
-            if let Some(next) = var.scope_next {
-                let _ = write!(out, " [next:{next}]");
+            // The scope chain is printed for every binding outside the function
+            // scope, i.e. everything the runtime has to instantiate per block.
+            // `-1` means "no further binding visible from this scope".
+            if var.scope_level != 0 {
+                let _ = write!(out, " [next:{}]", var.scope_next.unwrap_or(-1));
             }
             let _ = writeln!(out);
         }

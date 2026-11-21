@@ -103,6 +103,13 @@ pub struct VarDef {
     /// Whether a closure captures this variable, which forces it into a
     /// heap-allocated reference cell.
     pub is_captured: bool,
+    /// The lexical scope the binding belongs to.
+    ///
+    /// Scope 0 is the function scope, where `var` and hoisted function
+    /// declarations live; the body and every block introduce a child scope. A
+    /// binding only exists between its scope's entry and exit, which is what the
+    /// runtime uses to swap `let`/`const` bindings in and out.
+    pub scope_level: u32,
     /// Index of the next block-scoped variable in the enclosing scope chain, or
     /// `None` for a `var` (which is visible in the whole function).
     ///
@@ -121,8 +128,15 @@ impl VarDef {
             is_lexical: false,
             kind: VarKind::Normal,
             is_captured: false,
+            scope_level: 0,
             scope_next: None,
         }
+    }
+
+    /// Whether reading this binding can hit the temporal dead zone, i.e. it is
+    /// `let`/`const`/`class` and therefore starts out uninitialised.
+    pub fn needs_check(&self) -> bool {
+        self.is_lexical
     }
 
     /// A `let` binding.
@@ -241,9 +255,13 @@ impl Constant {
             // The reference prints BigInts in decimal, whatever the source radix.
             Constant::BigInt { digits, .. } => format!("{digits}n"),
             Constant::Function(f) => {
-                // The reference prints `[bytecode <name>]` from the object pool,
-                // where the name is `""` for an anonymous function.
-                format!("[bytecode {}]", f.name)
+                // The reference prints the function's name atom, which is `<null>`
+                // for an anonymous function expression.
+                if f.name.is_empty() {
+                    "[bytecode <null>]".to_string()
+                } else {
+                    format!("[bytecode {}]", f.name)
+                }
             }
             Constant::Template(quasis) => {
                 let parts: Vec<String> = quasis

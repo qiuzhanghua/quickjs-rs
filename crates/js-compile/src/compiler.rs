@@ -22,7 +22,7 @@
 //! an unnecessary `dup` or a differently chosen short form shows up immediately.
 
 use crate::bytecode::{
-    ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef, VarKind,
+    ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
@@ -90,12 +90,19 @@ enum Insn {
     Var { action: VarAction, name: String },
 }
 
-#[derive(Debug, Clone)]
-struct LexScope {
-    /// Innermost variable declared in this scope, as an index into `vars`.
-    first: i32,
-    /// Enclosing scope.
-    parent: usize,
+/// A lexical scope, identified while hoisting and numbered at the end.
+///
+/// Scope identity is needed in two passes that must agree: declarations are
+/// hoisted in source order (so slots come out in source order, as in the
+/// reference), but a binding belongs to the block it was written in, which is only
+/// entered later. Blocks are therefore keyed by the source position of their
+/// opening brace, which is stable across both walks.
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    /// Source position of the block.
+    key: u64,
+    /// The block this one is nested in; `0` for the function scope.
+    parent: u64,
 }
 
 /// One function under construction.
@@ -108,10 +115,18 @@ struct FnState {
     closure_vars: Vec<ClosureVar>,
     cpool: Vec<Constant>,
     atoms: Vec<String>,
-    scopes: Vec<LexScope>,
-    scope_level: usize,
-    scope_first: i32,
-    body_scope: usize,
+    /// Every lexical scope, in creation order.
+    blocks: Vec<Block>,
+    /// The block currently being parsed or compiled.
+    current_block: u64,
+    /// The block each local was declared in, parallel to `vars`. `0` means the
+    /// function scope, where `var` bindings live.
+    var_block: Vec<u64>,
+    /// The block that holds the function body.
+    body_block: u64,
+    /// Head of each scope's binding chain, indexed by level. Filled in by
+    /// [`rebuild_scope_chain`]; the scope chain is only needed at run time.
+    block_heads: Vec<i32>,
     insns: Vec<Insn>,
     labels: Vec<Option<usize>>,
     /// Captured locals, which need a reference cell.
@@ -127,6 +142,20 @@ struct FnState {
     leaves_value: bool,
     /// Statement nesting depth, used to tell top-level statements apart.
     stmt_depth: u32,
+    /// Function declarations waiting to be instantiated at scope entry, as
+    /// (target slot, constant pool index). The reference emits these from
+    /// `instantiate_hoisted_definitions` rather than at the statement, because a
+    /// declaration is visible before it is reached.
+    hoisted: Vec<(u64, HoistTarget, u32)>,
+}
+
+/// Where a hoisted function declaration is stored.
+#[derive(Debug, Clone)]
+enum HoistTarget {
+    Arg(u32),
+    Loc(u32),
+    /// A global, which the resolver looks up by name.
+    Global(String),
 }
 
 impl FnState {
@@ -140,14 +169,11 @@ impl FnState {
             closure_vars: Vec::new(),
             cpool: Vec::new(),
             atoms: Vec::new(),
-            // Scope 0 is the function scope; the body gets its own child scope.
-            scopes: vec![LexScope {
-                first: -1,
-                parent: 0,
-            }],
-            scope_level: 0,
-            scope_first: -1,
-            body_scope: 0,
+            blocks: Vec::new(),
+            current_block: 0,
+            var_block: Vec::new(),
+            body_block: 0,
+            block_heads: Vec::new(),
             insns: Vec::new(),
             labels: Vec::new(),
             var_ref_count: 0,
@@ -156,13 +182,14 @@ impl FnState {
             is_script: false,
             leaves_value: false,
             stmt_depth: 0,
+            hoisted: Vec::new(),
         }
     }
 
     /// The scope a declaration lands in: a script's top-level declarations are
     /// globals, everything else gets a slot.
     fn declares_globally(&self) -> bool {
-        self.is_script && self.scope_level == self.body_scope
+        self.is_script && self.current_block == self.body_block
     }
 }
 
@@ -202,33 +229,24 @@ impl Compiler {
         // Locals are numbered in declaration order; `<ret>` is always slot 0.
         state.vars.push(VarDef::var("<ret>"));
         self.stack.push(state);
-        self.enter_scope();
-        self.state().body_scope = self.cur().scope_level;
-        self.hoist(&program.body)?;
+        // The body is its own scope, keyed by the position of the program.
+        let body_key = program.span.start.offset as u64;
+        self.push_block(body_key, 0);
+        self.state().body_block = body_key;
+        self.hoist(&program.body, body_key)?;
+        self.emit_scope_enter(body_key);
         for stmt in &program.body {
             self.stmt(stmt)?;
+            if Self::terminates(stmt) {
+                break;
+            }
         }
-        // A trailing expression statement *is* the program's value, so its store
-        // becomes a `set_` (which keeps the value) and the return needs no load.
-        if self.cur().leaves_value
-            && let Some(Insn::Fixed { op, operands }) = self.state().insns.last_mut()
-            && *op == Opcode::PutLoc0
-            && matches!(operands.first(), Some(Op::Slot(Slot::Loc(0))))
-        {
-            *op = Opcode::SetLoc0;
-            self.state().insns.push(Insn::Fixed {
-                op: Opcode::Return,
-                operands: Vec::new(),
-            });
-            self.leave_scope();
-            let state = self.stack.pop().expect("state");
-            return Ok(self.finish(state));
-        }
-        self.emit(Opcode::GetLoc0, &[Op::Slot(Slot::Loc(0))]);
+        // The program's value is whatever the last expression statement stored in
+        // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common
+        // case into a single `set_loc0`.
+        self.emit(Opcode::GetLoc, &[Op::Slot(Slot::Loc(0))]);
         self.emit(Opcode::Return, &[]);
-        self.leave_scope();
-        let state = self.stack.pop().expect("state");
-        Ok(self.finish(state))
+        Ok(self.finish_current())
     }
 
     // -- emitting ----------------------------------------------------------
@@ -258,7 +276,7 @@ impl Compiler {
             return;
         }
         self.emit(Opcode::Undefined, &[]);
-        self.emit(Opcode::PutLoc0, &[Op::Slot(Slot::Loc(0))]);
+        self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(0))]);
         self.state().leaves_value = false;
     }
 
@@ -310,24 +328,82 @@ impl Compiler {
 
     // -- scopes ------------------------------------------------------------
 
-    fn enter_scope(&mut self) {
+    /// Start a new lexical scope inside `parent`.
+    fn push_block(&mut self, key: u64, parent: u64) {
         let state = self.state();
-        let parent = state.scope_level;
-        let level = state.scopes.len();
-        let first = state.scope_first;
-        state.scopes.push(LexScope { first: -1, parent });
-        state.scope_level = level;
-        let _ = first;
+        if !state.blocks.iter().any(|b| b.key == key) {
+            state.blocks.push(Block { key, parent });
+        }
+        state.current_block = key;
     }
 
-    fn leave_scope(&mut self) {
-        let state = self.state();
-        let level = state.scope_level;
-        if level == 0 {
-            return;
+    /// Emit the code that runs when a lexical scope is entered.
+    ///
+    /// Every `let`/`const`/`class` binding starts out in the temporal dead zone,
+    /// so entering its block marks it uninitialised. Hoisted function
+    /// declarations are created here instead, which is why a call before the
+    /// declaration still works.
+    ///
+    /// The order is not obvious: bindings are emitted in *reverse* declaration
+    /// order, because the reference walks its scope chain, which is built by
+    /// prepending.
+    fn emit_scope_enter(&mut self, block: u64) {
+        let hoisted = std::mem::take(&mut self.state().hoisted);
+        let mut mine: Vec<(HoistTarget, u32)> = hoisted
+            .into_iter()
+            .filter(|(owner, _, _)| *owner == block)
+            .map(|(_, target, pool_index)| (target, pool_index))
+            .collect();
+        mine.sort_by_key(|(target, _)| match target {
+            HoistTarget::Arg(index) | HoistTarget::Loc(index) => *index,
+            HoistTarget::Global(_) => u32::MAX,
+        });
+        for (target, pool_index) in mine {
+            self.emit(Opcode::Fclosure, &[Op::Const(pool_index)]);
+            match target {
+                HoistTarget::Arg(index) => self.emit(Opcode::PutArg, &[Op::Slot(Slot::Arg(index))]),
+                HoistTarget::Loc(index) => self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(index))]),
+                HoistTarget::Global(name) => {
+                    // A global binding lives in a reference cell, so the store
+                    // goes through `put_var_ref` while reads use `get_var`.
+                    self.state().insns.push(Insn::Var {
+                        action: VarAction::PutRef,
+                        name,
+                    });
+                }
+            }
         }
-        state.scope_level = state.scopes[level].parent;
-        state.scope_first = first_lexical_var(state, state.scope_level);
+        for index in self.block_vars_reversed(block) {
+            self.emit(
+                Opcode::SetLocUninitialized,
+                &[Op::Slot(Slot::Loc(index as u32))],
+            );
+        }
+    }
+
+    /// Emit the code that runs when a lexical scope is exited.
+    ///
+    /// A captured binding has to be closed: detaching its reference cell freezes
+    /// the value the binding had when the block ended, which is what a closure
+    /// created inside the block must keep seeing.
+    fn emit_scope_leave(&mut self, block: u64) {
+        for index in self.block_vars_reversed(block) {
+            if self.cur().vars[index].is_captured {
+                self.emit(Opcode::CloseLoc, &[Op::Slot(Slot::Loc(index as u32))]);
+            }
+        }
+    }
+
+    /// Locals declared in `block`, in reverse declaration order.
+    fn block_vars_reversed(&self, block: u64) -> Vec<usize> {
+        let state = self.cur();
+        let mut out: Vec<usize> = (0..state.vars.len())
+            .filter(|index| {
+                state.var_block.get(*index).copied() == Some(block) && state.vars[*index].is_lexical
+            })
+            .collect();
+        out.reverse();
+        out
     }
 
     fn declare(&mut self, name: &str, def: VarDef) -> u32 {
@@ -337,147 +413,14 @@ impl Compiler {
         }
         let state = self.state();
         let index = state.vars.len() as u32;
-        let mut def = def;
-        if def.is_lexical {
-            def.scope_next = Some(state.scope_first);
-            let level = state.scope_level;
-            state.scopes[level].first = index as i32;
-            state.scope_first = index as i32;
-        }
+        let block = if def.is_lexical {
+            state.current_block
+        } else {
+            0
+        };
+        state.var_block.push(block);
         state.vars.push(def);
         index
-    }
-
-    /// Declare `var` and function names before compiling any statement, so that
-    /// a reference textually before the declaration still resolves.
-    fn hoist(&mut self, body: &[Stmt]) -> Result<(), SyntaxError> {
-        for stmt in body {
-            self.hoist_stmt(stmt)?;
-        }
-        Ok(())
-    }
-
-    fn hoist_stmt(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
-        match &stmt.kind {
-            StmtKind::VarDecl(decl) => {
-                if decl.kind == VarDeclKind::Var {
-                    for declarator in &decl.declarators {
-                        let mut names = Vec::new();
-                        declarator.target.bound_names(&mut names);
-                        for name in names {
-                            let text = name.name.clone();
-                            let def = VarDef::var(text.clone());
-                            self.declare_var(&text, def);
-                        }
-                    }
-                } else {
-                    for declarator in &decl.declarators {
-                        let mut names = Vec::new();
-                        declarator.target.bound_names(&mut names);
-                        for name in names {
-                            let text = name.name.clone();
-                            let def = if decl.kind == VarDeclKind::Const {
-                                VarDef::constant(text.clone())
-                            } else {
-                                VarDef::lexical(text.clone())
-                            };
-                            self.declare(&text, def);
-                        }
-                    }
-                }
-            }
-            StmtKind::FuncDecl(func) => {
-                if let Some(name) = &func.name {
-                    // A function declaration is a `var` binding that happens to
-                    // hold a function, not a lexical one.
-                    let def = VarDef {
-                        kind: VarKind::FunctionDecl,
-                        ..VarDef::var(name.name.clone())
-                    };
-                    self.declare(&name.name.clone(), def);
-                }
-            }
-            StmtKind::ClassDecl(class) => {
-                if let Some(name) = &class.name {
-                    self.declare(&name.name.clone(), VarDef::lexical(name.name.clone()));
-                }
-            }
-            StmtKind::Block(inner) => self.hoist(inner)?,
-            StmtKind::If { cons, alt, .. } => {
-                self.hoist_stmt(cons)?;
-                if let Some(alt) = alt {
-                    self.hoist_stmt(alt)?;
-                }
-            }
-            StmtKind::While { body, .. }
-            | StmtKind::DoWhile { body, .. }
-            | StmtKind::Labeled { body, .. }
-            | StmtKind::With { body, .. } => self.hoist_stmt(body)?,
-            StmtKind::For { init, body, .. } => {
-                if let Some(ForInit::VarDecl(decl)) = init
-                    && decl.kind == VarDeclKind::Var
-                {
-                    self.hoist_stmt(&Stmt::new(StmtKind::VarDecl(decl.clone()), stmt.span))?;
-                }
-                self.hoist_stmt(body)?;
-            }
-            StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
-                if let ForHead::VarDecl(decl) = left
-                    && decl.kind == VarDeclKind::Var
-                {
-                    self.hoist_stmt(&Stmt::new(StmtKind::VarDecl(decl.clone()), stmt.span))?;
-                }
-                self.hoist_stmt(body)?;
-            }
-            StmtKind::Try {
-                block,
-                handler,
-                finalizer,
-            } => {
-                self.hoist(block)?;
-                if let Some(handler) = handler {
-                    self.hoist(&handler.body)?;
-                }
-                if let Some(finalizer) = finalizer {
-                    self.hoist(finalizer)?;
-                }
-            }
-            StmtKind::Switch { cases, .. } => {
-                for case in cases {
-                    self.hoist(&case.body)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// Declare a `var`: it lives in the function's own scope, not the block's.
-    fn declare_var(&mut self, name: &str, def: VarDef) {
-        if self.cur().declares_globally() {
-            self.declare_global(name, &def);
-            return;
-        }
-        let state = self.state();
-        if state.vars.iter().any(|v| v.name == name) {
-            return;
-        }
-        state.vars.push(def);
-    }
-
-    /// Record a top-level script declaration as a global.
-    fn declare_global(&mut self, name: &str, def: &VarDef) {
-        let state = self.state();
-        if state.closure_vars.iter().any(|c| c.name == name) {
-            return;
-        }
-        state.closure_vars.push(ClosureVar {
-            name: name.to_string(),
-            is_const: def.is_const,
-            is_lexical: def.is_lexical,
-            closure_type: ClosureType::GlobalDecl,
-            var_idx: 0,
-        });
     }
 
     // -- statements --------------------------------------------------------
@@ -503,18 +446,33 @@ impl Compiler {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(expr) => {
                 self.expr(expr)?;
-                self.emit(Opcode::PutLoc0, &[Op::Slot(Slot::Loc(0))]);
+                if self.cur().is_script {
+                    // The program's value lands in the hidden `<ret>` local.
+                    self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(0))]);
+                } else {
+                    self.emit(Opcode::Drop, &[]);
+                }
             }
             StmtKind::Block(body) => {
-                self.enter_scope();
-                self.hoist(body)?;
+                // The block's declarations were hoisted with its enclosing
+                // statement list, so there is nothing left to declare here.
+                let key = stmt.span.start.offset as u64;
+                let parent = self.cur().current_block;
+                self.push_block(key, parent);
+                self.emit_scope_enter(key);
                 for stmt in body {
                     self.stmt(stmt)?;
+                    if Self::terminates(stmt) {
+                        break;
+                    }
                 }
-                self.leave_scope();
+                self.emit_scope_leave(key);
+                self.state().current_block = parent;
             }
             StmtKind::VarDecl(decl) => self.var_decl(decl)?,
-            StmtKind::FuncDecl(func) => self.func_decl(func)?,
+            // A function declaration was already instantiated when its scope was
+            // entered, so the statement itself emits nothing.
+            StmtKind::FuncDecl(_) => {}
             StmtKind::If { test, cons, alt } => {
                 self.reset_value();
                 let else_label = self.new_label();
@@ -561,11 +519,13 @@ impl Compiler {
                 body,
             } => {
                 self.reset_value();
-                self.enter_scope();
+                let for_key = stmt.span.start.offset as u64;
+                let for_parent = self.cur().current_block;
+                self.push_block(for_key, for_parent);
+                self.emit_scope_enter(for_key);
                 if let Some(init) = init {
                     match init {
                         ForInit::VarDecl(decl) => {
-                            self.hoist(&[Stmt::new(StmtKind::VarDecl(decl.clone()), stmt.span)])?;
                             self.var_decl(decl)?;
                         }
                         ForInit::Expr(expr) => {
@@ -590,7 +550,8 @@ impl Compiler {
                 }
                 self.emit_jump(Opcode::Goto, top, &[]);
                 self.place_label(end);
-                self.leave_scope();
+                self.emit_scope_leave(for_key);
+                self.state().current_block = for_parent;
             }
             StmtKind::Return(value) => match value {
                 Some(expr) => {
@@ -662,6 +623,188 @@ impl Compiler {
         Ok(())
     }
 
+    /// Declare every name a statement list introduces, before compiling any of
+    /// it, so a reference that appears textually before a declaration still
+    /// resolves.
+    ///
+    /// Declarations are walked in source order because that is the order the
+    /// reference numbers its slots in: `let a; var b;` gives `a` slot 0 and `b`
+    /// slot 1, while `var b; let a;` gives the opposite. `var` and function
+    /// declarations hoist out to the function scope; lexical names belong to the
+    /// block they were written in, which `block` records.
+    fn hoist(&mut self, body: &[Stmt], block: u64) -> Result<(), SyntaxError> {
+        let saved = self.cur().current_block;
+        self.state().current_block = block;
+        let result = self.hoist_list(body);
+        // `current_block` is restored by the caller for a block statement, since
+        // it needs it set while compiling; only clean up on the hoist path.
+        self.state().current_block = saved;
+        result
+    }
+
+    fn hoist_list(&mut self, body: &[Stmt]) -> Result<(), SyntaxError> {
+        for stmt in body {
+            self.hoist_stmt(stmt)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a statement always transfers control away, making everything after
+    /// it in the same list unreachable.
+    ///
+    /// The reference drops such statements in `skip_dead_code`, so `return 1;
+    /// let x = 2;` compiles to the same bytecode as `return 1;`.
+    fn terminates(stmt: &Stmt) -> bool {
+        matches!(
+            stmt.kind,
+            StmtKind::Return(_) | StmtKind::Throw(_) | StmtKind::Break(_) | StmtKind::Continue(_)
+        )
+    }
+
+    fn hoist_stmt(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
+        match &stmt.kind {
+            StmtKind::VarDecl(decl) => {
+                for declarator in &decl.declarators {
+                    let mut names = Vec::new();
+                    declarator.target.bound_names(&mut names);
+                    for name in names {
+                        let text = name.name.clone();
+                        if decl.kind == VarDeclKind::Var {
+                            let def = VarDef::var(text.clone());
+                            self.declare_var(&text, def);
+                        } else {
+                            let def = if decl.kind == VarDeclKind::Const {
+                                VarDef::constant(text.clone())
+                            } else {
+                                VarDef::lexical(text.clone())
+                            };
+                            self.declare(&text, def);
+                        }
+                    }
+                }
+            }
+            StmtKind::FuncDecl(func) => {
+                if let Some(name) = &func.name {
+                    // A function declaration is a `var` binding that happens to
+                    // hold a function, not a lexical one.
+                    let def = VarDef::var(name.name.clone());
+                    self.declare_var(&name.name.clone(), def);
+                }
+                // The function object is created when the scope is entered, so it
+                // exists before the declaration is reached.
+                self.func_decl(func)?;
+            }
+            StmtKind::ClassDecl(class) => {
+                if let Some(name) = &class.name {
+                    self.declare(&name.name.clone(), VarDef::lexical(name.name.clone()));
+                }
+            }
+            StmtKind::Block(inner) => self.hoist_block(stmt, inner)?,
+            StmtKind::If { cons, alt, .. } => {
+                self.hoist_stmt(cons)?;
+                if let Some(alt) = alt {
+                    self.hoist_stmt(alt)?;
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::DoWhile { body, .. }
+            | StmtKind::Labeled { body, .. }
+            | StmtKind::With { body, .. } => self.hoist_stmt(body)?,
+            StmtKind::For { init, body, .. } => {
+                // A `for` head gets its own scope even when it declares nothing,
+                // because `let` in the head is scoped to the loop.
+                let key = stmt.span.start.offset as u64;
+                let parent = self.cur().current_block;
+                self.push_block(key, parent);
+                if let Some(init) = init
+                    && let ForInit::VarDecl(decl) = init
+                {
+                    self.hoist_stmt(&Stmt::new(StmtKind::VarDecl(decl.clone()), stmt.span))?;
+                }
+                self.hoist_stmt(body)?;
+                self.state().current_block = parent;
+            }
+            StmtKind::ForIn { left, body, .. } | StmtKind::ForOf { left, body, .. } => {
+                let key = stmt.span.start.offset as u64;
+                let parent = self.cur().current_block;
+                self.push_block(key, parent);
+                if let ForHead::VarDecl(decl) = left {
+                    self.hoist_stmt(&Stmt::new(StmtKind::VarDecl(decl.clone()), stmt.span))?;
+                }
+                self.hoist_stmt(body)?;
+                self.state().current_block = parent;
+            }
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            } => {
+                self.hoist_block(stmt, block)?;
+                if let Some(handler) = handler {
+                    self.hoist_block(stmt, &handler.body)?;
+                }
+                if let Some(finalizer) = finalizer {
+                    self.hoist_block(stmt, finalizer)?;
+                }
+            }
+            StmtKind::Switch { cases, .. } => {
+                let key = stmt.span.start.offset as u64;
+                let parent = self.cur().current_block;
+                self.push_block(key, parent);
+                for case in cases {
+                    self.hoist_list(&case.body)?;
+                }
+                self.state().current_block = parent;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Hoist a nested statement list, which is its own lexical scope.
+    fn hoist_block(&mut self, owner: &Stmt, body: &[Stmt]) -> Result<(), SyntaxError> {
+        let key = owner.span.start.offset as u64;
+        let parent = self.cur().current_block;
+        self.push_block(key, parent);
+        self.hoist_list(body)?;
+        self.state().current_block = parent;
+        Ok(())
+    }
+
+    /// Declare a `var`: it lives in the function's own scope, not the block's.
+    fn declare_var(&mut self, name: &str, def: VarDef) {
+        if self.cur().declares_globally() {
+            self.declare_global(name, &def);
+            return;
+        }
+        let state = self.state();
+        if state.vars.iter().any(|v| v.name == name) {
+            return;
+        }
+        // A `var` belongs to the function scope, never to the enclosing block.
+        state.var_block.push(0);
+        state.vars.push(def);
+    }
+
+    /// Record a top-level script declaration as a global.
+    ///
+    /// A script's top-level `var`/`let`/`function` create properties of the
+    /// global object, not slots in the script's frame, so they show up as closure
+    /// variables instead.
+    fn declare_global(&mut self, name: &str, def: &VarDef) {
+        let state = self.state();
+        if state.closure_vars.iter().any(|c| c.name == name) {
+            return;
+        }
+        state.closure_vars.push(ClosureVar {
+            name: name.to_string(),
+            is_const: def.is_const,
+            is_lexical: def.is_lexical,
+            closure_type: ClosureType::GlobalDecl,
+            var_idx: 0,
+        });
+    }
+
     /// Compile a loop body, registering the labels `break` and `continue` jump to.
     fn loop_body(
         &mut self,
@@ -722,13 +865,21 @@ impl Compiler {
     fn var_decl(&mut self, decl: &VarDecl) -> Result<(), SyntaxError> {
         for declarator in &decl.declarators {
             let Some(init) = &declarator.init else {
-                // `var x;` with no initialiser keeps `undefined`; a lexical
-                // declaration without one was already rejected by the parser.
+                // `var x;` stays `undefined`. A lexical binding is different: it
+                // has to be *initialised* to leave the temporal dead zone, so the
+                // compiler supplies an explicit `undefined`.
+                if decl.kind.is_lexical()
+                    && let PatternKind::Ident(name) = &declarator.target.kind
+                {
+                    self.emit(Opcode::Undefined, &[]);
+                    self.emit_var(VarAction::PutInit, &name.name);
+                }
                 continue;
             };
             match &declarator.target.kind {
                 PatternKind::Ident(name) => {
                     self.expr(init)?;
+                    self.set_name_if_anonymous(init, &name.name);
                     // A declaration statement produces no value, so nothing is
                     // duplicated onto the stack.
                     match decl.kind {
@@ -747,18 +898,33 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a function declaration and queue it for instantiation at scope
+    /// entry.
+    ///
+    /// A declaration is visible before the statement that declares it, so the
+    /// code that creates the function object belongs at the top of the enclosing
+    /// scope, not at the declaration.
     fn func_decl(&mut self, func: &ast::Function) -> Result<(), SyntaxError> {
-        let function = self.compile_function(func)?;
-        let index = self.push_constant(Constant::Function(Box::new(function)));
-        self.emit(Opcode::Fclosure, &[Op::Const(index)]);
         let name = func.name.as_ref().expect("a declaration has a name");
-        let action = if self.cur().is_script {
-            VarAction::PutRef
-        } else {
-            VarAction::PutInit
-        };
-        self.emit_var(action, &name.name);
+        let function = self.compile_function(func)?;
+        let pool_index = self.push_constant(Constant::Function(Box::new(function)));
+        let target = self.hoist_target(&name.name);
+        let block = self.cur().current_block;
+        self.state().hoisted.push((block, target, pool_index));
         Ok(())
+    }
+
+    /// Where a name lives, for a hoisted declaration.
+    fn hoist_target(&self, name: &str) -> HoistTarget {
+        let state = self.cur();
+        if let Some(index) = state.args.iter().position(|a| a.name == name) {
+            return HoistTarget::Arg(index as u32);
+        }
+        if let Some(index) = state.vars.iter().position(|v| v.name == name) {
+            return HoistTarget::Loc(index as u32);
+        }
+        // A global function declaration is not a slot at all.
+        HoistTarget::Global(name.to_string())
     }
 
     // -- expressions -------------------------------------------------------
@@ -913,6 +1079,17 @@ impl Compiler {
         self.emit(Opcode::PushAtomValue, &[Op::Atom(text.to_string())]);
     }
 
+    /// Name an anonymous function from the binding it is assigned to.
+    ///
+    /// `var f = function(){}` produces a function whose `name` is `f`, which the
+    /// runtime cannot know without being told: the function object is created
+    /// before the store. `set_name` carries the name across.
+    fn set_name_if_anonymous(&mut self, value: &Expr, name: &str) {
+        if value.is_anonymous_function_definition() {
+            self.emit(Opcode::SetName, &[Op::Atom(name.to_string())]);
+        }
+    }
+
     fn push_this(&mut self) {
         self.emit(Opcode::PushThis, &[]);
     }
@@ -989,6 +1166,7 @@ impl Compiler {
                 match op {
                     AssignOp::Assign => {
                         self.expr(value)?;
+                        self.set_name_if_anonymous(value, &name.name);
                         self.emit(Opcode::Dup, &[]);
                         self.emit_var(VarAction::Put, &name.name);
                     }
@@ -1113,35 +1291,109 @@ impl Compiler {
             state.args.push(VarDef::var(name.name.clone()));
         }
         self.stack.push(state);
-        self.enter_scope();
+        let body_key = func.params_span.end.offset as u64;
+        self.push_block(body_key, 0);
+        self.state().body_block = body_key;
         let body = func
             .body
             .statements()
             .ok_or_else(|| SyntaxError::new("concision bodies are not supported yet", func.span))?;
-        self.hoist(body)?;
+        self.hoist(body, body_key)?;
+        self.emit_scope_enter(body_key);
         for stmt in body {
             self.stmt(stmt)?;
+            if Self::terminates(stmt) {
+                break;
+            }
         }
-        // The reference never emits an implicit return after a definite one.
-        let reachable = !matches!(
-            self.cur().insns.last(),
-            Some(Insn::Fixed {
-                op: Opcode::Return | Opcode::ReturnUndef | Opcode::Throw,
-                ..
-            })
-        );
-        if reachable {
+        // The implicit return only exists if control can actually get here: an
+        // infinite loop never falls off the end.
+        if self.end_is_reachable() {
             self.emit(Opcode::ReturnUndef, &[]);
         }
-        self.leave_scope();
-        let state = self.stack.pop().expect("state");
-        Ok(self.finish(state))
+        // Resolution runs while this function is still on the stack: capturing a
+        // variable from an enclosing function means reaching into that
+        // function's state, which requires the whole chain to be present.
+        Ok(self.finish_current())
     }
 
-    /// Resolve one function's symbolic instructions into final bytecode.
-    fn finish(&mut self, mut state: FnState) -> CompiledFunction {
-        let resolved = resolve(&mut state);
-        let (code, stack_size) = assemble(&resolved, &state);
+    /// Whether the current position in the instruction stream can be reached.
+    ///
+    /// A walk over the control-flow graph, using labels as instruction indices.
+    /// The reference does the same thing to drop dead code; here it decides
+    /// whether an implicit `return_undef` needs emitting.
+    fn end_is_reachable(&self) -> bool {
+        let state = self.cur();
+        let count = state.insns.len();
+        let mut seen = vec![false; count + 1];
+        let mut worklist = vec![0usize];
+        while let Some(index) = worklist.pop() {
+            if index > count || seen[index] {
+                continue;
+            }
+            seen[index] = true;
+            if index == count {
+                continue;
+            }
+            let (op, operands) = match &state.insns[index] {
+                Insn::Fixed { op, operands } => (*op, operands.as_slice()),
+                // A variable access never transfers control.
+                Insn::Var { .. } => {
+                    worklist.push(index + 1);
+                    continue;
+                }
+            };
+            match op {
+                Opcode::Return | Opcode::ReturnUndef | Opcode::Throw => {}
+                Opcode::Goto => {
+                    if let Some(target) = self.label_position(operands) {
+                        worklist.push(target);
+                    }
+                }
+                Opcode::IfTrue | Opcode::IfFalse => {
+                    if let Some(target) = self.label_position(operands) {
+                        worklist.push(target);
+                    }
+                    worklist.push(index + 1);
+                }
+                _ => worklist.push(index + 1),
+            }
+        }
+        seen[count]
+    }
+
+    /// The instruction index a jump operand points at.
+    ///
+    /// Label ids are handed out in creation order, which has nothing to do with
+    /// where the label ends up, so the id has to go through the placement table.
+    fn label_position(&self, operands: &[Op]) -> Option<usize> {
+        let id = label_id(operands)?;
+        self.cur().labels.get(id as usize).copied().flatten()
+    }
+
+    /// Resolve and assemble the function on top of the compiler stack, then pop
+    /// it.
+    fn finish_current(&mut self) -> CompiledFunction {
+        let mut resolved = resolve(&mut self.stack);
+        // Captured bindings need a reference cell; the count goes in the header so
+        // the runtime knows how many cells to allocate on entry.
+        let current = self.stack.len() - 1;
+        let captured = self.stack[current]
+            .args
+            .iter()
+            .filter(|a| a.is_captured)
+            .count()
+            + self.stack[current]
+                .vars
+                .iter()
+                .filter(|v| v.is_captured)
+                .count();
+        self.stack[current].var_ref_count = captured as u32;
+        // The scope chain is only final now that every binding is known.
+        rebuild_scope_chain(&mut self.stack[current]);
+        let (code, stack_size) = assemble(&mut resolved, &self.stack[current]);
+        let _ = &mut resolved;
+        let state = self.stack.pop().expect("a function is being compiled");
         CompiledFunction {
             name: state.name,
             kind: state.kind,
@@ -1162,76 +1414,534 @@ impl Compiler {
     }
 }
 
-/// Resolve one function's symbolic instructions into final bytecode.
+/// Assign each binding a scope level and rebuild the scope chains.
 ///
-/// This is where names become slots. A name is looked up in the current
-/// function's arguments, then its locals, then its existing closure entries; a
-/// name that is nowhere to be found becomes a new `[global]` closure entry, which
-/// is what lets sloppy mode assign to an undeclared variable.
-fn resolve(state: &mut FnState) -> Vec<(Opcode, Vec<Op>)> {
-    let insns = std::mem::take(&mut state.insns);
-    let mut out = Vec::with_capacity(insns.len());
+/// Levels are numbered in the order the blocks appear, with 0 reserved for the
+/// function scope where `var` and hoisted functions live. Every binding outside
+/// level 0 gets a `scope_next` link to the next binding visible from the same
+/// point, so walking a block's chain enumerates exactly the bindings live there.
+///
+/// The links cannot be filled in while hoisting: `{ let a } let b` needs `a` to
+/// point at `b`, which is declared later in the source but earlier in the chain.
+fn rebuild_scope_chain(state: &mut FnState) {
+    // Block key -> level. Level 0 is the function scope.
+    let mut levels: Vec<u64> = vec![0];
+    for block in &state.blocks {
+        if !levels.contains(&block.key) {
+            levels.push(block.key);
+        }
+    }
+    let level_of = |key: u64| -> usize { levels.iter().position(|k| *k == key).unwrap_or(0) };
+    let parent_level = |level: usize| -> usize {
+        if level == 0 {
+            return 0;
+        }
+        let key = levels[level];
+        let parent = state
+            .blocks
+            .iter()
+            .find(|b| b.key == key)
+            .map(|b| b.parent)
+            .unwrap_or(0);
+        level_of(parent)
+    };
+
+    // Own bindings per level, in declaration order.
+    let mut own: Vec<Vec<usize>> = vec![Vec::new(); levels.len()];
+    let keys: Vec<u64> = (0..state.vars.len())
+        .map(|index| state.var_block.get(index).copied().unwrap_or(0))
+        .collect();
+    for (index, key) in keys.into_iter().enumerate() {
+        let level = level_of(key);
+        state.vars[index].scope_level = level as u32;
+        if state.vars[index].is_lexical {
+            own[level].push(index);
+        }
+    }
+
+    // A scope's chain is its own bindings in reverse declaration order followed
+    // by the enclosing scope's chain.
+    let mut head = vec![-1i32; levels.len()];
+    for level in 0..levels.len() {
+        let inherited = if level == 0 {
+            -1
+        } else {
+            head[parent_level(level)]
+        };
+        let chain: Vec<usize> = own[level].iter().rev().copied().collect();
+        head[level] = chain.first().map_or(inherited, |first| *first as i32);
+        for (position, &index) in chain.iter().enumerate() {
+            let next = chain
+                .get(position + 1)
+                .map_or(inherited, |next| *next as i32);
+            state.vars[index].scope_next = if next < 0 { None } else { Some(next) };
+        }
+    }
+    state.block_heads = head;
+}
+
+/// This is where names become slots and where the temporal dead zone shows up in
+/// the instruction stream: a read of a `let`/`const` binding compiles to
+/// `get_loc_check`, which throws if the binding is still uninitialised.
+///
+/// The peephole pass from the reference implementation is applied at the end,
+/// for the same reason it is applied to resolved bytecode there: the patterns are
+/// stated in terms of `put_loc`/`set_loc` pairs, which only exist after
+/// resolution. Deleted instructions stay in the list as `None` so that label
+/// indices remain valid; [`Assembler`] maps them to byte offsets.
+fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
+    let current = stack.len() - 1;
+    let insns = std::mem::take(&mut stack[current].insns);
+    let mut out: Vec<Option<(Opcode, Vec<Op>)>> = Vec::with_capacity(insns.len());
     for insn in &insns {
         match insn {
             Insn::Fixed { op, operands } => {
                 let operands = operands
                     .iter()
                     .map(|operand| match operand {
-                        Op::Atom(text) => Op::AtomId(intern_atom(state, text)),
+                        Op::Atom(text) => Op::AtomId(intern_atom(&mut stack[current], text)),
                         other => other.clone(),
                     })
                     .collect();
-                out.push((*op, operands));
+                out.push(Some((*op, operands)));
             }
             Insn::Var { action, name } => {
-                let slot = resolve_slot(state, name);
-                out.push(variable_instruction(*action, slot));
+                let slot = resolve_slot(stack, current, name);
+                out.push(Some(variable_instruction(stack, current, *action, slot)));
             }
         }
     }
+    let label_positions: Vec<bool> = {
+        let mut marks = vec![false; out.len() + 1];
+        for placed in stack[current].labels.iter().flatten() {
+            marks[*placed] = true;
+        }
+        marks
+    };
+    peephole(&mut out, &label_positions);
     out
 }
 
-/// Find where `name` lives, adding a closure entry if needed.
-fn resolve_slot(state: &mut FnState, name: &str) -> Slot {
-    if let Some(index) = state.args.iter().position(|a| a.name == name) {
+/// Find where `name` lives, capturing it in an enclosing function when needed.
+///
+/// The search runs outward through the enclosing functions' states, which are
+/// still on the compiler stack while a nested function is resolved. Finding the
+/// name in an enclosing function is what creates a closure reference, and every
+/// function in between has to forward it — a function can only reach its own
+/// parent's frame.
+///
+/// A name declared nowhere is a global. The reference does *not* look it up by
+/// name from the inner function: the top-level function gets one `[global]`
+/// entry and every nested function gets a `[global_ref<n>]` pointing at its
+/// parent's entry, which is why `function f(){ g(); }` shows `[global_ref0]`
+/// rather than `[global]`.
+fn resolve_slot(stack: &mut [FnState], current: usize, name: &str) -> Slot {
+    if let Some(index) = stack[current].args.iter().position(|a| a.name == name) {
         return Slot::Arg(index as u32);
     }
-    if let Some(index) = state.vars.iter().position(|v| v.name == name) {
+    if let Some(index) = stack[current].vars.iter().position(|v| v.name == name) {
         return Slot::Loc(index as u32);
     }
-    if let Some(index) = state.closure_vars.iter().position(|c| c.name == name) {
-        return match state.closure_vars[index].closure_type {
-            ClosureType::Global => Slot::Global(index as u32),
-            ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport => {
-                Slot::GlobalDecl(index as u32)
-            }
-            _ => Slot::VarRef(index as u32),
-        };
+    if let Some(index) = stack[current]
+        .closure_vars
+        .iter()
+        .position(|c| c.name == name)
+    {
+        return slot_for_closure(&stack[current].closure_vars[index], index as u32);
     }
-    // Not declared anywhere: a dynamic global lookup.
-    state.closure_vars.push(ClosureVar {
-        name: name.to_string(),
-        is_const: false,
-        is_lexical: false,
-        closure_type: ClosureType::Global,
-        var_idx: 0,
-    });
-    Slot::Global(state.closure_vars.len() as u32 - 1)
+
+    for owner in (0..current).rev() {
+        let found = if let Some(index) = stack[owner].args.iter().position(|a| a.name == name) {
+            Some(Found::Local(ClosureType::Arg, index as u32, false, false))
+        } else if let Some(index) = stack[owner].vars.iter().position(|v| v.name == name) {
+            let var = &stack[owner].vars[index];
+            Some(Found::Local(
+                ClosureType::Local,
+                index as u32,
+                var.is_const,
+                var.is_lexical,
+            ))
+        } else if let Some(index) = stack[owner]
+            .closure_vars
+            .iter()
+            .position(|c| c.name == name)
+        {
+            let closure = &stack[owner].closure_vars[index];
+            Some(match closure.closure_type {
+                ClosureType::Global
+                | ClosureType::GlobalDecl
+                | ClosureType::ModuleDecl
+                | ClosureType::ModuleImport => Found::Global(index as u32),
+                _ => Found::Local(
+                    ClosureType::Ref,
+                    index as u32,
+                    closure.is_const,
+                    closure.is_lexical,
+                ),
+            })
+        } else {
+            None
+        };
+        let Some(found) = found else { continue };
+
+        let (is_const, is_lexical) = match found {
+            Found::Local(_, _, is_const, is_lexical) => (is_const, is_lexical),
+            Found::Global(_) => (false, false),
+        };
+        // Mark the owner's binding as captured so it moves into a reference cell.
+        if let Found::Local(ClosureType::Arg | ClosureType::Local, index, _, _) = found {
+            let slot = match found {
+                Found::Local(ClosureType::Arg, _, _, _) => &mut stack[owner].args[index as usize],
+                _ => &mut stack[owner].vars[index as usize],
+            };
+            slot.is_captured = true;
+        }
+        // Forward the reference through every function in between.
+        let mut previous = match found {
+            Found::Local(kind, index, _, _) => (kind, index),
+            Found::Global(index) => (ClosureType::Global, index),
+        };
+        for level in owner + 1..=current {
+            let kind = match (previous.0, level) {
+                (ClosureType::Global | ClosureType::GlobalDecl, _) => ClosureType::GlobalRef,
+                (ClosureType::Arg | ClosureType::Local, level) if level == owner + 1 => previous.0,
+                _ => ClosureType::Ref,
+            };
+            let index = ensure_closure(stack, level, name, is_const, is_lexical, kind, previous.1);
+            previous = (kind, index);
+        }
+        let index = previous.1;
+        return slot_for_closure(&stack[current].closure_vars[index as usize], index);
+    }
+
+    // Declared nowhere: a dynamic global lookup, which sloppy mode may satisfy by
+    // creating a property. The top-level function holds the entry.
+    let mut previous = (
+        ClosureType::Global,
+        ensure_closure(stack, 0, name, false, false, ClosureType::Global, 0),
+    );
+    for level in 1..=current {
+        let index = ensure_closure(
+            stack,
+            level,
+            name,
+            false,
+            false,
+            ClosureType::GlobalRef,
+            previous.1,
+        );
+        previous = (ClosureType::GlobalRef, index);
+    }
+    Slot::Global(previous.1)
 }
 
-fn first_lexical_var(state: &FnState, scope: usize) -> i32 {
-    let mut scope = scope;
-    loop {
-        let entry = &state.scopes[scope];
-        if entry.first >= 0 {
-            return entry.first;
-        }
-        if scope == entry.parent {
-            return -1;
-        }
-        scope = entry.parent;
+/// What an outward search turned up.
+#[derive(Debug, Clone, Copy)]
+enum Found {
+    /// A binding in an enclosing function, reachable through a closure of this
+    /// type, with its const/lexical flags.
+    Local(ClosureType, u32, bool, bool),
+    /// A global, reached through the enclosing function's closure entry.
+    Global(u32),
+}
+
+/// Add a closure entry to `level` if it is not there yet.
+fn ensure_closure(
+    stack: &mut [FnState],
+    level: usize,
+    name: &str,
+    is_const: bool,
+    is_lexical: bool,
+    closure_type: ClosureType,
+    var_idx: u32,
+) -> u32 {
+    if let Some(index) = stack[level]
+        .closure_vars
+        .iter()
+        .position(|c| c.name == name)
+    {
+        return index as u32;
     }
+    stack[level].closure_vars.push(ClosureVar {
+        name: name.to_string(),
+        is_const,
+        is_lexical,
+        closure_type,
+        var_idx: var_idx as u16,
+    });
+    stack[level].closure_vars.len() as u32 - 1
+}
+
+fn slot_for_closure(closure: &ClosureVar, index: u32) -> Slot {
+    match closure.closure_type {
+        // A `global_ref` only says *how* the binding is found (through the
+        // parent's closure table); the access itself is an ordinary global one.
+        ClosureType::Global | ClosureType::GlobalRef => Slot::Global(index),
+        ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport => {
+            Slot::GlobalDecl(index)
+        }
+        _ => Slot::VarRef(index),
+    }
+}
+
+/// Pick the opcode for one variable access.
+///
+/// The `_check` variants are what enforce the temporal dead zone. They are used
+/// for every access to a `let`/`const` binding except its own initialisation —
+/// which is exactly the operation that takes the binding out of the dead zone.
+fn variable_instruction(
+    stack: &[FnState],
+    current: usize,
+    action: VarAction,
+    slot: Slot,
+) -> (Opcode, Vec<Op>) {
+    let lexical = match slot {
+        Slot::Loc(index) => stack[current]
+            .vars
+            .get(index as usize)
+            .is_some_and(|v| v.needs_check()),
+        Slot::VarRef(index) => stack[current]
+            .closure_vars
+            .get(index as usize)
+            .is_some_and(|c| c.is_lexical),
+        _ => false,
+    };
+    let operand = vec![Op::Slot(slot)];
+    match (action, slot) {
+        (VarAction::Get, Slot::Loc(index)) => (
+            if lexical {
+                Opcode::GetLocCheck
+            } else {
+                Opcode::GetLoc
+            },
+            vec![Op::Slot(Slot::Loc(index))],
+        ),
+        (VarAction::Get, Slot::Arg(index)) => (Opcode::GetArg, vec![Op::Slot(Slot::Arg(index))]),
+        (VarAction::Get, Slot::VarRef(index)) => (
+            if lexical {
+                Opcode::GetVarRefCheck
+            } else {
+                Opcode::GetVarRef
+            },
+            vec![Op::Slot(Slot::VarRef(index))],
+        ),
+        (VarAction::Get, Slot::Global(_)) => (Opcode::GetVar, operand),
+        (VarAction::Get, Slot::GlobalDecl(_)) => (Opcode::GetVar, operand),
+        (VarAction::GetUndef, Slot::Loc(_)) => (Opcode::GetLoc, operand),
+        (VarAction::GetUndef, Slot::Arg(_)) => (Opcode::GetArg, operand),
+        (VarAction::GetUndef, Slot::VarRef(_)) => (Opcode::GetVarRef, operand),
+        (VarAction::GetUndef, Slot::Global(_) | Slot::GlobalDecl(_)) => {
+            (Opcode::GetVarUndef, operand)
+        }
+        (VarAction::Put, Slot::Loc(_)) => (
+            if lexical {
+                Opcode::PutLocCheck
+            } else {
+                Opcode::PutLoc
+            },
+            operand,
+        ),
+        (VarAction::Put, Slot::Arg(_)) => (Opcode::PutArg, operand),
+        (VarAction::Put, Slot::VarRef(_)) => (
+            if lexical {
+                Opcode::PutVarRefCheck
+            } else {
+                Opcode::PutVarRef
+            },
+            operand,
+        ),
+        (VarAction::Put, Slot::Global(_)) => (Opcode::PutVar, operand),
+        (VarAction::Put, Slot::GlobalDecl(_)) => (Opcode::PutVar, operand),
+        // Initialisation is what ends the dead zone, so it never checks.
+        (VarAction::PutInit, Slot::Loc(_)) => (Opcode::PutLoc, operand),
+        (VarAction::PutInit, Slot::Arg(_)) => (Opcode::PutArg, operand),
+        (VarAction::PutInit, Slot::VarRef(_)) => (Opcode::PutVarRef, operand),
+        (VarAction::PutInit, Slot::Global(_) | Slot::GlobalDecl(_)) => {
+            (Opcode::PutVarInit, operand)
+        }
+        (VarAction::Set, Slot::Loc(_)) => (
+            if lexical {
+                Opcode::SetLocCheck
+            } else {
+                Opcode::SetLoc
+            },
+            operand,
+        ),
+        (VarAction::Set, Slot::Arg(_)) => (Opcode::SetArg, operand),
+        (VarAction::Set, Slot::VarRef(_)) => (Opcode::SetVarRef, operand),
+        (VarAction::Set, Slot::Global(_)) => (Opcode::PutVar, operand),
+        (VarAction::Set, Slot::GlobalDecl(_)) => (Opcode::SetVarRef, operand),
+        (VarAction::PutRef, Slot::Loc(_)) => (Opcode::PutLoc, operand),
+        (VarAction::PutRef, Slot::Arg(_)) => (Opcode::PutArg, operand),
+        (VarAction::PutRef, Slot::VarRef(_)) => (Opcode::PutVarRef, operand),
+        (VarAction::PutRef, Slot::Global(_) | Slot::GlobalDecl(_)) => (Opcode::PutVarRef, operand),
+    }
+}
+
+/// The instruction-rewriting pass.
+///
+/// These are the reference implementation's patterns, restricted to the ones the
+/// constructs this compiler supports can produce. Each entry is a comment on the
+/// bytecode it removes, because the whole point is that the result is one
+/// instruction shorter than the literal translation of the AST.
+fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
+    fold_dup_patterns(insns, label_positions);
+
+    // `drop` before `return_undef` is dead: the return discards the whole frame
+    // anyway. This runs *after* the `dup` folds, because a `dup; put; drop` there
+    // consumes its own `drop`; removing the drop first would leave the `dup` and
+    // produce a `set_` where the reference has a `put_`.
+    for index in 0..insns.len() {
+        if opcode_at(insns, index) != Some(Opcode::Drop) {
+            continue;
+        }
+        // Skip over a run of drops, but stop at a jump target: removing code on
+        // one side of a label would silently retarget the jump.
+        let mut next = index + 1;
+        while opcode_at(insns, next) == Some(Opcode::Drop) && !is_label_at(label_positions, next) {
+            next += 1;
+        }
+        if is_label_at(label_positions, next) {
+            continue;
+        }
+        if opcode_at(insns, next) == Some(Opcode::ReturnUndef) {
+            for entry in &mut insns[index..next] {
+                *entry = None;
+            }
+        }
+    }
+
+    // `put_x(n) get_x(n)` -> `set_x(n)`, which is what a declaration followed by
+    // a use of the same variable boils down to.
+    for index in 0..insns.len() {
+        let Some((put_op, _)) = insns[index].clone() else {
+            continue;
+        };
+        if !is_foldable_put(put_op) {
+            continue;
+        }
+        if is_label_at(label_positions, index + 1) {
+            continue;
+        }
+        let Some((get_op, get_operands)) = insns.get(index + 1).cloned().flatten() else {
+            continue;
+        };
+        if get_op != get_form_of(put_op) {
+            continue;
+        }
+        let put_slot = insns[index].as_ref().and_then(|(_, o)| o.first().cloned());
+        if put_slot.is_none() || put_slot != get_operands.first().cloned() {
+            continue;
+        }
+        insns[index] = Some((set_form_of(put_op), get_operands));
+        insns[index + 1] = None;
+    }
+}
+
+/// The label an instruction refers to.
+fn label_id(operands: &[Op]) -> Option<u32> {
+    operands.iter().find_map(|operand| match operand {
+        Op::Label(label) => Some(label.0),
+        _ => None,
+    })
+}
+
+/// Whether a jump target is placed at this instruction index.
+fn is_label_at(label_positions: &[bool], index: usize) -> bool {
+    label_positions.get(index).copied().unwrap_or(false)
+}
+
+fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
+    // `dup put_x(n)` -> `set_x(n)`
+    // `dup put_x(n) drop` -> `put_x(n)`
+    // `dup put_x(n) drop get_x(n)` -> `set_x(n)`
+    for index in 0..insns.len() {
+        if opcode_at(insns, index) != Some(Opcode::Dup) {
+            continue;
+        }
+        if is_label_at(label_positions, index + 1) {
+            continue;
+        }
+        let Some((put_op, put_operands)) = insns[index + 1].clone() else {
+            continue;
+        };
+        if !is_foldable_put(put_op) {
+            continue;
+        }
+        let Some(Op::Slot(slot)) = put_operands.first().cloned() else {
+            continue;
+        };
+        let mut new_op = set_form_of(put_op);
+        let mut end = index + 2;
+        if is_label_at(label_positions, end) {
+            // The `put` has to stay as it is; only the `dup` can be folded.
+            insns[index] = Some((set_form_of(put_op), vec![Op::Slot(slot)]));
+            insns[index + 1] = None;
+            continue;
+        }
+        if opcode_at(insns, end) == Some(Opcode::Drop) {
+            new_op = put_op;
+            end += 1;
+            if opcode_at(insns, end) == Some(get_form_of(put_op))
+                && insns[end]
+                    .as_ref()
+                    .is_some_and(|(_, operands)| operands.first() == Some(&Op::Slot(slot)))
+            {
+                new_op = set_form_of(put_op);
+                end += 1;
+            }
+        }
+        insns[index] = Some((new_op, vec![Op::Slot(slot)]));
+        for entry in &mut insns[index + 1..end] {
+            *entry = None;
+        }
+    }
+}
+
+fn opcode_at(insns: &[Option<(Opcode, Vec<Op>)>], index: usize) -> Option<Opcode> {
+    insns
+        .get(index)
+        .and_then(|entry| entry.as_ref())
+        .map(|(op, _)| *op)
+}
+
+/// The four `put_` families that have a `set_` twin. Deliberately not including
+/// the global forms or `put_var_ref_check`: the reference's peephole lists exactly
+/// these, and folding the others would produce instructions that do not exist.
+fn is_foldable_put(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::PutLoc | Opcode::PutLocCheck | Opcode::PutArg | Opcode::PutVarRef
+    )
+}
+
+fn set_form_of(op: Opcode) -> Opcode {
+    match op {
+        Opcode::PutLoc => Opcode::SetLoc,
+        Opcode::PutLocCheck => Opcode::SetLocCheck,
+        Opcode::PutArg => Opcode::SetArg,
+        Opcode::PutVarRef => Opcode::SetVarRef,
+        other => other,
+    }
+}
+
+fn get_form_of(op: Opcode) -> Opcode {
+    match op {
+        Opcode::PutLoc => Opcode::GetLoc,
+        Opcode::PutLocCheck => Opcode::GetLocCheck,
+        Opcode::PutArg => Opcode::GetArg,
+        Opcode::PutVarRef => Opcode::GetVarRef,
+        other => other,
+    }
+}
+
+/// Atom interning, per function.
+fn intern_atom(state: &mut FnState, name: &str) -> u32 {
+    if let Some(index) = state.atoms.iter().position(|a| a == name) {
+        return index as u32;
+    }
+    state.atoms.push(name.to_string());
+    state.atoms.len() as u32 - 1
 }
 
 fn binary_opcode(op: BinaryOp) -> Opcode {
@@ -1279,74 +1989,76 @@ fn compound_opcode(op: AssignOp) -> Opcode {
     }
 }
 
-fn variable_instruction(action: VarAction, slot: Slot) -> (Opcode, Vec<Op>) {
-    use Opcode::*;
-    match (action, slot) {
-        (VarAction::Get, Slot::Loc(i)) => (GetLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::Get, Slot::Arg(i)) => (GetArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::Get, Slot::VarRef(i)) => (GetVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::Get, Slot::Global(_)) => (GetVar, vec![Op::Slot(slot)]),
-        (VarAction::GetUndef, Slot::Loc(i)) => (GetLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::GetUndef, Slot::Arg(i)) => (GetArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::GetUndef, Slot::VarRef(i)) => (GetVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::GetUndef, Slot::Global(_)) => (GetVarUndef, vec![Op::Slot(slot)]),
-        (VarAction::Put, Slot::Loc(i)) => (PutLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::Put, Slot::Arg(i)) => (PutArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::Put, Slot::VarRef(i)) => (PutVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::Put, Slot::Global(_)) => (PutVar, vec![Op::Slot(slot)]),
-        (VarAction::PutInit, Slot::Loc(i)) => (PutLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::PutInit, Slot::Arg(i)) => (PutArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::PutInit, Slot::VarRef(i)) => (PutVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::PutInit, Slot::Global(_)) => (PutVarInit, vec![Op::Slot(slot)]),
-        (VarAction::Set, Slot::Loc(i)) => (SetLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::Set, Slot::Arg(i)) => (SetArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::Set, Slot::VarRef(i)) => (SetVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::Set, Slot::Global(_)) => (PutVar, vec![Op::Slot(slot)]),
-        (VarAction::Get, Slot::GlobalDecl(i)) => (GetVar, vec![Op::Slot(Slot::Global(i))]),
-        (VarAction::GetUndef, Slot::GlobalDecl(i)) => {
-            (GetVarUndef, vec![Op::Slot(Slot::Global(i))])
-        }
-        (VarAction::Put, Slot::GlobalDecl(i)) => (PutVar, vec![Op::Slot(Slot::Global(i))]),
-        (VarAction::PutInit, Slot::GlobalDecl(i)) => (PutVarInit, vec![Op::Slot(Slot::Global(i))]),
-        // A function declaration's global binding is a reference cell, because
-        // the function object and any closure over it must share one variable.
-        (VarAction::PutRef, Slot::GlobalDecl(i)) => (PutVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::PutRef, Slot::Loc(i)) => (PutLoc, vec![Op::Slot(Slot::Loc(i))]),
-        (VarAction::PutRef, Slot::Arg(i)) => (PutArg, vec![Op::Slot(Slot::Arg(i))]),
-        (VarAction::PutRef, Slot::VarRef(i)) => (PutVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-        (VarAction::PutRef, Slot::Global(_)) => (PutVar, vec![Op::Slot(slot)]),
-        (VarAction::Set, Slot::GlobalDecl(i)) => (SetVarRef, vec![Op::Slot(Slot::VarRef(i))]),
-    }
-}
-
 /// Encode the resolved instruction stream, choosing short forms where possible.
-fn assemble(insns: &[(Opcode, Vec<Op>)], state: &FnState) -> (Vec<u8>, u32) {
-    // First pass: pick an opcode for each instruction and its size, so label
-    // offsets can be computed.
-    let mut sizes = Vec::with_capacity(insns.len());
-    let mut chosen = Vec::with_capacity(insns.len());
-    for (op, operands) in insns {
-        let op = choose_short_form(*op, operands);
-        sizes.push(op.size() as usize);
-        chosen.push(op);
+///
+/// The peephole pass leaves holes in the instruction list so that label indices
+/// stay valid. A label names an *instruction index*, and an index that was
+/// deleted has to resolve to the next surviving instruction, which is what
+/// [`resolve_label`] does before the byte offsets are known.
+fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &FnState) -> (Vec<u8>, u32) {
+    // Compaction: surviving instructions in order, plus the index mapping.
+    let mut kept: Vec<(usize, Opcode, Vec<Op>)> = Vec::with_capacity(insns.len());
+    let mut original_to_kept: Vec<Option<usize>> = vec![None; insns.len()];
+    for (original, entry) in insns.iter_mut().enumerate() {
+        if let Some((op, operands)) = entry.take() {
+            original_to_kept[original] = Some(kept.len());
+            kept.push((original, op, operands));
+        }
     }
-    let mut offsets = Vec::with_capacity(insns.len() + 1);
+
+    // Choose an opcode for each instruction and its size, so label offsets can be
+    // computed.
+    let mut chosen = Vec::with_capacity(kept.len());
+    let mut offsets = Vec::with_capacity(kept.len() + 1);
     let mut offset = 0usize;
-    for size in &sizes {
+    for (_, op, operands) in &kept {
+        let op = choose_short_form(*op, operands);
         offsets.push(offset);
-        offset += size;
+        chosen.push(op);
+        offset += op.size() as usize;
     }
     offsets.push(offset);
 
     let mut code = Vec::with_capacity(offset);
-    for (index, (_, operands)) in insns.iter().enumerate() {
-        let op = chosen[index];
+    for (position, (_, _, operands)) in kept.iter().enumerate() {
+        let op = chosen[position];
         code.push(op as u8);
-        let position = offsets[index];
-        encode_operands(&mut code, op, operands, position, &offsets, state);
+        let operands = remap_label(operands, &state.labels, &original_to_kept, kept.len());
+        encode_operands(&mut code, op, &operands, offsets[position], &offsets);
     }
     let stack_size = compute_stack_size(&code);
     (code, stack_size)
+}
+
+/// Rewrite a label operand from an original instruction index to the kept index
+/// of the first instruction at or after it that survived the peephole pass.
+fn remap_label(
+    operands: &[Op],
+    placed: &[Option<usize>],
+    original_to_kept: &[Option<usize>],
+    kept_len: usize,
+) -> Vec<Op> {
+    operands
+        .iter()
+        .map(|operand| match operand {
+            Op::Label(label) => {
+                // Label id -> instruction index -> index after compaction. A
+                // target whose instruction the peephole deleted resolves to the
+                // next surviving one, which is the instruction that now does the
+                // same work.
+                let target = placed
+                    .get(label.0 as usize)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(original_to_kept.len());
+                let remapped = (target..original_to_kept.len())
+                    .find_map(|index| original_to_kept[index])
+                    .unwrap_or(kept_len);
+                Op::Label(Label(remapped as u32))
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 /// Compute the maximum value-stack depth by exploring the control-flow graph.
@@ -1473,7 +2185,10 @@ fn choose_short_form(op: Opcode, operands: &[Op]) -> Opcode {
         (Fclosure, Some(Op::Const(index))) if *index < 256 => Opcode::Fclosure8,
         (GetLoc | PutLoc | SetLoc, Some(Op::Slot(Slot::Loc(index))))
         | (GetArg | PutArg | SetArg, Some(Op::Slot(Slot::Arg(index))))
-        | (GetVarRef | PutVarRef | SetVarRef, Some(Op::Slot(Slot::VarRef(index)))) => {
+        | (GetVarRef | PutVarRef | SetVarRef, Some(Op::Slot(Slot::VarRef(index))))
+        // A declared global is reached through its reference cell, so it shares
+        // the `var_ref` encodings, short forms included.
+        | (GetVarRef | PutVarRef | SetVarRef, Some(Op::Slot(Slot::GlobalDecl(index)))) => {
             op.short_form(*index).unwrap_or(op)
         }
         (Call, Some(Op::Int(count))) if (0..=3).contains(count) => {
@@ -1492,7 +2207,6 @@ fn encode_operands(
     operands: &[Op],
     position: usize,
     offsets: &[usize],
-    state: &FnState,
 ) {
     use crate::opcode::OpFormat::*;
     let info = op.info();
@@ -1550,11 +2264,11 @@ fn encode_operands(
         }
         Label | Label8 | Label16 => {
             if let Some(Op::Label(label)) = operands.first() {
-                let Some(index) = state.labels[label.0 as usize] else {
-                    debug_assert!(false, "unplaced label {}", label.0);
+                // Labels were already remapped to kept-instruction indices.
+                let Some(&target) = offsets.get(label.0 as usize) else {
+                    debug_assert!(false, "label {} is past the end", label.0);
                     return;
                 };
-                let target = offsets[index];
                 let relative = target as i64 - (position as i64 + 1);
                 match info.format {
                     Label8 => code.push(relative as i8 as u8),
@@ -1580,15 +2294,6 @@ fn operand_uint(op: &Op) -> Option<u32> {
         Op::Int(value) => Some(*value as u32),
         _ => None,
     }
-}
-
-/// Intern `name` in the function's atom table.
-fn intern_atom(state: &mut FnState, name: &str) -> u32 {
-    if let Some(index) = state.atoms.iter().position(|a| a == name) {
-        return index as u32;
-    }
-    state.atoms.push(name.to_string());
-    state.atoms.len() as u32 - 1
 }
 
 /// Disassemble a compiled function.

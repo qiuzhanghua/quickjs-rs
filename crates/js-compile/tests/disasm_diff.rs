@@ -296,6 +296,108 @@ fn statements_match_the_reference() {
     assert_cases(&cases);
 }
 
+/// The temporal dead zone and the scope chain.
+///
+/// Every case here exercises `set_loc_uninitialized`, the `_check` opcodes, or
+/// the `scope_next` links the runtime walks to instantiate a scope.
+#[test]
+fn tdz_and_scopes_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        // A `let` in a function body starts uninitialised.
+        "function f(){ let x = 1; return x; }",
+        "function f(){ let x; return x; }",
+        "function f(){ let x; x = 1; return x; }",
+        "function f(){ let x = 0; x = 1; return x; }",
+        "function f(){ let x = 0; x += 1; }",
+        "function f(){ let x = 0; x++; }",
+        "function f(){ const c = 1; return c; }",
+        // Reads before the declaration are still inside the dead zone.
+        "function f(){ return x; let x = 1; }",
+        "function f(){ g(); let x = 1; }",
+        // Blocks: the binding is marked when the block is entered.
+        "function f(){ { let x = 1; } return 0; }",
+        "function f(){ { let x = 1; return x; } }",
+        "function f(){ let a = 1; { let b = 2; return b; } }",
+        "function f(){ let a; { let b = a; } }",
+        "function f(){ { let a; let b; } }",
+        "function f(){ let a; let b; }",
+        "function f(){ let a; let b; let c; }",
+        "function f(){ { let a; } { let b; } }",
+        "function f(){ let a; { let b; { let c; } } }",
+        "function f(){ { { let c; } let b; } let a; }",
+        "function f(){ { let a = 1; } let b = 2; }",
+        "function f(){ let b = 2; { let a = 1; } }",
+        // `var` never enters the dead zone.
+        "function f(){ return v; var v = 1; }",
+        "function f(){ var v = 1; { let w = 2; } return v; }",
+        // Closures capture the binding, which forces a reference cell.
+        "function f(){ let x = 1; return function(){ return x; }; }",
+        "function f(){ let x = 0; return function(){ x += 1; }; }",
+        "function f(){ let x = 1; return function(){ x = 2; return x; }; }",
+        "function f(a){ return function(){ return a; }; }",
+        "function f(){ var v = 1; return function(){ return v; }; }",
+        // Function declarations are instantiated when the scope is entered.
+        "function f(){ function g(){} return g; }",
+        "function f(){ a; function g(){} }",
+        "g(); function f(){ return 1; }",
+        "function f(){ function g(){} function h(){} return h; }",
+        // A captured binding in a nested block is closed when the block ends.
+        "function f(){ { let x = 1; g = function(){ return x; }; } }",
+        "function f(){ let a = 1; { let b = 2; g = function(){ return a + b; }; } }",
+        // Globals reached from a nested function go through the parent's entry.
+        "function f(){ g(); }",
+        "var g; function f(){ g(); }",
+        "function f(){ function h(){ k(); } }",
+        "function f(){ g(); h(); }",
+        // Dead code after a `return` is not compiled.
+        "function f(){ return 1; let x = 2; }",
+        "function f(){ return 1; var x = 2; }",
+        "function f(){ return; g(); }",
+        "function f(){ throw 1; g(); }",
+        // `const` is checked like `let`, but never written.
+        "function f(){ const c = 1; return c; }",
+        "function f(){ const c = 1; c; return c; }",
+        // Source-order slot numbering must survive interleaved declarations.
+        "function f(){ let a = 1; var b = 2; }",
+        "function f(){ var b = 2; let a = 1; }",
+        "function f(){ { let a = 1; } var b = 2; }",
+        "function f(){ var b = 2; { let a = 1; } }",
+        "function f(){ let a = 1; function g(){} }",
+        // Nesting depth: the chain has to reach across several scopes.
+        "function f(){ let a; { let b; { let c; } } }",
+        "function f(){ { { let c; } let b; } let a; }",
+        "function f(){ let a; { let b; } let c; }",
+    ];
+    assert_cases(&cases);
+}
+
+/// Function name inference and closure plumbing, which the TDZ work touches.
+#[test]
+fn named_functions_and_captures_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        "var f = function(){};",
+        "var f = function named(){};",
+        "g = function(){};",
+        "function k(){ var f = function(){}; }",
+        "function k(p){ return function(){ return p; }; }",
+        "function k(p){ var q = p; return function(){ return q + p; }; }",
+        "function k(){ var a = 1; var b = 2; return function(){ return a + b; }; }",
+        "function k(){ return function(){ return function(){ return 1; }; }; }",
+        "function k(){ var a = 1; return function(){ return function(){ return a; }; }; }",
+        "function k(){ { let a = 1; } return 0; }",
+        "function k(){ for (let i = 0; i < 1; i++); }",
+        "function k(){ for (;;) { let a = 1; } }",
+        "function k(){ { } }",
+        "function k(){ {} {} }",
+        "function k(){}",
+        "function k(a, b, c, d){ return d; }",
+        "function k(a, b, c, d, e){ return e; }",
+    ];
+    assert_cases(&cases);
+}
+
 fn assert_cases(cases: &[&str]) {
     let failures = compare(cases);
     assert!(
