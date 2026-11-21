@@ -1,0 +1,19 @@
+[package]
+name = "quickjs-pure"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Embeddable JavaScript engine written in pure Rust (QuickJS-compatible)"
+
+# crates.io 上的 `quickjs` 已被一个 2019 年的 FFI 包装占用，因此包名加 `-pure`
+# 后缀；lib 名保持 `quickjs`，使用者写 `use quickjs::…`。
+[lib]
+name = "quickjs"
+
+[dependencies]
+quickjs-gc.workspace = true

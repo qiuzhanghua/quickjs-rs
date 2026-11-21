@@ -3,39 +3,39 @@
 version = 4
 
 [[package]]
-name = "js-compile"
-version = "0.1.1"
-dependencies = [
- "js-parse",
- "quickjs-conformance",
-]
-
-[[package]]
-name = "js-gc"
-version = "0.1.1"
-
-[[package]]
-name = "js-parse"
+name = "quickjs-cli"
 version = "0.1.1"
 dependencies = [
  "quickjs-conformance",
+ "quickjs-pure",
 ]
 
 [[package]]
-name = "qjs"
+name = "quickjs-compile"
 version = "0.1.1"
 dependencies = [
- "quickjs",
  "quickjs-conformance",
-]
-
-[[package]]
-name = "quickjs"
-version = "0.1.1"
-dependencies = [
- "js-gc",
+ "quickjs-parse",
 ]
 
 [[package]]
 name = "quickjs-conformance"
 version = "0.1.1"
+
+[[package]]
+name = "quickjs-gc"
+version = "0.1.1"
+
+[[package]]
+name = "quickjs-parse"
+version = "0.1.1"
+dependencies = [
+ "quickjs-conformance",
+]
+
+[[package]]
+name = "quickjs-pure"
+version = "0.1.1"
+dependencies = [
+ "quickjs-gc",
+]

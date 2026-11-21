@@ -1,0 +1,16 @@
+[package]
+name = "quickjs-gc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Reference counting with cycle collection for the pure-Rust QuickJS port"
+
+# 包名带 `quickjs-` 前缀：`js-gc` 这类通名不该被这个项目占用。
+# lib 名保持 `js_gc`，模块路径短，代码里 `use js_gc::…` 不必改动。
+[lib]
+name = "js_gc"

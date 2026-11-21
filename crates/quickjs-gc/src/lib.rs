@@ -1,4 +1,4 @@
-//! `js-gc` — reference counting with cycle collection.
+//! `quickjs-gc` — reference counting with cycle collection.
 //!
 //! QuickJS frees memory by reference counting and removes reference cycles with a
 //! periodic collector (see `JS_RunGC` / `JS_SetGCThreshold` in the C API). Its

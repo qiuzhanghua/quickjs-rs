@@ -1,4 +1,4 @@
-//! `js-parse` — ECMAScript 2025 lexer, AST and parser.
+//! `quickjs-parse` — ECMAScript 2025 lexer, AST and parser.
 //!
 //! Milestone status: **the lexer is complete (M1a)**; the AST and parser are the
 //! next step and do not exist yet.

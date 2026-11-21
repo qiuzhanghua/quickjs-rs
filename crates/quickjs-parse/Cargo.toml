@@ -1,10 +1,18 @@
 [package]
-name = "js-parse"
+name = "quickjs-parse"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "ECMAScript 2025 lexer, AST and parser for the pure-Rust QuickJS port"
+
+# lib 名保持 `js_parse`；见 quickjs-gc 的说明。
+[lib]
+name = "js_parse"
 
 [dependencies]
 

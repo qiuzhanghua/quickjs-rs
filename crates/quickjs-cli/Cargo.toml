@@ -1,0 +1,24 @@
+[package]
+name = "quickjs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Command line interpreter for the pure-Rust QuickJS port"
+# CLI 与上游 `qjs` 同名，装上会和 C 版抢同一个命令名，因此不发布。
+publish = false
+
+# crates.io 上的 `qjs` 已被占用；包名区分，二进制名保持 `qjs`。
+[[bin]]
+name = "qjs"
+path = "src/main.rs"
+
+[dependencies]
+quickjs-pure.workspace = true
+
+[dev-dependencies]
+quickjs-conformance = { path = "../quickjs-conformance" }

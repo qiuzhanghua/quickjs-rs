@@ -41,7 +41,7 @@ if [ ! -x "$DEST/qjsc-dump" ]; then
     make -C "$DEST" -j"$NPROC" qjsc CFLAGS="$BASE_CFLAGS" >/dev/null
     cp "$DEST/qjsc" "$DEST/qjsc-dump"
     # Rebuild the plain compiler, so `qjsc` stays the parse-only oracle that
-    # `js-parse`'s tests compare against.
+    # `quickjs-parse`'s tests compare against.
     make -C "$DEST" clean >/dev/null 2>&1 || true
     make -C "$DEST" -j"$NPROC" qjs qjsc >/dev/null
 fi

@@ -21,7 +21,7 @@
 
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
-| M0 | 工作区骨架、`js-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
+| M0 | 工作区骨架、`quickjs-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
 | M1a | 词法分析器（ES2025 全量词法） | ✅ |
 | M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 🚧 核心子集已通过差分（见下） |
@@ -32,15 +32,20 @@
 ## 已交付的结构
 
 ```
-crates/js-gc/                引用计数 + 循环回收（16 个测试）
-crates/js-parse/             词法 + AST + 解析器（34 单元 + 36 结构 + 差分：字面量/语法/作用域/上游语料）
-crates/js-compile/           字节码编译器：opcode 表（转录自上游头文件）+ 两阶段编译 + 反汇编 + 序列化
-crates/quickjs/              公共 API 骨架：Runtime / Context / Error / COMPAT_VERSION
-crates/qjs/                  CLI：选项面与上游逐字节一致（--help、用法错误、-q）
+crates/quickjs-gc/           引用计数 + 循环回收（16 个测试）           lib: js_gc
+crates/quickjs-parse/        词法 + AST + 解析器 + 差分测试            lib: js_parse
+crates/quickjs-compile/      字节码编译器 + 反汇编 + 序列化            lib: js_compile
+crates/quickjs-pure/         公共 API 骨架：Runtime / Context / Error  lib: quickjs
+crates/quickjs-cli/          CLI：选项面与上游逐字节一致（--help、-q） bin: qjs
 crates/quickjs-conformance/  差分测试 harness（候选 vs C 参考实现）
 scripts/setup-oracle.sh      下载并构建 C 参考实现（oracle）
 scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + test
 ```
+
+包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
+已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
+**尚未发布到 crates.io** —— 计划在 M3 之后（见
+[`docs/requirements.md` 的发布策略](docs/requirements.md)）。
 
 ## 开发
 

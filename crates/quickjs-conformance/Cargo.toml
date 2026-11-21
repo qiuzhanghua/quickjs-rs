@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
 description = "Differential test harness: pure-Rust qjs vs the C reference implementation"
-
-[dependencies]
+# 测试专用 harness，依赖本机构建的 C 版参考实现，不发布。
+publish = false

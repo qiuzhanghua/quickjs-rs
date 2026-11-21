@@ -2,6 +2,42 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
+## 未发布
+
+### 包名与发布准备（行为无变化）
+
+crates.io 上 `quickjs`、`qjs`、`quickjs-rs` 三个名字都已被他人占用，其中
+`quickjs`（2019，FFI 包装）与 `qjs`（2019，`qjs-sys` 绑定）都还很活跃；
+`quickjs-rs` 的版本虽已全部 yank，yank 不等于让名。因此包名一律加前缀，
+**lib 名与二进制名保持不变** —— 包名与模块路径是两件事。
+
+| 目录 | 包名 | lib / bin |
+|---|---|---|
+| `crates/quickjs-gc` | `quickjs-gc` | lib `js_gc` |
+| `crates/quickjs-parse` | `quickjs-parse` | lib `js_parse` |
+| `crates/quickjs-compile` | `quickjs-compile` | lib `js_compile` |
+| `crates/quickjs-pure` | `quickjs-pure` | lib `quickjs` |
+| `crates/quickjs-cli` | `quickjs-cli` | bin `qjs` |
+| `crates/quickjs-conformance` | `quickjs-conformance` | lib，不发布 |
+
+配套改动：
+
+- 内部依赖同时写 `path` 与 `version`（集中在 `[workspace.dependencies]`，
+  version 用宽版本 `"0.1"`，patch 升级只改 `workspace.package.version`），
+  这是 `cargo publish` 的硬要求：发布时 `path` 会被去掉，只留版本约束。
+- 补 `repository`、`readme`、`keywords`、`categories`；`readme` 从 workspace
+  继承根 `README.md`，每个待发布 crate 目录内放 `LICENSE` 副本。
+  此前 `cargo package` 会警告「没有 documentation/homepage/repository」，
+  打包产物里也没有 README 与 LICENSE。
+- `quickjs-cli` 与 `quickjs-conformance` 设 `publish = false`：前者会和 C 版抢
+  同一个 `qjs` 命令名，后者依赖本机构建的 C 参考实现。
+
+**发布本身仍未做**，本项目在 M3 让 `qjs` 能真正执行 JavaScript 之前不发布 ——
+理由记在 `docs/requirements.md` 的「发布策略」。当前 `cargo package` 在
+`quickjs-pure` / `quickjs-compile` 上仍会离线失败，原因是本机 cargo 走 mirror
+索引且这两个包的上游依赖尚未上传；只要 path 依赖都带了 version，发布顺序
+`quickjs-gc → quickjs-parse → quickjs-compile → quickjs-pure` 即可。
+
 ## v0.1.1 — 2026-11-21
 
 **可用性边界未变**：`qjs` 仍不能执行 JavaScript，任何需要求值的命令依旧以

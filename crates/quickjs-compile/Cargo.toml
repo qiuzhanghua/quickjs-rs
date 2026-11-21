@@ -1,0 +1,22 @@
+[package]
+name = "quickjs-compile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Bytecode compiler for the pure-Rust QuickJS port"
+
+# lib 名保持 `js_compile`；见 quickjs-gc 的说明。
+[lib]
+name = "js_compile"
+
+[dependencies]
+quickjs-parse.workspace = true
+
+[dev-dependencies]
+# 差分 harness 只用于本地测试，不上传，因此不加版本约束。
+quickjs-conformance = { path = "../quickjs-conformance" }
