@@ -4,7 +4,9 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
+- 📌 当前版本：**v0.1.0** —— 解析器与字节码编译器可用，**运行期尚未开始**（`qjs` 还不能执行 JS）
 - 🚧 当前进度：**M2 进行中**（字节码编译器核心已通过逐 opcode 差分），M0/M1 已完成
+- 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 已确认决策
 
