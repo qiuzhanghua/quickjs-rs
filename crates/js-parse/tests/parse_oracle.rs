@@ -35,15 +35,12 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(tag: &str) -> TempDir {
+        // The tests run in parallel, and a timestamp alone can collide: two
+        // threads are quite capable of reading the same nanosecond.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        let unique = format!(
-            "quickjs-rs-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        );
+        let unique = format!("quickjs-rs-{tag}-{}-{sequence}", std::process::id());
         path.push(unique);
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)

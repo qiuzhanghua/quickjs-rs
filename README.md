@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 🚧 当前进度：**M1 完成**（词法 + AST + 解析器 + early errors），M0（骨架 + `js-gc` + 差分框架）已完成
+- 🚧 当前进度：**M2 进行中**（字节码编译器核心已通过逐 opcode 差分），M0/M1 已完成
 
 ## 已确认决策
 
@@ -22,7 +22,7 @@
 | M0 | 工作区骨架、`js-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
 | M1a | 词法分析器（ES2025 全量词法） | ✅ |
 | M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
-| M2 | 字节码编译器 + 作用域解析 + 序列化 | ⬜ |
+| M2 | 字节码编译器 + 作用域解析 + 序列化 | 🚧 核心子集已通过差分（见下） |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ⬜ |
 | M4–M11 | 内建库、ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
 | M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
@@ -32,6 +32,7 @@
 ```
 crates/js-gc/                引用计数 + 循环回收（16 个测试）
 crates/js-parse/             词法 + AST + 解析器（34 单元 + 36 结构 + 差分：字面量/语法/作用域/上游语料）
+crates/js-compile/           字节码编译器：opcode 表（转录自上游头文件）+ 两阶段编译 + 反汇编 + 序列化
 crates/quickjs/              公共 API 骨架：Runtime / Context / Error / COMPAT_VERSION
 crates/qjs/                  CLI：选项面与上游逐字节一致（--help、用法错误、-q）
 crates/quickjs-conformance/  差分测试 harness（候选 vs C 参考实现）
@@ -61,6 +62,18 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + 55 无效 + 39 模块用例一致 |
 | 声明冲突 | 同上 | 41 个作用域冲突用例一致 |
 | 上游语料 | 同上 | `tests/` + `examples/` 全部 `.js` 一致 |
+| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 71 条用例、131 条指令逐字节一致 |
+
+### M2 已知差距
+
+编译器目前覆盖：字面量、算术/比较/逻辑/位运算、变量读写（含 `var`/`let`/`const` 的全局与局部差异）、
+`if`/`while`/`do`/`for`、函数声明与表达式、闭包、调用、成员访问、`return`、`typeof`/`void`/`!`/`~`、
+自增自减、复合赋值、条件与逗号表达式。反汇编与参考实现**逐字节一致**。
+
+尚未实现（都返回明确的 `SyntaxError`，不会静默生成错误字节码）：
+`break`/`continue` 与标签、`switch`、`try/catch/finally`、`for-in`/`for-of`、解构、类、
+生成器与 async（需要状态机）、`with`、模块、可选链、数组字面量与对象字面量、
+`??`、TDZ 检查（`get_loc_check`）与 `enter_scope`/`leave_scope` 作用域链。
 
 ## 提交约定
 

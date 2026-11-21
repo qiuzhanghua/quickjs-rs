@@ -1,0 +1,12 @@
+[package]
+name = "js-compile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bytecode compiler for the pure-Rust QuickJS port"
+
+[dependencies]
+js-parse = { path = "../js-parse" }
+
+[dev-dependencies]
+quickjs-conformance = { path = "../quickjs-conformance" }

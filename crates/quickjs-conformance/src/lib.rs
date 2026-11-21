@@ -324,6 +324,34 @@ pub fn locate_qjsc() -> Option<PathBuf> {
     None
 }
 
+/// Search for a `qjsc` built with bytecode disassembly enabled.
+///
+/// The disassembler is a compile-time option in the reference implementation
+/// (`-DDUMP_BYTECODE=1`), so it needs its own binary; `scripts/setup-oracle.sh`
+/// builds it next to the normal one.
+pub fn locate_disassembler() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("QJSC_DUMP_ORACLE") {
+        let path = PathBuf::from(path);
+        if is_executable(&path) {
+            return Some(path);
+        }
+    }
+    let candidates = [
+        "/tmp/quickjs-master/qjsc-dump",
+        "/tmp/quickjs/qjsc-dump",
+        "quickjs/qjsc-dump",
+        "vendor/quickjs/qjsc-dump",
+        "../quickjs/qjsc-dump",
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if is_executable(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Search for a reference `qjs` binary.
 pub fn locate_oracle() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("QJS_ORACLE") {

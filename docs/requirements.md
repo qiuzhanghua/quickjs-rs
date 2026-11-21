@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v0.5 —— 需求分析已确认（§8），M0 与 M1（词法 + AST + 解析器 + early errors）已完成，下一步 M2（字节码编译器）
+> 状态：v0.6 —— 需求分析已确认（§8），M0/M1 已完成，M2（字节码编译器）核心子集已通过逐 opcode 差分
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
