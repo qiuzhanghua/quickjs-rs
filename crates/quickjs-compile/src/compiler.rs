@@ -118,6 +118,14 @@ enum Insn {
         name: String,
         block: u64,
     },
+    /// Close a binding *if* it turned out to be captured.
+    ///
+    /// Whether a `for (let i ...)` loop variable needs a fresh per-iteration cell is
+    /// only known once the body has been compiled — a closure created there is the
+    /// thing that makes it necessary. The reference emits `close_loc` exactly in that
+    /// case and nothing otherwise, so the decision is deferred to [`resolve`] instead
+    /// of emitted blind.
+    CloseCaptured { name: String, block: u64 },
     /// An instruction that dead-code elimination removed. It keeps its slot so
     /// that label indices stay valid, and resolves to no bytecode.
     Dead,
@@ -849,6 +857,33 @@ impl Compiler {
                         }
                     }
                 }
+                // A `let`/`const` in the head gets a *fresh binding per iteration*,
+                // so a closure made in the body captures that iteration's value
+                // instead of sharing one. The reference expresses this with
+                // `close_loc`, which swaps in a new reference cell holding the
+                // current value; the three points below are the ones it uses — after
+                // the initialiser, before the update, and after the loop.
+                let loop_bindings = match init {
+                    Some(ForInit::VarDecl(decl)) if decl.kind != VarDeclKind::Var => {
+                        let mut names: Vec<String> = Vec::new();
+                        for declarator in &decl.declarators {
+                            let mut idents = Vec::new();
+                            declarator.target.bound_names(&mut idents);
+                            names.extend(idents.into_iter().map(|ident| ident.name));
+                        }
+                        names
+                    }
+                    _ => Vec::new(),
+                };
+                // The reference also closes right after the initialiser, so the first
+                // iteration's closures get their own cell rather than sharing the one
+                // the initialiser wrote into.
+                for name in &loop_bindings {
+                    self.state().insns.push(Insn::CloseCaptured {
+                        name: name.clone(),
+                        block: for_key,
+                    });
+                }
                 let top = self.new_label();
                 let cont = self.new_label();
                 let end = self.new_label();
@@ -861,6 +896,16 @@ impl Compiler {
                 // `cont`, which sits just before the update.
                 self.loop_body(body, labels, cont, end)?;
                 self.place_label(cont);
+                // Each iteration ends with a fresh cell, so the closures the body just
+                // created keep the cell they captured and the update writes to a new
+                // one. Without this every closure in the loop shares one binding.
+                let binding_block = for_key;
+                for name in &loop_bindings {
+                    self.state().insns.push(Insn::CloseCaptured {
+                        name: name.clone(),
+                        block: binding_block,
+                    });
+                }
                 if let Some(update) = update {
                     self.state().discard_value = true;
                     let result = self.expr(update);
@@ -3128,6 +3173,25 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
                 let slot = resolve_slot(stack, current, name, *block);
                 out.push(Some(variable_instruction(stack, current, *action, slot)));
             }
+            Insn::CloseCaptured { name, block } => {
+                // The block matters: a loop variable is scoped to the `for` head's own
+                // block, so resolving it against block 0 would miss it entirely and
+                // silently emit nothing.
+                let slot = resolve_slot(stack, current, name, *block);
+                // Only a local with a reference cell has anything to close. A global
+                // or a never-captured local resolves to no instruction at all, which
+                // keeps the bytecode identical to the reference's.
+                if let Slot::Loc(index) = slot
+                    && stack[current]
+                        .vars
+                        .get(index as usize)
+                        .is_some_and(|v| v.is_captured)
+                {
+                    out.push(Some((Opcode::CloseLoc, vec![Op::Slot(slot)])));
+                } else {
+                    out.push(None);
+                }
+            }
             Insn::Dead => out.push(None),
         }
     }
@@ -3676,7 +3740,7 @@ fn reachable_instructions(state: &FnState, count: usize) -> Vec<bool> {
             Insn::Fixed { op, operands } => (*op, operands.as_slice()),
             // A variable access never transfers control, and a removed
             // instruction is only reachable if it is already marked.
-            Insn::Var { .. } | Insn::Dead => {
+            Insn::Var { .. } | Insn::CloseCaptured { .. } | Insn::Dead => {
                 worklist.push(index + 1);
                 continue;
             }

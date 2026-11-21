@@ -1283,8 +1283,24 @@ impl<'a> Interp<'a> {
                 self.put_loc(slot, Value::Uninitialized);
             }
             CloseLoc => {
+                // "Close" a binding: give it a *fresh* cell holding the current
+                // value. Closures created before this point keep the old cell and the
+                // ones created after see the new one, which is what makes every
+                // iteration of `for (let i ...)` capture its own `i`, and what freezes
+                // a block-scoped binding when the block ends.
+                //
+                // Clearing the slot instead (which this used to do) broke both: a
+                // closure over a captured block variable read `undefined`, and a loop
+                // terminated after one iteration.
                 let slot = self.slot_operand(op, a);
-                self.put_loc(slot, Value::Undefined);
+                let index = self.frame().code.loc_cell.get(slot).copied().unwrap_or(-1);
+                if index >= 0 {
+                    let current = self.frame().cells[index as usize].get();
+                    let fresh = self.new_cell(current);
+                    if let Some(cell) = self.frame_mut().cells.get_mut(index as usize) {
+                        *cell = fresh;
+                    }
+                }
             }
             GetArg | GetArg0 | GetArg1 | GetArg2 | GetArg3 => {
                 let slot = self.slot_operand(op, a);

@@ -667,3 +667,30 @@ fn string_conversion_runs_to_primitive() {
     );
     assert_eq!(eval(r#"print(String(new Error("m")))"#), "Error: m\n");
 }
+
+#[test]
+fn a_for_let_loop_binds_freshly_each_iteration() {
+    // `let` in a `for` head creates a new binding per iteration, so a closure made in
+    // the body captures that iteration's value. Sharing one binding — which is what
+    // happens with `var` — gives the final value everywhere.
+    assert_eq!(
+        eval(
+            "var a=[];for(let i=0;i<3;i++)a.push(function(){return i});print(a[0](),a[1](),a[2]())"
+        ),
+        "0 1 2\n"
+    );
+    assert_eq!(
+        eval(
+            "var a=[];for(var i=0;i<3;i++)a.push(function(){return i});print(a[0](),a[1](),a[2]())"
+        ),
+        "3 3 3\n"
+    );
+    // A block-scoped binding is frozen when its block ends, so a closure made inside
+    // keeps the value it had then.
+    assert_eq!(
+        eval("var f; { let x=1; f=function(){return x} } print(f())"),
+        "1\n"
+    );
+    // A loop variable that no closure captures needs no per-iteration cell at all.
+    assert_eq!(eval("var n=0;for(let i=0;i<3;i++)n++;print(n)"), "3\n");
+}
