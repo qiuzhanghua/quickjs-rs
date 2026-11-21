@@ -744,12 +744,79 @@ impl<'a> Interp<'a> {
         (name, lexical, is_const)
     }
 
+    /// The value of `name` in the innermost active `with` object, if any.
+    ///
+    /// The active objects are the [`VarKind::With`] locals of every frame still running,
+    /// innermost frame first and innermost block first within one. Walking frames rather
+    /// than keeping a separate stack is what makes a closure called from inside a `with`
+    /// see it, and what keeps the object alive only as long as the block is.
+    /// The innermost active `with` object that has `name`, if any.
+    fn with_owner(&mut self, name: &str) -> Option<Gc<JsObject>> {
+        let objects = self.with_objects();
+        for object in objects {
+            let key = self.string(name.to_string());
+            if self
+                .has_property(&key, &Value::Object(object.clone()))
+                .ok()?
+            {
+                return Some(object);
+            }
+        }
+        None
+    }
+
+    /// Every active `with` object, innermost first.
+    fn with_objects(&self) -> Vec<Gc<JsObject>> {
+        let mut objects = Vec::new();
+        for frame in self.frames.iter().rev() {
+            for (index, var) in frame.code.code.vars.iter().enumerate().rev() {
+                if var.kind != js_compile::VarKind::With {
+                    continue;
+                }
+                // A captured binding lives in its cell and not in the slot list, so the
+                // cell is consulted first — a closure created inside the block is exactly
+                // what makes the object captured. Before the store runs the slot still
+                // holds `undefined`, and a `with` object is always boxed, so a non-object
+                // entry is simply not in scope yet.
+                let value = frame
+                    .code
+                    .loc_cell
+                    .get(index)
+                    .copied()
+                    .filter(|cell| *cell >= 0)
+                    .and_then(|cell| frame.cells.get(cell as usize))
+                    .map(|cell| cell.get())
+                    .or_else(|| frame.locals.get(index).cloned());
+                if let Some(Value::Object(object)) = value {
+                    objects.push(object);
+                }
+            }
+        }
+        objects
+    }
+
+    fn with_lookup(&mut self, name: &str) -> JsResult<Option<Value>> {
+        for object in self.with_objects() {
+            let key = self.string(name.to_string());
+            if self.has_property(&key, &Value::Object(object.clone()))? {
+                return Ok(Some(self.read_field(&Value::Object(object), name)?));
+            }
+        }
+        Ok(None)
+    }
+
     fn get_global(&mut self, slot: usize) -> JsResult<Value> {
         let (name, lexical, _) = self.global_binding(slot);
         if name == "arguments"
             && let Some(arguments) = &self.eval_arguments
         {
             return Ok(arguments.clone());
+        }
+        // A `with` block around the *call site* is part of the scope an `eval` sees, so
+        // the objects registered by the frames still on the stack are consulted before
+        // anything else.
+        if let Some(value) = self.with_lookup(&name)? {
+            return Ok(value);
         }
         // The frame that called `eval` is the innermost scope the eval'd code sees, so
         // its local `a` wins over a global `a`.
@@ -790,6 +857,12 @@ impl<'a> Interp<'a> {
     /// deleted but is always writable.
     fn put_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
         let (name, lexical, is_const) = self.global_binding(slot);
+        // An assignment inside a `with` writes through to the object that supplies the
+        // name, which for an `eval` means consulting the same chain `get_global` does.
+        if let Some(owner) = self.with_owner(&name) {
+            self.set_property_with(&owner, &name, value, DeleteFailure::Ignore)?;
+            return Ok(());
+        }
         // A binding of the frame that called `eval` takes the write, which is what
         // makes `f("a = 3")` change the caller's `a`.
         if self.set_eval_binding(&name, &value) {

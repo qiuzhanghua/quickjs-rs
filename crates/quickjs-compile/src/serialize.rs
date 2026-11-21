@@ -455,6 +455,7 @@ fn var_kind_tag(kind: VarKind) -> u8 {
         VarKind::GlobalFunctionDecl => 10,
         VarKind::Using => 11,
         VarKind::UsingMethod => 12,
+        VarKind::With => 13,
     }
 }
 
@@ -473,6 +474,7 @@ fn var_kind_from_tag(tag: u8) -> Result<VarKind, DecodeError> {
         10 => VarKind::GlobalFunctionDecl,
         11 => VarKind::Using,
         12 => VarKind::UsingMethod,
+        13 => VarKind::With,
         other => return Err(DecodeError::BadTag("variable kind", other)),
     })
 }

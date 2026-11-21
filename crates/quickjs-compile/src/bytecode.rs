@@ -137,6 +137,12 @@ pub enum VarKind {
     Using,
     /// The hidden local holding a `using` declaration's cached dispose method.
     UsingMethod,
+    /// The hidden local holding a `with` statement's boxed object.
+    ///
+    /// Marked rather than merely named so the runtime can find the active ones without
+    /// guessing from a name prefix: an `eval` inside a `with` has to resolve names
+    /// against these objects before it reaches the realm.
+    With,
 }
 
 impl VarKind {

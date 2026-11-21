@@ -265,7 +265,6 @@ fn unsupported_constructs_fail_loudly() {
         "class A { }",
         "function* g() { }",
         "async function f() { }",
-        "with (a) b;",
     ] {
         let program = parse_script(source).expect("parses");
         let error =

@@ -369,6 +369,11 @@ struct FnState {
     defined_args: u32,
     /// Parameters that are not a plain name, with the argument slot each came from.
     param_prologue: Vec<(usize, Pattern)>,
+    /// Hidden locals of the `with` blocks currently open, innermost last.
+    with_names: Vec<String>,
+    /// Set while a with-guard is being emitted, so the guard's own accesses are not
+    /// wrapped in another guard.
+    emitting_with_guard: bool,
     self_name: Option<String>,
     /// Whether the self-name prologue (`special_object 2` then the store) has been
     /// emitted for this function.
@@ -433,6 +438,8 @@ impl FnState {
             is_arrow: false,
             defined_args: 0,
             param_prologue: Vec::new(),
+            with_names: Vec::new(),
+            emitting_with_guard: false,
             self_name: None,
             self_name_initialized: false,
             leaves_value: false,
@@ -563,6 +570,102 @@ impl Compiler {
             || self.cur().args.iter().any(|a| a.name == name)
     }
 
+    /// `with (object) body`
+    ///
+    /// The boxed object lives in a hidden local marked [`VarKind::With`]. A local is
+    /// what makes the object reachable from a closure created inside the block, and it
+    /// is also what lets an `eval` find it: the runtime collects the active `With`
+    /// locals of every frame and resolves names against them before the realm.
+    ///
+    /// Inside the block every name reference is spelled as "look in the with objects
+    /// first", innermost outwards, and falls through to the ordinary access. The test is
+    /// `in`, which is `HasProperty` — the same question the spec's Object Environment
+    /// Record asks.
+    fn with_stmt(&mut self, object: &Expr, body: &Stmt) -> Result<(), SyntaxError> {
+        let name = self.next_with_name();
+        // The object expression is evaluated *outside* the scope it introduces, so no
+        // wrapper may be emitted for the names it mentions.
+        let saved = std::mem::take(&mut self.state().with_names);
+        self.expr(object)?;
+        self.state().with_names = saved;
+        self.emit(Opcode::ToObject, &[]);
+        self.declare_hidden_local(&name, VarKind::With);
+        // Pushed before the store so the store itself is not guarded by an *outer*
+        // `with` — the object being stored is the new one, not something to look up.
+        self.state().with_names.push(name.clone());
+        self.emit_var(VarAction::Put, &name);
+        let result = self.stmt(body);
+        self.state().with_names.pop();
+        result
+    }
+
+    /// A hidden-local name for one `with` block, distinct from every enclosing one.
+    fn next_with_name(&self) -> String {
+        let depth = self.cur().with_names.len();
+        if depth == 0 {
+            "<with>".to_string()
+        } else {
+            format!("<with{depth}>")
+        }
+    }
+
+    /// Declare a hidden local that must stay a *local* even in a script.
+    ///
+    /// A script's `var` is a property of the global object, but the `with` object is not
+    /// part of the source program's name space at all — it only exists for the compiler
+    /// and the runtime — so it goes straight into the frame's slot list.
+    fn declare_hidden_local(&mut self, name: &str, kind: VarKind) {
+        let state = self.state();
+        if state.vars.iter().any(|v| v.name == name) {
+            return;
+        }
+        state.var_block.push(FUNCTION_SCOPE);
+        state.vars.push(VarDef {
+            kind,
+            ..VarDef::var(name)
+        });
+    }
+
+    /// Emit a name access, guarded by every active `with` object.
+    ///
+    /// Each guard is `get_loc <with>; push_atom_value name; in; if_false <next>` and then
+    /// the read itself; the outer guards and the plain access are what the `if_false`
+    /// jumps to, so the innermost object wins.
+    fn emit_with_guarded(&mut self, action: VarAction, name: &str) {
+        let names = self.cur().with_names.clone();
+        let done = self.new_label();
+        let mut starts = Vec::new();
+        // Innermost object first: the last `with` opened is the one that shadows the
+        // others, so its guard has to be the first chance to satisfy the name.
+        for with_name in names.iter().rev() {
+            let next = self.new_label();
+            // `in` takes the key then the object.
+            self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(name))]);
+            self.emit_var(VarAction::Get, with_name);
+            self.emit(Opcode::In, &[]);
+            self.emit_jump(Opcode::IfFalse, next, &[]);
+            starts.push(next);
+            match action {
+                // A store keeps the value under the receiver, which is where
+                // `put_field` expects it.
+                VarAction::Put | VarAction::PutInit => {
+                    self.emit_var(VarAction::Get, with_name);
+                    self.emit(Opcode::Swap, &[]);
+                    self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text(name))]);
+                }
+                _ => {
+                    self.emit_var(VarAction::Get, with_name);
+                    self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(name))]);
+                    self.emit(Opcode::GetArrayEl, &[]);
+                }
+            }
+            self.emit_jump(Opcode::Goto, done, &[]);
+            self.place_label(next);
+        }
+        self.emit_var(action, name);
+        self.place_label(done);
+    }
+
     fn emit_var(&mut self, action: VarAction, name: &str) {
         // Peephole: `put_x v` followed by `get_x v` becomes `set_x v`, which
         // stores and keeps the value in one instruction. The reference does this
@@ -601,6 +704,18 @@ impl Compiler {
                 *previous = VarAction::Set;
                 return;
             }
+        }
+        // Inside a `with`, every name lookup consults the with objects first. The
+        // hidden `<with…>` locals themselves are exempt, or the guard would recurse.
+        let guarded = !self.cur().with_names.is_empty()
+            && !self.cur().with_names.iter().any(|hidden| hidden == name)
+            && matches!(action, VarAction::Get | VarAction::Put | VarAction::PutInit)
+            && !self.state().emitting_with_guard;
+        if guarded {
+            self.state().emitting_with_guard = true;
+            self.emit_with_guarded(action, name);
+            self.state().emitting_with_guard = false;
+            return;
         }
         let block = self.cur().current_block;
         self.state().label_since_insn = false;
@@ -1005,14 +1120,7 @@ impl Compiler {
                 }
                 self.for_in_of(stmt, left, right, body, ForLoopKind::Of)?;
             }
-            StmtKind::With { .. } => {
-                // `with` is sloppy-mode only and needs the object scope chain at
-                // run time; left for the milestone that adds it.
-                return Err(SyntaxError::new(
-                    "'with' is not supported by the compiler yet",
-                    stmt.span,
-                ));
-            }
+            StmtKind::With { object, body } => self.with_stmt(object, body)?,
             StmtKind::ClassDecl(_) => {
                 return Err(SyntaxError::new(
                     "class declarations are not supported by the compiler yet",
@@ -3535,6 +3643,10 @@ impl Compiler {
         // function's instead let a nested `"use strict"` directive be ignored, so the
         // body ran with sloppy `this`, sloppy `arguments` and no const checks.
         state.strict = func.strict;
+        // A function defined inside a `with` block keeps seeing that object: the guard
+        // chain names the enclosing `<with>` locals, which resolve outward into closure
+        // variables exactly like any other captured binding.
+        state.with_names = self.cur().with_names.clone();
         state.is_arrow = func.is_arrow;
         // A named *expression* binds its own name; a declaration's name is already
         // bound in the enclosing scope.

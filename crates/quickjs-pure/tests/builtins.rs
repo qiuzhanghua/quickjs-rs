@@ -1051,3 +1051,51 @@ fn a_tagged_template_passes_the_call_site_object() {
         "5!\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// with
+// ---------------------------------------------------------------------------
+
+#[test]
+fn with_puts_an_object_in_front_of_every_scope() {
+    // The object shadows a global and a local alike: the Object Environment Record sits
+    // between the block and the function's own bindings.
+    assert_eq!(eval("var o={x:1},x=2; with(o){print(x)}"), "1\n");
+    assert_eq!(
+        eval("function f(){var x=2; with({x:1}) return x} print(f())"),
+        "1\n"
+    );
+    // A store writes through to the object that supplied the name.
+    assert_eq!(eval("var o={x:1},x=2; with(o){x=5} print(x,o.x)"), "2 5\n");
+    // Nested blocks resolve innermost first.
+    assert_eq!(
+        eval("var o1={x:1},o2={y:2}; with(o1){with(o2){print(x,y)}}"),
+        "1 2\n"
+    );
+    // A name the object does not have falls through to the ordinary lookup.
+    assert_eq!(
+        eval("var o={x:1}; with(o){print(typeof nope)}"),
+        "undefined\n"
+    );
+    // A function created inside the block keeps seeing the object, because the boxed
+    // object is a captured local.
+    assert_eq!(
+        eval("var f; with({z:1}){f=function(){return z}} print(f())"),
+        "1\n"
+    );
+}
+
+#[test]
+fn eval_inside_with_sees_the_object() {
+    assert_eq!(eval("var o={x:'o1'}; with(o){print(eval('x'))}"), "o1\n");
+    // A write through an `eval` reaches the object too.
+    assert_eq!(
+        eval("var o={x:'o1'}; with(o){eval('x=7')} print(o.x)"),
+        "7\n"
+    );
+    // The innermost object wins, and a name it lacks comes from the enclosing one.
+    assert_eq!(
+        eval("var o1={x:'a',y:'b'},o2={x:'c'}; with(o1){with(o2){print(eval('x'),eval('y'))}}"),
+        "c b\n"
+    );
+}
