@@ -176,6 +176,11 @@ pub struct Interp<'a> {
     /// Kept apart from [`Interp::eval_scope`] because a sloppy eval has no scope of its
     /// own yet still has to see the caller's `arguments`.
     eval_arguments: Option<Value>,
+    /// The `with` objects live at the moment the running `eval` started, innermost first.
+    ///
+    /// `None` outside an eval, which is what keeps a finished block's object from
+    /// shadowing ordinary bytecode reads.
+    eval_with: Option<Vec<Gc<JsObject>>>,
     /// Names of the native functions currently executing, outermost first.
     ///
     /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
@@ -226,6 +231,7 @@ impl<'a> Interp<'a> {
             eval_scope: None,
             eval_bindings: Vec::new(),
             eval_arguments: None,
+            eval_with: None,
             native_frames: Vec::new(),
             output: String::new(),
             max_frames: 4096,
@@ -421,6 +427,7 @@ impl<'a> Interp<'a> {
             None
         };
         let previous_arguments = self.eval_arguments.replace(arguments);
+        let previous_with = self.eval_with.replace(self.with_objects());
         let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
         let compiled = Gc::new(self.heap, CompiledCode::new(code));
         let closure_vars = compiled.code.closure_vars.clone();
@@ -429,6 +436,7 @@ impl<'a> Interp<'a> {
         let result = self.execute(compiled, env, this, Vec::new(), callee);
         self.eval_scope = previous_scope;
         self.eval_arguments = previous_arguments;
+        self.eval_with = previous_with;
         self.eval_bindings = previous_bindings;
         result
     }
@@ -752,7 +760,7 @@ impl<'a> Interp<'a> {
     /// see it, and what keeps the object alive only as long as the block is.
     /// The innermost active `with` object that has `name`, if any.
     fn with_owner(&mut self, name: &str) -> Option<Gc<JsObject>> {
-        let objects = self.with_objects();
+        let objects = self.eval_with.clone().unwrap_or_default();
         for object in objects {
             let key = self.string(name.to_string());
             if self
@@ -796,7 +804,7 @@ impl<'a> Interp<'a> {
     }
 
     fn with_lookup(&mut self, name: &str) -> JsResult<Option<Value>> {
-        for object in self.with_objects() {
+        for object in self.eval_with.clone().unwrap_or_default() {
             let key = self.string(name.to_string());
             if self.has_property(&key, &Value::Object(object.clone()))? {
                 return Ok(Some(self.read_field(&Value::Object(object), name)?));
@@ -813,8 +821,10 @@ impl<'a> Interp<'a> {
             return Ok(arguments.clone());
         }
         // A `with` block around the *call site* is part of the scope an `eval` sees, so
-        // the objects registered by the frames still on the stack are consulted before
-        // anything else.
+        // the objects live when the eval started are consulted before anything else. The
+        // snapshot is taken at entry rather than scanning the frames on every read: a
+        // block that has already finished still leaves its object in the slot, and a
+        // bytecode read outside the block must not see it.
         if let Some(value) = self.with_lookup(&name)? {
             return Ok(value);
         }
