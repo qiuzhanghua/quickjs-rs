@@ -1704,6 +1704,20 @@ impl<'a> Interp<'a> {
                 self.pop();
                 self.push(top);
             }
+            Perm4 => {
+                // `obj prop a b -> a obj prop b`, the reference's reordering for a
+                // postfix update of a computed element: it puts the *old* value
+                // underneath the receiver and key so `put_array_el` can consume them
+                // and leave the old value as the expression's result.
+                let d = self.pop();
+                let c = self.pop();
+                let b = self.pop();
+                let a = self.pop();
+                self.push(c);
+                self.push(a);
+                self.push(b);
+                self.push(d);
+            }
             Insert2 => {
                 // `obj a -> a obj a`
                 let value = self.pop();

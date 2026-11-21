@@ -2987,6 +2987,66 @@ impl Compiler {
     }
 
     fn update(&mut self, op: UpdateOp, argument: &Expr, prefix: bool) -> Result<(), SyntaxError> {
+        let instruction = match (op, prefix) {
+            (UpdateOp::Increment, true) => Opcode::Inc,
+            (UpdateOp::Increment, false) => Opcode::PostInc,
+            (UpdateOp::Decrement, true) => Opcode::Dec,
+            (UpdateOp::Decrement, false) => Opcode::PostDec,
+        };
+        if let ExprKind::Member {
+            object,
+            property,
+            optional: _,
+        } = &argument.kind
+        {
+            // `o.x++` needs the receiver twice, so the last link is read with the
+            // `get_*2`/`get_*3` form that keeps it, and the update is written back
+            // with `put_field`/`put_array_el`. The reordering in between is what puts
+            // the old value below the receiver for a postfix update and the new one
+            // above it for a prefix one:
+            //
+            //   `obj val` → `post_inc` → `obj old new` → `perm3` → `old obj new`
+            //   `obj val` → `inc`      → `obj new new` → `insert2` → `new obj new`
+            //
+            // This mirrors the reference instruction for instruction.
+            self.expr(object)?;
+            match property {
+                MemberProp::Ident(name) => {
+                    self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text(&name.name))]);
+                    self.emit(instruction, &[]);
+                    self.emit(
+                        if prefix {
+                            Opcode::Insert2
+                        } else {
+                            Opcode::Perm3
+                        },
+                        &[],
+                    );
+                    self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text(&name.name))]);
+                }
+                MemberProp::Computed(index) => {
+                    self.expr(index)?;
+                    self.emit(Opcode::GetArrayEl3, &[]);
+                    self.emit(instruction, &[]);
+                    self.emit(
+                        if prefix {
+                            Opcode::Insert3
+                        } else {
+                            Opcode::Perm4
+                        },
+                        &[],
+                    );
+                    self.emit(Opcode::PutArrayEl, &[]);
+                }
+                MemberProp::Private(_) => {
+                    return Err(SyntaxError::new(
+                        "private fields are not supported by the compiler yet",
+                        argument.span,
+                    ));
+                }
+            }
+            return Ok(());
+        }
         let ExprKind::Ident(name) = &argument.kind else {
             return Err(SyntaxError::new(
                 "increment of a non-variable is not supported by the compiler yet",
@@ -3001,12 +3061,6 @@ impl Compiler {
         // than saving two instructions.
         let _ = !std::mem::take(&mut self.state().discard_value);
         self.emit_var(VarAction::Get, &name.name);
-        let instruction = match (op, prefix) {
-            (UpdateOp::Increment, true) => Opcode::Inc,
-            (UpdateOp::Increment, false) => Opcode::PostInc,
-            (UpdateOp::Decrement, true) => Opcode::Dec,
-            (UpdateOp::Decrement, false) => Opcode::PostDec,
-        };
         self.emit(instruction, &[]);
         if prefix {
             self.emit(Opcode::Dup, &[]);

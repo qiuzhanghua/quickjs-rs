@@ -847,6 +847,29 @@ fn spread_arguments_reach_the_callee() {
 }
 
 #[test]
+fn update_expressions_work_on_members_and_elements() {
+    // `o.x++` has to read the receiver twice, so it compiles to a `get_field2` /
+    // `post_inc` / `perm3` / `put_field` sequence; a prefix one swaps `perm3` for
+    // `insert2`. Both forms must write back *and* leave the right result behind.
+    assert_eq!(
+        eval("var o={x:1}; print(o.x++, o.x, ++o.x, o.x--, o.x)"),
+        "1 2 3 3 2\n"
+    );
+    // A computed element keeps the key alive as well, which is the `perm4` /
+    // `insert3` shape.
+    assert_eq!(
+        eval("var a=[5],i=0; print(a[i]++, a[0], ++a[i], --a[i])"),
+        "5 6 7 6\n"
+    );
+    // The receiver of a deep chain is evaluated once, and only the last link is read
+    // with the form that keeps it.
+    assert_eq!(
+        eval("var o={a:{b:2}}; print(o.a.b++, o.a.b, ++o.a.b)"),
+        "2 3 4\n"
+    );
+}
+
+#[test]
 fn eval_sees_the_calling_scope() {
     // `this` and `arguments` come from the callee, not from global scope. Strict
     // mode is needed for `this` to stay the primitive: a sloppy function boxes it.
