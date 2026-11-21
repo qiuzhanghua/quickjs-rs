@@ -4,8 +4,8 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.1.1** —— 解析器、字节码编译器与 **VM 核心**可用：`qjs` 能执行 JS
-- 🚧 当前进度：**M2 进行中**（字节码编译器核心已通过逐 opcode 差分），M0/M1 已完成
+- 📌 当前版本：**v0.2.0** —— 首个发布版本：`qjs` 能执行 JS，标准库第一波可用
+- 🚧 当前进度：**M0–M4 已完成**；M5（ES6+ 运行期）未开始
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 已确认决策
@@ -24,7 +24,7 @@
 | M0 | 工作区骨架、`quickjs-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
 | M1a | 词法分析器（ES2025 全量词法） | ✅ |
 | M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
-| M2 | 字节码编译器 + 作用域解析 + 序列化 | 🚧 核心子集已通过差分（见下） |
+| M2 | 字节码编译器 + 作用域解析 + 序列化 | ✅ 逐 opcode 差分通过 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ✅ `qjs` 能执行 JS |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Reflect） | ✅ `test_builtin.js` 的 M4 部分 229/237 语句通过 |
 | M5–M11 | ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
@@ -48,8 +48,11 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 **尚未发布到 crates.io**。M3（能执行 JS）与 M4（标准库第一波）都已达成：
 `Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、
 `Reflect` 与错误类均可用，`qjs` 能跑通参考实现的 `test_builtin.js` 中 M4 覆盖的部分。
-剩下的已知缺口（`Error.stack`、`Date`、`RegExp`、`Symbol`、`Map`/`Set`、生成器）
-记在 `docs/requirements.md`，发布计划见同处的「发布策略」。
+`error.stack` 可用：位置来自编译期为每条指令记录的表，所以栈帧能报到
+`file:line:column`，抛错、`catch`、`JSON.parse` 的语法错误都带它。
+剩下的已知缺口（`Date`、`RegExp`、`Symbol`、`Map`/`Set`、TypedArray、生成器/async、
+spread 调用参数、直接 `eval` 的作用域、`Function.prototype.toString` 的源码回读、
+字符串拼接的 rope 优化）记在 `docs/requirements.md`，发布计划见同处的「发布策略」。
 
 ## 开发
 

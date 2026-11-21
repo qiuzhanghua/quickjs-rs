@@ -1,11 +1,13 @@
 //! `Number`, `Boolean`, `parseInt`/`parseFloat`/`isNaN`/`isFinite`, `eval` and the
 //! remaining global functions.
 
+use crate::bignum::Big;
 use crate::builtins::{arg, define_method};
 use crate::interp::{Interp, JsResult};
 use crate::object::{JsObject, Property};
 use crate::value::{Value, number_to_string, string_to_number};
 use js_gc::Gc;
+use std::cmp::Ordering;
 
 /// Install `Number` and `Number.prototype`.
 pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
@@ -94,90 +96,213 @@ fn to_string(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<V
 
 /// `number.toString(radix)` for a radix other than ten.
 ///
-/// The integer part is repeated division. The fraction is the interesting half:
-/// emitting digits until the remainder is zero never terminates for most values, so
-/// the loop stops once the remaining error is smaller than half an ulp of the
-/// original number — which yields the shortest representation that reads back
-/// exactly, the same shape V8 and QuickJS produce.
+/// The answer is the shortest digit string that reads back as the same double, decided
+/// the way the reference decides it: in exact integer arithmetic. The value is held as
+/// `mantissa * 2^exponent`, a candidate of `digits` significant digits is obtained by
+/// rounding `value / radix^place` to nearest-even with [`Big`], and the candidate is
+/// accepted when `candidate * radix^place` lands inside the interval that rounds back
+/// to the original double. Searching `digits` upwards finds the shortest such candidate;
+/// the search bound is `1 + ceil(53 / log2(radix))`, which is the reference's
+/// `dtoa_max_digits_table`.
+///
+/// The previous version grew a float `delta` alongside the fraction and stopped when the
+/// remainder dropped below it. That is the right idea and the wrong arithmetic: for
+/// `(1.3).toString(7)` the error accumulated over the multiply-and-subtract loop and it
+/// stopped one digit early with the last digit misrounded, printing
+/// `1.204620462046204621` where the reference prints `1.2046204620462046205`.
 fn radix_string(value: f64, radix: u32) -> String {
     if value == 0.0 {
         return "0".to_string();
     }
     let negative = value < 0.0;
     let magnitude = value.abs();
-    let integer = magnitude.trunc();
-    let mut fraction = magnitude - integer;
+    let bits = magnitude.to_bits();
+    let biased_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    // `magnitude == mantissa * 2^exponent`, exactly. A subnormal keeps its 52 mantissa
+    // bits and shares the minimum exponent, which is also the spacing between doubles
+    // there, so the interval below needs no special case.
+    let (mantissa, exponent) = if biased_exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), biased_exponent - 1075)
+    };
 
-    let mut integer_digits = Vec::new();
-    let mut remaining = integer;
-    if remaining == 0.0 {
-        integer_digits.push('0');
-    }
-    while remaining >= 1.0 {
-        let digit = (remaining % radix as f64) as u32;
-        integer_digits.push(std::char::from_digit(digit, radix).unwrap_or('0'));
-        remaining = (remaining / radix as f64).trunc();
-    }
-    integer_digits.reverse();
+    // The number of significant digits that always suffices for this radix.
+    let max_digits = 1 + (53.0 / (radix as f64).log2()).ceil() as u32;
+    // Where the radix point falls: the smallest `point` with `radix^(point-1) <= value`.
+    let point = radix_point(magnitude, mantissa, exponent, radix);
 
+    let mut candidate = (Big::zero(), 0);
+    for digits in 1..=max_digits {
+        // `value ≈ scaled * radix^place`, with `scaled` the `digits`-digit mantissa.
+        let mut place = point - digits as i32;
+        let mut scaled = scaled_round(mantissa, exponent, radix, place);
+        // Rounding can carry into one more digit (`1/3` in radix 3 rounds to `3`, which
+        // is two digits). The reference bumps its exponent in that case and tries again;
+        // at most one bump is possible, because the carry adds at most one digit.
+        if scaled.to_radix_string(radix).len() > digits as usize {
+            place += 1;
+            scaled = scaled_round(mantissa, exponent, radix, place);
+        }
+        if scaled.is_zero() {
+            continue;
+        }
+        candidate = (scaled, place);
+        if round_trips(&candidate.0, place, radix, mantissa, exponent) {
+            break;
+        }
+    }
+    // The shortest candidate wins; the widest one is guaranteed to work, so the loop
+    // always leaves something usable here even if no early acceptance happened.
+    let (scaled, place) = candidate;
     let mut out = String::new();
     if negative {
         out.push('-');
     }
-    out.extend(integer_digits);
-    if fraction == 0.0 {
-        return out;
-    }
-    out.push('.');
-
-    // Half an ulp at the number's own scale, grown by the radix alongside `fraction`
-    // so the two stay comparable after every multiplication.
-    let mut delta = 0.5 * (next_after(magnitude) - magnitude);
-    delta = delta.max(f64::MIN_POSITIVE);
-    loop {
-        fraction *= radix as f64;
-        delta *= radix as f64;
-        let digit = fraction.floor();
-        out.push(std::char::from_digit(digit as u32, radix).unwrap_or('0'));
-        fraction -= digit;
-        // Round the last digit up when the remainder is past the halfway point; a
-        // carry can only happen when the fraction is about to end.
-        let past_half = fraction > 0.5 || (fraction == 0.5 && (digit as u32) % 2 == 1);
-        if past_half && fraction + delta > 1.0 {
-            return round_up(&out, radix);
-        }
-        if fraction < delta {
-            break;
-        }
-    }
+    out.push_str(&place_radix_point(&scaled, place, radix));
     out
 }
 
-/// The next representable double above `value`.
-fn next_after(value: f64) -> f64 {
-    f64::from_bits(value.to_bits() + 1)
+/// Lay `value = scaled * radix^place` out with the radix point in place.
+fn place_radix_point(scaled: &Big, place: i32, radix: u32) -> String {
+    let digits = scaled.to_radix_string(radix);
+    let length = digits.len() as i32;
+    let point = length + place;
+    if point <= 0 {
+        // Purely fractional: `0.` then the zeros the value needs, then the digits.
+        let mut out = String::from("0.");
+        out.extend(std::iter::repeat_n('0', (-point) as usize));
+        out.push_str(&digits);
+        out
+    } else if point >= length {
+        // Integral: the digits, then the zeros the value needs to reach the point.
+        let mut out = digits;
+        out.extend(std::iter::repeat_n('0', (point - length) as usize));
+        out
+    } else {
+        let (whole, rest) = digits.split_at(point as usize);
+        format!("{whole}.{rest}")
+    }
 }
 
-/// Increment the last digit of `text`, carrying leftwards.
-fn round_up(text: &str, radix: u32) -> String {
-    let mut chars: Vec<char> = text.chars().collect();
-    let mut index = chars.len();
-    let max = std::char::from_digit(radix - 1, radix).unwrap_or('z');
-    while index > 0 {
-        index -= 1;
-        if chars[index] == '.' || chars[index] == '-' {
-            continue;
-        }
-        if chars[index] == max {
-            chars[index] = '0';
-            continue;
-        }
-        // The digit is below the maximum, so it simply increments.
-        let digit = chars[index].to_digit(radix).unwrap_or(0) + 1;
-        chars[index] = std::char::from_digit(digit, radix).unwrap_or('0');
-        return chars.into_iter().collect();
+/// The smallest `point` with `radix^(point-1) <= value < radix^point`.
+///
+/// The logarithm gives the answer almost always; the correction loops make it exact,
+/// because `f64::log2` is not trustworthy at the boundaries and a wrong `point` would
+/// shift every digit of the output by one place.
+///
+/// `magnitude` is passed in rather than rebuilt from the mantissa: `mantissa *
+/// 2^exponent` underflows to zero for the smallest subnormals, and a zero magnitude
+/// sends `log2` to negative infinity and the correction loop off the end of `i32`.
+fn radix_point(magnitude: f64, mantissa: u64, exponent: i32, radix: u32) -> i32 {
+    let mut point = (magnitude.log2() / (radix as f64).log2()).floor() as i32 + 1;
+    while compare_power(mantissa, exponent, point - 1, radix) == Ordering::Less {
+        point -= 1;
     }
-    chars.into_iter().collect()
+    while compare_power(mantissa, exponent, point, radix) != Ordering::Less {
+        point += 1;
+    }
+    point
+}
+
+/// Compare `mantissa * 2^exponent` with `radix^power`.
+fn compare_power(mantissa: u64, exponent: i32, power: i32, radix: u32) -> Ordering {
+    let (value_num, value_den) = scaled_exact(&Big::from_u64(mantissa), exponent, radix, 0);
+    let (power_num, power_den) = scaled_exact(&Big::one(), 0, radix, power);
+    value_num.mul(&power_den).cmp(&power_num.mul(&value_den))
+}
+
+/// `base * 2^exponent * radix^place` as an exact fraction.
+fn scaled_exact(base: &Big, exponent: i32, radix: u32, place: i32) -> (Big, Big) {
+    let mut num = base.clone();
+    let mut den = Big::one();
+    if exponent >= 0 {
+        num.shl(exponent as u32);
+    } else {
+        den.shl((-exponent) as u32);
+    }
+    if place >= 0 {
+        num.mul_pow(radix, place as u32);
+    } else {
+        den.mul_pow(radix, (-place) as u32);
+    }
+    (num, den)
+}
+
+/// `round(value / radix^place)`, ties to even — the reference's `JS_RNDN`.
+fn scaled_round(mantissa: u64, exponent: i32, radix: u32, place: i32) -> Big {
+    // Dividing by `radix^place` is multiplying by `radix^-place`.
+    let (num, den) = scaled_exact(&Big::from_u64(mantissa), exponent, radix, -place);
+    let (mut quotient, remainder) = num.div_rem_radix(&den, radix);
+    let mut twice = remainder;
+    twice.mul_small(2);
+    match twice.cmp(&den) {
+        Ordering::Greater => quotient.add_one(),
+        // A tie goes to the even neighbour, matching round-to-nearest-even.
+        Ordering::Equal if quotient.is_odd() => quotient.add_one(),
+        _ => {}
+    }
+    quotient
+}
+
+/// Whether `scaled * radix^place` rounds back to the original double.
+///
+/// The doubles that round to `mantissa * 2^exponent` are the ones inside
+/// `value ± half an ulp`. The ulp is `2^exponent`, except just above a power of two,
+/// where the spacing below is half that — hence the `1 << 52` test. A candidate exactly
+/// on a boundary rounds to whichever neighbour is even, so the endpoints are included
+/// only when the mantissa is even.
+fn round_trips(scaled: &Big, place: i32, radix: u32, mantissa: u64, exponent: i32) -> bool {
+    let (value_num, value_den) = scaled_exact(scaled, 0, radix, place);
+    let inclusive = mantissa % 2 == 0;
+    // Upper: `(mantissa * 2 + 1) * 2^(exponent - 1)`; lower, past a power of two:
+    // `(mantissa * 4 - 1) * 2^(exponent - 2)`.
+    let lower_half_bits = if mantissa == 1 << 52 { 2 } else { 1 };
+    let upper = compare_bound(&value_num, &value_den, mantissa, exponent, 1, 1);
+    let lower = compare_bound(
+        &value_num,
+        &value_den,
+        mantissa,
+        exponent,
+        lower_half_bits,
+        -1,
+    );
+    let below_upper = match upper {
+        Ordering::Equal => inclusive,
+        other => other == Ordering::Less,
+    };
+    let above_lower = match lower {
+        Ordering::Equal => inclusive,
+        other => other == Ordering::Greater,
+    };
+    below_upper && above_lower
+}
+
+/// Compare `value_num / value_den` with `(mantissa * 2^half_bits + sign) * 2^(exponent - half_bits)`.
+fn compare_bound(
+    value_num: &Big,
+    value_den: &Big,
+    mantissa: u64,
+    exponent: i32,
+    half_bits: u32,
+    sign: i64,
+) -> Ordering {
+    // `mantissa * 2^half_bits` fits comfortably: the mantissa uses at most 53 bits.
+    let mut bound_num = Big::from_u64(mantissa << half_bits);
+    if sign < 0 {
+        bound_num.sub_one();
+    } else {
+        bound_num.add_one();
+    }
+    let mut bound_den = Big::one();
+    let shift = exponent - half_bits as i32;
+    if shift >= 0 {
+        bound_num.shl(shift as u32);
+    } else {
+        bound_den.shl((-shift) as u32);
+    }
+    value_num.mul(&bound_den).cmp(&bound_num.mul(value_den))
 }
 
 fn to_fixed(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {

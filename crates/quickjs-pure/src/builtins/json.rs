@@ -239,19 +239,66 @@ fn parse(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
     parser.skip_whitespace();
     let value = match parser.value(interp) {
         Ok(value) => value,
-        Err(message) => {
-            return Err(crate::interp::Signal::Throw(
-                interp.make_error("SyntaxError", &message),
-            ));
+        Err(error) => {
+            return Err(crate::interp::Signal::Throw(json_error(
+                interp, &text, error,
+            )));
         }
     };
     parser.skip_whitespace();
     if parser.position != parser.bytes.len() {
-        return Err(crate::interp::Signal::Throw(
-            interp.make_error("SyntaxError", "unexpected data after JSON value"),
-        ));
+        return Err(crate::interp::Signal::Throw(json_error(
+            interp,
+            &text,
+            JsonError {
+                message: "unexpected data after JSON value".to_string(),
+                offset: parser.position,
+            },
+        )));
     }
     Ok(value)
+}
+
+/// A `SyntaxError` that reports where in the JSON text parsing failed.
+///
+/// The reference builds these with an explicit position, so the trace starts with
+/// `    at <input>:line:column` — the position inside the text — and only then lists
+/// the caller. `<input>` is the reference's placeholder for text that came from a
+/// string rather than a file, so it is kept even when the caller is a real script.
+fn json_error(interp: &mut Interp<'_>, text: &str, error: JsonError) -> Value {
+    let (line, column) = line_and_column(text, error.offset);
+    let trace = format!("    at <input>:{line}:{column}\n{}", interp.stack_trace());
+    let value = interp.make_error("SyntaxError", &error.message);
+    if let Value::Object(object) = &value {
+        let text = interp.string(trace);
+        object.define(
+            "stack",
+            crate::object::Property::with_attributes(text, true, true),
+        );
+    }
+    value
+}
+
+/// The 1-based line and column of `offset` in `text`.
+///
+/// Columns count UTF-16 code units, like every other position in this engine, so a
+/// character outside the BMP counts twice.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let before = &text[..offset.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    let column = before[line_start..].encode_utf16().count() + 1;
+    (line, column)
+}
+
+/// A JSON syntax error and where in the JSON text it happened.
+///
+/// The offset is what lets `JSON.parse` report a position the way the reference does:
+/// its stack starts with the line and column inside the *text being parsed*, not with
+/// the caller's frame.
+struct JsonError {
+    message: String,
+    offset: usize,
 }
 
 struct Parser<'a> {
@@ -261,6 +308,14 @@ struct Parser<'a> {
 }
 
 impl Parser<'_> {
+    /// An error blamed on the parser's current position.
+    fn error<T>(&self, message: impl Into<String>) -> Result<T, JsonError> {
+        Err(JsonError {
+            message: message.into(),
+            offset: self.position,
+        })
+    }
+
     fn skip_whitespace(&mut self) {
         while let Some(byte) = self.bytes.get(self.position) {
             match byte {
@@ -274,10 +329,10 @@ impl Parser<'_> {
         self.bytes.get(self.position).copied()
     }
 
-    fn value(&mut self, interp: &mut Interp<'_>) -> Result<Value, String> {
+    fn value(&mut self, interp: &mut Interp<'_>) -> Result<Value, JsonError> {
         self.skip_whitespace();
         match self.peek() {
-            None => Err("unexpected end of JSON input".to_string()),
+            None => self.error("unexpected end of JSON input"),
             Some(b'{') => self.object(interp),
             Some(b'[') => self.array(interp),
             Some(b'"') => Ok(interp.string(self.string()?)),
@@ -288,16 +343,16 @@ impl Parser<'_> {
         }
     }
 
-    fn literal(&mut self, word: &str, value: Value) -> Result<Value, String> {
+    fn literal(&mut self, word: &str, value: Value) -> Result<Value, JsonError> {
         if self.text[self.position..].starts_with(word) {
             self.position += word.len();
             Ok(value)
         } else {
-            Err(format!("unexpected token at offset {}", self.position))
+            self.error("unexpected token")
         }
     }
 
-    fn number(&mut self) -> Result<Value, String> {
+    fn number(&mut self) -> Result<Value, JsonError> {
         let start = self.position;
         if matches!(self.peek(), Some(b'-')) {
             self.position += 1;
@@ -311,16 +366,19 @@ impl Parser<'_> {
         let text = &self.text[start..self.position];
         text.parse::<f64>()
             .map(Value::Float)
-            .map_err(|_| format!("invalid number at offset {start}"))
+            .map_err(|_| JsonError {
+                message: "invalid number".to_string(),
+                offset: start,
+            })
     }
 
-    fn string(&mut self) -> Result<String, String> {
+    fn string(&mut self) -> Result<String, JsonError> {
         // The opening quote is already known to be there.
         self.position += 1;
         let mut out = String::new();
         loop {
             let Some(byte) = self.peek() else {
-                return Err("unterminated string".to_string());
+                return self.error("unterminated string");
             };
             match byte {
                 b'"' => {
@@ -330,9 +388,10 @@ impl Parser<'_> {
                 b'\\' => {
                     self.position += 1;
                     let Some(escape) = self.peek() else {
-                        return Err("unterminated escape".to_string());
+                        return self.error("unterminated escape");
                     };
                     self.position += 1;
+                    let start_of_escape = self.position - 1;
                     match escape {
                         b'"' => out.push('"'),
                         b'\\' => out.push('\\'),
@@ -345,11 +404,13 @@ impl Parser<'_> {
                         b'u' => {
                             let end = self.position + 4;
                             if end > self.bytes.len() {
-                                return Err("truncated \\u escape".to_string());
+                                return self.error("truncated \\u escape");
                             }
                             let hex = &self.text[self.position..end];
-                            let unit = u16::from_str_radix(hex, 16)
-                                .map_err(|_| "invalid \\u escape".to_string())?;
+                            let unit = u16::from_str_radix(hex, 16).map_err(|_| JsonError {
+                                message: "invalid \\u escape".to_string(),
+                                offset: start_of_escape,
+                            })?;
                             self.position = end;
                             // A surrogate pair arrives as two escapes; reassemble it.
                             if (0xd800..0xdc00).contains(&unit)
@@ -374,13 +435,23 @@ impl Parser<'_> {
                             }
                             out.push(char::from_u32(unit as u32).unwrap_or('\u{fffd}'));
                         }
-                        other => return Err(format!("invalid escape \\{}", other as char)),
+                        // The offending character is the one just consumed, so the
+                        // position has to step back over it.
+                        other => {
+                            return Err(JsonError {
+                                message: format!("invalid escape \\{}", other as char),
+                                offset: self.position - 1,
+                            });
+                        }
                     }
                 }
                 _ => {
                     // Copy one whole UTF-8 character so multi-byte text survives.
                     let rest = &self.text[self.position..];
-                    let character = rest.chars().next().ok_or("invalid UTF-8")?;
+                    let character = rest.chars().next().ok_or_else(|| JsonError {
+                        message: "invalid UTF-8".to_string(),
+                        offset: self.position,
+                    })?;
                     out.push(character);
                     self.position += character.len_utf8();
                 }
@@ -388,7 +459,7 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self, interp: &mut Interp<'_>) -> Result<Value, String> {
+    fn array(&mut self, interp: &mut Interp<'_>) -> Result<Value, JsonError> {
         self.position += 1;
         let mut elements = Vec::new();
         self.skip_whitespace();
@@ -407,12 +478,12 @@ impl Parser<'_> {
                     self.position += 1;
                     return Ok(Value::Object(interp.new_array(elements)));
                 }
-                _ => return Err("expected ',' or ']'".to_string()),
+                _ => return self.error("expected ',' or ']'"),
             }
         }
     }
 
-    fn object(&mut self, interp: &mut Interp<'_>) -> Result<Value, String> {
+    fn object(&mut self, interp: &mut Interp<'_>) -> Result<Value, JsonError> {
         self.position += 1;
         let proto = interp.realm.object_proto.clone();
         let object = interp.new_object(Some(proto));
@@ -424,12 +495,12 @@ impl Parser<'_> {
         loop {
             self.skip_whitespace();
             if !matches!(self.peek(), Some(b'"')) {
-                return Err("expected a string key".to_string());
+                return self.error("expected a string key");
             }
             let key = self.string()?;
             self.skip_whitespace();
             if !matches!(self.peek(), Some(b':')) {
-                return Err("expected ':'".to_string());
+                return self.error("expected ':'");
             }
             self.position += 1;
             let value = self.value(interp)?;
@@ -443,7 +514,7 @@ impl Parser<'_> {
                     self.position += 1;
                     return Ok(Value::Object(object));
                 }
-                _ => return Err("expected ',' or '}'".to_string()),
+                _ => return self.error("expected ',' or '}'"),
             }
         }
     }

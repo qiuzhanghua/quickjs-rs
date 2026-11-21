@@ -24,13 +24,14 @@
 //!   code        u32 length + bytes
 //!   stack_size  u32
 //!   var_refs    u32
+//!   positions   u32 count, then pc/line/column u32 each
 //! ```
 //!
 //! A version bump is required for any change to this layout; [`MAGIC`] plus
 //! [`VERSION`] make a stale blob fail loudly instead of being misinterpreted.
 
 use crate::bytecode::{
-    Atom, ClosureType, ClosureVar, Constant, Function, FunctionKind, VarDef, VarKind,
+    Atom, ClosureType, ClosureVar, Constant, Function, FunctionKind, LineCol, VarDef, VarKind,
 };
 use std::fmt;
 
@@ -38,7 +39,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +189,14 @@ fn write_function(out: &mut Vec<u8>, function: &Function) {
     out.extend_from_slice(&function.code);
     out.extend_from_slice(&function.stack_size.to_be_bytes());
     out.extend_from_slice(&function.var_ref_count.to_be_bytes());
+    // The position table travels with the code: an AOT binary that dropped it would
+    // lose `error.stack`'s file:line:col even though the bytecode is identical.
+    out.extend_from_slice(&(function.positions.len() as u32).to_be_bytes());
+    for entry in &function.positions {
+        out.extend_from_slice(&entry.pc.to_be_bytes());
+        out.extend_from_slice(&entry.line.to_be_bytes());
+        out.extend_from_slice(&entry.column.to_be_bytes());
+    }
 }
 
 fn write_constant(out: &mut Vec<u8>, constant: &Constant) {
@@ -342,6 +351,15 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let code = reader.take(code_length)?.to_vec();
     let stack_size = reader.u32()?;
     let var_ref_count = reader.u32()?;
+    let position_count = reader.u32()? as usize;
+    let mut positions = Vec::with_capacity(position_count);
+    for _ in 0..position_count {
+        positions.push(LineCol {
+            pc: reader.u32()?,
+            line: reader.u32()?,
+            column: reader.u32()?,
+        });
+    }
     Ok(Function {
         name,
         kind,
@@ -353,6 +371,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         atoms,
         code,
         stack_size,
+        positions,
         var_ref_count,
         source: None,
         line,
@@ -495,6 +514,18 @@ mod tests {
             atoms: vec![Atom::from_text("a"), Atom::from_text("2")],
             code: vec![0x2c, 0x00, 0x00],
             stack_size: 3,
+            positions: vec![
+                LineCol {
+                    pc: 0,
+                    line: 1,
+                    column: 1,
+                },
+                LineCol {
+                    pc: 2,
+                    line: 3,
+                    column: 7,
+                },
+            ],
             var_ref_count: 0,
             source: None,
             line: 1,

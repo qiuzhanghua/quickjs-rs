@@ -11,7 +11,7 @@
 //! a script and a module), the node carries a discriminant instead of being
 //! duplicated.
 
-use crate::token::{Punct, Span};
+use crate::token::{Position, Punct, Span};
 use std::fmt;
 
 /// A whole program: a script or a module.
@@ -575,6 +575,13 @@ pub struct MemberPattern {
     pub property: MemberProp,
     /// Source range.
     pub span: Span,
+    /// Where the selector punctuator (`.` or `[`) sits, carried over from the
+    /// expression this pattern came from.
+    ///
+    /// A store is blamed on that token, not on the `=` and not on the base object, so
+    /// the compiler needs the position after the expression has been turned into a
+    /// pattern.
+    pub op_pos: Option<Position>,
 }
 
 impl MemberPattern {
@@ -594,12 +601,33 @@ pub struct Expr {
     pub kind: ExprKind,
     /// Source range.
     pub span: Span,
+    /// Where the operator or punctuator that produced this node sits.
+    ///
+    /// Stack traces report the position of the token that failed, not the start of
+    /// the enclosing expression: `1 + null[0]` blames the `[`, and `o.foo = 1` blames
+    /// the `.`. `span.start` cannot stand in for it — the base expression starts
+    /// earlier — so the parser records the token here for the node kinds that emit an
+    /// instruction at an operator, and the compiler puts it in the position table.
+    pub op_pos: Option<Position>,
 }
 
 impl Expr {
     /// Build an expression node.
     pub fn new(kind: ExprKind, span: Span) -> Expr {
-        Expr { kind, span }
+        Expr {
+            kind,
+            span,
+            op_pos: None,
+        }
+    }
+
+    /// Build an expression node whose failing instruction sits at `pos`.
+    pub fn at_operator(kind: ExprKind, span: Span, pos: Position) -> Expr {
+        Expr {
+            kind,
+            span,
+            op_pos: Some(pos),
+        }
     }
 
     /// Strip any `( … )` wrappers, which carry no runtime meaning.

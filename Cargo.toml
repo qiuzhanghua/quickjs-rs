@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -24,11 +24,11 @@ categories = ["development-tools"]
 # 内部 crate 同时写 path 与 version：path 供本地构建，version 供发布解析
 # （`cargo publish` 会把 path 去掉，只留版本约束）。
 #
-# version 写宽版本 "0.1" 而不是精确的 "0.1.1"，这样 patch 升级只需改
+# version 写宽版本 "0.2" 而不是精确的 "0.2.0"，这样 patch 升级只需改
 # 上面 `workspace.package.version` 一处；抬 minor 时这里必须同步。
-quickjs-gc = { path = "crates/quickjs-gc", version = "0.1" }
-quickjs-parse = { path = "crates/quickjs-parse", version = "0.1" }
-quickjs-compile = { path = "crates/quickjs-compile", version = "0.1" }
-quickjs-pure = { path = "crates/quickjs-pure", version = "0.1" }
+quickjs-gc = { path = "crates/quickjs-gc", version = "0.2" }
+quickjs-parse = { path = "crates/quickjs-parse", version = "0.2" }
+quickjs-compile = { path = "crates/quickjs-compile", version = "0.2" }
+quickjs-pure = { path = "crates/quickjs-pure", version = "0.2" }
 # 仅 dev 使用，不上传，因此不需要版本约束。
 quickjs-conformance = { path = "crates/quickjs-conformance" }

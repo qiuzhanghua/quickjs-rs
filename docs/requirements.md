@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v1.0 —— M0/M1/M2 已完成；**M3 VM 核心已完成**（`qjs` 能执行 JS：调用/对象/异常/闭包/原型/迭代）；发布策略仍定在 M4 内建库之后
+> 状态：v1.0 —— M0/M1/M2/M3/M4 已完成（`qjs` 能执行 JS 并带标准库第一波与栈回溯）；发布策略定在 M4 之后，可以发
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -227,7 +227,7 @@ crates/
 | M1b ✅ | AST + 解析器 + early errors + 作用域分析 | 已完成：上游 `tests/`、`examples/` 全部 `.js` 的接受/拒绝与 `qjsc -c` 一致；104+55 条脚本、39 条模块、41 条声明冲突用例一致 |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 反汇编输出可读；往返稳定 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | ✅ 能跑递归/fib/数组/闭包脚本 |
-| M4 | 内建库第一波（未开始）（Object/Function/Array/String/Number/Math/JSON/Error/Date） | `tests/test_builtin.js` 大部分通过 |
+| M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/栈回溯） | ✅ M4 范围内 `test_builtin.js` 全通过；`Date` 未做 |
 | M5 | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | `test_language.js`、`test_closure.js` 通过 |
 | M6 | 模块系统 + 动态 import + JSON 模块 | `test_cyclic_import.js`、`hello_module.js` 通过 |
 | M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
@@ -276,11 +276,25 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 **结论：发布门槛（M4）已跨过，可以发；具体时点待定**（决策 5，经 M3/M4 两次修订）。
 
 M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`、`JSON.stringify`、
-`Math.sumPrecise`、`Reflect.apply`、`Object.freeze` 的冻结语义都按参考实现的行为工作，
-参考实现的 `test_builtin.js` 中 M4 覆盖的 237 条语句里有 229 条通过。原先"连 `Object`
-都没有"的理由消失了，发布线可以往前移。**剩余的已知缺口**（`Error.stack`、`Date`、
-`RegExp`、`Symbol`、`Map`/`Set`、生成器/async、`eval` 的直接作用域）应当写进发布说明，
-而不是假装不存在。理由与硬约束：
+`Math.sumPrecise`、`Reflect.apply`、`Object.freeze` 的冻结语义都按参考实现的行为工作。
+`test_builtin.js` 里 M4 范围内的测试函数（`test`、`test_function`、`test_enum`、
+`test_array`、`test_array_extension`、`test_array_iterator`、`test_string`、`test_math`、
+`test_number`、`test_json`、`test_line_column_numbers`）全部通过；
+`error.stack` 精确到 `file:line:column`。原先"连 `Object` 都没有"的理由消失了，
+发布线可以往前移。**剩余的已知缺口**应当写进发布说明，而不是假装不存在：
+
+| 缺口 | 影响 | 计划 |
+|---|---|---|
+| `Date` | `Date` 未定义 | M4 剩余部分 |
+| `RegExp` / `Symbol` / `Map` / `Set` | 未定义 | M7 / M8 |
+| TypedArray / ArrayBuffer | 未定义 | M8 |
+| 生成器 / async | 语法接受，运行期未实现 | M5 |
+| spread 调用参数 `f(...a)` | 编译器明确报错 | M5 |
+| 直接 `eval` 的变量作用域 | `eval("var v=1")` 泄漏到全局 | M5 |
+| `Function.prototype.toString` | 返回 `[native code]` | 未排期 |
+| 字符串拼接 | O(n²)，大循环慢 | M11 |
+
+理由与硬约束：
 
 - **名字被占**：`quickjs`（danclive，2019，FFI 包装）、`qjs`（flier，2019，`qjs-sys`
   绑定）都在 crates.io 上；`quickjs-rs` 亦被占用（2026-04 三个版本全被 yank，

@@ -39,7 +39,7 @@ mod unicode_id;
 
 pub use error::{LexError, ParseError, Result, SyntaxError};
 pub use lexer::Lexer;
-pub use parser::{Parser, parse_expression, parse_module, parse_script};
+pub use parser::{Parser, parse_expression, parse_module, parse_script, parse_script_strict};
 
 /// Parser configuration constants and helpers.
 pub mod parser_limits {

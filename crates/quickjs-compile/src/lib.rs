@@ -21,6 +21,6 @@ pub mod disasm;
 pub mod opcode;
 pub mod serialize;
 
-pub use bytecode::{Function, FunctionKind, VarDef, VarKind};
+pub use bytecode::{Function, FunctionKind, LineCol, VarDef, VarKind};
 pub use compiler::{Compiler, compile_module, compile_script, disassemble};
 pub use opcode::{OpFormat, OpInfo, Opcode};

@@ -304,6 +304,27 @@ fn number_to_string_in_other_radixes() {
 }
 
 #[test]
+fn number_to_string_radix_is_the_shortest_that_reads_back() {
+    // Taken from the reference. Each of these is one digit short or one digit
+    // misrounded by any conversion that decides "close enough" in floating point:
+    // the error of the multiply-and-subtract loop compounds before the remainder
+    // drops under half an ulp.
+    assert_eq!(eval("print((1.3).toString(7))"), "1.2046204620462046205\n");
+    assert_eq!(eval("print((1.3).toString(35))"), "1.ahhhhhhhhhm\n");
+    assert_eq!(
+        eval("print((1 - 2**-53).toString(12))"),
+        "0.bbbbbbbbbbbbbba\n"
+    );
+    // Rounding up to `radix^digits` carries into an extra digit, which has to move the
+    // radix point rather than print a trailing zero: `1/3` in radix 3 is `0.1`.
+    assert_eq!(eval("print((1/3).toString(3))"), "0.1\n");
+    // The smallest subnormal is exactly `2^-1074`; its magnitude underflows to zero
+    // when rebuilt as `mantissa * 2^exponent`, which used to send the digit count
+    // search off the end of the integer range.
+    assert_eq!(eval("print((5e-324).toString(16).length)"), "271\n");
+}
+
+#[test]
 fn math_round_and_sign_keep_negative_zero() {
     assert_eq!(eval("print(Math.round(-0.5), Math.round(0.5))"), "-0 1\n");
     assert_eq!(eval("print(1/Math.round(-0.4))"), "-Infinity\n");

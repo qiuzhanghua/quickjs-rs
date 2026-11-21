@@ -269,3 +269,106 @@ fn a_script_reports_its_completion_value() {
     assert_eq!(value("var x = 5"), "undefined");
     assert_eq!(value("'text'"), "text");
 }
+
+// ---------------------------------------------------------------------------
+// Silent-wrong-answer regressions
+//
+// Each of these used to return a plausible but wrong value with no error. They
+// were found by running the reference `test_builtin.js`, and each is asserted
+// against what the reference prints.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_object_literal_keeps_both_halves_of_an_accessor() {
+    // Defining the setter used to replace the property outright, dropping the
+    // getter, so `a.z` read `undefined`.
+    assert_eq!(
+        eval("var a={get z(){return 4},set z(v){this.v=v}}; print(a.z, a.z=5, a.v)"),
+        "4 5 5\n"
+    );
+    // The accessor functions are named `get z`/`set z`, which is what the
+    // reference does and what a stack trace prints.
+    assert_eq!(
+        eval("var a={get z(){return 1},set z(v){}}; print(a.z.name !== '')"),
+        "true\n"
+    );
+}
+
+#[test]
+fn new_on_a_bound_function_constructs_its_target() {
+    // `new` has to unwrap `bind` and use the target's prototype; without that the
+    // body ran with `this === null` and threw.
+    assert_eq!(
+        eval(
+            "function C(a){this.x=a} var g=C.bind(null,1); var r=new g(); print(r.x, r instanceof C)"
+        ),
+        "1 true\n"
+    );
+}
+
+#[test]
+fn arithmetic_operators_run_to_primitive_on_objects() {
+    // A bare tag check turned the operand into NaN and swallowed exceptions thrown
+    // by `valueOf`.
+    assert_eq!(
+        eval("var o={valueOf:function(){return 3}}; print(2*o)"),
+        "6\n"
+    );
+    assert_eq!(
+        eval("var o={valueOf:function(){throw Error('p')}}; try{2*o}catch(e){print('caught')}"),
+        "caught\n"
+    );
+    // The primitive coercions still behave.
+    assert_eq!(
+        eval(r#"print(2*"3", 2*"x", 2*null, 2*true)"#),
+        "6 NaN 0 2\n"
+    );
+}
+
+#[test]
+fn a_strict_directive_is_scoped_to_its_own_function() {
+    // The directive used to leak outwards, so a function declared *after* a strict
+    // function lost its declaration status and calling it raised.
+    assert_eq!(
+        eval(
+            r#"function a(){return b()} function c(){"use strict";return 1} function b(){return "b"} print(a(), c())"#
+        ),
+        "b 1\n"
+    );
+}
+
+#[test]
+fn a_call_before_its_function_declaration_still_resolves() {
+    // `a` resolves `b` while `b` is still unknown; the guess has to be corrected
+    // when the declaration is reached, or `b` does not exist at run time.
+    assert_eq!(
+        eval(r#"function a(){return b()} function b(){return 42} print(a())"#),
+        "42\n"
+    );
+}
+
+#[test]
+fn assignment_to_an_undeclared_name_is_an_error_in_strict_mode() {
+    assert_eq!(
+        eval(r#""use strict"; try { not_def = 1; print("no") } catch(e) { print(e.name) }"#),
+        "ReferenceError\n"
+    );
+    // Sloppy mode still creates the implicit global, and it stays deletable.
+    assert_eq!(
+        eval(r#"not_def = 1; print(not_def, delete not_def, typeof not_def)"#),
+        "1 true undefined\n"
+    );
+}
+
+#[test]
+fn a_throw_in_tail_position_does_not_reuse_the_frame() {
+    // The reference's `tail_call` still pushes a frame, so unbounded tail recursion
+    // hits the stack limit rather than looping forever. Reusing the frame made
+    // `function f(){return f()}` hang instead of reporting an overflow.
+    let rt = quickjs::Runtime::new();
+    let mut ctx = quickjs::Context::new(&rt);
+    let error = ctx
+        .eval("function f(n){ return n<=0 ? 'done' : f(n-1) } f(200000)")
+        .expect_err("deep tail recursion overflows");
+    assert!(error.to_string().contains("stack"), "{error}");
+}

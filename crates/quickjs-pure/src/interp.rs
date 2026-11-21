@@ -109,8 +109,20 @@ struct Frame {
     stack: Vec<Value>,
     /// Byte offset of the next instruction.
     pc: usize,
+    /// Byte offset of the instruction being executed, which is what a stack trace
+    /// reports. `pc` has already moved past it by the time an instruction runs.
+    at: usize,
     /// The callee, so a native builtin can tell which constructor it is.
     callee: Value,
+    /// Whether this frame's body ended in a `tail_call`.
+    ///
+    /// The reference's `tail_call` is not a frame-reusing tail call: it calls the callee
+    /// with its own frame just like `call` does and only skips storing the result
+    /// (`goto done` in `quickjs.c`). So a runaway tail recursion still hits
+    /// `InternalError: stack overflow` there, and the flag reproduces that: the frame is
+    /// pushed as usual, and this marker makes its return value the *caller's* return
+    /// value without running the instructions after the call.
+    tail: bool,
 }
 
 /// The interpreter: a realm plus a frame stack.
@@ -248,12 +260,75 @@ impl<'a> Interp<'a> {
     /// for a `Function` body; a *direct* eval that reads a local variable would need
     /// the compiler to hand its variable environment over, which is not implemented.
     pub fn eval_in_global(&mut self, source: &str) -> JsResult<Value> {
-        let program = js_parse::parse_script(source).map_err(|error| {
-            Signal::Throw(self.make_error("SyntaxError", &format!("invalid source: {error}")))
-        })?;
-        let compiled = js_compile::compile_script(&program)
-            .map_err(|error| Signal::Throw(self.make_error("SyntaxError", &error.message)))?;
+        // The reference names eval'd code `<input>` rather than inheriting the caller's
+        // file name, and stack traces show it, so `eval("1 + x")` failing reports
+        // `(<input>:1:5)`.
+        const EVAL_FILE: &str = "<input>";
+        // A *direct* eval inherits the strictness of the code that called it, which is
+        // why `eval("x = 1")` in a strict function is a ReferenceError instead of an
+        // implicit global. The caller's frame is the innermost one here, because a
+        // native function does not push a frame of its own.
+        let strict = self.current_strict();
+        let parsed = if strict {
+            js_parse::parse_script_strict(source)
+        } else {
+            js_parse::parse_script(source)
+        };
+        let program = match parsed {
+            Ok(program) => program,
+            Err(error) => {
+                return Err(Signal::Throw(self.syntax_error_at(
+                    EVAL_FILE,
+                    error.span.start.line,
+                    error.span.start.column,
+                    &format!("invalid source: {error}"),
+                )));
+            }
+        };
+        let mut compiled = match js_compile::compile_script(&program) {
+            Ok(compiled) => compiled,
+            // A construct the compiler does not handle yet is reported the same way a
+            // parse error is: it happens before anything runs, so the trace is the
+            // position in the source followed by the caller.
+            Err(error) => {
+                return Err(Signal::Throw(self.syntax_error_at(
+                    EVAL_FILE,
+                    error.span.start.line,
+                    error.span.start.column,
+                    &error.message,
+                )));
+            }
+        };
+        compiled.set_filename(EVAL_FILE);
         self.run_script(compiled)
+    }
+
+    /// A `SyntaxError` that reports where in the source it happened.
+    ///
+    /// Compile-time failures never run, so they have no frame of their own; the
+    /// reference still puts the position first in the trace, with no function name and
+    /// no parentheses, and the caller's frames after it. It also defines `fileName`,
+    /// `lineNumber` and `columnNumber` on the object (a SpiderMonkey convention the
+    /// reference borrows), which is how a script reads the position without parsing
+    /// the trace.
+    fn syntax_error_at(&mut self, file: &str, line: u32, column: u32, message: &str) -> Value {
+        let blamed = format!("    at {file}:{line}:{column}\n{}", self.stack_trace());
+        let value = self.make_error("SyntaxError", message);
+        if let Value::Object(object) = &value {
+            let text = self.string(blamed);
+            object.define("stack", Property::with_attributes(text, true, true));
+            let name = self.string(file);
+            object.define("fileName", Property::with_attributes(name, true, true));
+            object.define(
+                "lineNumber",
+                Property::with_attributes(Value::Int(line as i32), true, true),
+            );
+            object.define(
+                "columnNumber",
+                Property::with_attributes(Value::Int(column as i32), true, true),
+            );
+        }
+        value
     }
 
     /// Run a compiled script whose completion value is a function, returning it.
@@ -318,6 +393,14 @@ impl<'a> Interp<'a> {
                 Ok(Step::Continue) => {}
                 Ok(Step::Return(value)) => {
                     self.frames.pop();
+                    // A frame that ended in a `tail_call` hands its value straight to
+                    // its caller: nothing after the call can run, so every frame above
+                    // the callee unwinds with the same value. See [`Frame::tail`] —
+                    // the reference does not reuse frames either, so recursion depth
+                    // and the stack-overflow limit behave the same way.
+                    while self.frames.len() > depth && self.frame().tail {
+                        self.frames.pop();
+                    }
                     if self.frames.len() == depth {
                         return Ok(value);
                     }
@@ -433,7 +516,9 @@ impl<'a> Interp<'a> {
             cells,
             stack: Vec::with_capacity(16),
             pc: 0,
+            at: 0,
             callee,
+            tail: false,
         });
         Ok(())
     }
@@ -578,14 +663,31 @@ impl<'a> Interp<'a> {
             // A `var` global is writable, so the store goes straight through — but
             // through the property, so `globalThis.v = 3` and `v = 3` agree.
             Some(_) => self.set_property_with(&global, &name, value, DeleteFailure::Throw),
-            // Only an implicit global reaches here: `x = 1` with no declaration
-            // creates a *configurable* property, which is what makes it deletable and
-            // is the one way a global differs from a declared `var`.
+            // Only an implicit global reaches here. In sloppy mode `x = 1` with no
+            // declaration creates a *configurable* property, which is what makes it
+            // deletable and is the one way a global differs from a declared `var`.
+            // In strict mode the same store is a `ReferenceError` instead: that is the
+            // whole point of strict mode, and creating the global silently meant
+            // `"use strict"; x = 1` looked like it worked.
             None => {
+                if self.current_strict() {
+                    return Err(self.throw_reference(&name));
+                }
                 global.define_data(&name, value);
                 Ok(())
             }
         }
+    }
+
+    /// Whether the code currently running is strict.
+    ///
+    /// Read off the frame's function, which is where the parser's answer ended up; a
+    /// native function never runs strict-only checks, and there is no frame at all
+    /// before the first script.
+    pub fn current_strict(&self) -> bool {
+        self.frames
+            .last()
+            .is_some_and(|frame| frame.code.code.strict)
     }
 
     /// Initialise a declared global, which is what ends its dead zone.
@@ -814,15 +916,15 @@ impl<'a> Interp<'a> {
         let callable = function.with(|data| match &data.kind {
             ObjectKind::Function(callable) => match callable {
                 Callable::Native { func } => Some(NativeCall::Native(*func)),
-                Callable::Bound { target, this, args } => {
-                    let mut all = args.clone();
-                    all.extend(args.iter().take(0).cloned());
-                    Some(NativeCall::Bound {
-                        target: target.clone(),
-                        this: this.clone(),
-                        leading: args.clone(),
-                    })
-                }
+                Callable::Bound {
+                    target,
+                    this,
+                    args: leading,
+                } => Some(NativeCall::Bound {
+                    target: target.clone(),
+                    this: this.clone(),
+                    leading: leading.clone(),
+                }),
                 Callable::Bytecode { code, env } => {
                     Some(NativeCall::Bytecode(code.clone(), env.clone()))
                 }
@@ -910,17 +1012,11 @@ impl<'a> Interp<'a> {
         this: Value,
         args: Vec<Value>,
     ) -> JsResult<Option<Value>> {
-        if let Value::Object(function) = &callee {
-            let bytecode = function.with(|data| match &data.kind {
-                ObjectKind::Function(Callable::Bytecode { code, env }) => {
-                    Some((code.clone(), env.clone()))
-                }
-                _ => None,
-            });
-            if let Some((code, env)) = bytecode {
-                self.push_frame(code, env, this, args, callee)?;
-                return Ok(None);
-            }
+        if let Value::Object(function) = &callee
+            && let Some((code, env)) = bytecode_of(function)
+        {
+            self.push_frame(code, env, this, args, callee)?;
+            return Ok(None);
         }
         self.call_value(callee, this, args).map(Some)
     }
@@ -938,10 +1034,38 @@ impl<'a> Interp<'a> {
         _new_target: Value,
         args: Vec<Value>,
     ) -> JsResult<Value> {
+        // `new` on a bound function constructs its *target*, prepending the arguments
+        // the bind fixed and ignoring the bound `this` — a bound function is a
+        // constructor only when its target is one, and `new` always makes a fresh
+        // object of the target's prototype rather than reusing the bound receiver.
+        // Without this unwrapping, `constructor1.bind(null, 1)` called under `new`
+        // ran the body with `this === null` and threw on `this.x = a`.
+        let mut callee = callee;
+        let mut args = args;
+        loop {
+            let Some(object) = callee.as_object().cloned() else {
+                return Err(Signal::Throw(
+                    self.make_error("TypeError", "not a constructor"),
+                ));
+            };
+            let bound = object.with(|data| match &data.kind {
+                ObjectKind::Function(Callable::Bound {
+                    target,
+                    args: leading,
+                    ..
+                }) => Some((target.clone(), leading.clone())),
+                _ => None,
+            });
+            let Some((target, leading)) = bound else {
+                break;
+            };
+            let mut all = leading;
+            all.extend(args);
+            args = all;
+            callee = target;
+        }
         let Value::Object(function) = &callee else {
-            return Err(Signal::Throw(
-                self.make_error("TypeError", "not a constructor"),
-            ));
+            unreachable!("the loop above only breaks on an object");
         };
         // `new` on a native builtin: hand it the fresh object, which is how the
         // error classes and the object wrappers will initialise their own fields.
@@ -984,7 +1108,26 @@ impl<'a> Interp<'a> {
             "message",
             Property::with_attributes(self.string(message), true, false),
         );
+        // The trace is captured where the error is *made*, which is where the reference
+        // captures it too: `JS_ThrowTypeError` and friends call `build_backtrace` on the
+        // way out, so a caught engine error already has its stack even if the handler
+        // never rethrows it.
+        self.add_stack(&error);
         Value::Object(error)
+    }
+
+    /// Give an error object its `stack` property, from the current frame stack.
+    ///
+    /// Only objects get one — `throw 42` has no stack anywhere — and an object that
+    /// already has a `stack` keeps it, so an error caught and rethrown, or one whose
+    /// `stack` a script set, is not rewritten.
+    pub fn add_stack(&self, object: &Gc<JsObject>) {
+        if object.has_own("stack") {
+            return;
+        }
+        let trace = self.stack_trace();
+        let text = self.string(trace);
+        object.define("stack", Property::with_attributes(text, true, true));
     }
 
     /// The function object currently being called, if any.
@@ -1117,6 +1260,7 @@ impl<'a> Interp<'a> {
             ));
         };
         let (op, a, b, next) = decoded;
+        self.frame_mut().at = pc;
         self.frame_mut().pc = next;
         self.execute_instruction(op, a, b, next)
     }
@@ -1361,6 +1505,23 @@ impl<'a> Interp<'a> {
                     .or_else(|_| Ok(Value::Undefined))?;
                 self.push(value);
             }
+            DeleteVar => {
+                // `delete name` for a name that is not a declared binding. A lexical
+                // global lives in the reference table and cannot be deleted; anything
+                // reachable only as a property of the global object is *implicit* —
+                // `x = 1` with no declaration — and goes away if it is configurable,
+                // which is what `delete` on an implicit global answers.
+                let name = self.atom_text(a as usize);
+                let global = self.realm.global.clone();
+                let deleted = if self.realm.globals.contains_key(&name) {
+                    false
+                } else if global.own_property(&name).is_some() {
+                    self.delete_property(&global, &name)
+                } else {
+                    true
+                };
+                self.push(Value::Bool(deleted));
+            }
             PutVar => {
                 let value = self.pop();
                 self.put_global(a as usize, value)?;
@@ -1570,6 +1731,37 @@ impl<'a> Interp<'a> {
                     self.push(result);
                 }
             }
+            TailCall | TailCallMethod => {
+                // `tail_call` is `call` whose result is returned immediately — the
+                // reference jumps straight to `done` instead of storing the value and
+                // running on. The callee still gets its own frame, so deep tail
+                // recursion hits the stack limit exactly like plain recursion does;
+                // marking this frame lets the return path unwind without needing
+                // instructions after the call.
+                let argc = if op == TailCallMethod {
+                    a as usize
+                } else {
+                    self.argc_operand(op, a)
+                };
+                let args = self.pop_n(argc);
+                let callee = self.pop();
+                let this = if op == TailCallMethod {
+                    self.pop()
+                } else {
+                    Value::Undefined
+                };
+                if let Value::Object(function) = &callee
+                    && let Some((code, env)) = bytecode_of(function)
+                {
+                    self.frame_mut().tail = true;
+                    self.push_frame(code, env, this, args, callee)?;
+                    return Ok(Step::Continue);
+                }
+                // A native callee has no frame to reuse, so its value is simply
+                // returned.
+                let value = self.call_value(callee, this, args)?;
+                return Ok(Step::Return(value));
+            }
 
             // -- objects ----------------------------------------------------
             SpecialObject => {
@@ -1629,6 +1821,10 @@ impl<'a> Interp<'a> {
                 let value = self.pop();
                 let object = self.pop();
                 let key = self.atom_text(a as usize);
+                // `{m: function(){}}` names the function `m`, the same way assigning
+                // it to a property does. Without this the frame is anonymous and a
+                // stack trace reads `at  (file:1:2)`.
+                self.set_function_name(&value, &key);
                 if let Some(target) = object.as_object() {
                     // Only an *array* stores into the element vector. A numeric key
                     // on an ordinary object is an ordinary property, which is what
@@ -1655,6 +1851,7 @@ impl<'a> Interp<'a> {
                 let function = self.pop();
                 let object = self.pop();
                 let key = self.atom_text(a as usize);
+                self.set_function_name(&function, &key_with_accessor_prefix(&key, b));
                 if let Some(array) = object.as_object() {
                     define_function_property(array, &key, function, b);
                 }
@@ -1665,6 +1862,7 @@ impl<'a> Interp<'a> {
                 let key = self.pop();
                 let object = self.pop();
                 let text = self.propkey_of(&key);
+                self.set_function_name(&function, &key_with_accessor_prefix(&text, a));
                 if let Some(array) = object.as_object() {
                     define_function_property(array, &text, function, a);
                 }
@@ -2034,10 +2232,14 @@ impl<'a> Interp<'a> {
     }
 
     fn numeric(&mut self, value: Value) -> JsResult<Value> {
-        Ok(match value {
-            Value::Int(_) | Value::Float(_) => value,
-            other => Value::Float(other.to_number()),
-        })
+        // `ToNumber` on an object runs `ToPrimitive` first, which is how
+        // `2 * {valueOf(){return 3}}` sees the 3 — and how a `valueOf` that throws is
+        // heard at all. Reading the object's own tag instead (`other.to_number()`)
+        // turned the whole operand into `NaN` and swallowed the exception.
+        match value {
+            Value::Int(_) | Value::Float(_) => Ok(value),
+            other => Ok(Value::Float(self.to_js_number(&other)?)),
+        }
     }
 
     fn binary_add(&mut self) -> JsResult<()> {
@@ -2475,36 +2677,81 @@ impl<'a> Interp<'a> {
 
     /// How an uncaught exception is reported.
     ///
-    /// An error object prints as `Name: message`, the way `qjs` reports it. Any
-    /// other thrown value prints as its own `ToString`, wrapped in the "uncaught"
-    /// phrasing the reference uses.
-    pub fn describe_exception(&self, value: &Value) -> String {
-        if let Value::Object(object) = value
-            && let Some(Value::String(name)) = object.own_property("name").and_then(|p| p.value)
-        {
-            let message = object
-                .own_property("message")
-                .and_then(|p| p.value)
-                .map(|value| value.to_js_string())
-                .unwrap_or_default();
-            if message.is_empty() {
-                return format!("Uncaught {}", name.as_str());
+    /// The reference reports a pending exception through `JS_PrintValue`, which ends
+    /// up calling the thrown value's `toString`, so `throw new TypeError("x")` prints
+    /// `TypeError: x`. Reading `name`/`message` off the object directly got this wrong
+    /// two ways: `name` usually lives on the prototype rather than on the instance, and
+    /// a thrown non-error object was not consulted at all, coming out as
+    /// `[object Object]`. Routing through `ToString` keeps every case on one path and
+    /// honours a user-defined `toString`, as the reference does.
+    ///
+    /// A `toString` that throws must not take the reporter down with it, so that case
+    /// falls back to the type-level rendering. The reference's printer also walks into
+    /// plain objects (`throw 1, {a:1}` prints `{ a: 1 }`); that formatting is a gap
+    /// shared with `console.log`.
+    pub fn describe_exception(&mut self, value: &Value) -> String {
+        self.to_js_string(value).unwrap_or_else(|_| display(value))
+    }
+
+    /// The current call stack, formatted the way `qjs` prints `error.stack`.
+    ///
+    /// One `    at name (file:line:col)` line per active frame, innermost first. The
+    /// position is the one recorded for the instruction each frame is stopped on, which
+    /// is why the compiler builds a pc-to-position table per function: without it a
+    /// trace could only name the function, not the line inside it.
+    ///
+    /// A frame whose code has no positions prints just `(file)`, matching the
+    /// reference's output for stripped bytecode.
+    pub fn stack_trace(&self) -> String {
+        let mut out = String::new();
+        for frame in self.frames.iter().rev() {
+            let code = &frame.code.code;
+            let file = code.filename.as_deref().unwrap_or("<input>");
+            // The name comes from the function *object*, not from the compiled code:
+            // an anonymous function expression is named by the property it is stored
+            // in (`{valueOf: function(){}}`), which only the object knows.
+            let bound_name = match &frame.callee {
+                Value::Object(object) => {
+                    object
+                        .own_property("name")
+                        .and_then(|property| match property.value {
+                            Some(Value::String(text)) if !text.as_str().is_empty() => {
+                                Some(text.as_str().to_string())
+                            }
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            out.push_str("    at ");
+            out.push_str(bound_name.as_deref().unwrap_or(&code.name));
+            match code.position_at(frame.at as u32) {
+                Some((line, column)) => {
+                    out.push_str(&format!(" ({file}:{line}:{column})\n"));
+                }
+                None => out.push_str(&format!(" ({file})\n")),
             }
-            return format!("Uncaught {}: {message}", name.as_str());
         }
-        format!("Uncaught {}", display(value))
+        out
     }
 
     /// Give an anonymous function the name of the property it is stored in.
     ///
     /// `{m: function(){}}.m.name` is `"m"`. The name property is not writable, not
-    /// enumerable and not configurable, and an already-named function keeps its
-    /// name.
+    /// enumerable and not configurable, and a function that already has a real name
+    /// keeps it.
+    ///
+    /// "Already named" means a *non-empty* name: every function object is created with
+    /// a `name` of `""` so the property exists on all of them, and treating that empty
+    /// string as a name left every anonymous function nameless — which is how a stack
+    /// trace came out as `at  (file:1:2)` instead of `at valueOf (file:1:2)`.
     fn set_function_name(&mut self, function: &Value, name: &str) {
         let Value::Object(object) = function else {
             return;
         };
-        if object.has_own("name") {
+        if let Some(Value::String(existing)) = object.own_property("name").and_then(|p| p.value)
+            && !existing.as_str().is_empty()
+        {
             return;
         }
         let text = self.string(name);
@@ -2555,6 +2802,16 @@ impl<'a> Interp<'a> {
     }
 }
 
+/// The bytecode and environment of a function object, if it is a bytecode function.
+///
+/// Extracted before a call so no borrow of the object is held across it.
+fn bytecode_of(function: &Gc<JsObject>) -> Option<(Gc<CompiledCode>, Gc<ClosureEnv>)> {
+    function.with(|data| match &data.kind {
+        ObjectKind::Function(Callable::Bytecode { code, env }) => Some((code.clone(), env.clone())),
+        _ => None,
+    })
+}
+
 /// A native call target, extracted before the call so no borrow is held.
 enum NativeCall {
     Native(NativeFn),
@@ -2599,22 +2856,49 @@ struct Iterator {
     next: Value,
 }
 
+/// The name an accessor function gets: `get a` for a getter, `set a` for a setter,
+/// and plain `a` for a method.
+///
+/// The reference prefixes accessors (`js_method_set_properties`), and the prefix is
+/// visible: `{get a(){}}.a.name` is `"get a"`, and a stack trace from inside a getter
+/// reads `at get a (file:1:2)`.
+fn key_with_accessor_prefix(key: &str, flags: u32) -> String {
+    match flags & 3 {
+        1 => format!("get {key}"),
+        2 => format!("set {key}"),
+        _ => key.to_string(),
+    }
+}
+
 /// Define a method or accessor property, per the `define_method` flag byte.
 ///
 /// The low two bits pick value/getter/setter and bit 2 marks the property
-/// enumerable; a property defined by a method is not configurable in an object
-/// literal, but nothing in this milestone can tell the difference.
+/// enumerable.
+///
+/// A getter and a setter arrive as two separate `define_method` instructions, and the
+/// second one must only fill in its own half: `{get z(){…}, set z(v){…}}` defines
+/// `z` twice, and replacing the property wholesale dropped the getter, so `a.z` read
+/// `undefined`. The reference passes `JS_PROP_HAS_GET`/`JS_PROP_HAS_SET` to
+/// `JS_DefineProperty`, which leaves the other half alone.
 fn define_function_property(object: &Gc<JsObject>, key: &str, function: Value, flags: u32) {
     let enumerable = flags & 4 != 0;
     let kind = flags & 3;
+    let existing = object.own_property(key);
     let property = match kind {
         1 => Property {
             getter: Some(function),
+            // The setter half, if this literal already defined one.
+            setter: existing
+                .filter(Property::is_accessor)
+                .and_then(|p| p.setter),
             enumerable,
             configurable: true,
             ..Property::default()
         },
         2 => Property {
+            getter: existing
+                .filter(Property::is_accessor)
+                .and_then(|p| p.getter),
             setter: Some(function),
             enumerable,
             configurable: true,

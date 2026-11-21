@@ -448,6 +448,22 @@ pub enum Storage {
     Global,
 }
 
+/// A stretch of bytecode and the source position it came from.
+///
+/// One entry per run of instructions that share a position, ordered by `pc`, which is
+/// what [`Function::position_at`] binary searches. This is the port of the reference's
+/// `pc2line` table: it is how a stack trace says `file:line:col` for a frame that is
+/// deep inside a function rather than at its first statement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineCol {
+    /// Byte offset in [`Function::code`] where this position takes over.
+    pub pc: u32,
+    /// 1-based line.
+    pub line: u32,
+    /// 1-based column, in UTF-16 code units like every other position here.
+    pub column: u32,
+}
+
 /// A compiled function.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Function {
@@ -473,6 +489,8 @@ pub struct Function {
     pub code: Vec<u8>,
     /// Maximum value-stack depth.
     pub stack_size: u32,
+    /// Source positions, ordered by bytecode offset.
+    pub positions: Vec<LineCol>,
     /// Number of reference cells allocated on entry.
     pub var_ref_count: u32,
     /// Source text, kept for `Function.prototype.toString` and stack traces.
@@ -486,6 +504,36 @@ pub struct Function {
 }
 
 impl Function {
+    /// Name the script this function belongs to.
+    ///
+    /// Nested functions inherit it, because a stack trace names every frame with the
+    /// file the code came from and the parser does not know file names — the host
+    /// does, after the source has already been compiled.
+    pub fn set_filename(&mut self, name: &str) {
+        self.filename = Some(name.to_string());
+        for constant in &mut self.cpool {
+            if let Constant::Function(inner) = constant {
+                inner.set_filename(name);
+            }
+        }
+    }
+
+    /// The source position of the instruction at `pc`.
+    ///
+    /// The last entry at or before `pc` wins, so a position applies until the next one
+    /// starts. `None` when the function carries no positions at all — a script compiled
+    /// without source information.
+    pub fn position_at(&self, pc: u32) -> Option<(u32, u32)> {
+        let index = match self.positions.binary_search_by_key(&pc, |entry| entry.pc) {
+            Ok(index) => index,
+            Err(0) => return None,
+            Err(index) => index - 1,
+        };
+        self.positions
+            .get(index)
+            .map(|entry| (entry.line, entry.column))
+    }
+
     /// Decode the instruction stream back into instructions.
     ///
     /// Labels are already resolved, so a `label` operand is an absolute byte

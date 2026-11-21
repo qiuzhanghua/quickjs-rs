@@ -130,6 +130,10 @@ fn error_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> Js
             Property::with_attributes(interp.string(class.clone()), true, false),
         );
     }
+    // The trace is taken here, in the constructor, exactly as the reference does
+    // (`JS_NewError` calls `build_backtrace`): an error object carries its stack from
+    // the moment it exists, whether or not it is ever thrown.
+    interp.add_stack(&target);
     Ok(Value::Object(target))
 }
 

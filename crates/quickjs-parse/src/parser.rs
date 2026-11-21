@@ -250,6 +250,19 @@ pub fn parse_module(src: &str) -> Result<Program> {
     Parser::new(src, true)?.parse_program()
 }
 
+/// Parse `src` as a `Script` whose code is strict from the first token.
+///
+/// This is what a *direct* `eval` needs: the eval'd code inherits strictness from the
+/// code that called it, so `eval("x = 1")` inside a strict function is a
+/// `ReferenceError` rather than an implicit global. Prepending a `"use strict"`
+/// directive instead would shift every column on the first line, and the positions are
+/// exactly what a stack trace has to report.
+pub fn parse_script_strict(src: &str) -> Result<Program> {
+    let mut parser = Parser::new(src, false)?;
+    parser.enter_strict()?;
+    parser.parse_program()
+}
+
 /// Parse `src` as a single `Expression` (used by tests and by `eval`-like entry
 /// points that need the expression grammar only).
 pub fn parse_expression(src: &str) -> Result<Expr> {
@@ -1720,6 +1733,12 @@ impl<'a> Parser<'a> {
         };
         let saved_top = self.top_level;
         self.top_level = false;
+        // Strictness is per function: `function f(){ "use strict"; }` must leave the
+        // code *after* it sloppy. Without this save the directive leaked outwards, the
+        // enclosing script was compiled as strict, and a later `function g(){}` lost its
+        // declaration status — `typeof g` then raised instead of answering, because an
+        // implicit global is not a declaration.
+        let saved_strict = self.strict;
         let params_result = self.parse_formal_parameters();
         let result = match params_result {
             Ok(params) => self.parse_function_body(params, is_generator, is_async),
@@ -1727,6 +1746,8 @@ impl<'a> Parser<'a> {
         };
         self.ctx = saved;
         self.top_level = saved_top;
+        self.strict = saved_strict;
+        self.lexer.set_strict(saved_strict);
         let (params, params_span, body) = result?;
         Ok(Function {
             name,
@@ -2510,11 +2531,13 @@ impl<'a> Parser<'a> {
                 if optional {
                     return Err(self.error_at("invalid assignment target", span));
                 }
+                let op_pos = expr.op_pos;
                 Ok(Pattern::new(
                     PatternKind::Member(Box::new(MemberPattern {
                         object,
                         property,
                         span,
+                        op_pos,
                     })),
                     span,
                 ))
@@ -2599,16 +2622,18 @@ impl<'a> Parser<'a> {
         };
 
         if let Some(op) = self.current.kind.as_punct().and_then(AssignOp::from_punct) {
+            let op_pos = self.current.span.start;
             let target = self.expr_to_pattern(lhs, TargetKind::Assignment)?;
             self.bump()?;
             let value = self.parse_assignment(allow_in)?;
-            return Ok(Expr::new(
+            return Ok(Expr::at_operator(
                 ExprKind::Assign {
                     op,
                     target: Box::new(target),
                     value: Box::new(value),
                 },
                 self.span_from(start),
+                op_pos,
             ));
         }
         let _ = start;
@@ -2872,6 +2897,7 @@ impl<'a> Parser<'a> {
             if prec < min_prec {
                 break;
             }
+            let op_pos = self.current.span.start;
             self.bump()?;
             let next_min = if op.is_right_associative() {
                 prec
@@ -2879,7 +2905,7 @@ impl<'a> Parser<'a> {
                 prec + 1
             };
             let rhs = self.parse_binary(allow_in, next_min)?;
-            lhs = build_binary(op, lhs, rhs, self.span_from(start))?;
+            lhs = build_binary(op, lhs, rhs, self.span_from(start), op_pos)?;
         }
         Ok(lhs)
     }
@@ -2900,6 +2926,7 @@ impl<'a> Parser<'a> {
             _ => None,
         };
         if let Some(op) = unary {
+            let op_pos = self.current.span.start;
             self.bump()?;
             let argument = self.parse_unary()?;
             if op == UnaryOp::Delete && self.strict {
@@ -2909,12 +2936,13 @@ impl<'a> Parser<'a> {
                     );
                 }
             }
-            let expr = Expr::new(
+            let expr = Expr::at_operator(
                 ExprKind::Unary {
                     op,
                     argument: Box::new(argument),
                 },
                 self.span_from(start),
+                op_pos,
             );
             if self.at_punct(Punct::StarStar) {
                 return Err(self.error(
@@ -2925,6 +2953,7 @@ impl<'a> Parser<'a> {
         }
         // Prefix increment/decrement.
         if self.at_punct(Punct::PlusPlus) || self.at_punct(Punct::MinusMinus) {
+            let op_pos = self.current.span.start;
             let op = if self.at_punct(Punct::PlusPlus) {
                 UpdateOp::Increment
             } else {
@@ -2933,13 +2962,14 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let argument = self.parse_unary()?;
             self.check_simple_target(&argument)?;
-            return Ok(Expr::new(
+            return Ok(Expr::at_operator(
                 ExprKind::Update {
                     op,
                     argument: Box::new(argument),
                     prefix: true,
                 },
                 self.span_from(start),
+                op_pos,
             ));
         }
         // `await` in async contexts (and at a module's top level).
@@ -2973,6 +3003,7 @@ impl<'a> Parser<'a> {
         let result = if (self.at_punct(Punct::PlusPlus) || self.at_punct(Punct::MinusMinus))
             && !self.current.newline_before
         {
+            let op_pos = self.current.span.start;
             let op = if self.at_punct(Punct::PlusPlus) {
                 UpdateOp::Increment
             } else {
@@ -2980,13 +3011,14 @@ impl<'a> Parser<'a> {
             };
             self.check_simple_target(&expr)?;
             self.bump()?;
-            Expr::new(
+            Expr::at_operator(
                 ExprKind::Update {
                     op,
                     argument: Box::new(expr),
                     prefix: false,
                 },
                 self.span_from(start),
+                op_pos,
             )
         } else {
             expr
@@ -3013,17 +3045,21 @@ impl<'a> Parser<'a> {
         };
         let mut saw_optional = false;
         loop {
+            // The position of the punctuator that follows the base expression: a
+            // failed `.`, `[` or `(` is blamed on that token, not on the base.
+            let op_pos = self.current.span.start;
             match self.current.kind.clone() {
                 TokenKind::Punct(Punct::Dot) => {
                     self.bump()?;
                     let property = self.parse_member_property()?;
-                    expr = Expr::new(
+                    expr = Expr::at_operator(
                         ExprKind::Member {
                             object: Box::new(expr),
                             property,
                             optional: false,
                         },
                         self.span_from(start),
+                        op_pos,
                     );
                 }
                 TokenKind::Punct(Punct::QuestionDot) => {
@@ -3031,35 +3067,38 @@ impl<'a> Parser<'a> {
                     self.bump()?;
                     if self.at_punct(Punct::LParen) {
                         let arguments = self.parse_arguments()?;
-                        expr = Expr::new(
+                        expr = Expr::at_operator(
                             ExprKind::Call {
                                 callee: Box::new(expr),
                                 arguments,
                                 optional: true,
                             },
                             self.span_from(start),
+                            op_pos,
                         );
                     } else if self.at_punct(Punct::LBracket) {
                         self.bump()?;
                         let index = self.parse_expression(true)?;
                         self.expect_punct(Punct::RBracket)?;
-                        expr = Expr::new(
+                        expr = Expr::at_operator(
                             ExprKind::Member {
                                 object: Box::new(expr),
                                 property: MemberProp::Computed(Box::new(index)),
                                 optional: true,
                             },
                             self.span_from(start),
+                            op_pos,
                         );
                     } else {
                         let property = self.parse_member_property()?;
-                        expr = Expr::new(
+                        expr = Expr::at_operator(
                             ExprKind::Member {
                                 object: Box::new(expr),
                                 property,
                                 optional: true,
                             },
                             self.span_from(start),
+                            op_pos,
                         );
                     }
                 }
@@ -3067,24 +3106,26 @@ impl<'a> Parser<'a> {
                     self.bump()?;
                     let index = self.parse_expression(true)?;
                     self.expect_punct(Punct::RBracket)?;
-                    expr = Expr::new(
+                    expr = Expr::at_operator(
                         ExprKind::Member {
                             object: Box::new(expr),
                             property: MemberProp::Computed(Box::new(index)),
                             optional: false,
                         },
                         self.span_from(start),
+                        op_pos,
                     );
                 }
                 TokenKind::Punct(Punct::LParen) => {
                     let arguments = self.parse_arguments()?;
-                    expr = Expr::new(
+                    expr = Expr::at_operator(
                         ExprKind::Call {
                             callee: Box::new(expr),
                             arguments,
                             optional: false,
                         },
                         self.span_from(start),
+                        op_pos,
                     );
                 }
                 TokenKind::Template(_) => {
@@ -3168,30 +3209,33 @@ impl<'a> Parser<'a> {
         };
         // Member accesses bind tighter than `new`, calls do not.
         loop {
+            let op_pos = self.current.span.start;
             match self.current.kind.clone() {
                 TokenKind::Punct(Punct::Dot) => {
                     self.bump()?;
                     let property = self.parse_member_property()?;
-                    callee = Expr::new(
+                    callee = Expr::at_operator(
                         ExprKind::Member {
                             object: Box::new(callee),
                             property,
                             optional: false,
                         },
                         self.span_from(start),
+                        op_pos,
                     );
                 }
                 TokenKind::Punct(Punct::LBracket) => {
                     self.bump()?;
                     let index = self.parse_expression(true)?;
                     self.expect_punct(Punct::RBracket)?;
-                    callee = Expr::new(
+                    callee = Expr::at_operator(
                         ExprKind::Member {
                             object: Box::new(callee),
                             property: MemberProp::Computed(Box::new(index)),
                             optional: false,
                         },
                         self.span_from(start),
+                        op_pos,
                     );
                 }
                 TokenKind::Punct(Punct::QuestionDot) => {
@@ -3204,7 +3248,17 @@ impl<'a> Parser<'a> {
             return Err(self.error_at("cannot use 'new' with an optional chain", callee.span));
         }
         let arguments = if self.at_punct(Punct::LParen) {
-            Some(self.parse_arguments()?)
+            // `new C(...)`: a failure in the constructor call is blamed on the `(`.
+            let op_pos = self.current.span.start;
+            let arguments = Some(self.parse_arguments()?);
+            return Ok(Expr::at_operator(
+                ExprKind::New {
+                    callee: Box::new(callee),
+                    arguments,
+                },
+                self.span_from(start),
+                op_pos,
+            ));
         } else {
             None
         };
@@ -3849,15 +3903,16 @@ fn binary_operator(kind: &TokenKind, allow_in: bool) -> Option<(u8, BinOp)> {
     Some(result)
 }
 
-fn build_binary(op: BinOp, left: Expr, right: Expr, span: Span) -> Result<Expr> {
+fn build_binary(op: BinOp, left: Expr, right: Expr, span: Span, op_pos: Position) -> Result<Expr> {
     match op {
-        BinOp::Binary(op) => Ok(Expr::new(
+        BinOp::Binary(op) => Ok(Expr::at_operator(
             ExprKind::Binary {
                 op,
                 left: Box::new(left),
                 right: Box::new(right),
             },
             span,
+            op_pos,
         )),
         BinOp::Logical(op) => {
             // `??` may not be mixed with `&&`/`||` without parentheses.
@@ -3873,13 +3928,14 @@ fn build_binary(op: BinOp, left: Expr, right: Expr, span: Span) -> Result<Expr> 
                     span,
                 ));
             }
-            Ok(Expr::new(
+            Ok(Expr::at_operator(
                 ExprKind::Logical {
                     op,
                     left: Box::new(left),
                     right: Box::new(right),
                 },
                 span,
+                op_pos,
             ))
         }
     }

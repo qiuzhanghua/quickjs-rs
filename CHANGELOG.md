@@ -7,7 +7,14 @@
 ### M4：标准库第一波
 
 `Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、`Reflect`
-与八个错误类。参考实现的 `test_builtin.js` 中 M4 覆盖的 237 条语句通过 229 条。
+与八个错误类，外加精确到 `file:line:column` 的栈回溯。
+
+参考实现的 `test_builtin.js` 里 M4 范围的测试函数全部通过：`test`、`test_function`、
+`test_enum`、`test_array`、`test_array_extension`、`test_array_iterator`、`test_string`、
+`test_math`、`test_number`、`test_json`、`test_line_column_numbers`。用
+`scripts/slice-builtin-test.py` 可以复现（它把每个测试函数单独切出来，这样一个测试
+失败不会因为整文件编译失败而掩盖其余）。尚未通过的三项都在下面的已知缺口里：
+`test_eval`/`test_eval2`（直接 eval 的作用域、spread 调用参数）、`test_date`（`Date`）。
 
 几处容易写错、都按参考行为实现的语义：
 
@@ -45,14 +52,69 @@
    的 `AtomU8` 一类问题），`inc_loc` 因此编码出垃圾字节。
 5. **`compile_function` 早退留下 `FnState`**：后续 `stmt_depth -= 1` 作用到错的状态。
 
+### 栈回溯与位置信息
+
+`error.stack` 现在可用，位置精确到 `file:line:column`，且与参考逐字一致。
+
+- **编译期为每条指令记录位置**：`Function::positions` 是 `pc → (line, column)` 表，
+  由 `pc2line` 一样的思路生成——只记位置变化的点，运行时二分查找。解析器把算符
+  所在的 token 位置带到 AST（`Expr::op_pos`），因为出错的是**算符**而不是表达式
+  起点：`1 + null[0]` 报 `[` 的列，`o.foo = 1` 报 `.` 的列，`not_def = 1` 报标识符
+  的列，而 `a += poisoned` 报 `+=` 的列（读 `a` 成功、在 `ToPrimitive` 里才失败）。
+- **`stack` 在错误被创建时生成**，不是被抛出时：`new Error("x").stack` 立刻可用，
+  引擎内部抛的 `TypeError` 也带位置。`throw 42` 没有栈（非对象），参考同样如此。
+- **`<input>` 与文件名的分工**：直接 `eval` 的代码叫 `<input>`，`-e` 叫 `<cmdline>`，
+  脚本文件用自己的路径。宿主通过 `Context::set_script_name` 告诉引擎。
+- **`JSON.parse` 的错误位置指向解析文本内部**：`JSON.parse('
+ "  \@x"')` 的栈首行是
+  `<input>:2:5`，其后才是调用者。
+- **`Function.prototype.fileName`/`lineNumber`/`columnNumber`** 三个 getter 读函数自己的
+  声明位置（参考实现私有约定，测试脚本依赖它）。
+
+### 修：静默错误答案（不是"字节码不同"，是结果错）
+
+跑参考的 `test_builtin.js` 时暴露出来的六处，每处都返回一个看起来合理但错误的答案：
+
+1. **对象字面量的 getter 被 setter 覆盖**：`{get z(){…}, set z(v){…}}` 的第二个
+   `define_method` 整体替换了属性，于是 `a.z` 是 `undefined`。现在只填自己那一半。
+2. **`new` 不展开 `bind`**：`new (C.bind(null,1))()` 用 bound 的 `this` 跑函数体，
+   报 `cannot set property 'x' of null`。现在解包到 target、按 target 的原型造对象。
+3. **算术运算符不走 `ToPrimitive`**：`2 * {valueOf(){return 3}}` 是 `NaN`，且
+   `valueOf` 抛的异常被吞掉。现在走 `ToNumber`。
+4. **访问器函数没有名字**：`{get z(){}}.z.name` 是空串，栈帧因此打印成 `at  (…)`。
+   现在叫 `get z`/`set z`（`set_name` 不能把空串当成"已有名字"）。
+5. **`"use strict"` 泄漏到函数的兄弟**：解析器保存/恢复了 `ctx` 与 `top_level`，
+   却漏了 `strict`，于是某个函数里的指令让整个脚本变 strict，**它后面**的函数声明
+   失去声明身份，调用时报未定义。
+6. **先引用、后声明的全局函数解析错**：`function a(){ b() } function b(){}` 在编译
+   `a` 时还不知道 `b`，把这个名字记成了未声明的全局，等真正遇到声明时直接 return，
+   于是 `b` 在运行期不存在。现在会把那个猜测改成声明。
+
+另外补齐了：
+
+- **`toString(radix)` 的精确转换**：新增 `bignum` 模块（只用加、减、乘、移位、
+  除以小整数和按基数长除），按参考 `dtoa.c` 的算法找「能读回同一个 double 的最短
+  数字串」。旧的浮点近似会少一位或末位舍错（`(1.3).toString(7)` 是
+  `1.204620462046204621`，参考是 `1.2046204620462046205`）。
+- **`delete <名字>`**：新增 `delete_var` 指令。声明的绑定（局部、参数、全局声明）
+  一律 `false`；**隐式全局**（`x = 1` 且无声明）是全局对象上可配置的属性，真的删得掉。
+- **strict 模式下给未声明名字赋值抛 `ReferenceError`**：之前静默创建全局。
+- **直接 `eval` 继承调用者的 strictness**：`"use strict"` 函数里的
+  `eval("x = 1")` 现在抛 `ReferenceError`。
+
 ### 已知缺口（记录，不隐藏）
 
-- `Error.stack` / 栈回溯：需要 `pc2line` 表，`assert_json_error` 因此仍失败。
-- `toString(radix)` 的**小数**部分精度不足：`(1.3).toString(7)` 少两位，
-  需要精确 bignum 转换。
+- `Date`、`RegExp`、`Symbol`、`Map`/`Set`、TypedArray、生成器/async。
+- **直接 `eval` 的变量作用域**：`eval` 在全局作用域里跑，所以函数内的
+  `eval("var v = 1")` 泄漏到全局。间接 eval 与 `1+1` 这类用法是正确的。
+- **spread 调用参数**：`f(...args)` 需要新增 `apply` 指令，编译器现在明确报
+  "not supported"，不生成错码。
+- **`Function.prototype.toString`** 返回 `[native code]` 而不是源码，需要保留源码
+  与函数自身的 span。
+- **字符串拼接是 O(n²)**：`test_rope` 的 10 万次拼接要几十秒（参考有 rope）。
+  属 M11 性能优化。
 - `Object.freeze` 后的数组在参考里退化为稀疏形态、打印成 `[ 0: 1, … ]`；
   这是其内部表示泄漏，未复刻。
-- `Date`、`RegExp`、`Symbol`、`Map`/`Set`、生成器/async、直接 `eval` 的作用域。
 
 ### M3：VM 核心
 

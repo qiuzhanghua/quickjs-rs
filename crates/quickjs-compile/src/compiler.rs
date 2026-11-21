@@ -21,11 +21,13 @@
 //! differential test compares disassembly with the reference opcode by opcode, so
 //! an unnecessary `dup` or a differently chosen short form shows up immediately.
 
+use crate::bytecode::LineCol;
 use crate::bytecode::{
     Atom, ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
+use js_parse::Position;
 use js_parse::Span;
 use js_parse::SyntaxError;
 use js_parse::ast::{self, *};
@@ -126,6 +128,12 @@ enum Insn {
     /// case and nothing otherwise, so the decision is deferred to [`resolve`] instead
     /// of emitted blind.
     CloseCaptured { name: String, block: u64 },
+    /// `delete name`, which can only answer `false` once the binding is known.
+    ///
+    /// It is not a `Var` action because `delete_var` carries an *atom*: the runtime
+    /// looks the name up on the global object, which is what distinguishes an implicit
+    /// global (configurable, deletable) from a declared one (a binding, always `false`).
+    DeleteVar { name: String },
     /// An instruction that dead-code elimination removed. It keeps its slot so
     /// that label indices stay valid, and resolves to no bytecode.
     Dead,
@@ -367,6 +375,11 @@ struct FnState {
     /// `instantiate_hoisted_definitions` rather than at the statement, because a
     /// declaration is visible before it is reached.
     hoisted: Vec<(u64, HoistTarget, u32)>,
+    /// The source position of the node being compiled. Every instruction emitted
+    /// takes it, which is how the position table that feeds stack traces is built.
+    cur_pos: Option<Position>,
+    /// One position per entry in `insns`, index-aligned.
+    insn_pos: Vec<Option<Position>>,
 }
 
 /// Where a hoisted function declaration is stored.
@@ -409,6 +422,8 @@ impl FnState {
             leaves_value: false,
             stmt_depth: 0,
             hoisted: Vec::new(),
+            cur_pos: None,
+            insn_pos: Vec::new(),
         }
     }
 
@@ -504,10 +519,12 @@ impl Compiler {
 
     fn emit(&mut self, op: Opcode, operands: &[Op]) {
         self.state().label_since_insn = false;
+        let pos = self.cur().cur_pos;
         self.state().insns.push(Insn::Fixed {
             op,
             operands: operands.to_vec(),
         });
+        self.state().insn_pos.push(pos);
     }
 
     /// Reset the script's hidden return value to `undefined`.
@@ -571,11 +588,13 @@ impl Compiler {
         }
         let block = self.cur().current_block;
         self.state().label_since_insn = false;
+        let pos = self.cur().cur_pos;
         self.state().insns.push(Insn::Var {
             action,
             name: name.to_string(),
             block,
         });
+        self.state().insn_pos.push(pos);
     }
 
     fn new_label(&mut self) -> Label {
@@ -637,11 +656,13 @@ impl Compiler {
                     // A global binding lives in a reference cell, so the store
                     // goes through `put_var_ref` while reads use `get_var`.
                     let block = self.cur().current_block;
+                    let pos = self.cur().cur_pos;
                     self.state().insns.push(Insn::Var {
                         action: VarAction::PutRef,
                         name,
                         block,
                     });
+                    self.state().insn_pos.push(pos);
                 }
             }
         }
@@ -879,10 +900,12 @@ impl Compiler {
                 // iteration's closures get their own cell rather than sharing the one
                 // the initialiser wrote into.
                 for name in &loop_bindings {
+                    let pos = self.cur().cur_pos;
                     self.state().insns.push(Insn::CloseCaptured {
                         name: name.clone(),
                         block: for_key,
                     });
+                    self.state().insn_pos.push(pos);
                 }
                 let top = self.new_label();
                 let cont = self.new_label();
@@ -901,10 +924,12 @@ impl Compiler {
                 // one. Without this every closure in the loop shares one binding.
                 let binding_block = for_key;
                 for name in &loop_bindings {
+                    let pos = self.cur().cur_pos;
                     self.state().insns.push(Insn::CloseCaptured {
                         name: name.clone(),
                         block: binding_block,
                     });
+                    self.state().insn_pos.push(pos);
                 }
                 if let Some(update) = update {
                     self.state().discard_value = true;
@@ -997,6 +1022,18 @@ impl Compiler {
     fn return_stmt(&mut self, value: Option<&Expr>) -> Result<(), SyntaxError> {
         let mut has_value = value.is_some();
         if let Some(expr) = value {
+            // `return f(x)` is a tail call *only* when nothing has to happen to the
+            // value afterwards. A `finally` or an open iterator in scope forces the
+            // normal path, because the cleanup has to run after the call returns —
+            // which is exactly what a tail call refuses to do.
+            let plain = self
+                .cur()
+                .jump_targets
+                .iter()
+                .all(|target| target.finally_label.is_none() && !target.has_iterator);
+            if plain && self.expr_if_tail_call(expr)? {
+                return Ok(());
+            }
             self.expr(expr)?;
         }
         let targets = self.cur().jump_targets.clone();
@@ -1339,7 +1376,18 @@ impl Compiler {
     /// variables instead.
     fn declare_global(&mut self, name: &str, def: &VarDef) {
         let state = self.state();
-        if state.closure_vars.iter().any(|c| c.name == name) {
+        if let Some(existing) = state.closure_vars.iter_mut().find(|c| c.name == name) {
+            // The name was already referenced, from a function compiled before this
+            // declaration was reached — `function a(){ b() } function b(){}` resolves
+            // `b` while `b` is still unknown, and that guess has to be corrected here.
+            // Leaving it as a plain global meant the declaration was never registered,
+            // so the binding did not exist at run time and `a()` threw
+            // `b is not defined`.
+            if matches!(existing.closure_type, ClosureType::Global) {
+                existing.closure_type = ClosureType::GlobalDecl;
+                existing.is_const = def.is_const;
+                existing.is_lexical = def.is_lexical;
+            }
             return;
         }
         state.closure_vars.push(ClosureVar {
@@ -1999,7 +2047,21 @@ impl Compiler {
 
     // -- expressions -------------------------------------------------------
 
+    /// Compile one expression, recording where its instructions sit.
+    ///
+    /// The position is the node's operator when it has one and its first token
+    /// otherwise, and it is restored on the way out so a parent's own instructions —
+    /// which are emitted *after* its children — are blamed on the parent. Without the
+    /// restore the `add` in `a + b` would inherit `b`'s position instead of the `+`.
     fn expr(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
+        let saved = self.cur().cur_pos;
+        self.state().cur_pos = Some(expr.op_pos.unwrap_or(expr.span.start));
+        let result = self.expr_inner(expr);
+        self.state().cur_pos = saved;
+        result
+    }
+
+    fn expr_inner(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
         match &expr.kind {
             ExprKind::Number(value) => self.push_number(*value),
             ExprKind::Bool(true) => self.emit(Opcode::PushTrue, &[]),
@@ -2398,6 +2460,54 @@ impl Compiler {
         }
     }
 
+    /// Compile `expr` as a tail call when it is one, reporting whether it was.
+    ///
+    /// `tail_call` reuses the current frame instead of pushing a new one, so a
+    /// tail-recursive function runs in constant stack space. It also has to be the
+    /// *last* thing the function does, which is why only a `return` reaches here.
+    fn expr_if_tail_call(&mut self, expr: &Expr) -> Result<bool, SyntaxError> {
+        let ExprKind::Call {
+            callee,
+            arguments,
+            optional: false,
+        } = &expr.unparen().kind
+        else {
+            return Ok(false);
+        };
+        let end = self.new_label();
+        if let ExprKind::Member {
+            object,
+            property,
+            optional: false,
+        } = &callee.unparen().kind
+        {
+            self.chain_link(object, end)?;
+            match property {
+                MemberProp::Ident(name) => {
+                    self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text(&name.name))])
+                }
+                MemberProp::Computed(index) => {
+                    self.expr(index)?;
+                    self.emit(Opcode::GetArrayEl2, &[]);
+                }
+                MemberProp::Private(_) => return Ok(false),
+            }
+            for argument in arguments {
+                self.expr(argument)?;
+            }
+            self.emit(Opcode::TailCallMethod, &[Op::Int(arguments.len() as i32)]);
+            self.place_label(end);
+            return Ok(true);
+        }
+        self.chain_link(callee, end)?;
+        for argument in arguments {
+            self.expr(argument)?;
+        }
+        self.emit(Opcode::TailCall, &[Op::Int(arguments.len() as i32)]);
+        self.place_label(end);
+        Ok(true)
+    }
+
     /// The `?.` guard: keep the value if it is neither null nor undefined,
     /// otherwise replace it with `undefined` and leave the whole chain.
     fn optional_guard(&mut self, end: Label) {
@@ -2550,6 +2660,18 @@ impl Compiler {
                         }
                         self.emit(Opcode::Delete, &[]);
                     }
+                    ExprKind::Ident(name) => {
+                        // `delete name`: a declared global, a local and an argument all
+                        // answer `false`, but an *implicit* global (`x = 1` with no
+                        // declaration) is a configurable property of the global object
+                        // and really goes away. Which of those a name is only the
+                        // resolver knows, so the decision waits for it.
+                        let pos = self.cur().cur_pos;
+                        self.state().insns.push(Insn::DeleteVar {
+                            name: name.name.clone(),
+                        });
+                        self.state().insn_pos.push(pos);
+                    }
                     _ => self.emit(Opcode::PushFalse, &[]),
                 }
             }
@@ -2599,6 +2721,23 @@ impl Compiler {
         let keep = !std::mem::take(&mut self.state().discard_value);
         match &target.kind {
             PatternKind::Ident(name) => {
+                // A *simple* store is blamed on the identifier, not on the `=`: a
+                // strict-mode `not_def = 1` raises when the name is written, which the
+                // reference reports at the name's column. A compound store is blamed on
+                // the operator instead (`a += poisoned` raises inside `ToPrimitive`,
+                // which the reference reports at the `+=`), so only the simple case
+                // moves the position.
+                let saved = self.cur().cur_pos;
+                let name_pos = Some(name.span.start);
+                if matches!(op, AssignOp::Assign) {
+                    self.state().cur_pos = name_pos;
+                }
+                // A *compound* store reads the binding before it combines, and that read
+                // is blamed on the identifier: `not_def += 2` fails while reading
+                // `not_def`, so the position is the name's, not the `+=`'s. The
+                // combination that follows is blamed on the operator, which is why
+                // `cur_pos` is put back to the operator position before it is emitted.
+                self.state().cur_pos = name_pos;
                 match op {
                     AssignOp::Assign => {
                         self.expr(value)?;
@@ -2619,6 +2758,7 @@ impl Compiler {
                     AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
                         let end = self.new_label();
                         self.emit_var(VarAction::Get, &name.name);
+                        self.state().cur_pos = saved;
                         self.emit(Opcode::Dup, &[]);
                         self.emit_logical_test(op);
                         self.emit_jump(logical_jump(op), end, &[]);
@@ -2631,14 +2771,23 @@ impl Compiler {
                     _ => {
                         self.emit_var(VarAction::Get, &name.name);
                         self.expr(value)?;
+                        self.state().cur_pos = saved;
                         self.emit(compound_opcode(op), &[]);
                         self.emit(Opcode::Dup, &[]);
                         self.emit_var(VarAction::Put, &name.name);
                     }
                 }
+                self.state().cur_pos = saved;
                 Ok(())
             }
             PatternKind::Member(member) => {
+                // A store is blamed on the selector punctuator (`.` or `[`), the same
+                // token a load is blamed on — the reference records `put_field obj.a`
+                // at the `.`, so a setter that throws reports that column and not the
+                // `=` of the assignment it sits in. The inner expressions restore their
+                // own positions, so the selector's sticks for the store instructions.
+                let saved = self.cur().cur_pos;
+                self.state().cur_pos = member.op_pos.or(Some(member.span.start));
                 self.expr(&member.object)?;
                 match &member.property {
                     MemberProp::Ident(property) => {
@@ -2733,6 +2882,7 @@ impl Compiler {
                         ));
                     }
                 }
+                self.state().cur_pos = saved;
                 Ok(())
             }
             _ => Err(SyntaxError::new(
@@ -3013,7 +3163,7 @@ impl Compiler {
     fn finish_current(&mut self) -> CompiledFunction {
         self.provide_arguments();
         self.provide_self_name();
-        let mut resolved = resolve(&mut self.stack);
+        let (mut resolved, resolved_pos) = resolve(&mut self.stack);
         // Captured bindings need a reference cell; the count goes in the header so
         // the runtime knows how many cells to allocate on entry.
         let current = self.stack.len() - 1;
@@ -3030,7 +3180,8 @@ impl Compiler {
         self.stack[current].var_ref_count = captured as u32;
         // The scope chain is only final now that every binding is known.
         rebuild_scope_chain(&mut self.stack[current]);
-        let (code, stack_size) = assemble(&mut resolved, &mut self.stack[current]);
+        let (code, stack_size, positions) =
+            assemble(&mut resolved, &resolved_pos, &mut self.stack[current]);
         let _ = &mut resolved;
         let state = self.stack.pop().expect("a function is being compiled");
         CompiledFunction {
@@ -3045,6 +3196,7 @@ impl Compiler {
             code,
             stack_size,
             var_ref_count: state.var_ref_count,
+            positions,
             source: None,
             line: state.line,
             column: state.column,
@@ -3140,7 +3292,13 @@ fn rebuild_scope_chain(state: &mut FnState) {
 /// stated in terms of `put_loc`/`set_loc` pairs, which only exist after
 /// resolution. Deleted instructions stay in the list as `None` so that label
 /// indices remain valid; [`Assembler`] maps them to byte offsets.
-fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
+/// A resolved instruction and the source position it came from.
+type ResolvedInsn = Option<(Opcode, Vec<Op>)>;
+
+/// A resolved instruction paired with its position, which is what `assemble` consumes.
+type PositionedInsn = (Opcode, Vec<Op>);
+
+fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) {
     let current = stack.len() - 1;
     // Dead-code elimination, on the symbolic form where labels are still
     // instruction indices. A `break` inside a loop leaves the trailing `goto`
@@ -3150,8 +3308,15 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
     strip_empty_gosubs(stack, current);
     eliminate_dead_code(stack, current);
     let insns = std::mem::take(&mut stack[current].insns);
+    // One entry per instruction, carried alongside: `insn_pos` is index-aligned with
+    // `insns`, and every arm below pushes exactly one instruction, so the positions
+    // stay aligned with `out`.
+    let positions = std::mem::take(&mut stack[current].insn_pos);
     let mut out: Vec<Option<(Opcode, Vec<Op>)>> = Vec::with_capacity(insns.len());
-    for insn in &insns {
+    let mut out_pos: Vec<Option<Position>> = Vec::with_capacity(insns.len());
+    for (index, insn) in insns.iter().enumerate() {
+        let pos = positions.get(index).copied().flatten();
+        out_pos.push(pos);
         match insn {
             Insn::Fixed { op, operands } => {
                 let operands = operands
@@ -3192,6 +3357,17 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
                     out.push(None);
                 }
             }
+            Insn::DeleteVar { name } => {
+                // A binding — a local, an argument, or a declared global — cannot be
+                // deleted, and the reference encodes that as a constant `push_false`.
+                // Only an implicit global needs the runtime lookup.
+                if matches!(resolve_slot(stack, current, name, 0), Slot::Global(_)) {
+                    let atom = intern_atom(&mut stack[current], name);
+                    out.push(Some((Opcode::DeleteVar, vec![Op::AtomId(atom)])));
+                } else {
+                    out.push(Some((Opcode::PushFalse, Vec::new())));
+                }
+            }
             Insn::Dead => out.push(None),
         }
     }
@@ -3214,7 +3390,7 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
         eprintln!("label_at: {label_at:?}");
     }
     peephole(&mut out, &label_at, &stack[current].labels);
-    out
+    (out, out_pos)
 }
 
 /// Find where `name` lives, capturing it in an enclosing function when needed.
@@ -3490,6 +3666,7 @@ fn variable_instruction(
         (VarAction::GetUndef, Slot::Global(_) | Slot::GlobalDecl(_)) => {
             (Opcode::GetVarUndef, operand)
         }
+
         (VarAction::Put, Slot::Loc(_)) => (
             if lexical {
                 Opcode::PutLocCheck
@@ -3588,8 +3765,29 @@ fn peephole(
 
     let mut doomed = vec![false; insns.len()];
     for index in 0..insns.len() {
-        // `undefined` followed by `drop` pushes a value only to throw it away.
-        if snapshot[index] == Some(Opcode::Undefined)
+        // A constant pushed only to be dropped does nothing at all. This is what a
+        // comma expression with a literal left operand compiles to — `(0, f)()` — and
+        // the reference removes the pair rather than making the reader step over it.
+        let constant = matches!(
+            snapshot[index],
+            Some(
+                Opcode::Undefined
+                    | Opcode::Null
+                    | Opcode::PushMinus1
+                    | Opcode::Push0
+                    | Opcode::Push1
+                    | Opcode::Push2
+                    | Opcode::Push3
+                    | Opcode::Push4
+                    | Opcode::Push5
+                    | Opcode::Push6
+                    | Opcode::Push7
+                    | Opcode::PushTrue
+                    | Opcode::PushFalse
+                    | Opcode::PushI32
+            )
+        );
+        if constant
             && let Some(next) = next_op(index)
             && snapshot[next] == Some(Opcode::Drop)
         {
@@ -3628,7 +3826,17 @@ fn peephole(
         }
     }
 
+    // A constant condition is decided here rather than at run time.
+    fold_constant_conditions(insns);
+    // The conditional folding below is about pairs of *real* branches, so it runs
+    // before a jump to the next instruction is dropped: `do { … if (c) continue }
+    // while (t)` puts `continue` exactly on the condition, and the reference inverts
+    // the branch first and only then notices the jump goes nowhere.
     fold_conditional_jumps(insns, label_at, placed);
+
+    // A jump whose destination is the very next instruction does nothing, which is
+    // what constant folding leaves behind for `while (1) { … }`.
+    remove_jump_to_next(insns, placed);
 
     // `put_x(n) get_x(n)` -> `set_x(n)`, which is what a declaration followed by
     // a use of the same variable boils down to.
@@ -3740,7 +3948,7 @@ fn reachable_instructions(state: &FnState, count: usize) -> Vec<bool> {
             Insn::Fixed { op, operands } => (*op, operands.as_slice()),
             // A variable access never transfers control, and a removed
             // instruction is only reachable if it is already marked.
-            Insn::Var { .. } | Insn::CloseCaptured { .. } | Insn::Dead => {
+            Insn::Var { .. } | Insn::CloseCaptured { .. } | Insn::DeleteVar { .. } | Insn::Dead => {
                 worklist.push(index + 1);
                 continue;
             }
@@ -3749,8 +3957,12 @@ fn reachable_instructions(state: &FnState, count: usize) -> Vec<bool> {
             // A return, a throw and a `ret` all leave this instruction stream: the
             // first two give control to the caller or the handler, and `ret`
             // returns to a `gosub` elsewhere.
+            // A tail call leaves the function too: the callee's result becomes this
+            // function's result, so nothing after it runs.
             Opcode::Return
             | Opcode::ReturnUndef
+            | Opcode::TailCall
+            | Opcode::TailCallMethod
             | Opcode::Throw
             | Opcode::ThrowError
             | Opcode::Ret => {}
@@ -3808,6 +4020,99 @@ fn label_id(operands: &[Op]) -> Option<u32> {
 /// A conditional whose alternate branch is an unconditional jump needs one jump,
 /// not two. This is the shape `if (c) break;` produces, so folding it removes an
 /// instruction and a label from every conditional `break`.
+/// The boolean a constant-push instruction produces, or `None` if it is not one.
+///
+/// Only the operators whose truthiness is decided by the opcode are covered; a
+/// constant that needs the constant pool (a string) is left alone, because reading it
+/// would mean threading the pool through the peephole for a case the reference also
+/// skips.
+fn constant_truth(op: Opcode, operands: &[Op]) -> Option<bool> {
+    match op {
+        // `push_0` returns -1 for zero, `push_1` 1, and so on.
+        Opcode::PushMinus1 => Some(true),
+        Opcode::Push0 => Some(false),
+        Opcode::Push1
+        | Opcode::Push2
+        | Opcode::Push3
+        | Opcode::Push4
+        | Opcode::Push5
+        | Opcode::Push6
+        | Opcode::Push7 => Some(true),
+        Opcode::PushTrue => Some(true),
+        Opcode::PushFalse => Some(false),
+        Opcode::Undefined | Opcode::Null => Some(false),
+        Opcode::PushI32 => match operands.first() {
+            Some(Op::Int(value)) => Some(*value != 0),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Fold a branch on a constant condition.
+///
+/// `if (0) a() else b()` must not test anything at run time, and the reference
+/// compiles it to a plain `goto`. Removing the test also removes the unreachable arm,
+/// which is why the bytecode for a `while (1)` loop has no condition at all.
+///
+/// Two instructions become one, so the slot the test occupied is left empty rather
+/// than shifting everything after it: labels have already been resolved to indices.
+fn fold_constant_conditions(insns: &mut [Option<(Opcode, Vec<Op>)>]) {
+    for index in 0..insns.len() {
+        let Some((push_op, push_operands)) = insns[index].clone() else {
+            continue;
+        };
+        let Some(truth) = constant_truth(push_op, &push_operands) else {
+            continue;
+        };
+        let Some((branch_op, branch_operands)) = insns.get(index + 1).cloned().flatten() else {
+            continue;
+        };
+        let (destination, taken) = match branch_op {
+            Opcode::IfTrue => (branch_operands.first().cloned(), truth),
+            Opcode::IfFalse => (branch_operands.first().cloned(), !truth),
+            _ => continue,
+        };
+        let Some(destination) = destination else {
+            continue;
+        };
+        insns[index] = if taken {
+            // The branch is always taken, so it becomes an unconditional jump.
+            Some((Opcode::Goto, vec![destination]))
+        } else {
+            // The branch never runs: both instructions disappear and control falls
+            // through to what came after.
+            None
+        };
+        insns[index + 1] = None;
+    }
+}
+
+/// Remove a jump whose destination is the instruction right after it.
+///
+/// Folding a constant condition leaves these behind often: `while (1) { ... }` turns
+/// its test into nothing, and the loop-end jump then points at the following
+/// instruction. The reference drops them, so `stack_size` and the listing agree.
+fn remove_jump_to_next(insns: &mut [Option<(Opcode, Vec<Op>)>], placed: &[Option<usize>]) {
+    for index in 0..insns.len() {
+        let Some((op, operands)) = insns[index].clone() else {
+            continue;
+        };
+        if !is_goto(op) {
+            continue;
+        }
+        let Some(id) = label_id(&operands) else {
+            continue;
+        };
+        // The next instruction that still exists, which is what "the instruction
+        // after this jump" means once earlier folds have punched holes.
+        let next = (index + 1..insns.len()).find(|position| insns[*position].is_some());
+        if placed.get(id as usize).copied().flatten() == next {
+            insns[index] = None;
+        }
+    }
+}
+
 fn fold_conditional_jumps(
     insns: &mut [Option<(Opcode, Vec<Op>)>],
     label_at: &[Option<u32>],
@@ -4001,14 +4306,24 @@ fn compound_opcode(op: AssignOp) -> Opcode {
 /// stay valid. A label names an *instruction index*, and an index that was
 /// deleted has to resolve to the next surviving instruction, which is what
 /// [`resolve_label`] does before the byte offsets are known.
-fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Vec<u8>, u32) {
+fn assemble(
+    insns: &mut [Option<(Opcode, Vec<Op>)>],
+    insn_pos: &[Option<Position>],
+    state: &mut FnState,
+) -> (Vec<u8>, u32, Vec<LineCol>) {
     // Compaction: surviving instructions in order, plus the index mapping.
+    //
+    // `spans` runs parallel to `kept` and is compacted in lock step with it, at every
+    // point below where instructions are removed — otherwise a stack trace would point
+    // at the wrong source line as soon as dead-code elimination kicked in.
     let mut kept: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(insns.len());
+    let mut spans: Vec<Option<Position>> = Vec::with_capacity(insns.len());
     let mut original_to_kept: Vec<Option<usize>> = vec![None; insns.len()];
     for (original, entry) in insns.iter_mut().enumerate() {
         if let Some((op, operands)) = entry.take() {
             original_to_kept[original] = Some(kept.len());
             kept.push((op, operands));
+            spans.push(insn_pos.get(original).copied().flatten());
         }
     }
 
@@ -4093,7 +4408,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         if !any {
             break;
         }
-        kept = drop_instructions(kept, &mut label_kept, &doomed);
+        (kept, spans) = drop_instructions(kept, spans, &mut label_kept, &doomed);
     }
 
     // A label that lands on an unconditional jump stands for wherever that jump
@@ -4149,6 +4464,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         }
         // Drop the deleted instructions and renumber everything.
         let mut next: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
+        let mut next_spans: Vec<Option<Position>> = Vec::with_capacity(kept.len());
         let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
         for (old, entry) in kept.into_iter().enumerate() {
             if delete[old] {
@@ -4156,6 +4472,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
             }
             moved[old] = Some(next.len());
             next.push(entry);
+            next_spans.push(spans[old]);
         }
         for (id, slot) in label_kept.iter_mut().enumerate() {
             let Some(old) = *slot else { continue };
@@ -4169,6 +4486,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
             let _ = id;
         }
         kept = next;
+        spans = next_spans;
     }
 
     // The same walk at the end of the function: `try`/`catch`'s `goto end` becomes a
@@ -4211,6 +4529,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         end = last;
     }
     kept.truncate(end);
+    spans.truncate(end);
 
     // Choose an opcode for each instruction and its size, so label offsets can be
     // computed.
@@ -4233,7 +4552,24 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         encode_operands(&mut code, op, &operands, offsets[position], &offsets);
     }
     let stack_size = compute_stack_size(&code);
-    (code, stack_size)
+    // Keep only the offsets where the position actually changes: a run of
+    // instructions on one line is one table entry, and the runtime binary searches
+    // the table for the frame's pc.
+    let mut positions: Vec<LineCol> = Vec::new();
+    let mut last: Option<Position> = None;
+    for (index, span) in spans.iter().enumerate() {
+        let Some(pos) = *span else { continue };
+        if last == Some(pos) {
+            continue;
+        }
+        last = Some(pos);
+        positions.push(LineCol {
+            pc: offsets[index] as u32,
+            line: pos.line,
+            column: pos.column,
+        });
+    }
+    (code, stack_size, positions)
 }
 
 /// Whether an instruction always transfers control away, so anything after it in the
@@ -4257,10 +4593,12 @@ fn is_transfer(op: Opcode) -> bool {
 /// follows it, since a jump is never left with nowhere to land.
 fn drop_instructions(
     kept: Vec<(Opcode, Vec<Op>)>,
+    spans: Vec<Option<Position>>,
     label_kept: &mut [Option<usize>],
     doomed: &[bool],
-) -> Vec<(Opcode, Vec<Op>)> {
+) -> (Vec<PositionedInsn>, Vec<Option<Position>>) {
     let mut result: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
+    let mut result_spans: Vec<Option<Position>> = Vec::with_capacity(kept.len());
     let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
     for (old, entry) in kept.into_iter().enumerate() {
         if doomed.get(old).copied().unwrap_or(false) {
@@ -4268,6 +4606,7 @@ fn drop_instructions(
         }
         moved[old] = Some(result.len());
         result.push(entry);
+        result_spans.push(spans[old]);
     }
     for slot in label_kept.iter_mut() {
         let Some(old) = *slot else { continue };
@@ -4278,7 +4617,7 @@ fn drop_instructions(
                 .or(Some(result.len())),
         };
     }
-    result
+    (result, result_spans)
 }
 
 fn is_goto(op: Opcode) -> bool {

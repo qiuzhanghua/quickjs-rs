@@ -28,6 +28,8 @@ pub use js_compile;
 pub use js_gc::{CollectStats, Gc, Heap, Trace, Tracer, WeakGc};
 pub use js_parse;
 
+mod bignum;
+
 pub mod builtins;
 pub mod interp;
 pub mod object;
@@ -137,6 +139,9 @@ pub struct Context<'rt> {
     interp: Option<Interp<'rt>>,
     /// The value of the last script, as `qjs` reports it.
     last_value: Value,
+    /// The name a top-level script is compiled under, which is what `error.stack`
+    /// prints: `<cmdline>` for `-e`, a path for a file, `None` for `<input>`.
+    script_name: Option<String>,
 }
 
 impl<'rt> Context<'rt> {
@@ -146,7 +151,17 @@ impl<'rt> Context<'rt> {
             runtime,
             interp: None,
             last_value: Value::Undefined,
+            script_name: None,
         }
+    }
+
+    /// Name the scripts this context evaluates, for stack traces.
+    ///
+    /// Mirrors what `qjs` passes to `JS_Eval`: `-e` code is `<cmdline>`, a script file
+    /// is its own path. Without a name, frames print `<input>`, which is what the
+    /// reference uses for code with no file behind it.
+    pub fn set_script_name(&mut self, name: impl Into<String>) {
+        self.script_name = Some(name.into());
     }
 
     /// The runtime this context belongs to.
@@ -172,8 +187,11 @@ impl<'rt> Context<'rt> {
     pub fn eval(&mut self, source: &str) -> Result<Value> {
         let program =
             js_parse::parse_script(source).map_err(|error| Error::Syntax(error.to_string()))?;
-        let code = js_compile::compile_script(&program)
+        let mut code = js_compile::compile_script(&program)
             .map_err(|error| Error::Syntax(error.message.clone()))?;
+        // Position information travels with the code, but the file name is the host's
+        // to supply — the parser never sees it.
+        code.set_filename(self.script_name.as_deref().unwrap_or("<input>"));
         let interp = self.interp();
         match interp.run_script(code) {
             Ok(value) => {

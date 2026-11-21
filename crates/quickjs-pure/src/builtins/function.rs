@@ -16,6 +16,23 @@ pub fn install(interp: &mut Interp<'_>, function_proto: &Gc<JsObject>) {
     define_method(function_proto, "apply", 2, apply, interp);
     define_method(function_proto, "bind", 1, bind, interp);
     define_method(function_proto, "toString", 0, to_string, interp);
+    // Where the function was written. The reference exposes these as accessors on
+    // `Function.prototype` reading the function's own bytecode debug info, which is why
+    // `eval("\n  function f(){}; f").lineNumber` is `2` — the declaration's line, not
+    // the eval call's. Test scripts use them to check that positions are reported
+    // rather than approximated.
+    //
+    // The three getters are separate functions rather than one function told which
+    // field to read: a native getter runs without a frame of its own, so it cannot
+    // recognise itself the way a constructor reads its `_class`.
+    for (name, getter) in [
+        ("fileName", file_name as crate::object::NativeFn),
+        ("lineNumber", line_number),
+        ("columnNumber", column_number),
+    ] {
+        let getter = interp.new_native(name, 0, getter);
+        function_proto.define(name, Property::accessor(Some(Value::Object(getter)), None));
+    }
 
     let constructor = interp.new_native("Function", 1, constructor);
     constructor.define(
@@ -137,4 +154,43 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
         .map(|value| value.to_js_string())
         .unwrap_or_default();
     Ok(interp.string(format!("function {name}() {{\n    [native code]\n}}")))
+}
+
+/// The declaration position of a function object: file, line and column.
+///
+/// `None` for a native function or a bound function, which have no source behind them;
+/// the reference answers `undefined` for those rather than guessing.
+fn declaration_position(this: &Value) -> Option<(Option<String>, u32, u32)> {
+    this.as_object().and_then(|object| {
+        object.with(|data| match &data.kind {
+            crate::object::ObjectKind::Function(crate::object::Callable::Bytecode {
+                code, ..
+            }) => Some((code.code.filename.clone(), code.code.line, code.code.column)),
+            _ => None,
+        })
+    })
+}
+
+/// `Function.prototype.fileName`.
+fn file_name(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(match declaration_position(&this) {
+        Some((Some(name), _, _)) => interp.string(name),
+        _ => Value::Undefined,
+    })
+}
+
+/// `Function.prototype.lineNumber`.
+fn line_number(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(match declaration_position(&this) {
+        Some((_, line, _)) => Value::Int(line as i32),
+        None => Value::Undefined,
+    })
+}
+
+/// `Function.prototype.columnNumber`.
+fn column_number(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(match declaration_position(&this) {
+        Some((_, _, column)) => Value::Int(column as i32),
+        None => Value::Undefined,
+    })
 }

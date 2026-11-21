@@ -93,7 +93,8 @@ fn unknown_option(display: &str) -> ExitCode {
 /// through. With `-e` the completion value is printed when it is not `undefined`,
 /// which is what makes `qjs -e '1+1'` print `2`.
 fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode {
-    let is_eval = filename == "<cmdline>";
+    // Stack traces name the script, so the context has to know it before compiling.
+    ctx.set_script_name(filename);
     let result = ctx.eval(source);
     let output = ctx.output().to_string();
     print!("{output}");
@@ -108,8 +109,10 @@ fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode
             ExitCode::from(1)
         }
         Err(error) => {
-            let prefix = if is_eval { "<cmdline>" } else { filename };
-            let _ = writeln!(std::io::stderr(), "{prefix}: {error}");
+            // Upstream reports a pending exception through `JS_PrintValue`, which
+            // prints just the value — no file prefix, and no position either (the
+            // position lives in `error.stack`, which is printed when it exists).
+            let _ = writeln!(std::io::stderr(), "{error}");
             ExitCode::from(1)
         }
     }
