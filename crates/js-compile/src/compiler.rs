@@ -617,7 +617,7 @@ impl Compiler {
                 discriminant,
                 cases,
             } => {
-                self.switch(discriminant, cases)?;
+                self.switch(discriminant, cases, stmt)?;
             }
             StmtKind::Try {
                 block,
@@ -656,6 +656,18 @@ impl Compiler {
                     "modules are not supported by the compiler yet",
                     stmt.span,
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile a statement list, stopping at the first statement that cannot
+    /// fall through.
+    fn stmts(&mut self, body: &[Stmt]) -> Result<(), SyntaxError> {
+        for stmt in body {
+            self.stmt(stmt)?;
+            if Self::terminates(stmt) {
+                break;
             }
         }
         Ok(())
@@ -956,11 +968,141 @@ impl Compiler {
         )
     }
 
-    fn switch(&mut self, _discriminant: &Expr, _cases: &[SwitchCase]) -> Result<(), SyntaxError> {
-        Err(SyntaxError::new(
-            "switch is not supported by the compiler yet",
-            Span::start(),
-        ))
+    /// Compile `switch`.
+    ///
+    /// The discriminant is evaluated once and stays on the value stack while the
+    /// clauses compare against copies of it, so it is dropped at the end — which is
+    /// why `switch (x) { }` still leaves `x` behind. Fallthrough is real: a
+    /// clause's body jumps over the *next* clause's tests straight into its body.
+    ///
+    /// The tests form a chain: each `case` run compares and, on a miss, hands over to
+    /// the next run's tests. Only the last run's miss reaches the `default` body, or
+    /// the end of the switch when there is no `default`. That failure path can point
+    /// backwards (`default` written first), so the runs and their labels are worked
+    /// out before any code is emitted.
+    fn switch(
+        &mut self,
+        discriminant: &Expr,
+        cases: &[SwitchCase],
+        stmt: &Stmt,
+    ) -> Result<(), SyntaxError> {
+        self.reset_value();
+        // The discriminant is evaluated outside the switch's block scope, before
+        // any `case` clause exists.
+        self.expr(discriminant)?;
+
+        let switch_key = stmt.span.start.offset as u64;
+        let switch_parent = self.cur().current_block;
+        self.push_block(switch_key, switch_parent);
+        self.emit_scope_enter(switch_key);
+
+        let break_label = self.new_label();
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label,
+            // `switch` is a valid `break` target but not a `continue` target.
+            continue_label: None,
+        });
+
+        // Runs of tests. `case 1: case 2: body` is one run: the empty clause hands
+        // its label to the clause after it, so both tests reach the same body.
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut scan = 0;
+        while scan < cases.len() {
+            if cases[scan].test.is_some() {
+                let mut last = scan;
+                while last + 1 < cases.len()
+                    && cases[last].test.is_some()
+                    && cases[last].body.is_empty()
+                    && cases[last + 1].test.is_some()
+                {
+                    last += 1;
+                }
+                runs.push((scan, last));
+                scan = last + 1;
+            } else {
+                scan += 1;
+            }
+        }
+
+        let body_labels: Vec<Label> = cases.iter().map(|_| self.new_label()).collect();
+        let run_labels: Vec<Label> = runs.iter().map(|_| self.new_label()).collect();
+        let default_at = cases.iter().position(|case| case.test.is_none());
+        // Where the last run sends control when nothing matched.
+        let miss_target = match default_at {
+            Some(index) => body_labels[index],
+            None => break_label,
+        };
+
+        // When `default` comes first, control has to jump over it to reach the
+        // tests. It only needs to when some clause actually has a test; otherwise
+        // the default body is the entry point.
+        let mut entry = None;
+        if default_at == Some(0) && !runs.is_empty() {
+            self.emit_jump(Opcode::Goto, run_labels[0], &[]);
+            entry = Some(run_labels[0]);
+        }
+
+        let mut index = 0;
+        let mut run = 0;
+        let result = (|| -> Result<(), SyntaxError> {
+            while index < cases.len() {
+                if cases[index].test.is_some() {
+                    let (first, last) = runs[run];
+                    // Reaching these tests from the preceding body is a
+                    // fallthrough, which continues inside the body and skips them.
+                    if index > 0 {
+                        self.emit_jump(Opcode::Goto, body_labels[index], &[]);
+                    }
+                    if let Some(label) = entry.take() {
+                        self.place_label(label);
+                    }
+                    self.place_label(run_labels[run]);
+
+                    for (offset, case) in cases[first..=last].iter().enumerate() {
+                        let test = case.test.as_ref().unwrap();
+                        self.emit(Opcode::Dup, &[]);
+                        self.expr(test)?;
+                        self.emit(Opcode::StrictEq, &[]);
+                        if first + offset < last {
+                            self.emit_jump(Opcode::IfTrue, body_labels[index], &[]);
+                        } else {
+                            // Hand over to the next run's tests, or give up.
+                            let next = match runs.get(run + 1) {
+                                Some(_) => run_labels[run + 1],
+                                None => miss_target,
+                            };
+                            self.emit_jump(Opcode::IfFalse, next, &[]);
+                        }
+                    }
+
+                    self.place_label(body_labels[index]);
+                    for case in &cases[first..=last] {
+                        self.stmts(&case.body)?;
+                    }
+                    index = last + 1;
+                    run += 1;
+                } else {
+                    // `default`: control arrives here either by falling through or
+                    // because every test missed.
+                    self.place_label(body_labels[index]);
+                    self.stmts(&cases[index].body)?;
+                    index += 1;
+                }
+            }
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            self.place_label(break_label);
+            // Discard the discriminant now that no test needs it.
+            self.emit(Opcode::Drop, &[]);
+        }
+
+        self.pop_jump_target();
+        self.emit_scope_leave(switch_key);
+        self.state().current_block = switch_parent;
+        result
     }
 
     fn try_stmt(
@@ -1909,6 +2051,31 @@ fn peephole(
         }
     }
 
+    // A conditional whose destination is the very next instruction just pops its
+    // condition, so it becomes a plain `drop`. This is what an empty `case` clause
+    // compiles to.
+    //
+    // Order matters, and it is the reference's order: this runs *before* the
+    // folding below, on the instruction the conditional originally had. Folding
+    // moves a conditional's destination, and the reference never re-examines it
+    // afterwards — which is why `if (c) continue;` at the end of a `do` body stays
+    // a conditional even though folding leaves it pointing at the next
+    // instruction.
+    for (index, entry) in insns.iter_mut().enumerate() {
+        let Some((op, operands)) = entry.clone() else {
+            continue;
+        };
+        if !matches!(op, Opcode::IfTrue | Opcode::IfFalse) {
+            continue;
+        }
+        let Some(id) = label_id(&operands) else {
+            continue;
+        };
+        if placed.get(id as usize).copied().flatten() == Some(index + 1) {
+            *entry = Some((Opcode::Drop, Vec::new()));
+        }
+    }
+
     fold_conditional_jumps(insns, label_at, placed);
 
     // `put_x(n) get_x(n)` -> `set_x(n)`, which is what a declaration followed by
@@ -2212,6 +2379,10 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         }
     }
 
+    // How many labels are real, as opposed to the per-instruction ones allocated
+    // just below. Only a real label marks a spot in the source program.
+    let real_labels = state.labels.len();
+
     // Give every surviving instruction a label of its own. Jump cleanup below
     // redirects jumps to arbitrary instructions, and a jump target has to be a
     // label; pre-allocating one per index means a redirect never has to invent
@@ -2261,6 +2432,33 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         .collect();
     label_kept = folded;
 
+    // A `drop` immediately before `return_undef` throws away a value the return
+    // never looks at; `switch`'s discriminant drop is exactly that. Two details
+    // keep this matching the reference:
+    //
+    //   * a label sitting between the drop and the return means they are *not*
+    //     adjacent — labels are real pseudo-instructions, so `l: { … b(); }` keeps
+    //     the drop that discards `b()`'s result, while `switch (x) { }` drops the
+    //     discriminant because nothing separates them;
+    //   * one pass, no cascading: removing a drop must not expose another one, or
+    //     the value the preceding instruction left behind goes with it.
+    let mut label_here = vec![false; kept.len() + 1];
+    for slot in label_kept.iter().take(real_labels).flatten() {
+        if *slot < label_here.len() {
+            label_here[*slot] = true;
+        }
+    }
+    let delete: Vec<bool> = (0..kept.len())
+        .map(|index| {
+            kept[index].0 == Opcode::Drop
+                && kept.get(index + 1).map(|(op, _)| *op) == Some(Opcode::ReturnUndef)
+                && !label_here[index + 1]
+        })
+        .collect();
+    if delete.iter().any(|d| *d) {
+        kept = compact(kept, &mut label_kept, &delete);
+    }
+
     // Jump cleanup, in compacted index space. Two rewrites the reference also
     // applies while it resolves labels:
     //   * a jump whose destination is the very next instruction does nothing;
@@ -2280,6 +2478,14 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
             let target = follow_jump_chain(&kept, &label_kept, immediate);
             if target == index + 1 {
                 delete[index] = true;
+                changed = true;
+            } else if matches!(
+                kept.get(target).map(|(op, _)| *op),
+                Some(Opcode::Return | Opcode::ReturnUndef | Opcode::Throw)
+            ) {
+                // Jumping straight to a return or throw is the same as doing it
+                // here, so the jump becomes that instruction.
+                kept[index] = (kept[target].0, Vec::new());
                 changed = true;
             } else if target != immediate {
                 // Redirect to the end of the chain.
@@ -2340,6 +2546,37 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
     }
     let stack_size = compute_stack_size(&code);
     (code, stack_size)
+}
+
+/// Drop the instructions marked in `delete` and renumber the label table so it
+/// keeps pointing at the same instructions.
+///
+/// A label whose instruction was deleted moves to whatever follows it, since the
+/// reference never leaves a jump with nowhere to land.
+fn compact(
+    kept: Vec<(Opcode, Vec<Op>)>,
+    label_kept: &mut [Option<usize>],
+    delete: &[bool],
+) -> Vec<(Opcode, Vec<Op>)> {
+    let mut next: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
+    let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
+    for (old, entry) in kept.into_iter().enumerate() {
+        if delete[old] {
+            continue;
+        }
+        moved[old] = Some(next.len());
+        next.push(entry);
+    }
+    for slot in label_kept.iter_mut() {
+        let Some(old) = *slot else { continue };
+        *slot = match moved.get(old).copied().flatten() {
+            Some(new) => Some(new),
+            None => (old..moved.len())
+                .find_map(|i| moved[i])
+                .or(Some(next.len())),
+        };
+    }
+    next
 }
 
 fn is_goto(op: Opcode) -> bool {

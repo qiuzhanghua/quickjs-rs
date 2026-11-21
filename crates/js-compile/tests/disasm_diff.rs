@@ -256,7 +256,6 @@ fn variables_match_the_reference() {
 #[test]
 fn unsupported_constructs_fail_loudly() {
     for source in [
-        "switch (a) { }",
         "try { } catch (e) { }",
         "for (const x of xs) ;",
         "class A { }",
@@ -466,6 +465,42 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
         "function f(c){ o: for(;;){ i: while(c2){ break o; } } }",
         "function f(c){ o: for(;;){ i: while(c2){ break i; a(); } } }",
         "function f(c){ o: for(;;){ i: while(c2){ continue i; } } }",
+    ];
+    assert_cases(&cases);
+}
+
+/// `switch`.
+#[test]
+fn switch_matches_the_reference() {
+    require_oracle!();
+    let cases = [
+        // The discriminant stays on the stack; the trailing drop may be removed.
+        "function f(x){ switch(x){ } }",
+        "function f(x){ switch(x){ case 1: a(); } }",
+        "function f(x){ switch(x){ case 1: } }",
+        // Fallthrough: a clause continues into the next one's body, not its test.
+        "function f(x){ switch(x){ case 1: a(); case 2: b(); } }",
+        // Break.
+        "function f(x){ switch(x){ case 1: a(); break; } }",
+        "function f(x){ switch(x){ case 1: a(); break; case 2: b(); break; } }",
+        // Default.
+        "function f(x){ switch(x){ default: b(); } }",
+        "function f(x){ switch(x){ case 1: a(); break; default: b(); } }",
+        "function f(x){ switch(x){ default: b(); case 2: c(); } }",
+        // Chains of case labels share one body.
+        "function f(x){ switch(x){ case 1: case 2: a(); } }",
+        "function f(x){ switch(x){ case 1: case 2: case 3: a(); break; } }",
+        "function f(x){ switch(x){ case 1: case 2: a(); case 3: b(); } }",
+        // `default` in the middle: the first run hands over to the later run's
+        // tests, and the later run falls back to the default body.
+        "function f(x){ switch(x){ case 1: a(); default: b(); case 2: c(); } }",
+        "function f(x){ switch(x){ case 1: default: b(); } }",
+        // Runs whose bodies are all empty.
+        "function f(x){ switch(x){ case 1: case 2: } }",
+        "function f(x){ switch(x){ case 1: case 2: case 3: } }",
+        // A different discriminant, and a body that returns.
+        "function f(x){ switch(x.y){ case 1: return 1; } }",
+        "function f(x){ switch(x){ case 1: return; default: b(); } }",
     ];
     assert_cases(&cases);
 }

@@ -465,3 +465,116 @@ fn every_jump_lands_on_an_instruction_boundary() {
         }
     }
 }
+
+#[test]
+fn a_break_in_a_switch_leaves_the_switch() {
+    // `switch` is a break target but not a continue target, so `break` must land
+    // between the switch's last test and the statement after the switch — inside
+    // the enclosing loop, not outside it.
+    let compiled = compile(
+        "function f(c){ while(c){ switch(c){ case 1: break; default: break; } d(); } e(); }",
+    );
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let first_of = |op: Opcode| {
+        instructions
+            .iter()
+            .find(|(_, i)| general_form(i.op) == op)
+            .map(|(pc, _)| *pc)
+            .unwrap_or_else(|| panic!("no {op:?}\n{}", disassemble(inner)))
+    };
+    let last_test = first_of(Opcode::StrictEq);
+    let calls: Vec<usize> = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::Call)
+        .map(|(pc, _)| *pc)
+        .collect();
+    let (d_call, e_call) = (calls[0], calls[1]);
+
+    let forward_jumps: Vec<usize> = instructions
+        .iter()
+        .filter_map(|(pc, i)| i.jump_target(*pc).map(|t| (*pc, t as usize)))
+        .filter(|(pc, target)| target > pc)
+        .map(|(_, target)| target)
+        .collect();
+
+    assert!(
+        forward_jumps
+            .iter()
+            .any(|target| *target >= last_test && *target < d_call),
+        "break must land between the last test ({last_test}) and d() ({d_call})\n{}",
+        disassemble(inner)
+    );
+    assert!(
+        !forward_jumps.iter().any(|target| *target >= e_call),
+        "break must not leave the enclosing loop (e at {e_call})\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn switch_tests_its_cases_in_source_order() {
+    // `default` is only a fallback position, not a fence: a `case` written after
+    // it is still tested, and the miss path has to reach the default body. A
+    // regression here silently makes `default` swallow every later case.
+    for source in [
+        "function f(x){ switch(x){ default: a(); case 2: b(); } }",
+        "function f(x){ switch(x){ case 1: a(); default: b(); case 2: c(); } }",
+    ] {
+        let compiled = compile(source);
+        let inner = functions(&compiled)
+            .into_iter()
+            .find(|f| f.name == "f")
+            .unwrap();
+        let instructions = inner.instructions();
+        let comparisons = instructions
+            .iter()
+            .filter(|(_, i)| general_form(i.op) == Opcode::StrictEq)
+            .count();
+        assert_eq!(
+            comparisons,
+            source.matches("case ").count(),
+            "{source:?}: every case needs a comparison\n{}",
+            disassemble(inner)
+        );
+    }
+}
+
+#[test]
+fn a_switch_discriminant_is_evaluated_once() {
+    // The discriminant is evaluated before the switch and stays on the stack, so a
+    // side-effecting discriminant must appear exactly once.
+    let compiled = compile("function f(x){ switch(x.g()){ case 1: a(); case 2: b(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let getters = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::GetField)
+        .count();
+    assert_eq!(
+        getters,
+        1,
+        "the discriminant must be read once\n{}",
+        disassemble(inner)
+    );
+    let dups = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::Dup)
+        .count();
+    let comparisons = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::StrictEq)
+        .count();
+    assert_eq!(
+        dups,
+        comparisons,
+        "each test compares against a copy of the discriminant\n{}",
+        disassemble(inner)
+    );
+}

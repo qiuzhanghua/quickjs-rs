@@ -65,6 +65,7 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 138 条用例逐字节一致 |
 | TDZ/作用域 | 同上 + 14 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
 | break/continue/标签 | 同上 | 24 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
+| switch | 同上 | 20 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
 
 ### M2 已知差距
 
@@ -72,24 +73,24 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 `if`/`while`/`do`/`for`、函数声明与表达式、闭包、调用、成员访问、`return`、`typeof`/`void`/`!`/`~`、
 自增自减、复合赋值、条件与逗号表达式。反汇编与参考实现**逐字节一致**。
 
-当前已覆盖 `break`/`continue` 与标签（含多层标签链、跨层 `break outer`），以及 TDZ 与作用域链：`let`/`const` 在作用域入口被标记未初始化（`set_loc_uninitialized`），
+当前已覆盖 `break`/`continue` 与标签（含多层标签链、跨层 `break outer`）、`switch`
+（fallthrough、`default` 写在任意位置、空 `case` 链、`break`），以及 TDZ 与作用域链：`let`/`const` 在作用域入口被标记未初始化（`set_loc_uninitialized`），
 读取走 `get_loc_check`、写入走 `put_loc_check`/`set_loc_check`，捕获的绑定分配引用格并在
 离开块时 `close_loc`，函数声明在作用域入口实例化，`global` 访问通过 `global_ref` 逐层转发，
 `return` 之后的死代码不编译。
 
 尚未实现（都返回明确的 `SyntaxError`，不会静默生成错误字节码）：
-`switch`、`try/catch/finally`、`for-in`/`for-of`、解构、类、生成器与 async（需要状态机）、
+`try/catch/finally`、`for-in`/`for-of`、解构、类、生成器与 async（需要状态机）、
 `with`、模块、可选链、数组字面量与对象字面量、`??`。
 
 ### 已知优化差距
 
-有一个 `#[ignore]` 的差分测试列出了 15 个**语义正确但字节码不同**的用例，全部来自
+有一个 `#[ignore]` 的差分测试列出了 16 个**语义正确但字节码不同**的用例，全部来自
 参考实现的优化层，与本项目的功能无关：
 
 - `fold_constants`：常量条件（`while(1)`、`if(0)`）应删除测试指令
 - `skip_dead_code`：跳转之后的连续死跳转应删除
-- `resolve_labels` 的跳转改写：`goto` 目标恰为下一条时删除、`goto` 指向
-  return/throw 时替换为该返回
+- `tail_call`：`return f()` 应编译为尾调用
 
 这些用例被单独列出而不是混在通过列表里，是为了让差距可见且不会悄悄扩大。
 
