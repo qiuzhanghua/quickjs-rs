@@ -3,13 +3,13 @@
 use crate::token::Span;
 use std::fmt;
 
-/// A syntax error produced while scanning.
+/// A syntax error produced while scanning or parsing.
 ///
 /// The message vocabulary follows the upstream QuickJS parser wherever a test
 /// observes it (`unexpected character`, `unterminated string literal`, …) so
 /// that the differential harness can compare messages once the parser lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LexError {
+pub struct SyntaxError {
     /// Human readable message (no position prefix).
     pub message: String,
     /// Where the error happened.
@@ -36,13 +36,20 @@ impl LexError {
     }
 }
 
-impl fmt::Display for LexError {
+/// Lexical errors share the syntax error type: the engine reports both as
+/// `SyntaxError`.
+pub type LexError = SyntaxError;
+
+/// Parser errors share the syntax error type.
+pub type ParseError = SyntaxError;
+
+impl fmt::Display for SyntaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}: {}", self.line(), self.column(), self.message)
     }
 }
 
-impl std::error::Error for LexError {}
+impl std::error::Error for SyntaxError {}
 
-/// Result type used by the lexer.
-pub type Result<T> = std::result::Result<T, LexError>;
+/// Result type used by the lexer and the parser.
+pub type Result<T> = std::result::Result<T, SyntaxError>;

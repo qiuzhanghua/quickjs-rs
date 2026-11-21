@@ -3,8 +3,8 @@
 用**纯 Rust** 重写 [bellard/quickjs](https://github.com/bellard/quickjs)（基线 `VERSION = 2026-06-04`），
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
-- 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.2，关键决策已确认）
-- 🚧 当前进度：**M1a 完成**（词法分析器），M0（骨架 + `js-gc` + 差分框架）已完成
+- 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
+- 🚧 当前进度：**M1 完成**（词法 + AST + 解析器 + early errors），M0（骨架 + `js-gc` + 差分框架）已完成
 
 ## 已确认决策
 
@@ -21,17 +21,17 @@
 |---|---|---|
 | M0 | 工作区骨架、`js-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
 | M1a | 词法分析器（ES2025 全量词法） | ✅ |
-| M1b | AST + 解析器 + early errors | ⬜ |
+| M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | ⬜ |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ⬜ |
 | M4–M11 | 内建库、ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
 | M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
 
-## M0 已交付
+## 已交付的结构
 
 ```
 crates/js-gc/                引用计数 + 循环回收（16 个测试）
-crates/js-parse/             词法分析器（33 个单元测试 + 5 个差分测试）
+crates/js-parse/             词法 + AST + 解析器（34 单元 + 36 结构 + 差分：字面量/语法/作用域/上游语料）
 crates/quickjs/              公共 API 骨架：Runtime / Context / Error / COMPAT_VERSION
 crates/qjs/                  CLI：选项面与上游逐字节一致（--help、用法错误、-q）
 crates/quickjs-conformance/  差分测试 harness（候选 vs C 参考实现）
@@ -50,6 +50,17 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 差分测试会自动寻找 `$QJS_ORACLE`、`/tmp/quickjs-master/qjs` 等路径；找不到参考实现时
 相关用例打印 `skipping:` 而不是失败。引擎尚未能执行 JS 时，`qjs` 以退出码 2 + stderr
 `not implemented yet` 表示“待实现”，harness 记为 *pending* 而非失败。
+
+## 与 C 版的一致性验证
+
+| 层面 | 差分手段 | 结果 |
+|---|---|---|
+| CLI | `qjs --help` / 用法错误 | stdout+stderr+退出码**逐字节一致** |
+| 数值字面量 | `DataView` 取 f64 两半 | 35 个字面量**逐位相同** |
+| 字符串字面量 | `JSON.stringify` 往返 | 13 个字面量解码一致 |
+| 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + 55 无效 + 39 模块用例一致 |
+| 声明冲突 | 同上 | 41 个作用域冲突用例一致 |
+| 上游语料 | 同上 | `tests/` + `examples/` 全部 `.js` 一致 |
 
 ## 提交约定
 

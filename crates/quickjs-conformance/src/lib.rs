@@ -290,6 +290,40 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or_default().to_string()
 }
 
+/// Search for the reference `qjsc` compiler.
+///
+/// `qjsc -c` is the parse-only oracle: it compiles a script to bytecode and does
+/// not run it, so its exit status is a pure accept/reject verdict.
+pub fn locate_qjsc() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("QJSC_ORACLE") {
+        let path = PathBuf::from(path);
+        if is_executable(&path) {
+            return Some(path);
+        }
+    }
+    if let Some(qjs) = locate_oracle() {
+        let sibling = qjs.with_file_name(if cfg!(windows) { "qjsc.exe" } else { "qjsc" });
+        if is_executable(&sibling) {
+            return Some(sibling);
+        }
+    }
+    let candidates = [
+        "/tmp/quickjs-master/qjsc",
+        "/tmp/quickjs/qjsc",
+        "quickjs/qjsc",
+        "vendor/quickjs/qjsc",
+        "../quickjs/qjsc",
+        "../../quickjs/qjsc",
+    ];
+    for candidate in candidates {
+        let path = PathBuf::from(candidate);
+        if is_executable(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Search for a reference `qjs` binary.
 pub fn locate_oracle() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("QJS_ORACLE") {

@@ -20,6 +20,10 @@ use crate::token::{
 use crate::unicode_id::{is_id_continue, is_id_start};
 
 /// A streaming lexer over one source text.
+///
+/// `Clone` is implemented deliberately: the parser snapshots the lexer to
+/// backtrack (arrow-function cover grammar), and cloning is a handful of words.
+#[derive(Clone)]
 pub struct Lexer<'a> {
     src: &'a str,
     bytes: &'a [u8],
@@ -27,6 +31,7 @@ pub struct Lexer<'a> {
     line: u32,
     column: u32,
     strict: bool,
+    legacy_octal: bool,
 }
 
 /// Every punctuator, longest first so that a prefix test picks the longest form.
@@ -43,6 +48,9 @@ const PUNCTUATORS: &[(&str, Punct)] = &[
     ("||=", Punct::PipePipeEq),
     ("??=", Punct::QuestionQuestionEq),
     ("=>", Punct::Arrow),
+    ("&=", Punct::AmpEq),
+    ("|=", Punct::PipeEq),
+    ("^=", Punct::CaretEq),
     ("==", Punct::EqEq),
     ("!=", Punct::NotEq),
     ("<=", Punct::LtEq),
@@ -98,6 +106,7 @@ impl<'a> Lexer<'a> {
             line: 1,
             column: 1,
             strict: false,
+            legacy_octal: false,
         }
     }
 
@@ -125,8 +134,20 @@ impl<'a> Lexer<'a> {
         self.src
     }
 
+    /// Whether the token most recently returned by [`Lexer::next_token`]
+    /// contained an Annex B legacy octal escape (`"\101"`).
+    ///
+    /// The flag is reset by every `next_token` call, so it always describes the
+    /// token currently held by the caller. The parser uses it because strictness
+    /// is only known once the directive prologue has been read, which happens
+    /// after the offending literal was already scanned.
+    pub fn had_legacy_octal(&self) -> bool {
+        self.legacy_octal
+    }
+
     /// Scan the next token.
     pub fn next_token(&mut self) -> Result<Token> {
+        self.legacy_octal = false;
         let newline_before = self.skip_trivia()?;
         let start = self.position();
         let Some(c) = self.peek_char() else {
@@ -455,6 +476,7 @@ impl<'a> Lexer<'a> {
             // `08.5`, `08e1`, `0_1` are ordinary decimal literals / errors; hand
             // back to the general scanner by re-reading the leading `0`.
             self.reset_to(start);
+            self.legacy_octal = true;
             self.bump();
             let mut digits = String::from("0");
             let mut rest = String::new();
@@ -506,6 +528,9 @@ impl<'a> Lexer<'a> {
             }));
         }
         self.ensure_literal_boundary(start)?;
+        // `017` and `019` are both Annex B legacy literals, forbidden in strict
+        // mode.
+        self.legacy_octal = true;
         let value = if all_octal {
             radix_digits_to_f64(&text, 8)
         } else {
@@ -626,8 +651,10 @@ impl<'a> Lexer<'a> {
             if digits == 0 {
                 return Err(self.error("malformed Unicode escape", start));
             }
-            return char::from_u32(value)
-                .ok_or_else(|| self.error("malformed Unicode escape", start));
+            // A surrogate code point is a legal escape (`"\u{d800}"` has length 1
+            // in an engine). `char` cannot hold it, so substitute U+FFFD until
+            // strings learn to carry WTF-8 (see the crate docs).
+            return Ok(char::from_u32(value).unwrap_or('\u{fffd}'));
         }
         let mut value: u32 = 0;
         for _ in 0..4 {
@@ -663,6 +690,30 @@ impl<'a> Lexer<'a> {
             'f' => out.push('\u{c}'),
             'v' => out.push('\u{b}'),
             '0' if !self.peek_char().is_some_and(|c| c.is_ascii_digit()) => out.push('\0'),
+            '0' => {
+                // `\0` followed by a digit is a legacy octal escape.
+                self.legacy_octal = true;
+                if context == EscapeContext::Template {
+                    return Err(self.invalid_escape(context, start));
+                }
+                if self.strict {
+                    return Err(self.error(
+                        "octal escape sequences are not allowed in strict mode",
+                        start,
+                    ));
+                }
+                let mut value = 0u32;
+                for _ in 0..2 {
+                    match self.peek_char() {
+                        Some(d @ '0'..='7') => {
+                            value = value * 8 + d.to_digit(8).expect("octal digit");
+                            self.bump();
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(char::from_u32(value).expect("value <= 63"));
+            }
             'x' => {
                 let mut value = 0u32;
                 for _ in 0..2 {
@@ -687,6 +738,7 @@ impl<'a> Lexer<'a> {
                 // continuation). `\r\n` was already folded by `bump`.
             }
             '1'..='7' => {
+                self.legacy_octal = true;
                 if context == EscapeContext::Template {
                     // Templates never allow octal escapes: this is an invalid
                     // escape sequence, so `cooked` becomes `undefined`.
@@ -715,6 +767,7 @@ impl<'a> Lexer<'a> {
                 out.push(char::from_u32(value).expect("value <= 0xff"));
             }
             '8' | '9' => {
+                self.legacy_octal = true;
                 if context == EscapeContext::Template {
                     return Err(self.invalid_escape(context, start));
                 }

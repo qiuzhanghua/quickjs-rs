@@ -30,13 +30,21 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod ast;
 mod error;
 mod lexer;
+pub mod parser;
 mod token;
 mod unicode_id;
 
-pub use error::{LexError, Result};
+pub use error::{LexError, ParseError, Result, SyntaxError};
 pub use lexer::Lexer;
+pub use parser::{Parser, parse_expression, parse_module, parse_script};
+
+/// Parser configuration constants and helpers.
+pub mod parser_limits {
+    pub use crate::parser::DEFAULT_MAX_DEPTH;
+}
 pub use token::{
     BigIntLiteral, Keyword, NumberLiteral, Position, Punct, Span, TemplateKind, TemplateToken,
     Token, TokenKind,

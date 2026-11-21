@@ -39,6 +39,14 @@ pub struct Span {
 }
 
 impl Span {
+    /// A zero-width span at the very start of a source.
+    pub const fn start() -> Span {
+        Span {
+            start: Position::START,
+            end: Position::START,
+        }
+    }
+
     /// Create a span from two positions.
     pub fn new(start: Position, end: Position) -> Span {
         Span { start, end }

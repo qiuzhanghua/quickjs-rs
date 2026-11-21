@@ -450,6 +450,86 @@ fn question_dot_versus_conditional_number() {
     );
 }
 
+/// Every variant of [`Punct`]; kept exhaustive so a missing lexer table entry
+/// (a punctuator that can never be produced) fails the round-trip test.
+const ALL_PUNCTUATORS: &[Punct] = &[
+    Punct::LBrace,
+    Punct::RBrace,
+    Punct::LParen,
+    Punct::RParen,
+    Punct::LBracket,
+    Punct::RBracket,
+    Punct::Semicolon,
+    Punct::Comma,
+    Punct::Lt,
+    Punct::Gt,
+    Punct::LtEq,
+    Punct::GtEq,
+    Punct::EqEq,
+    Punct::NotEq,
+    Punct::EqEqEq,
+    Punct::NotEqEq,
+    Punct::Plus,
+    Punct::Minus,
+    Punct::Star,
+    Punct::Slash,
+    Punct::Percent,
+    Punct::StarStar,
+    Punct::PlusPlus,
+    Punct::MinusMinus,
+    Punct::Shl,
+    Punct::Shr,
+    Punct::UShr,
+    Punct::Amp,
+    Punct::Pipe,
+    Punct::Caret,
+    Punct::Bang,
+    Punct::Tilde,
+    Punct::AmpAmp,
+    Punct::PipePipe,
+    Punct::QuestionQuestion,
+    Punct::Question,
+    Punct::Colon,
+    Punct::Eq,
+    Punct::PlusEq,
+    Punct::MinusEq,
+    Punct::StarEq,
+    Punct::SlashEq,
+    Punct::PercentEq,
+    Punct::StarStarEq,
+    Punct::ShlEq,
+    Punct::ShrEq,
+    Punct::UShrEq,
+    Punct::AmpEq,
+    Punct::PipeEq,
+    Punct::CaretEq,
+    Punct::AmpAmpEq,
+    Punct::PipePipeEq,
+    Punct::QuestionQuestionEq,
+    Punct::Arrow,
+    Punct::Ellipsis,
+    Punct::Dot,
+    Punct::QuestionDot,
+    Punct::Hash,
+];
+
+#[test]
+fn every_punctuator_lexes_back_to_itself() {
+    for &punct_value in ALL_PUNCTUATORS {
+        assert_eq!(
+            kinds(punct_value.as_str()),
+            vec![punct(punct_value)],
+            "{punct_value:?}"
+        );
+    }
+    // `?.` is the one punctuator whose text is also a prefix of another token,
+    // so check it in a context that cannot be mistaken for a conditional.
+    assert_eq!(
+        kinds("a?.b"),
+        vec![ident("a"), punct(Punct::QuestionDot), ident("b")]
+    );
+}
+
 #[test]
 fn all_punctuators_round_trip() {
     for punct_value in [

@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v0.4 —— 需求分析已确认（§8），M0 与 M1a（词法器）已完成，下一步 M1b（AST + 解析器）
+> 状态：v0.5 —— 需求分析已确认（§8），M0 与 M1（词法 + AST + 解析器 + early errors）已完成，下一步 M2（字节码编译器）
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -221,7 +221,7 @@ crates/
 |---|---|---|
 | M0 ✅ | 工作区骨架 + 差分 oracle 框架 + `js-gc` | 已完成：`js-gc` 16 个测试全绿；`qjs --help`/用法错误与 C 版**逐字节一致**；harness 自检通过 |
 | M1a ✅ | 词法分析器 | 已完成：33 个单元测试；35 个数值字面量与 C 版**逐位相同**（DataView 取位对比）；13 个字符串字面量解码一致 |
-| M1b | AST + 解析器 + early errors | 所有上游 JS 测试文件能"解析成功/失败符合预期" |
+| M1b ✅ | AST + 解析器 + early errors + 作用域分析 | 已完成：上游 `tests/`、`examples/` 全部 `.js` 的接受/拒绝与 `qjsc -c` 一致；104+55 条脚本、39 条模块、41 条声明冲突用例一致 |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 反汇编输出可读；往返稳定 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | 能跑递归/fib/数组/闭包脚本 |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Date） | `tests/test_builtin.js` 大部分通过 |

@@ -1,0 +1,3936 @@
+//! The parser: tokens to [`crate::ast`].
+//!
+//! A recursive-descent parser with precedence climbing for expressions. It
+//! follows the specification's grammar productions closely, which keeps the
+//! early errors next to the code that can detect them.
+//!
+//! Two productions need backtracking / reinterpretation, exactly as in an
+//! engine:
+//!
+//! * **arrow functions** use the cover grammar. `(` starts either a
+//!   parenthesized expression or a parameter list; the parser speculatively
+//!   parses a parameter list and commits only if `=>` follows, otherwise it
+//!   restores the lexer and parses an expression.
+//! * **`let`** at statement start is a declaration keyword when followed by a
+//!   binding, otherwise an identifier.
+//!
+//! Automatic semicolon insertion is implemented where the grammar allows it
+//! (`Stmt` terminators, `do…while`, `return`/`throw` restricted productions,
+//! postfix `++`/`--`, `async` before arrow parameters, `yield`/`await`).
+//!
+//! Early errors implemented here (not at run time):
+//!
+//! * `with`, legacy octal literals/escapes, `delete identifier`,
+//!   `eval`/`arguments` as binding or assignment target — strict mode only;
+//! * `super` outside a method, `super()` outside a derived constructor,
+//!   `new.target` outside a function;
+//! * `await`/`yield` used as identifiers where they are reserved;
+//! * duplicate `__proto__` in an object literal, duplicate private names;
+//! * `break`/`continue` target validity, `return` outside a function;
+//! * `??` mixed with `&&`/`||` without parentheses, `-x ** y`, assignment to a
+//!   non-assignable target, `new` on an optional chain;
+//! * duplicate parameter names (always for arrows/methods/non-simple lists).
+//!
+//! Not implemented yet (tracked for M1b.2): scope-analysis early errors such as
+//! `let x; let x;` in the same block, and parameter/`var` conflicts.
+
+use crate::ast::*;
+use crate::error::{Result, SyntaxError};
+use crate::lexer::Lexer;
+use crate::token::{Keyword, NumberLiteral, Position, Punct, Span, TemplateKind, Token, TokenKind};
+
+/// Everything that has to be saved to backtrack.
+struct Snapshot<'a> {
+    lexer: Lexer<'a>,
+    current: Token,
+    prev_end: Position,
+    strict: bool,
+    allow_in: bool,
+    ctx: FnCtx,
+    loop_depth: u32,
+    switch_depth: u32,
+    labels: Vec<Label>,
+    private: Vec<PrivateEnv>,
+    top_level: bool,
+    cover_inits: Vec<Span>,
+    pending_exports: Vec<(String, Span)>,
+    current_legacy_octal: bool,
+    scopes: Vec<Scope>,
+}
+
+/// Context of the function currently being parsed.
+#[derive(Debug, Clone, Copy, Default)]
+struct FnCtx {
+    in_function: bool,
+    in_generator: bool,
+    in_async: bool,
+    /// Inside a method (or a nested arrow in one): `super.x` is legal.
+    in_method: bool,
+    /// Inside a derived class constructor: `super()` is legal.
+    in_derived_constructor: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabelKind {
+    /// Labels a loop.
+    Iteration,
+    /// Labels any other statement.
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct Label {
+    name: String,
+    kind: LabelKind,
+}
+
+/// Private names declared by the class currently being parsed.
+#[derive(Debug, Clone, Default)]
+struct PrivateEnv {
+    names: Vec<PrivateName>,
+}
+
+#[derive(Debug, Clone)]
+struct PrivateName {
+    name: String,
+    has_get: bool,
+    has_set: bool,
+}
+
+impl PrivateEnv {
+    /// Register a private name. `get #x` + `set #x` is the only legal pair;
+    /// every other duplicate (including `get #x` twice) is an early error.
+    fn declare(&mut self, name: &str, accessor: Option<MethodKind>) -> bool {
+        if let Some(existing) = self.names.iter_mut().find(|n| n.name == name) {
+            return match accessor {
+                Some(MethodKind::Get) if !existing.has_get => {
+                    existing.has_get = true;
+                    true
+                }
+                Some(MethodKind::Set) if !existing.has_set => {
+                    existing.has_set = true;
+                    true
+                }
+                _ => false,
+            };
+        }
+        let mut entry = PrivateName {
+            name: name.to_string(),
+            has_get: false,
+            has_set: false,
+        };
+        match accessor {
+            Some(MethodKind::Get) => entry.has_get = true,
+            Some(MethodKind::Set) => entry.has_set = true,
+            _ => {}
+        }
+        self.names.push(entry);
+        true
+    }
+
+    fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|n| n.name == name)
+    }
+}
+
+/// One lexical scope, used for the declaration-conflict early errors.
+#[derive(Debug, Clone)]
+struct Scope {
+    /// Whether this is a function/module scope (where `var` lands).
+    is_var_scope: bool,
+    /// `var`-declared names.
+    var_names: Vec<String>,
+    /// `let`/`const`/`class`/`import` names declared directly in this scope.
+    lex_names: Vec<String>,
+    /// Function-declaration names declared directly in this scope.
+    ///
+    /// Tracked apart from `var_names` because engines treat them differently:
+    /// two function declarations may share a name, a function at the top level
+    /// does not clash with an earlier `let`, and a function inside a block is
+    /// scoped to that block instead of hoisting.
+    fn_names: Vec<String>,
+    /// Names of *simple* (identifier) parameters, if this is a function body.
+    params: Vec<String>,
+}
+
+impl Scope {
+    fn block() -> Scope {
+        Scope {
+            is_var_scope: false,
+            var_names: Vec::new(),
+            lex_names: Vec::new(),
+            fn_names: Vec::new(),
+            params: Vec::new(),
+        }
+    }
+
+    fn function(params: Vec<String>) -> Scope {
+        Scope {
+            is_var_scope: true,
+            var_names: Vec::new(),
+            lex_names: Vec::new(),
+            fn_names: Vec::new(),
+            params,
+        }
+    }
+}
+
+/// Which kind of target a pattern is being built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetKind {
+    /// `let x = 1`, `function f(x)`, `catch (x)` — binds new names.
+    Binding,
+    /// `x = 1`, `[a, b] = c` — assigns to existing bindings.
+    Assignment,
+}
+
+/// The arrow head produced by a successful speculative parse.
+struct ArrowHead {
+    params: Vec<Pattern>,
+    is_async: bool,
+    span: Span,
+    params_span: Span,
+}
+
+/// Default nesting limit.
+///
+/// QuickJS stops at roughly 700 nested parentheses, because it compares the real
+/// stack pointer against `--stack-size` (1 MiB by default). This port cannot do
+/// that portably, so it counts recursion depth instead; the depth a given stack
+/// can hold depends on the frame size, which differs a lot between build
+/// profiles (measured on an 8 MiB stack: ~220 levels in debug, ~1500 in release).
+/// The limit is therefore profile-dependent and deliberately leaves headroom, so
+/// that over-deep input produces a `SyntaxError: stack overflow` — exactly what
+/// QuickJS reports — instead of aborting the process.
+///
+/// [`Parser::set_max_depth`] raises it for callers that know they have a bigger
+/// stack (or a release build).
+pub const DEFAULT_MAX_DEPTH: u32 = if cfg!(debug_assertions) { 120 } else { 600 };
+
+/// ECMAScript 2025 parser.
+pub struct Parser<'a> {
+    lexer: Lexer<'a>,
+    current: Token,
+    prev_end: Position,
+    strict: bool,
+    module: bool,
+    allow_in: bool,
+    ctx: FnCtx,
+    loop_depth: u32,
+    switch_depth: u32,
+    labels: Vec<Label>,
+    private: Vec<PrivateEnv>,
+    top_level: bool,
+    /// Whether the token currently held by the parser contains an Annex B octal
+    /// literal or escape (checked again when strictness is switched on).
+    current_legacy_octal: bool,
+    /// Current recursion depth, and the limit that turns it into a
+    /// `SyntaxError` instead of a stack overflow.
+    depth: u32,
+    max_depth: u32,
+
+    /// Spans of `{a = 1}` object-literal shorthands. They are only legal when
+    /// the object is converted to a destructuring pattern, so any entry left
+    /// over at the end of a statement is a syntax error.
+    cover_inits: Vec<Span>,
+    /// `export {name}` clauses whose local binding still has to be checked
+    /// against the module's declared names (forward references are legal).
+    pending_exports: Vec<(String, Span)>,
+    /// Open lexical scopes, innermost last.
+    scopes: Vec<Scope>,
+}
+
+/// Parse `src` as a `Script`.
+pub fn parse_script(src: &str) -> Result<Program> {
+    Parser::new(src, false)?.parse_program()
+}
+
+/// Parse `src` as a `Module`.
+pub fn parse_module(src: &str) -> Result<Program> {
+    Parser::new(src, true)?.parse_program()
+}
+
+/// Parse `src` as a single `Expression` (used by tests and by `eval`-like entry
+/// points that need the expression grammar only).
+pub fn parse_expression(src: &str) -> Result<Expr> {
+    let mut parser = Parser::new(src, false)?;
+    let expr = parser.parse_expression(true)?;
+    if !parser.current.is_eof() {
+        return Err(parser.unexpected());
+    }
+    Ok(expr)
+}
+
+impl<'a> Parser<'a> {
+    /// Create a parser over `src`. A module is always strict.
+    pub fn new(src: &'a str, module: bool) -> Result<Parser<'a>> {
+        let mut lexer = Lexer::new(src);
+        lexer.set_strict(module);
+        let current = lexer.next_token()?;
+        let current_legacy_octal = lexer.had_legacy_octal();
+        if module && current_legacy_octal {
+            return Err(SyntaxError::new(
+                "octal literals and octal escape sequences are not allowed in strict mode",
+                current.span,
+            ));
+        }
+        Ok(Parser {
+            lexer,
+            current,
+            prev_end: Position::START,
+            strict: module,
+            module,
+            allow_in: true,
+            ctx: FnCtx::default(),
+            loop_depth: 0,
+            switch_depth: 0,
+            labels: Vec::new(),
+            private: Vec::new(),
+            top_level: true,
+            current_legacy_octal,
+            depth: 0,
+            max_depth: DEFAULT_MAX_DEPTH,
+
+            cover_inits: Vec::new(),
+            pending_exports: Vec::new(),
+            scopes: vec![Scope::function(Vec::new())],
+        })
+    }
+
+    /// Raise or lower the nesting limit.
+    pub fn set_max_depth(&mut self, depth: u32) {
+        self.max_depth = depth;
+    }
+
+    /// Enter one level of recursion.
+    fn enter(&mut self) -> Result<()> {
+        self.depth += 1;
+        if self.depth > self.max_depth {
+            return Err(SyntaxError::new("stack overflow", self.current.span));
+        }
+        Ok(())
+    }
+
+    fn leave(&mut self) {
+        self.depth -= 1;
+    }
+
+    /// Parse the whole source.
+    pub fn parse_program(&mut self) -> Result<Program> {
+        let start = self.current.span.start;
+        let mut body = Vec::new();
+        let mut prologue = true;
+        while !self.current.is_eof() {
+            let stmt = self.parse_statement_list_item()?;
+            if prologue {
+                match self.directive_value(&stmt) {
+                    Some(directive) if directive == "use strict" => self.enter_strict()?,
+                    Some(_) => {}
+                    None => prologue = false,
+                }
+            }
+            body.push(stmt);
+        }
+        if self.module {
+            self.check_module_exports(&body)?;
+        }
+        Ok(Program {
+            kind: if self.module {
+                ProgramKind::Module
+            } else {
+                ProgramKind::Script
+            },
+            body,
+            span: Span::new(start, self.prev_end),
+            strict: self.strict,
+        })
+    }
+
+    /// `export {a}` requires `a` to be declared somewhere in the module (forward
+    /// references are legal, so this can only run once the whole body is known).
+    fn check_module_exports(&mut self, body: &[Stmt]) -> Result<()> {
+        if self.pending_exports.is_empty() {
+            return Ok(());
+        }
+        let mut declared: Vec<String> = Vec::new();
+        for stmt in body {
+            collect_module_binding(stmt, &mut declared);
+        }
+        let pending = std::mem::take(&mut self.pending_exports);
+        for (name, span) in pending {
+            if !declared.contains(&name) {
+                return Err(
+                    self.error_at(format!("exported variable '{name}' does not exist"), span)
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // -- declaration tracking (early errors) -------------------------------
+
+    fn push_scope(&mut self, scope: Scope) {
+        self.scopes.push(scope);
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    /// Declare a `let`/`const`/`class`/`import` name in the current scope.
+    ///
+    /// Conflicts are per scope: a lexical declaration clashes with another
+    /// lexical declaration, a `var`/function declaration or a simple parameter
+    /// *of the same scope*. `var a; { let a; }` is legal, `{ let a; { var a; } }`
+    /// is not (the `var` hoists past the `let`, which `declare_var` checks).
+    fn declare_lexical(&mut self, name: &str, span: Span) -> Result<()> {
+        let Some(scope) = self.scopes.last() else {
+            return Ok(());
+        };
+        let clashes = scope.lex_names.iter().any(|n| n == name)
+            || scope.var_names.iter().any(|n| n == name)
+            || scope.fn_names.iter().any(|n| n == name)
+            || scope.params.iter().any(|n| n == name);
+        if clashes {
+            return Err(self.duplicate_declaration(name, span));
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.lex_names.push(name.to_string());
+        }
+        Ok(())
+    }
+
+    /// Declare a `var` or function-declaration name: it hoists to the nearest
+    /// function scope, but may not collide with a lexical name on the way up.
+    fn declare_var(&mut self, name: &str, span: Span) -> Result<()> {
+        for scope in self.scopes.iter().rev() {
+            if scope.lex_names.iter().any(|n| n == name) {
+                return Err(self.duplicate_declaration(name, span));
+            }
+            if scope.is_var_scope {
+                break;
+            }
+        }
+        let Some(index) = self.scopes.iter().rposition(|s| s.is_var_scope) else {
+            return Ok(());
+        };
+        // Record it in every scope it passes through: `{ var a; let a; }` is an
+        // early error because the block's VarDeclaredNames contain `a`.
+        for scope in &mut self.scopes[index..] {
+            if !scope.var_names.iter().any(|n| n == name) {
+                scope.var_names.push(name.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Declare a function declaration name.
+    ///
+    /// See [`Scope::fn_names`] for why this is not the same as a `var`.
+    fn declare_function(&mut self, name: &str, span: Span) -> Result<()> {
+        let in_var_scope = self.scopes.last().is_none_or(|s| s.is_var_scope);
+        if !in_var_scope {
+            let clashes = self
+                .scopes
+                .last()
+                .is_some_and(|s| s.lex_names.iter().any(|n| n == name));
+            if clashes {
+                return Err(self.duplicate_declaration(name, span));
+            }
+        } else if let Some(scope) = self.scopes.last_mut() {
+            if !scope.var_names.iter().any(|n| n == name) {
+                scope.var_names.push(name.to_string());
+            }
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            if !scope.fn_names.iter().any(|n| n == name) {
+                scope.fn_names.push(name.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn duplicate_declaration(&self, name: &str, span: Span) -> SyntaxError {
+        self.error_at(
+            format!("identifier '{name}' has already been declared"),
+            span,
+        )
+    }
+
+    /// Declare every name bound by a pattern.
+    fn declare_pattern(&mut self, pattern: &Pattern, is_var: bool) -> Result<()> {
+        let mut names = Vec::new();
+        pattern.bound_names(&mut names);
+        for name in names {
+            if is_var {
+                self.declare_var(&name.name, name.span)?;
+            } else {
+                self.declare_lexical(&name.name, name.span)?;
+            }
+        }
+        Ok(())
+    }
+
+    // -- token helpers -----------------------------------------------------
+
+    fn snapshot(&self) -> Snapshot<'a> {
+        Snapshot {
+            lexer: self.lexer.clone(),
+            current: self.current.clone(),
+            prev_end: self.prev_end,
+            strict: self.strict,
+            allow_in: self.allow_in,
+            ctx: self.ctx,
+            loop_depth: self.loop_depth,
+            switch_depth: self.switch_depth,
+            labels: self.labels.clone(),
+            private: self.private.clone(),
+            top_level: self.top_level,
+            cover_inits: self.cover_inits.clone(),
+            pending_exports: self.pending_exports.clone(),
+            current_legacy_octal: self.current_legacy_octal,
+            scopes: self.scopes.clone(),
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot<'a>) {
+        self.lexer = snap.lexer;
+        self.current = snap.current;
+        self.prev_end = snap.prev_end;
+        self.strict = snap.strict;
+        self.allow_in = snap.allow_in;
+        self.ctx = snap.ctx;
+        self.loop_depth = snap.loop_depth;
+        self.switch_depth = snap.switch_depth;
+        self.labels = snap.labels;
+        self.private = snap.private;
+        self.top_level = snap.top_level;
+        self.cover_inits = snap.cover_inits;
+        self.pending_exports = snap.pending_exports;
+        self.current_legacy_octal = snap.current_legacy_octal;
+        self.scopes = snap.scopes;
+    }
+
+    fn bump(&mut self) -> Result<()> {
+        self.prev_end = self.current.span.end;
+        self.current = self.lexer.next_token()?;
+        self.current_legacy_octal = self.lexer.had_legacy_octal();
+        if self.strict && self.current_legacy_octal {
+            return Err(SyntaxError::new(
+                "octal literals and octal escape sequences are not allowed in strict mode",
+                self.current.span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn peek(&self) -> Result<Token> {
+        let mut lexer = self.lexer.clone();
+        lexer.next_token()
+    }
+
+    fn enter_strict(&mut self) -> Result<()> {
+        self.strict = true;
+        self.lexer.set_strict(true);
+        // The token after the `"use strict"` directive has already been scanned
+        // with the old (sloppy) rules.
+        if self.current_legacy_octal {
+            return Err(SyntaxError::new(
+                "octal literals and octal escape sequences are not allowed in strict mode",
+                self.current.span,
+            ));
+        }
+        Ok(())
+    }
+
+    fn at_punct(&self, p: Punct) -> bool {
+        matches!(&self.current.kind, TokenKind::Punct(q) if *q == p)
+    }
+
+    fn at_keyword(&self, k: Keyword) -> bool {
+        matches!(&self.current.kind, TokenKind::Keyword(q) if *q == k)
+    }
+
+    fn at_contextual(&self, name: &str) -> bool {
+        self.at_ident(name)
+    }
+
+    fn at_ident(&self, name: &str) -> bool {
+        matches!(&self.current.kind, TokenKind::Ident(n) if n == name)
+    }
+
+    fn eat_punct(&mut self, p: Punct) -> Result<bool> {
+        if self.at_punct(p) {
+            self.bump()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn expect_punct(&mut self, p: Punct) -> Result<()> {
+        if self.eat_punct(p)? {
+            Ok(())
+        } else {
+            Err(self.unexpected())
+        }
+    }
+
+    fn eat_keyword(&mut self, k: Keyword) -> Result<bool> {
+        if self.at_keyword(k) {
+            self.bump()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn eat_contextual(&mut self, name: &str) -> Result<bool> {
+        if self.at_ident(name) {
+            self.bump()?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn unexpected(&self) -> SyntaxError {
+        SyntaxError::new(
+            format!("unexpected token: {}", self.current.kind.describe()),
+            self.current.span,
+        )
+    }
+
+    fn error(&self, message: impl Into<String>) -> SyntaxError {
+        SyntaxError::new(message, self.current.span)
+    }
+
+    fn error_at(&self, message: impl Into<String>, span: Span) -> SyntaxError {
+        SyntaxError::new(message, span)
+    }
+
+    fn span_from(&self, start: Position) -> Span {
+        Span::new(start, self.prev_end)
+    }
+
+    /// Read an identifier that *binds* a name, applying the binding rules
+    /// (`eval`/`arguments`/`let` are restricted in strict mode).
+    fn expect_binding_ident(&mut self) -> Result<Ident> {
+        let ident = self.expect_ident()?;
+        self.check_binding_name(&ident.name, ident.span)?;
+        Ok(ident)
+    }
+
+    /// Read an identifier, rejecting reserved words.
+    fn expect_ident(&mut self) -> Result<Ident> {
+        match self.current.kind.clone() {
+            TokenKind::Ident(name) => {
+                let span = self.current.span;
+                self.check_identifier(&name, span)?;
+                self.bump()?;
+                Ok(Ident { name, span })
+            }
+            _ => Err(self.error(format!(
+                "expecting a variable name, got {}",
+                self.current.kind.describe()
+            ))),
+        }
+    }
+
+    /// Reject words that may not appear as an `IdentifierReference` here.
+    fn check_identifier(&self, name: &str, span: Span) -> Result<()> {
+        if Keyword::lookup(name).is_some() {
+            return Err(self.error_at(format!("unexpected keyword '{name}'"), span));
+        }
+        if self.strict && Keyword::is_strict_reserved(name) {
+            return Err(self.error_at(
+                format!("invalid use of strict mode reserved word '{name}'"),
+                span,
+            ));
+        }
+        if self.ctx.in_generator && name == "yield" {
+            return Err(self.error_at(
+                "invalid use of 'yield' identifier in a generator function",
+                span,
+            ));
+        }
+        if self.ctx.in_async && name == "await" {
+            return Err(self.error_at("unexpected 'await' identifier in an async function", span));
+        }
+        Ok(())
+    }
+
+    /// A declarative name (`let`, `class`, `function`, parameter): stricter than
+    /// an identifier reference because `let` is reserved in strict mode.
+    fn check_binding_name(&self, name: &str, span: Span) -> Result<()> {
+        self.check_identifier(name, span)?;
+        if self.strict && (name == "eval" || name == "arguments") {
+            return Err(self.error_at(
+                format!("invalid use of '{name}' as a binding in strict mode"),
+                span,
+            ));
+        }
+        if self.strict && name == "let" {
+            return Err(self.error_at(
+                "invalid use of 'let' as a variable name in strict mode",
+                span,
+            ));
+        }
+        Ok(())
+    }
+
+    /// The value of an expression statement that is a string literal with no
+    /// escape sequences (a directive prologue candidate).
+    fn directive_value(&self, stmt: &Stmt) -> Option<String> {
+        let StmtKind::Expr(expr) = &stmt.kind else {
+            return None;
+        };
+        let ExprKind::String(value) = &expr.unparen().kind else {
+            return None;
+        };
+        let raw = self.slice(expr.span);
+        if !raw.starts_with('"') && !raw.starts_with('\'') {
+            return None;
+        }
+        if raw.trim_matches(|c| c == '"' || c == '\'').contains('\\') {
+            return None;
+        }
+        Some(value.clone())
+    }
+
+    fn slice(&self, span: Span) -> &'a str {
+        let src = self.lexer.source();
+        let start = span.start.offset as usize;
+        let end = (span.end.offset as usize).min(src.len());
+        src.get(start..end).unwrap_or("")
+    }
+
+    // -- automatic semicolon insertion ------------------------------------
+
+    fn can_insert_semicolon(&self) -> bool {
+        self.current.is_eof() || self.at_punct(Punct::RBrace) || self.current.newline_before
+    }
+
+    fn semicolon(&mut self) -> Result<()> {
+        if self.eat_punct(Punct::Semicolon)? {
+            return Ok(());
+        }
+        if self.can_insert_semicolon() {
+            return Ok(());
+        }
+        Err(self.unexpected())
+    }
+
+    // -- statements --------------------------------------------------------
+
+    fn parse_statement_list_item(&mut self) -> Result<Stmt> {
+        self.enter()?;
+        let result = self.parse_statement_list_item_guarded();
+        self.leave();
+        result
+    }
+
+    fn parse_statement_list_item_guarded(&mut self) -> Result<Stmt> {
+        let cover_mark = self.cover_inits.len();
+        let stmt = self.parse_statement_list_item_inner()?;
+        if self.cover_inits.len() > cover_mark {
+            let span = self.cover_inits[cover_mark];
+            self.cover_inits.truncate(cover_mark);
+            return Err(self.error_at("expecting '}'", span));
+        }
+        Ok(stmt)
+    }
+
+    fn parse_statement_list_item_inner(&mut self) -> Result<Stmt> {
+        if self.at_keyword(Keyword::Function) {
+            let start = self.current.span.start;
+            let func = self.parse_function(FunctionForm::Declaration, false)?;
+            if let Some(name) = &func.name {
+                self.declare_function(&name.name, name.span)?;
+            }
+            return Ok(Stmt::new(
+                StmtKind::FuncDecl(Box::new(func)),
+                self.span_from(start),
+            ));
+        }
+        if self.at_ident("async") {
+            let peek = self.peek()?;
+            if matches!(peek.kind, TokenKind::Keyword(Keyword::Function)) && !peek.newline_before {
+                let start = self.current.span.start;
+                self.bump()?; // async
+                let func = self.parse_function(FunctionForm::Declaration, true)?;
+                if let Some(name) = &func.name {
+                    self.declare_function(&name.name, name.span)?;
+                }
+                return Ok(Stmt::new(
+                    StmtKind::FuncDecl(Box::new(func)),
+                    self.span_from(start),
+                ));
+            }
+        }
+        if self.at_keyword(Keyword::Class) {
+            let start = self.current.span.start;
+            let class = self.parse_class(false)?;
+            if let Some(name) = &class.name {
+                self.declare_lexical(&name.name, name.span)?;
+            }
+            return Ok(Stmt::new(
+                StmtKind::ClassDecl(Box::new(class)),
+                self.span_from(start),
+            ));
+        }
+        if self.at_keyword(Keyword::Var) {
+            let start = self.current.span.start;
+            let decl = self.parse_var_decl(VarDeclKind::Var, false, true)?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
+        }
+        if self.at_keyword(Keyword::Const) {
+            let start = self.current.span.start;
+            let decl = self.parse_var_decl(VarDeclKind::Const, false, true)?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
+        }
+        if self.at_ident("let") && self.let_starts_declaration()? {
+            let start = self.current.span.start;
+            let decl = self.parse_var_decl(VarDeclKind::Let, false, true)?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
+        }
+        if self.module && self.at_keyword(Keyword::Import) {
+            let peek = self.peek()?;
+            // `import(` and `import.meta` are expressions, not declarations.
+            if !matches!(
+                peek.kind,
+                TokenKind::Punct(Punct::LParen) | TokenKind::Punct(Punct::Dot)
+            ) {
+                return self.parse_import_decl();
+            }
+        }
+        if self.module && self.at_keyword(Keyword::Export) {
+            return self.parse_export_decl();
+        }
+        self.parse_statement()
+    }
+
+    /// `let` is a declaration keyword when followed by a binding or a pattern.
+    fn let_starts_declaration(&self) -> Result<bool> {
+        let peek = self.peek()?;
+        Ok(matches!(
+            peek.kind,
+            TokenKind::Ident(_)
+                | TokenKind::Punct(Punct::LBracket)
+                | TokenKind::Punct(Punct::LBrace)
+        ))
+    }
+
+    fn parse_statement(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        if self.at_punct(Punct::Semicolon) {
+            self.bump()?;
+            return Ok(Stmt::new(StmtKind::Empty, self.span_from(start)));
+        }
+        if self.at_punct(Punct::LBrace) {
+            let body = self.parse_block()?;
+            return Ok(Stmt::new(StmtKind::Block(body), self.span_from(start)));
+        }
+        if self.at_keyword(Keyword::If) {
+            return self.parse_if();
+        }
+        if self.at_keyword(Keyword::Do) {
+            return self.parse_do_while();
+        }
+        if self.at_keyword(Keyword::While) {
+            return self.parse_while();
+        }
+        if self.at_keyword(Keyword::For) {
+            return self.parse_for();
+        }
+        if self.at_keyword(Keyword::Switch) {
+            return self.parse_switch();
+        }
+        if self.at_keyword(Keyword::Try) {
+            return self.parse_try();
+        }
+        if self.at_keyword(Keyword::Return) {
+            return self.parse_return();
+        }
+        if self.at_keyword(Keyword::Throw) {
+            return self.parse_throw();
+        }
+        if self.at_keyword(Keyword::Break) {
+            return self.parse_break_continue(true);
+        }
+        if self.at_keyword(Keyword::Continue) {
+            return self.parse_break_continue(false);
+        }
+        if self.at_keyword(Keyword::With) {
+            return self.parse_with();
+        }
+        if self.at_keyword(Keyword::Debugger) {
+            self.bump()?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::Debugger, self.span_from(start)));
+        }
+        if self.at_keyword(Keyword::Function) {
+            // Annex B: function declarations in statement position are legal in
+            // sloppy mode (`if (x) function f() {}`).
+            if self.strict {
+                return Err(
+                    self.error("invalid 'function' declaration in a single statement context")
+                );
+            }
+            let func = self.parse_function(FunctionForm::Declaration, false)?;
+            if let Some(name) = &func.name {
+                self.declare_function(&name.name, name.span)?;
+            }
+            return Ok(Stmt::new(
+                StmtKind::FuncDecl(Box::new(func)),
+                self.span_from(start),
+            ));
+        }
+        if self.at_keyword(Keyword::Class) {
+            return Err(self.error("invalid 'class' declaration in a single statement context"));
+        }
+        if self.at_keyword(Keyword::Import) {
+            return Err(self.error("'import' can only appear at the top level of a module"));
+        }
+        if self.at_keyword(Keyword::Export) {
+            return Err(self.error("'export' can only appear at the top level of a module"));
+        }
+        // Labelled statement.
+        if matches!(self.current.kind, TokenKind::Ident(_)) {
+            let peek = self.peek()?;
+            if matches!(peek.kind, TokenKind::Punct(Punct::Colon)) {
+                return self.parse_labeled();
+            }
+        }
+        self.parse_expression_statement()
+    }
+
+    fn parse_block(&mut self) -> Result<Vec<Stmt>> {
+        self.expect_punct(Punct::LBrace)?;
+        self.push_scope(Scope::block());
+        let result = self.parse_block_body();
+        self.pop_scope();
+        let body = result?;
+        self.bump()?; // }
+        Ok(body)
+    }
+
+    /// `{ … }` of a `catch` clause: parsed in the scope holding its parameter.
+    fn parse_catch_body(&mut self) -> Result<Vec<Stmt>> {
+        self.expect_punct(Punct::LBrace)?;
+        let body = self.parse_block_body()?;
+        self.bump()?; // }
+        Ok(body)
+    }
+
+    fn parse_block_body(&mut self) -> Result<Vec<Stmt>> {
+        let mut body = Vec::new();
+        while !self.at_punct(Punct::RBrace) {
+            if self.current.is_eof() {
+                return Err(self.unexpected());
+            }
+            body.push(self.parse_statement_list_item()?);
+        }
+        Ok(body)
+    }
+
+    fn parse_expression_statement(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        let expr = self.parse_expression(true)?;
+        self.semicolon()?;
+        Ok(Stmt::new(
+            StmtKind::Expr(Box::new(expr)),
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_if(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // if
+        self.expect_punct(Punct::LParen)?;
+        let test = self.parse_expression(true)?;
+        self.expect_punct(Punct::RParen)?;
+        let cons = self.parse_statement()?;
+        let alt = if self.eat_keyword(Keyword::Else)? {
+            Some(Box::new(self.parse_statement()?))
+        } else {
+            None
+        };
+        Ok(Stmt::new(
+            StmtKind::If {
+                test: Box::new(test),
+                cons: Box::new(cons),
+                alt,
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_do_while(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // do
+        self.loop_depth += 1;
+        let body = self.parse_statement();
+        self.loop_depth -= 1;
+        let body = body?;
+        if !self.eat_keyword(Keyword::While)? {
+            return Err(self.unexpected());
+        }
+        self.expect_punct(Punct::LParen)?;
+        let test = self.parse_expression(true)?;
+        self.expect_punct(Punct::RParen)?;
+        // `do … while (x)` allows a missing semicolon even without a newline.
+        let _ = self.eat_punct(Punct::Semicolon)?;
+        Ok(Stmt::new(
+            StmtKind::DoWhile {
+                body: Box::new(body),
+                test: Box::new(test),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_while(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // while
+        self.expect_punct(Punct::LParen)?;
+        let test = self.parse_expression(true)?;
+        self.expect_punct(Punct::RParen)?;
+        self.loop_depth += 1;
+        let body = self.parse_statement();
+        self.loop_depth -= 1;
+        Ok(Stmt::new(
+            StmtKind::While {
+                test: Box::new(test),
+                body: Box::new(body?),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // for
+        self.push_scope(Scope::block());
+        let result = self.parse_for_inner(start);
+        self.pop_scope();
+        result
+    }
+
+    fn parse_for_inner(&mut self, start: Position) -> Result<Stmt> {
+        let mut is_await = false;
+        if self.at_ident("await") && (self.ctx.in_async || (self.module && self.top_level)) {
+            let peek = self.peek()?;
+            if matches!(peek.kind, TokenKind::Punct(Punct::LParen)) && !peek.newline_before {
+                is_await = true;
+                self.bump()?;
+            }
+        }
+        self.expect_punct(Punct::LParen)?;
+
+        // `for (;;)`
+        if self.at_punct(Punct::Semicolon) {
+            self.bump()?;
+            return self.parse_for_classic(start, None);
+        }
+
+        // Declaration head.
+        let decl_kind = if self.at_keyword(Keyword::Var) {
+            Some(VarDeclKind::Var)
+        } else if self.at_keyword(Keyword::Const) {
+            Some(VarDeclKind::Const)
+        } else if self.at_ident("let") && self.let_starts_declaration()? {
+            Some(VarDeclKind::Let)
+        } else {
+            None
+        };
+        if let Some(kind) = decl_kind {
+            let decl_start = self.current.span.start;
+            let decl = self.parse_var_decl(kind, true, false)?;
+            if self.at_for_head_keyword() {
+                let is_of = self.at_contextual("of");
+                if !is_of && decl.declarators.len() != 1 {
+                    return Err(self.error_at(
+                        "only one binding allowed in a for-in loop",
+                        self.span_from(decl_start),
+                    ));
+                }
+                if is_of && decl.declarators.len() != 1 {
+                    return Err(self.error_at(
+                        "only one binding allowed in a for-of loop",
+                        self.span_from(decl_start),
+                    ));
+                }
+                if let Some(declarator) = decl.declarators.first() {
+                    if declarator.init.is_some() {
+                        // `for (var x = 1 in y)` is legacy in sloppy mode only.
+                        if is_of || kind.is_lexical() || self.strict {
+                            return Err(self.error_at(
+                                "for-in/of loop variable declaration may not have an initializer",
+                                declarator.span,
+                            ));
+                        }
+                    }
+                }
+                if is_await && !is_of {
+                    return Err(self.error("for await is only valid with 'of'"));
+                }
+                self.bump()?; // in / of
+                let right = self.parse_expression(true)?;
+                self.expect_punct(Punct::RParen)?;
+                self.loop_depth += 1;
+                let body = self.parse_statement();
+                self.loop_depth -= 1;
+                let head = ForHead::VarDecl(decl);
+                let span = self.span_from(start);
+                return Ok(Stmt::new(
+                    if is_of {
+                        StmtKind::ForOf {
+                            is_await,
+                            left: head,
+                            right: Box::new(right),
+                            body: Box::new(body?),
+                        }
+                    } else {
+                        StmtKind::ForIn {
+                            left: head,
+                            right: Box::new(right),
+                            body: Box::new(body?),
+                        }
+                    },
+                    span,
+                ));
+            }
+            self.expect_punct(Punct::Semicolon)?;
+            return self.parse_for_classic(start, Some(ForInit::VarDecl(decl)));
+        }
+
+        // Expression head.
+        let expr_start = self.current.span.start;
+        let expr = self.parse_expression(false)?;
+        if self.at_for_head_keyword() {
+            let is_of = self.at_contextual("of");
+            if is_await && !is_of {
+                return Err(self.error("for await is only valid with 'of'"));
+            }
+            let target = self.expr_to_pattern(expr, TargetKind::Assignment)?;
+            self.bump()?; // in / of
+            let right = self.parse_expression(true)?;
+            self.expect_punct(Punct::RParen)?;
+            self.loop_depth += 1;
+            let body = self.parse_statement();
+            self.loop_depth -= 1;
+            let head = ForHead::Assign(Box::new(target));
+            let span = self.span_from(start);
+            return Ok(Stmt::new(
+                if is_of {
+                    StmtKind::ForOf {
+                        is_await,
+                        left: head,
+                        right: Box::new(right),
+                        body: Box::new(body?),
+                    }
+                } else {
+                    StmtKind::ForIn {
+                        left: head,
+                        right: Box::new(right),
+                        body: Box::new(body?),
+                    }
+                },
+                span,
+            ));
+        }
+        let _ = expr_start;
+        self.expect_punct(Punct::Semicolon)?;
+        self.parse_for_classic(start, Some(ForInit::Expr(Box::new(expr))))
+    }
+
+    /// Whether the `for` head continues with `in` (a keyword) or `of` (a
+    /// contextual keyword).
+    fn at_for_head_keyword(&self) -> bool {
+        self.at_keyword(Keyword::In) || self.at_contextual("of")
+    }
+
+    fn parse_for_classic(&mut self, start: Position, init: Option<ForInit>) -> Result<Stmt> {
+        let test = if self.at_punct(Punct::Semicolon) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression(true)?))
+        };
+        self.expect_punct(Punct::Semicolon)?;
+        let update = if self.at_punct(Punct::RParen) {
+            None
+        } else {
+            Some(Box::new(self.parse_expression(true)?))
+        };
+        self.expect_punct(Punct::RParen)?;
+        self.loop_depth += 1;
+        let body = self.parse_statement();
+        self.loop_depth -= 1;
+        Ok(Stmt::new(
+            StmtKind::For {
+                init,
+                test,
+                update,
+                body: Box::new(body?),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_switch(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // switch
+        self.expect_punct(Punct::LParen)?;
+        let discriminant = self.parse_expression(true)?;
+        self.expect_punct(Punct::RParen)?;
+        self.expect_punct(Punct::LBrace)?;
+        self.switch_depth += 1;
+        self.push_scope(Scope::block());
+        let mut cases = Vec::new();
+        let mut seen_default = false;
+        while !self.at_punct(Punct::RBrace) {
+            if self.current.is_eof() {
+                self.switch_depth -= 1;
+                return Err(self.unexpected());
+            }
+            let case_start = self.current.span.start;
+            let test = if self.eat_keyword(Keyword::Case)? {
+                Some(Box::new(self.parse_expression(true)?))
+            } else if self.eat_keyword(Keyword::Default)? {
+                if seen_default {
+                    self.switch_depth -= 1;
+                    return Err(self.error("duplicate 'default' clause in switch statement"));
+                }
+                seen_default = true;
+                None
+            } else {
+                self.switch_depth -= 1;
+                return Err(self.unexpected());
+            };
+            self.expect_punct(Punct::Colon)?;
+            let mut body = Vec::new();
+            while !self.at_punct(Punct::RBrace)
+                && !self.at_keyword(Keyword::Case)
+                && !self.at_keyword(Keyword::Default)
+            {
+                if self.current.is_eof() {
+                    self.switch_depth -= 1;
+                    return Err(self.unexpected());
+                }
+                body.push(self.parse_statement_list_item()?);
+            }
+            cases.push(SwitchCase {
+                test,
+                body,
+                span: self.span_from(case_start),
+            });
+        }
+        self.switch_depth -= 1;
+        self.bump()?; // }
+        Ok(Stmt::new(
+            StmtKind::Switch {
+                discriminant: Box::new(discriminant),
+                cases,
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // try
+        let block = self.parse_block()?;
+        let mut handler = None;
+        let mut finalizer = None;
+        if self.at_keyword(Keyword::Catch) {
+            let catch_start = self.current.span.start;
+            self.bump()?;
+            // The catch parameter and the body share one scope, so `catch (e) {
+            // let e; }` is an early error. A *simple* parameter is exempt from
+            // the `var` check (`catch (e) { var e; }` is legal), a destructured
+            // one is not (`catch ({e}) { var e; }` is rejected) — this matches
+            // the reference engine.
+            let param = if self.eat_punct(Punct::LParen)? {
+                let pattern = self.parse_binding_target()?;
+                self.expect_punct(Punct::RParen)?;
+                Some(pattern)
+            } else {
+                None
+            };
+            self.push_scope(Scope::block());
+            let body = match &param {
+                // A simple parameter shares the body's scope: `catch (e) { let e;
+                // }` is an error, `catch (e) { var e; }` is not.
+                Some(Pattern {
+                    kind: PatternKind::Ident(id),
+                    ..
+                }) => {
+                    if let Some(scope) = self.scopes.last_mut() {
+                        scope.params.push(id.name.clone());
+                    }
+                    self.parse_catch_body()
+                }
+                // A destructuring parameter is declared lexically in the clause's
+                // own scope, with the body nested inside it: `catch ({e}) { var
+                // e; }` is an error (the `var` hoists past the binding) while
+                // `catch ({e}) { let e; }` is not.
+                Some(pattern) => {
+                    self.declare_pattern(pattern, false)?;
+                    self.parse_block()
+                }
+                None => self.parse_catch_body(),
+            };
+            self.pop_scope();
+            let body = body?;
+            handler = Some(CatchClause {
+                param,
+                body,
+                span: self.span_from(catch_start),
+            });
+        }
+        if self.eat_keyword(Keyword::Finally)? {
+            finalizer = Some(self.parse_block()?);
+        }
+        if handler.is_none() && finalizer.is_none() {
+            return Err(self.error("expecting catch or finally"));
+        }
+        Ok(Stmt::new(
+            StmtKind::Try {
+                block,
+                handler,
+                finalizer,
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_return(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        let span = self.current.span;
+        if !self.ctx.in_function {
+            return Err(self.error_at("invalid return statement outside of a function", span));
+        }
+        self.bump()?;
+        let argument = if self.at_punct(Punct::Semicolon)
+            || self.at_punct(Punct::RBrace)
+            || self.current.is_eof()
+            || self.current.newline_before
+        {
+            None
+        } else {
+            Some(Box::new(self.parse_expression(true)?))
+        };
+        self.semicolon()?;
+        Ok(Stmt::new(StmtKind::Return(argument), self.span_from(start)))
+    }
+
+    fn parse_throw(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // throw
+        if self.current.newline_before {
+            return Err(self.error("line terminator not allowed after 'throw'"));
+        }
+        let argument = self.parse_expression(true)?;
+        self.semicolon()?;
+        Ok(Stmt::new(
+            StmtKind::Throw(Box::new(argument)),
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_break_continue(&mut self, is_break: bool) -> Result<Stmt> {
+        let start = self.current.span.start;
+        let keyword_span = self.current.span;
+        self.bump()?;
+        let label = if matches!(self.current.kind, TokenKind::Ident(_))
+            && !self.current.newline_before
+        {
+            let ident = self.expect_ident()?;
+            let found = self.labels.iter().rev().find(|l| l.name == ident.name);
+            match found {
+                None => {
+                    return Err(
+                        self.error_at(format!("label '{}' not found", ident.name), ident.span)
+                    );
+                }
+                Some(label) => {
+                    if !is_break && label.kind != LabelKind::Iteration {
+                        return Err(self.error_at(
+                            format!("continue must be inside of a loop (label '{}')", ident.name),
+                            ident.span,
+                        ));
+                    }
+                }
+            }
+            Some(ident)
+        } else {
+            if !is_break && self.loop_depth == 0 {
+                return Err(self.error_at("continue must be inside of a loop", keyword_span));
+            }
+            if is_break && self.loop_depth == 0 && self.switch_depth == 0 && self.labels.is_empty()
+            {
+                return Err(self.error_at("break must be inside of a loop or switch", keyword_span));
+            }
+            None
+        };
+        self.semicolon()?;
+        Ok(Stmt::new(
+            if is_break {
+                StmtKind::Break(label)
+            } else {
+                StmtKind::Continue(label)
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_with(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        let span = self.current.span;
+        if self.strict {
+            return Err(self.error_at("invalid 'with' statement in strict mode", span));
+        }
+        self.bump()?; // with
+        self.expect_punct(Punct::LParen)?;
+        let object = self.parse_expression(true)?;
+        self.expect_punct(Punct::RParen)?;
+        let body = self.parse_statement()?;
+        Ok(Stmt::new(
+            StmtKind::With {
+                object: Box::new(object),
+                body: Box::new(body),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_labeled(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        let label = self.expect_ident()?;
+        self.expect_punct(Punct::Colon)?;
+        if self.labels.iter().any(|l| l.name == label.name) {
+            return Err(self.error_at(
+                format!("label '{}' already declared", label.name),
+                label.span,
+            ));
+        }
+        let kind = if self.at_keyword(Keyword::For)
+            || self.at_keyword(Keyword::While)
+            || self.at_keyword(Keyword::Do)
+        {
+            LabelKind::Iteration
+        } else {
+            LabelKind::Other
+        };
+        self.labels.push(Label {
+            name: label.name.clone(),
+            kind,
+        });
+        let body = self.parse_statement();
+        self.labels.pop();
+        Ok(Stmt::new(
+            StmtKind::Labeled {
+                label,
+                body: Box::new(body?),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    // -- declarations ------------------------------------------------------
+
+    fn parse_var_decl(
+        &mut self,
+        kind: VarDeclKind,
+        in_for_head: bool,
+        require_init: bool,
+    ) -> Result<VarDecl> {
+        let start = self.current.span.start;
+        self.bump()?; // var / let / const
+        let mut declarators = Vec::new();
+        loop {
+            let declarator_start = self.current.span.start;
+            let target = self.parse_binding_target()?;
+            let init = if self.eat_punct(Punct::Eq)? {
+                // `for (var x = a in b;;)` must not parse `a in b` as the
+                // initialiser: the head uses AssignmentExpression[~In].
+                Some(Box::new(self.parse_assignment(!in_for_head)?))
+            } else {
+                None
+            };
+            if init.is_none() && require_init {
+                if kind == VarDeclKind::Const {
+                    return Err(self.error("missing initializer in const declaration"));
+                }
+                if !matches!(target.unparen_kind(), PatternKind::Ident(_)) && !in_for_head {
+                    return Err(self.error_at(
+                        "missing initializer in destructuring declaration",
+                        target.span,
+                    ));
+                }
+            }
+            if kind.is_lexical() {
+                let mut names = Vec::new();
+                target.bound_names(&mut names);
+                if let Some(name) = names.iter().find(|n| n.name == "let") {
+                    return Err(self.error_at("'let' is not a valid lexical identifier", name.span));
+                }
+            }
+            self.declare_pattern(&target, !kind.is_lexical())?;
+            declarators.push(Declarator {
+                target,
+                init,
+                span: self.span_from(declarator_start),
+            });
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        Ok(VarDecl {
+            kind,
+            declarators,
+            span: self.span_from(start),
+        })
+    }
+
+    /// A binding element: `target` or `target = default`. Used for parameters and
+    /// for elements of array/object patterns.
+    fn parse_binding_element(&mut self) -> Result<Pattern> {
+        let pattern = self.parse_binding_target()?;
+        if self.eat_punct(Punct::Eq)? {
+            let start = pattern.span.start;
+            let default = self.parse_assignment(self.allow_in)?;
+            return Ok(Pattern::new(
+                PatternKind::Assign {
+                    target: Box::new(pattern),
+                    default: Box::new(default),
+                },
+                self.span_from(start),
+            ));
+        }
+        Ok(pattern)
+    }
+
+    /// A binding target: `Ident`, `[ … ]` or `{ … }`, with no default value.
+    /// Used for declarators, `catch` parameters, rest elements and `for` heads.
+    fn parse_binding_target(&mut self) -> Result<Pattern> {
+        self.enter()?;
+        let result = self.parse_binding_target_unguarded();
+        self.leave();
+        result
+    }
+
+    fn parse_binding_target_unguarded(&mut self) -> Result<Pattern> {
+        let start = self.current.span.start;
+        if self.at_punct(Punct::LBracket) {
+            return self.parse_array_pattern(start);
+        }
+        if self.at_punct(Punct::LBrace) {
+            return self.parse_object_pattern(start);
+        }
+        let ident = self.expect_binding_ident()?;
+        Ok(Pattern::new(
+            PatternKind::Ident(ident),
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_array_pattern(&mut self, start: Position) -> Result<Pattern> {
+        self.expect_punct(Punct::LBracket)?;
+        let mut elements = Vec::new();
+        let mut rest = None;
+        loop {
+            if self.at_punct(Punct::RBracket) {
+                break;
+            }
+            if self.at_punct(Punct::Comma) {
+                self.bump()?;
+                elements.push(None);
+                continue;
+            }
+            if self.at_punct(Punct::Ellipsis) {
+                self.bump()?;
+                let target = self.parse_binding_target()?;
+                if self.at_punct(Punct::Comma) {
+                    return Err(self.error("rest element must be last"));
+                }
+                rest = Some(Box::new(RestElement::Pattern(target)));
+                break;
+            }
+            let element_start = self.current.span.start;
+            let element = self.parse_binding_element()?;
+            let span = self.span_from(element_start);
+            elements.push(Some(PatternElement::Pattern(element)));
+            let _ = span;
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBracket)?;
+        Ok(Pattern::new(
+            PatternKind::Array { elements, rest },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_object_pattern(&mut self, start: Position) -> Result<Pattern> {
+        self.expect_punct(Punct::LBrace)?;
+        let mut properties = Vec::new();
+        let mut rest = None;
+        loop {
+            if self.at_punct(Punct::RBrace) {
+                break;
+            }
+            if self.at_punct(Punct::Ellipsis) {
+                self.bump()?;
+                let target = self.parse_binding_target()?;
+                rest = Some(Box::new(RestElement::Pattern(target)));
+                if self.at_punct(Punct::Comma) {
+                    return Err(self.error("rest element must be last"));
+                }
+                break;
+            }
+            let property_start = self.current.span.start;
+            let key = self.parse_property_key()?;
+            if self.eat_punct(Punct::Colon)? {
+                let value = self.parse_binding_element()?;
+                properties.push(Some(PatternElement::Property {
+                    key,
+                    value,
+                    shorthand: false,
+                    span: self.span_from(property_start),
+                }));
+            } else {
+                let PropName::Literal(PropKey::Str(name)) = &key else {
+                    return Err(
+                        self.error("expecting ':' after a computed or numeric property key")
+                    );
+                };
+                let span = self.span_from(property_start);
+                let ident = Ident {
+                    name: name.clone(),
+                    span,
+                };
+                self.check_binding_name(&ident.name, ident.span)?;
+                let mut value = Pattern::new(PatternKind::Ident(ident), span);
+                if self.eat_punct(Punct::Eq)? {
+                    let default = self.parse_assignment(self.allow_in)?;
+                    value = Pattern::new(
+                        PatternKind::Assign {
+                            target: Box::new(value),
+                            default: Box::new(default),
+                        },
+                        span,
+                    );
+                }
+                properties.push(Some(PatternElement::Property {
+                    key,
+                    value,
+                    shorthand: true,
+                    span,
+                }));
+            }
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(Pattern::new(
+            PatternKind::Object { properties, rest },
+            self.span_from(start),
+        ))
+    }
+
+    /// A property key: identifier, string, number, computed or `#private`.
+    fn parse_property_key(&mut self) -> Result<PropName> {
+        match self.current.kind.clone() {
+            TokenKind::Ident(name) => {
+                self.bump()?;
+                Ok(PropName::Literal(PropKey::Str(name)))
+            }
+            TokenKind::Keyword(kw) => {
+                // Reserved words are valid property names (`{ if: 1 }`).
+                self.bump()?;
+                Ok(PropName::Literal(PropKey::Str(kw.as_str().to_string())))
+            }
+            TokenKind::String(value) => {
+                self.bump()?;
+                Ok(PropName::Literal(PropKey::Str(value)))
+            }
+            TokenKind::Number(NumberLiteral::Int(v)) => {
+                self.bump()?;
+                Ok(PropName::Literal(PropKey::Num(v as f64)))
+            }
+            TokenKind::Number(NumberLiteral::Float(v)) => {
+                self.bump()?;
+                Ok(PropName::Literal(PropKey::Num(v)))
+            }
+            TokenKind::BigInt(big) => Err(self.error(format!(
+                "BigInt property keys are not supported ('{}n')",
+                big.digits
+            ))),
+            TokenKind::Punct(Punct::LBracket) => {
+                self.bump()?;
+                let expr = self.parse_assignment(true)?;
+                self.expect_punct(Punct::RBracket)?;
+                Ok(PropName::Computed(Box::new(expr)))
+            }
+            TokenKind::Punct(Punct::Hash) => {
+                self.bump()?;
+                let ident = self.expect_ident()?;
+                Ok(PropName::Private(ident))
+            }
+            _ => Err(self.error("expecting a property name")),
+        }
+    }
+
+    // -- functions ---------------------------------------------------------
+
+    fn parse_function(&mut self, form: FunctionForm, is_async: bool) -> Result<Function> {
+        let start = self.current.span.start;
+        self.bump()?; // function
+        let is_generator = self.eat_punct(Punct::Star)?;
+        let name = if matches!(self.current.kind, TokenKind::Ident(_)) {
+            let ident = if form == FunctionForm::Declaration {
+                self.expect_binding_ident()?
+            } else {
+                self.expect_ident()?
+            };
+            if is_generator && ident.name == "yield" {
+                return Err(self.error_at("invalid use of 'yield' as a function name", ident.span));
+            }
+            if is_async && ident.name == "await" {
+                return Err(self.error_at("invalid use of 'await' as a function name", ident.span));
+            }
+            Some(ident)
+        } else {
+            if form == FunctionForm::Declaration {
+                return Err(self.error("expecting a function name"));
+            }
+            None
+        };
+        let saved = self.ctx;
+        self.ctx = FnCtx {
+            in_function: true,
+            in_generator: is_generator,
+            in_async: is_async,
+            in_method: false,
+            in_derived_constructor: false,
+        };
+        let saved_top = self.top_level;
+        self.top_level = false;
+        let params_result = self.parse_formal_parameters();
+        let result = match params_result {
+            Ok(params) => self.parse_function_body(params, is_generator, is_async),
+            Err(err) => Err(err),
+        };
+        self.ctx = saved;
+        self.top_level = saved_top;
+        let (params, params_span, body) = result?;
+        Ok(Function {
+            name,
+            params,
+            body,
+            is_async,
+            is_generator,
+            is_arrow: false,
+            span: self.span_from(start),
+            params_span,
+        })
+    }
+
+    fn parse_formal_parameters(&mut self) -> Result<Vec<Pattern>> {
+        self.expect_punct(Punct::LParen)?;
+        let mut params = Vec::new();
+        loop {
+            if self.at_punct(Punct::RParen) {
+                break;
+            }
+            if self.at_punct(Punct::Ellipsis) {
+                self.bump()?;
+                let target = self.parse_binding_target()?;
+                if matches!(target.unparen_kind(), PatternKind::Assign { .. }) {
+                    return Err(self.error_at("rest parameter may not have a default", target.span));
+                }
+                params.push(Pattern::new(
+                    PatternKind::Rest(Box::new(target.clone())),
+                    target.span,
+                ));
+                if self.at_punct(Punct::Comma) {
+                    return Err(self.error("rest parameter must be last"));
+                }
+                break;
+            }
+            let param = self.parse_binding_element()?;
+            self.check_parameter(&param)?;
+            params.push(param);
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen)?;
+        Ok(params)
+    }
+
+    fn check_parameter(&self, param: &Pattern) -> Result<()> {
+        match &param.kind {
+            PatternKind::Ident(ident) => self.check_binding_name(&ident.name, ident.span),
+            PatternKind::Assign { target, .. } => self.check_parameter(target),
+            _ => Ok(()),
+        }
+    }
+
+    fn parse_function_body(
+        &mut self,
+        params: Vec<Pattern>,
+        is_generator: bool,
+        is_async: bool,
+    ) -> Result<(Vec<Pattern>, Span, FunctionBody)> {
+        let params_span = self.prev_end;
+        if !self.at_punct(Punct::LBrace) {
+            return Err(self.unexpected());
+        }
+        let param_names = simple_parameter_names(&params);
+        let simple_params = params
+            .iter()
+            .all(|p| matches!(p.unparen_kind(), PatternKind::Ident(_)));
+        let mut body = Vec::new();
+        let mut prologue = true;
+        let mut strict_seen = false;
+        self.bump()?; // {
+        self.push_scope(Scope::function(param_names));
+        while !self.at_punct(Punct::RBrace) {
+            if self.current.is_eof() {
+                return Err(self.unexpected());
+            }
+            let stmt = self.parse_statement_list_item()?;
+            if prologue {
+                match self.directive_value(&stmt) {
+                    Some(directive) if directive == "use strict" => {
+                        strict_seen = true;
+                        self.enter_strict()?;
+                    }
+                    Some(_) => {}
+                    None => prologue = false,
+                }
+            }
+            body.push(stmt);
+        }
+        self.pop_scope();
+        self.bump()?; // }
+        if strict_seen && !simple_params {
+            return Err(self.error_at(
+                "'use strict' directive is not allowed with non-simple parameters",
+                Span::new(params_span, params_span),
+            ));
+        }
+        // Duplicate parameter names: always illegal for non-simple lists and in
+        // strict mode; in sloppy simple lists they are allowed (last wins).
+        if self.strict || !simple_params || is_generator || is_async {
+            let mut seen: Vec<String> = Vec::new();
+            for param in &params {
+                let mut names = Vec::new();
+                param.bound_names(&mut names);
+                for name in names {
+                    if seen.contains(&name.name) {
+                        return Err(self.error_at(
+                            format!("duplicate parameter name '{}'", name.name),
+                            name.span,
+                        ));
+                    }
+                    seen.push(name.name);
+                }
+            }
+        }
+        let params_span_value = Span::new(params_span, params_span);
+        Ok((params, params_span_value, FunctionBody::Block(body)))
+    }
+
+    // -- classes -----------------------------------------------------------
+
+    fn parse_class(&mut self, is_expression: bool) -> Result<Class> {
+        let start = self.current.span.start;
+        self.bump()?; // class
+        let name = if matches!(self.current.kind, TokenKind::Ident(_)) {
+            if is_expression {
+                Some(self.expect_ident()?)
+            } else {
+                Some(self.expect_binding_ident()?)
+            }
+        } else {
+            if !is_expression {
+                return Err(self.error("expecting a class name"));
+            }
+            None
+        };
+        let super_class = if self.eat_keyword(Keyword::Extends)? {
+            Some(Box::new(self.parse_lhs_expression()?))
+        } else {
+            None
+        };
+        let has_super = super_class.is_some();
+        self.private.push(PrivateEnv::default());
+        self.expect_punct(Punct::LBrace)?;
+        let mut elements = Vec::new();
+        let mut seen_constructor = false;
+        let result = (|| -> Result<()> {
+            while !self.at_punct(Punct::RBrace) {
+                if self.current.is_eof() {
+                    return Err(self.unexpected());
+                }
+                if self.eat_punct(Punct::Semicolon)? {
+                    continue;
+                }
+                elements.push(self.parse_class_element(has_super, &mut seen_constructor)?);
+            }
+            Ok(())
+        })();
+        self.private.pop();
+        result?;
+        self.bump()?; // }
+        Ok(Class {
+            name,
+            super_class,
+            elements,
+            span: self.span_from(start),
+        })
+    }
+
+    fn parse_class_element(
+        &mut self,
+        has_super: bool,
+        seen_constructor: &mut bool,
+    ) -> Result<ClassElement> {
+        let start = self.current.span.start;
+        let mut is_static = false;
+        if self.at_ident("static") {
+            let peek = self.peek()?;
+            let is_modifier = !matches!(
+                peek.kind,
+                TokenKind::Punct(Punct::LParen)
+                    | TokenKind::Punct(Punct::Eq)
+                    | TokenKind::Punct(Punct::Semicolon)
+                    | TokenKind::Punct(Punct::RBrace)
+            );
+            if is_modifier {
+                if matches!(peek.kind, TokenKind::Punct(Punct::LBrace)) {
+                    self.bump()?; // static
+                    let body = self.parse_block()?;
+                    return Ok(ClassElement::StaticBlock {
+                        body,
+                        span: self.span_from(start),
+                    });
+                }
+                self.bump()?; // static
+                is_static = true;
+                if self.at_punct(Punct::LBrace) {
+                    let body = self.parse_block()?;
+                    return Ok(ClassElement::StaticBlock {
+                        body,
+                        span: self.span_from(start),
+                    });
+                }
+            }
+        }
+
+        // Modifiers: async, get, set, *
+        let mut is_async = false;
+        let mut is_generator = false;
+        let mut accessor: Option<MethodKind> = None;
+        if self.at_ident("async") {
+            let peek = self.peek()?;
+            let is_modifier = !matches!(
+                peek.kind,
+                TokenKind::Punct(Punct::LParen)
+                    | TokenKind::Punct(Punct::Eq)
+                    | TokenKind::Punct(Punct::Semicolon)
+                    | TokenKind::Punct(Punct::RBrace)
+            ) && !peek.newline_before;
+            if is_modifier {
+                self.bump()?;
+                is_async = true;
+            }
+        }
+        if self.at_punct(Punct::Star) {
+            self.bump()?;
+            is_generator = true;
+        }
+        if accessor.is_none() && (self.at_ident("get") || self.at_ident("set")) {
+            let is_get = self.at_ident("get");
+            let peek = self.peek()?;
+            if is_property_key_start(&peek.kind) {
+                self.bump()?;
+                accessor = Some(if is_get {
+                    MethodKind::Get
+                } else {
+                    MethodKind::Set
+                });
+            }
+        }
+        let key = self.parse_property_key()?;
+
+        // Private names must be registered (duplicates are early errors).
+        if let PropName::Private(ident) = &key {
+            if let Some(env) = self.private.last_mut() {
+                if !env.declare(&ident.name, accessor) {
+                    return Err(self.error_at(
+                        format!("duplicate private name '#{}'", ident.name),
+                        ident.span,
+                    ));
+                }
+            }
+        }
+
+        if self.at_punct(Punct::LParen) {
+            let kind = match accessor {
+                Some(kind) => kind,
+                None => {
+                    let is_constructor = !is_static
+                        && !is_generator
+                        && !is_async
+                        && matches!(&key, PropName::Literal(PropKey::Str(s)) if s == "constructor");
+                    if is_constructor {
+                        if *seen_constructor {
+                            return Err(self.error_at(
+                                "property constructor appears more than once",
+                                self.span_from(start),
+                            ));
+                        }
+                        *seen_constructor = true;
+                        MethodKind::Constructor
+                    } else {
+                        MethodKind::Method
+                    }
+                }
+            };
+            if kind == MethodKind::Constructor && (is_generator || is_async) {
+                return Err(self.error("a constructor may not be a generator or async"));
+            }
+            let saved = self.ctx;
+            self.ctx = FnCtx {
+                in_function: true,
+                in_generator: is_generator,
+                in_async: is_async,
+                in_method: true,
+                in_derived_constructor: kind == MethodKind::Constructor && has_super,
+            };
+            let saved_top = self.top_level;
+            self.top_level = false;
+            let result = (|| -> Result<Function> {
+                let params = self.parse_formal_parameters()?;
+                let (params, params_span, body) =
+                    self.parse_function_body(params, is_generator, is_async)?;
+                Ok(Function {
+                    name: None,
+                    params,
+                    body,
+                    is_async,
+                    is_generator,
+                    is_arrow: false,
+                    span: self.span_from(start),
+                    params_span,
+                })
+            })();
+            self.ctx = saved;
+            self.top_level = saved_top;
+            let func = result?;
+            if is_static {
+                if let PropName::Literal(PropKey::Str(name)) = &key {
+                    if name == "prototype" {
+                        return Err(self.error_at("invalid method name 'prototype'", func.span));
+                    }
+                }
+            }
+            if kind == MethodKind::Get && !func.params.is_empty() {
+                return Err(self.error_at("getter must have no arguments", func.span));
+            }
+            if kind == MethodKind::Set && func.params.len() != 1 {
+                return Err(self.error_at("setter must have exactly one argument", func.span));
+            }
+            return Ok(ClassElement::Method {
+                key,
+                is_static,
+                kind,
+                func: Box::new(func),
+                span: self.span_from(start),
+            });
+        }
+
+        // Field definition.
+        if accessor.is_some() {
+            return Err(self.error("expecting '(' after an accessor name"));
+        }
+        if let PropName::Literal(PropKey::Str(name)) = &key {
+            if name == "constructor" && !is_static {
+                return Err(self.error("classes may not have a field named 'constructor'"));
+            }
+            if name == "prototype" && is_static {
+                return Err(self.error("classes may not have a static property named 'prototype'"));
+            }
+        }
+        let value = if self.eat_punct(Punct::Eq)? {
+            Some(Box::new(self.parse_assignment(true)?))
+        } else {
+            None
+        };
+        // Fields are terminated by `;`, `}` or a line break.
+        self.semicolon()?;
+        Ok(ClassElement::Field {
+            key,
+            is_static,
+            value,
+            span: self.span_from(start),
+        })
+    }
+
+    // -- modules -----------------------------------------------------------
+
+    fn parse_import_decl(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // import
+        let mut specifiers = Vec::new();
+        if let TokenKind::String(source) = self.current.kind.clone() {
+            self.bump()?;
+            let attributes = self.parse_import_attributes()?;
+            self.semicolon()?;
+            return Ok(Stmt::new(
+                StmtKind::Import(Box::new(ImportDecl {
+                    specifiers,
+                    source,
+                    attributes,
+                    span: self.span_from(start),
+                })),
+                self.span_from(start),
+            ));
+        }
+        // Default import.
+        if matches!(self.current.kind, TokenKind::Ident(_)) {
+            let local = self.expect_ident()?;
+            specifiers.push(ImportSpecifier::Default(local));
+            if !self.eat_punct(Punct::Comma)? {
+                return self.finish_import(start, specifiers);
+            }
+        }
+        if self.at_punct(Punct::Star) {
+            self.bump()?;
+            if !self.eat_contextual("as")? {
+                return Err(self.unexpected());
+            }
+            let local = self.expect_ident()?;
+            specifiers.push(ImportSpecifier::Namespace(local));
+            return self.finish_import(start, specifiers);
+        }
+        if self.at_punct(Punct::LBrace) {
+            self.bump()?;
+            while !self.at_punct(Punct::RBrace) {
+                let imported = self.parse_module_name()?;
+                let local = if self.eat_contextual("as")? {
+                    self.expect_ident()?
+                } else {
+                    match &imported {
+                        ModuleName::Ident(id) => id.clone(),
+                        ModuleName::Str(_) => {
+                            return Err(self.error_at(
+                                "a string module name must be followed by 'as'",
+                                self.current.span,
+                            ));
+                        }
+                    }
+                };
+                specifiers.push(ImportSpecifier::Named { imported, local });
+                if !self.eat_punct(Punct::Comma)? {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RBrace)?;
+        } else if !specifiers.is_empty() {
+            return Err(self.unexpected());
+        } else if self.at_punct(Punct::LBrace) {
+            unreachable!("handled above");
+        } else {
+            return Err(self.unexpected());
+        }
+        self.finish_import(start, specifiers)
+    }
+
+    fn finish_import(&mut self, start: Position, specifiers: Vec<ImportSpecifier>) -> Result<Stmt> {
+        if !self.eat_contextual("from")? {
+            return Err(self.unexpected());
+        }
+        let TokenKind::String(source) = self.current.kind.clone() else {
+            return Err(self.error("expecting a module name string"));
+        };
+        self.bump()?;
+        let attributes = self.parse_import_attributes()?;
+        self.semicolon()?;
+        let span = self.span_from(start);
+        for specifier in &specifiers {
+            let local = match specifier {
+                ImportSpecifier::Default(id) => id,
+                ImportSpecifier::Namespace(id) => id,
+                ImportSpecifier::Named { local, .. } => local,
+            };
+            self.declare_lexical(&local.name, local.span)?;
+        }
+        Ok(Stmt::new(
+            StmtKind::Import(Box::new(ImportDecl {
+                specifiers,
+                source,
+                attributes,
+                span,
+            })),
+            span,
+        ))
+    }
+
+    fn parse_import_attributes(&mut self) -> Result<Vec<ImportAttribute>> {
+        let mut attributes = Vec::new();
+        let has_with = self.at_keyword(Keyword::With) || self.at_ident("assert");
+        if !has_with {
+            return Ok(attributes);
+        }
+        let peek = self.peek()?;
+        if !matches!(peek.kind, TokenKind::Punct(Punct::LBrace)) {
+            return Ok(attributes);
+        }
+        self.bump()?; // with / assert
+        self.expect_punct(Punct::LBrace)?;
+        while !self.at_punct(Punct::RBrace) {
+            let attr_start = self.current.span.start;
+            let key = match self.current.kind.clone() {
+                TokenKind::Ident(name) => name,
+                TokenKind::String(value) => value,
+                _ => return Err(self.error("expecting an import attribute name")),
+            };
+            self.bump()?;
+            self.expect_punct(Punct::Colon)?;
+            let TokenKind::String(value) = self.current.kind.clone() else {
+                return Err(self.error("expecting an import attribute value string"));
+            };
+            self.bump()?;
+            attributes.push(ImportAttribute {
+                key,
+                value,
+                span: self.span_from(attr_start),
+            });
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(attributes)
+    }
+
+    fn parse_module_name(&mut self) -> Result<ModuleName> {
+        match self.current.kind.clone() {
+            TokenKind::String(value) => {
+                self.bump()?;
+                Ok(ModuleName::Str(value))
+            }
+            TokenKind::Ident(_) => Ok(ModuleName::Ident(self.expect_ident()?)),
+            TokenKind::Keyword(kw) => {
+                let span = self.current.span;
+                self.bump()?;
+                Ok(ModuleName::Ident(Ident {
+                    name: kw.as_str().to_string(),
+                    span,
+                }))
+            }
+            _ => Err(self.error("expecting an export name")),
+        }
+    }
+
+    fn parse_export_decl(&mut self) -> Result<Stmt> {
+        let start = self.current.span.start;
+        self.bump()?; // export
+        if self.at_punct(Punct::Star) {
+            self.bump()?;
+            let mut exported = None;
+            if self.eat_contextual("as")? {
+                exported = Some(self.parse_module_name()?);
+            }
+            if !self.eat_contextual("from")? {
+                return Err(self.error("expecting 'from' after 'export *'"));
+            }
+            let TokenKind::String(source) = self.current.kind.clone() else {
+                return Err(self.error("expecting a module name string"));
+            };
+            self.bump()?;
+            let attributes = self.parse_import_attributes()?;
+            self.semicolon()?;
+            let span = self.span_from(start);
+            return Ok(Stmt::new(
+                StmtKind::Export(Box::new(ExportDecl {
+                    kind: ExportKind::All {
+                        source,
+                        exported,
+                        attributes,
+                    },
+                    span,
+                })),
+                span,
+            ));
+        }
+        if self.eat_keyword(Keyword::Default)? {
+            let value = if self.at_keyword(Keyword::Function) {
+                let func = self.parse_function(FunctionForm::Expression, false)?;
+                Expr::new(ExprKind::Function(Box::new(func)), self.span_from(start))
+            } else if self.at_ident("async") {
+                let peek = self.peek()?;
+                if matches!(peek.kind, TokenKind::Keyword(Keyword::Function)) {
+                    self.bump()?;
+                    let func = self.parse_function(FunctionForm::Expression, true)?;
+                    Expr::new(ExprKind::Function(Box::new(func)), self.span_from(start))
+                } else {
+                    self.parse_assignment(true)?
+                }
+            } else if self.at_keyword(Keyword::Class) {
+                let class = self.parse_class(true)?;
+                Expr::new(ExprKind::Class(Box::new(class)), self.span_from(start))
+            } else {
+                let expr = self.parse_assignment(true)?;
+                self.semicolon()?;
+                expr
+            };
+            let span = self.span_from(start);
+            return Ok(Stmt::new(
+                StmtKind::Export(Box::new(ExportDecl {
+                    kind: ExportKind::Default(Box::new(value)),
+                    span,
+                })),
+                span,
+            ));
+        }
+        if self.at_keyword(Keyword::Var)
+            || self.at_keyword(Keyword::Const)
+            || self.at_keyword(Keyword::Function)
+            || self.at_keyword(Keyword::Class)
+            || (self.at_ident("let") && self.let_starts_declaration()?)
+        {
+            let decl = self.parse_statement_list_item()?;
+            let span = self.span_from(start);
+            return Ok(Stmt::new(
+                StmtKind::Export(Box::new(ExportDecl {
+                    kind: ExportKind::Declaration(Box::new(decl)),
+                    span,
+                })),
+                span,
+            ));
+        }
+        if self.at_ident("async") {
+            let peek = self.peek()?;
+            if matches!(peek.kind, TokenKind::Keyword(Keyword::Function)) && !peek.newline_before {
+                let decl = self.parse_statement_list_item()?;
+                let span = self.span_from(start);
+                return Ok(Stmt::new(
+                    StmtKind::Export(Box::new(ExportDecl {
+                        kind: ExportKind::Declaration(Box::new(decl)),
+                        span,
+                    })),
+                    span,
+                ));
+            }
+        }
+        if self.at_punct(Punct::LBrace) {
+            self.bump()?;
+            let mut specifiers = Vec::new();
+            let mut source = None;
+            while !self.at_punct(Punct::RBrace) {
+                let spec_start = self.current.span.start;
+                let local = self.parse_module_name()?;
+                let exported = if self.eat_contextual("as")? {
+                    self.parse_module_name()?
+                } else {
+                    local.clone()
+                };
+                if source.is_none() {
+                    if let ModuleName::Ident(id) = &local {
+                        self.pending_exports.push((id.name.clone(), id.span));
+                    }
+                }
+                specifiers.push(ExportSpecifier {
+                    local,
+                    exported,
+                    span: self.span_from(spec_start),
+                });
+                if !self.eat_punct(Punct::Comma)? {
+                    break;
+                }
+            }
+            self.expect_punct(Punct::RBrace)?;
+            let mut attributes = Vec::new();
+            if self.eat_contextual("from")? {
+                let TokenKind::String(value) = self.current.kind.clone() else {
+                    return Err(self.error("expecting a module name string"));
+                };
+                self.bump()?;
+                source = Some(value);
+                attributes = self.parse_import_attributes()?;
+            }
+            self.semicolon()?;
+            let span = self.span_from(start);
+            return Ok(Stmt::new(
+                StmtKind::Export(Box::new(ExportDecl {
+                    kind: ExportKind::Named {
+                        specifiers,
+                        source,
+                        attributes,
+                    },
+                    span,
+                })),
+                span,
+            ));
+        }
+        Err(self.unexpected())
+    }
+
+    // -- patterns from expressions ----------------------------------------
+
+    fn expr_to_pattern(&mut self, expr: Expr, kind: TargetKind) -> Result<Pattern> {
+        self.expr_to_pattern_inner(expr, kind, false)
+    }
+
+    fn expr_to_pattern_inner(
+        &mut self,
+        expr: Expr,
+        kind: TargetKind,
+        nested: bool,
+    ) -> Result<Pattern> {
+        let span = expr.span;
+        match expr.kind {
+            ExprKind::Ident(ident) => {
+                if kind == TargetKind::Binding {
+                    self.check_binding_name(&ident.name, ident.span)?;
+                } else {
+                    self.check_identifier(&ident.name, ident.span)?;
+                    if self.strict && (ident.name == "eval" || ident.name == "arguments") {
+                        return Err(self.error_at(
+                            format!("invalid assignment to '{}' in strict mode", ident.name),
+                            ident.span,
+                        ));
+                    }
+                }
+                Ok(Pattern::new(PatternKind::Ident(ident), span))
+            }
+            ExprKind::Paren(inner) => self.expr_to_pattern_inner(*inner, kind, nested),
+            ExprKind::Array { elements } => {
+                let mut out = Vec::new();
+                let mut rest = None;
+                let count = elements.len();
+                for (index, element) in elements.into_iter().enumerate() {
+                    match element {
+                        None => out.push(None),
+                        Some(ArrayElement::Expr(expr)) => {
+                            let pattern = self.expr_to_pattern_inner(*expr, kind, true)?;
+                            out.push(Some(PatternElement::Pattern(pattern)));
+                        }
+                        Some(ArrayElement::Spread(expr)) => {
+                            if index + 1 != count {
+                                return Err(self.error_at("rest element must be last", expr.span));
+                            }
+                            rest = Some(Box::new(self.expr_to_rest(*expr, kind)?));
+                        }
+                    }
+                }
+                Ok(Pattern::new(
+                    PatternKind::Array {
+                        elements: out,
+                        rest,
+                    },
+                    span,
+                ))
+            }
+            ExprKind::Object(properties) => {
+                self.cover_inits
+                    .retain(|cover| !span_contains(span, *cover));
+                let mut out = Vec::new();
+                let mut rest = None;
+                let count = properties.len();
+                for (index, property) in properties.into_iter().enumerate() {
+                    match property {
+                        ObjectProperty::Spread(expr) => {
+                            if index + 1 != count {
+                                return Err(self.error_at("rest element must be last", expr.span));
+                            }
+                            rest = Some(Box::new(self.expr_to_rest(*expr, kind)?));
+                        }
+                        ObjectProperty::Property {
+                            key,
+                            value,
+                            kind: prop_kind,
+                            shorthand,
+                            span,
+                        } => {
+                            if prop_kind != MethodKind::Method
+                                && !matches!(prop_kind, MethodKind::Constructor)
+                                && prop_kind != MethodKind::Get
+                                && prop_kind != MethodKind::Set
+                            {
+                                return Ok(Pattern::new(PatternKind::Ident(Ident::new("")), span));
+                            }
+                            let pattern = self.expr_to_pattern_inner(*value, kind, true)?;
+                            out.push(Some(PatternElement::Property {
+                                key,
+                                value: pattern,
+                                shorthand,
+                                span,
+                            }));
+                        }
+                    }
+                }
+                Ok(Pattern::new(
+                    PatternKind::Object {
+                        properties: out,
+                        rest,
+                    },
+                    span,
+                ))
+            }
+            ExprKind::Assign { op, target, value } if op.is_simple() => {
+                // `{a = 1}` inside a pattern: the target must itself be a pattern.
+                let target = match target.kind {
+                    PatternKind::Ident(ident) => {
+                        Pattern::new(PatternKind::Ident(ident), target.span)
+                    }
+                    other => {
+                        let expr = pattern_to_expr(Pattern::new(other, target.span), target.span);
+                        self.expr_to_pattern_inner(expr, kind, nested)?
+                    }
+                };
+                Ok(Pattern::new(
+                    PatternKind::Assign {
+                        target: Box::new(target),
+                        default: value,
+                    },
+                    span,
+                ))
+            }
+            ExprKind::Member {
+                object,
+                property,
+                optional,
+            } => {
+                if kind == TargetKind::Binding {
+                    return Err(self.error_at("invalid binding pattern", span));
+                }
+                if optional {
+                    return Err(self.error_at("invalid assignment target", span));
+                }
+                Ok(Pattern::new(
+                    PatternKind::Member(Box::new(MemberPattern {
+                        object,
+                        property,
+                        span,
+                    })),
+                    span,
+                ))
+            }
+            ExprKind::OptionalChain(_) => {
+                Err(self.error_at("invalid assignment left-hand side", span))
+            }
+            // QuickJS reports `a() = 1` at run time (it evaluates the callee
+            // first, then rejects the reference) but rejects the same thing
+            // inside a destructuring pattern at parse time. Every other
+            // non-assignable expression is rejected here.
+            other @ ExprKind::Call { .. } if !nested && kind == TargetKind::Assignment => Ok(
+                Pattern::new(PatternKind::Invalid(Box::new(Expr::new(other, span))), span),
+            ),
+            _ if kind == TargetKind::Binding => Err(self.error_at("invalid binding pattern", span)),
+            _ => Err(self.error_at("invalid destructuring target", span)),
+        }
+    }
+
+    fn expr_to_rest(&mut self, expr: Expr, kind: TargetKind) -> Result<RestElement> {
+        // Array and object literals wrap their spread elements, so the target is
+        // one level in.
+        let expr = match expr.kind {
+            ExprKind::Spread(inner) => *inner,
+            other => Expr::new(other, expr.span),
+        };
+        if kind == TargetKind::Binding {
+            return Ok(RestElement::Pattern(
+                self.expr_to_pattern_inner(expr, kind, true)?,
+            ));
+        }
+        match &expr.kind {
+            ExprKind::Member { optional, .. } => {
+                if *optional {
+                    return Err(self.error_at("invalid assignment target", expr.span));
+                }
+                match self.expr_to_pattern_inner(expr, kind, true)?.kind {
+                    PatternKind::Member(member) => Ok(RestElement::Member(member)),
+                    _ => unreachable!("member expressions convert to member patterns"),
+                }
+            }
+            _ => Ok(RestElement::Pattern(
+                self.expr_to_pattern_inner(expr, kind, true)?,
+            )),
+        }
+    }
+
+    // -- expressions -------------------------------------------------------
+
+    /// `Expression` (comma separated).
+    fn parse_expression(&mut self, allow_in: bool) -> Result<Expr> {
+        self.enter()?;
+        let result = self.parse_expression_unguarded(allow_in);
+        self.leave();
+        result
+    }
+
+    fn parse_expression_unguarded(&mut self, allow_in: bool) -> Result<Expr> {
+        let start = self.current.span.start;
+        let first = self.parse_assignment(allow_in)?;
+        if !self.at_punct(Punct::Comma) {
+            return Ok(first);
+        }
+        let mut items = vec![first];
+        while self.eat_punct(Punct::Comma)? {
+            items.push(self.parse_assignment(allow_in)?);
+        }
+        Ok(Expr::new(ExprKind::Sequence(items), self.span_from(start)))
+    }
+
+    fn parse_assignment(&mut self, allow_in: bool) -> Result<Expr> {
+        let start = self.current.span.start;
+
+        // `yield` in a generator.
+        if self.ctx.in_generator && self.at_ident("yield") {
+            return self.parse_yield(allow_in);
+        }
+
+        let lhs = match self.try_parse_arrow(allow_in)? {
+            Some(arrow) => return Ok(arrow),
+            None => self.parse_conditional(allow_in)?,
+        };
+
+        if let Some(op) = self.current.kind.as_punct().and_then(AssignOp::from_punct) {
+            let target = self.expr_to_pattern(lhs, TargetKind::Assignment)?;
+            self.bump()?;
+            let value = self.parse_assignment(allow_in)?;
+            return Ok(Expr::new(
+                ExprKind::Assign {
+                    op,
+                    target: Box::new(target),
+                    value: Box::new(value),
+                },
+                self.span_from(start),
+            ));
+        }
+        let _ = start;
+        Ok(lhs)
+    }
+
+    fn parse_yield(&mut self, allow_in: bool) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.bump()?; // yield
+        let delegate = if self.at_punct(Punct::Star) && !self.current.newline_before {
+            self.bump()?;
+            true
+        } else {
+            false
+        };
+        let argument = if delegate {
+            Some(Box::new(self.parse_assignment(allow_in)?))
+        } else if self.current.newline_before
+            || self.at_punct(Punct::RParen)
+            || self.at_punct(Punct::RBracket)
+            || self.at_punct(Punct::RBrace)
+            || self.at_punct(Punct::Comma)
+            || self.at_punct(Punct::Semicolon)
+            || self.at_punct(Punct::Colon)
+            || self.current.is_eof()
+        {
+            None
+        } else {
+            Some(Box::new(self.parse_assignment(allow_in)?))
+        };
+        Ok(Expr::new(
+            ExprKind::Yield { argument, delegate },
+            self.span_from(start),
+        ))
+    }
+
+    fn try_parse_arrow(&mut self, allow_in: bool) -> Result<Option<Expr>> {
+        let starts_paren = self.at_punct(Punct::LParen);
+        let starts_ident = matches!(self.current.kind, TokenKind::Ident(_));
+        if !starts_paren && !starts_ident {
+            return Ok(None);
+        }
+        // `(` could be a parenthesised expression instead of a parameter list.
+        // Scanning ahead for the matching `)` and looking for `=>` avoids the
+        // speculative parse (and its stack cost) in the common case.
+        if starts_paren && !self.arrow_follows_paren()? {
+            return Ok(None);
+        }
+        let snapshot = self.snapshot();
+        let head = match self.parse_arrow_head() {
+            Ok(head) => head,
+            Err(_) => {
+                self.restore(snapshot);
+                return Ok(None);
+            }
+        };
+        let Some(head) = head else {
+            self.restore(snapshot);
+            return Ok(None);
+        };
+        // Committed: `=>` has been consumed, so errors from here on are real.
+        // Arrow parameter lists may never repeat a name, in any mode.
+        {
+            let mut seen: Vec<String> = Vec::new();
+            for param in &head.params {
+                let mut names = Vec::new();
+                param.bound_names(&mut names);
+                for name in names {
+                    if seen.contains(&name.name) {
+                        return Err(self.error_at(
+                            format!(
+                                "duplicate argument names not allowed in this context ('{}')",
+                                name.name
+                            ),
+                            name.span,
+                        ));
+                    }
+                    seen.push(name.name);
+                }
+            }
+        }
+        let saved_ctx = self.ctx;
+        let saved_loop = self.loop_depth;
+        let saved_switch = self.switch_depth;
+        let saved_labels = std::mem::take(&mut self.labels);
+        let saved_top = self.top_level;
+        self.ctx = FnCtx {
+            in_function: true,
+            in_generator: false,
+            in_async: head.is_async,
+            in_method: saved_ctx.in_method,
+            in_derived_constructor: saved_ctx.in_derived_constructor,
+        };
+        self.loop_depth = 0;
+        self.switch_depth = 0;
+        self.top_level = false;
+        let body_start = self.current.span.start;
+        let body = if self.at_punct(Punct::LBrace) {
+            let block = self.parse_arrow_block(&head.params)?;
+            (block, self.prev_end)
+        } else {
+            let expr = self.parse_assignment(allow_in)?;
+            let end = expr.span.end;
+            (FunctionBody::Expr(Box::new(expr)), end)
+        };
+        self.ctx = saved_ctx;
+        self.loop_depth = saved_loop;
+        self.switch_depth = saved_switch;
+        self.labels = saved_labels;
+        self.top_level = saved_top;
+        let _ = body_start;
+        let (body, end) = body;
+        let span = Span::new(head.span.start, end);
+        Ok(Some(Expr::new(
+            ExprKind::Arrow(Box::new(Function {
+                name: None,
+                params: head.params,
+                body,
+                is_async: head.is_async,
+                is_generator: false,
+                is_arrow: true,
+                span,
+                params_span: head.params_span,
+            })),
+            span,
+        )))
+    }
+
+    /// Parse the `{ … }` body of an arrow, honouring a `"use strict"` prologue.
+    fn parse_arrow_block(&mut self, params: &[Pattern]) -> Result<FunctionBody> {
+        self.expect_punct(Punct::LBrace)?;
+        self.push_scope(Scope::function(simple_parameter_names(params)));
+        let result = (|| -> Result<Vec<Stmt>> {
+            let mut body = Vec::new();
+            let mut prologue = true;
+            while !self.at_punct(Punct::RBrace) {
+                if self.current.is_eof() {
+                    return Err(self.unexpected());
+                }
+                let stmt = self.parse_statement_list_item()?;
+                if prologue {
+                    match self.directive_value(&stmt) {
+                        Some(directive) if directive == "use strict" => self.enter_strict()?,
+                        Some(_) => {}
+                        None => prologue = false,
+                    }
+                }
+                body.push(stmt);
+            }
+            Ok(body)
+        })();
+        self.pop_scope();
+        let body = result?;
+        self.bump()?;
+        Ok(FunctionBody::Block(body))
+    }
+
+    /// Whether the parenthesis at the current token is the parameter list of an
+    /// arrow function, i.e. the matching `)` is followed by `=>`.
+    ///
+    /// This is a plain token walk with a bracket counter: no recursion, so it
+    /// costs a clone of the lexer and nothing else.
+    fn arrow_follows_paren(&self) -> Result<bool> {
+        let mut lexer = self.lexer.clone();
+        // The opening `(` was already consumed by the caller.
+        let mut depth = 1usize;
+        loop {
+            let token = lexer.next_token()?;
+            match token.kind {
+                TokenKind::Eof => return Ok(false),
+                TokenKind::Punct(Punct::LParen)
+                | TokenKind::Punct(Punct::LBracket)
+                | TokenKind::Punct(Punct::LBrace) => depth += 1,
+                TokenKind::Punct(Punct::RParen)
+                | TokenKind::Punct(Punct::RBracket)
+                | TokenKind::Punct(Punct::RBrace) => {
+                    if depth == 0 {
+                        // Unbalanced input: the caller reports it.
+                        return Ok(false);
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        // The current token is the opening `(`, so the matching
+                        // `)` is the token that brought us back to zero.
+                        let next = lexer.next_token()?;
+                        return Ok(matches!(next.kind, TokenKind::Punct(Punct::Arrow))
+                            && !next.newline_before);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Speculatively parse an arrow head, consuming `=>` on success.
+    fn parse_arrow_head(&mut self) -> Result<Option<ArrowHead>> {
+        let start = self.current.span.start;
+        let mut is_async = false;
+        if self.at_ident("async") {
+            let peek = self.peek()?;
+            if peek.newline_before {
+                return Ok(None);
+            }
+            let plausible =
+                matches!(peek.kind, TokenKind::Punct(Punct::LParen)) || peek.kind.is_identifier();
+            if !plausible {
+                return Ok(None);
+            }
+            self.bump()?;
+            is_async = true;
+        }
+        let params_start = self.current.span.start;
+        let params = if self.at_punct(Punct::LParen) {
+            self.parse_formal_parameters()?
+        } else if matches!(self.current.kind, TokenKind::Ident(_)) {
+            let ident = self.expect_ident()?;
+            vec![Pattern::new(
+                PatternKind::Ident(ident),
+                self.span_from(params_start),
+            )]
+        } else {
+            return Ok(None);
+        };
+        let params_span = self.span_from(params_start);
+        if !self.at_punct(Punct::Arrow) || self.current.newline_before {
+            return Ok(None);
+        }
+        self.bump()?; // =>
+        Ok(Some(ArrowHead {
+            params,
+            is_async,
+            span: self.span_from(start),
+            params_span,
+        }))
+    }
+
+    fn parse_conditional(&mut self, allow_in: bool) -> Result<Expr> {
+        let start = self.current.span.start;
+        let test = self.parse_binary(allow_in, 0)?;
+        if !self.at_punct(Punct::Question) {
+            return Ok(test);
+        }
+        self.bump()?;
+        let consequent = self.parse_assignment(true)?;
+        self.expect_punct(Punct::Colon)?;
+        let alternate = self.parse_assignment(allow_in)?;
+        Ok(Expr::new(
+            ExprKind::Conditional {
+                test: Box::new(test),
+                cons: Box::new(consequent),
+                alt: Box::new(alternate),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_binary(&mut self, allow_in: bool, min_prec: u8) -> Result<Expr> {
+        let start = self.current.span.start;
+        let mut lhs = self.parse_unary()?;
+        while let Some((prec, op)) = binary_operator(&self.current.kind, allow_in) {
+            if prec < min_prec {
+                break;
+            }
+            self.bump()?;
+            let next_min = if op.is_right_associative() {
+                prec
+            } else {
+                prec + 1
+            };
+            let rhs = self.parse_binary(allow_in, next_min)?;
+            lhs = build_binary(op, lhs, rhs, self.span_from(start))?;
+        }
+        Ok(lhs)
+    }
+
+    /// Unary and postfix operators. `in` is handled by the binary layer, so no
+    /// `allow_in` flag is needed here.
+    fn parse_unary(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        // Unary operators.
+        let unary = match &self.current.kind {
+            TokenKind::Keyword(Keyword::Delete) => Some(UnaryOp::Delete),
+            TokenKind::Keyword(Keyword::Void) => Some(UnaryOp::Void),
+            TokenKind::Keyword(Keyword::Typeof) => Some(UnaryOp::Typeof),
+            TokenKind::Punct(Punct::Plus) => Some(UnaryOp::Plus),
+            TokenKind::Punct(Punct::Minus) => Some(UnaryOp::Minus),
+            TokenKind::Punct(Punct::Bang) => Some(UnaryOp::Not),
+            TokenKind::Punct(Punct::Tilde) => Some(UnaryOp::BitNot),
+            _ => None,
+        };
+        if let Some(op) = unary {
+            self.bump()?;
+            let argument = self.parse_unary()?;
+            if op == UnaryOp::Delete && self.strict {
+                if let ExprKind::Ident(ident) = &argument.unparen().kind {
+                    return Err(
+                        self.error_at("cannot delete a variable in strict mode", ident.span)
+                    );
+                }
+            }
+            let expr = Expr::new(
+                ExprKind::Unary {
+                    op,
+                    argument: Box::new(argument),
+                },
+                self.span_from(start),
+            );
+            if self.at_punct(Punct::StarStar) {
+                return Err(self.error(
+                    "unexpected token '**': a unary expression may not be the base of '**'",
+                ));
+            }
+            return Ok(expr);
+        }
+        // Prefix increment/decrement.
+        if self.at_punct(Punct::PlusPlus) || self.at_punct(Punct::MinusMinus) {
+            let op = if self.at_punct(Punct::PlusPlus) {
+                UpdateOp::Increment
+            } else {
+                UpdateOp::Decrement
+            };
+            self.bump()?;
+            let argument = self.parse_unary()?;
+            self.check_simple_target(&argument)?;
+            return Ok(Expr::new(
+                ExprKind::Update {
+                    op,
+                    argument: Box::new(argument),
+                    prefix: true,
+                },
+                self.span_from(start),
+            ));
+        }
+        // `await` in async contexts (and at a module's top level).
+        if self.at_ident("await") && (self.ctx.in_async || (self.module && self.top_level)) {
+            let peek = self.peek()?;
+            let starts_expression = !matches!(
+                peek.kind,
+                TokenKind::Punct(Punct::RParen)
+                    | TokenKind::Punct(Punct::RBracket)
+                    | TokenKind::Punct(Punct::RBrace)
+                    | TokenKind::Punct(Punct::Comma)
+                    | TokenKind::Punct(Punct::Semicolon)
+                    | TokenKind::Punct(Punct::Colon)
+                    | TokenKind::Punct(Punct::Eq)
+                    | TokenKind::Punct(Punct::Arrow)
+                    | TokenKind::Punct(Punct::Dot)
+                    | TokenKind::Punct(Punct::QuestionDot)
+                    | TokenKind::Punct(Punct::LBracket)
+            ) && !peek.newline_before;
+            if starts_expression {
+                self.bump()?;
+                let argument = self.parse_unary()?;
+                return Ok(Expr::new(
+                    ExprKind::Await(Box::new(argument)),
+                    self.span_from(start),
+                ));
+            }
+        }
+        let expr = self.parse_lhs_expression()?;
+        // Postfix increment/decrement (no line break allowed before the operator).
+        let result = if (self.at_punct(Punct::PlusPlus) || self.at_punct(Punct::MinusMinus))
+            && !self.current.newline_before
+        {
+            let op = if self.at_punct(Punct::PlusPlus) {
+                UpdateOp::Increment
+            } else {
+                UpdateOp::Decrement
+            };
+            self.check_simple_target(&expr)?;
+            self.bump()?;
+            Expr::new(
+                ExprKind::Update {
+                    op,
+                    argument: Box::new(expr),
+                    prefix: false,
+                },
+                self.span_from(start),
+            )
+        } else {
+            expr
+        };
+        Ok(result)
+    }
+
+    fn check_simple_target(&self, expr: &Expr) -> Result<()> {
+        match &expr.unparen().kind {
+            ExprKind::Ident(_) => Ok(()),
+            ExprKind::Member {
+                optional: false, ..
+            } => Ok(()),
+            _ => Err(self.error_at("invalid assignment left-hand side", expr.span)),
+        }
+    }
+
+    fn parse_lhs_expression(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        let mut expr = if self.at_keyword(Keyword::New) {
+            self.parse_new_expression()?
+        } else {
+            self.parse_primary()?
+        };
+        let mut saw_optional = false;
+        loop {
+            match self.current.kind.clone() {
+                TokenKind::Punct(Punct::Dot) => {
+                    self.bump()?;
+                    let property = self.parse_member_property()?;
+                    expr = Expr::new(
+                        ExprKind::Member {
+                            object: Box::new(expr),
+                            property,
+                            optional: false,
+                        },
+                        self.span_from(start),
+                    );
+                }
+                TokenKind::Punct(Punct::QuestionDot) => {
+                    saw_optional = true;
+                    self.bump()?;
+                    if self.at_punct(Punct::LParen) {
+                        let arguments = self.parse_arguments()?;
+                        expr = Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(expr),
+                                arguments,
+                                optional: true,
+                            },
+                            self.span_from(start),
+                        );
+                    } else if self.at_punct(Punct::LBracket) {
+                        self.bump()?;
+                        let index = self.parse_expression(true)?;
+                        self.expect_punct(Punct::RBracket)?;
+                        expr = Expr::new(
+                            ExprKind::Member {
+                                object: Box::new(expr),
+                                property: MemberProp::Computed(Box::new(index)),
+                                optional: true,
+                            },
+                            self.span_from(start),
+                        );
+                    } else {
+                        let property = self.parse_member_property()?;
+                        expr = Expr::new(
+                            ExprKind::Member {
+                                object: Box::new(expr),
+                                property,
+                                optional: true,
+                            },
+                            self.span_from(start),
+                        );
+                    }
+                }
+                TokenKind::Punct(Punct::LBracket) => {
+                    self.bump()?;
+                    let index = self.parse_expression(true)?;
+                    self.expect_punct(Punct::RBracket)?;
+                    expr = Expr::new(
+                        ExprKind::Member {
+                            object: Box::new(expr),
+                            property: MemberProp::Computed(Box::new(index)),
+                            optional: false,
+                        },
+                        self.span_from(start),
+                    );
+                }
+                TokenKind::Punct(Punct::LParen) => {
+                    let arguments = self.parse_arguments()?;
+                    expr = Expr::new(
+                        ExprKind::Call {
+                            callee: Box::new(expr),
+                            arguments,
+                            optional: false,
+                        },
+                        self.span_from(start),
+                    );
+                }
+                TokenKind::Template(_) => {
+                    if saw_optional || matches!(expr.unparen().kind, ExprKind::OptionalChain(_)) {
+                        return Err(
+                            self.error("tagged template cannot be used in an optional chain")
+                        );
+                    }
+                    let quasi = self.parse_template()?;
+                    expr = Expr::new(
+                        ExprKind::TaggedTemplate {
+                            tag: Box::new(expr),
+                            quasi: Box::new(quasi),
+                        },
+                        self.span_from(start),
+                    );
+                }
+                _ => break,
+            }
+        }
+        if saw_optional {
+            expr = Expr::new(
+                ExprKind::OptionalChain(Box::new(expr)),
+                self.span_from(start),
+            );
+        }
+        Ok(expr)
+    }
+
+    fn parse_member_property(&mut self) -> Result<MemberProp> {
+        if self.at_punct(Punct::Hash) {
+            self.bump()?;
+            let ident = self.expect_ident()?;
+            if !self.private.iter().any(|env| env.contains(&ident.name)) {
+                return Err(self.error_at(
+                    format!(
+                        "private field '#{}' must be declared in an enclosing class",
+                        ident.name
+                    ),
+                    ident.span,
+                ));
+            }
+            return Ok(MemberProp::Private(ident));
+        }
+        match self.current.kind.clone() {
+            TokenKind::Ident(name) => {
+                let span = self.current.span;
+                self.bump()?;
+                Ok(MemberProp::Ident(Ident { name, span }))
+            }
+            TokenKind::Keyword(kw) => {
+                let span = self.current.span;
+                self.bump()?;
+                Ok(MemberProp::Ident(Ident {
+                    name: kw.as_str().to_string(),
+                    span,
+                }))
+            }
+            _ => Err(self.error("expecting a property name")),
+        }
+    }
+
+    fn parse_new_expression(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.bump()?; // new
+        if self.at_punct(Punct::Dot) {
+            self.bump()?;
+            if !self.at_ident("target") {
+                return Err(self.error("expecting 'target' after 'new.'"));
+            }
+            if !self.ctx.in_function {
+                return Err(self.error("invalid use of 'new.target' outside of a function"));
+            }
+            self.bump()?;
+            return Ok(Expr::new(ExprKind::NewTarget, self.span_from(start)));
+        }
+        let mut callee = if self.at_keyword(Keyword::New) {
+            self.parse_new_expression()?
+        } else {
+            self.parse_primary()?
+        };
+        // Member accesses bind tighter than `new`, calls do not.
+        loop {
+            match self.current.kind.clone() {
+                TokenKind::Punct(Punct::Dot) => {
+                    self.bump()?;
+                    let property = self.parse_member_property()?;
+                    callee = Expr::new(
+                        ExprKind::Member {
+                            object: Box::new(callee),
+                            property,
+                            optional: false,
+                        },
+                        self.span_from(start),
+                    );
+                }
+                TokenKind::Punct(Punct::LBracket) => {
+                    self.bump()?;
+                    let index = self.parse_expression(true)?;
+                    self.expect_punct(Punct::RBracket)?;
+                    callee = Expr::new(
+                        ExprKind::Member {
+                            object: Box::new(callee),
+                            property: MemberProp::Computed(Box::new(index)),
+                            optional: false,
+                        },
+                        self.span_from(start),
+                    );
+                }
+                TokenKind::Punct(Punct::QuestionDot) => {
+                    return Err(self.error("new keyword cannot be used with an optional chain"));
+                }
+                _ => break,
+            }
+        }
+        if matches!(callee.unparen().kind, ExprKind::OptionalChain(_)) {
+            return Err(self.error_at("cannot use 'new' with an optional chain", callee.span));
+        }
+        let arguments = if self.at_punct(Punct::LParen) {
+            Some(self.parse_arguments()?)
+        } else {
+            None
+        };
+        Ok(Expr::new(
+            ExprKind::New {
+                callee: Box::new(callee),
+                arguments,
+            },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_arguments(&mut self) -> Result<Vec<Expr>> {
+        self.expect_punct(Punct::LParen)?;
+        let mut arguments = Vec::new();
+        while !self.at_punct(Punct::RParen) {
+            if self.at_punct(Punct::Ellipsis) {
+                let start = self.current.span.start;
+                self.bump()?;
+                let argument = self.parse_assignment(true)?;
+                arguments.push(Expr::new(
+                    ExprKind::Spread(Box::new(argument)),
+                    self.span_from(start),
+                ));
+            } else {
+                arguments.push(self.parse_assignment(true)?);
+            }
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RParen)?;
+        Ok(arguments)
+    }
+
+    /// Primary expressions.
+    ///
+    /// The rarely used forms are dispatched to [`Parser::parse_primary_complex`]
+    /// so that this function — which sits on every nesting level — keeps a small
+    /// stack frame. That directly raises how deeply a program may nest before
+    /// the stack limit is hit (debug builds get ~4x more depth out of it).
+    fn parse_primary(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        match self.current.kind.clone() {
+            TokenKind::Number(NumberLiteral::Int(value)) => {
+                self.bump()?;
+                Ok(Expr::new(
+                    ExprKind::Number(value as f64),
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Number(NumberLiteral::Float(value)) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Number(value), self.span_from(start)))
+            }
+            TokenKind::String(value) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::String(value), self.span_from(start)))
+            }
+            TokenKind::Ident(name) if name == "async" => {
+                let peek = self.peek()?;
+                if matches!(peek.kind, TokenKind::Keyword(Keyword::Function))
+                    && !peek.newline_before
+                {
+                    self.bump()?; // async
+                    let func = self.parse_function(FunctionForm::Expression, true)?;
+                    return Ok(Expr::new(
+                        ExprKind::Function(Box::new(func)),
+                        self.span_from(start),
+                    ));
+                }
+                let span = self.current.span;
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Ident(Ident { name, span }), span))
+            }
+            TokenKind::Ident(name) => {
+                let span = self.current.span;
+                self.check_identifier(&name, span)?;
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Ident(Ident { name, span }), span))
+            }
+            TokenKind::Keyword(Keyword::This) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::This, self.span_from(start)))
+            }
+            TokenKind::Keyword(Keyword::Null) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Null, self.span_from(start)))
+            }
+            TokenKind::Keyword(Keyword::True) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Bool(true), self.span_from(start)))
+            }
+            TokenKind::Keyword(Keyword::False) => {
+                self.bump()?;
+                Ok(Expr::new(ExprKind::Bool(false), self.span_from(start)))
+            }
+            TokenKind::Punct(Punct::LParen) => {
+                self.bump()?;
+                let inner = self.parse_expression(true)?;
+                self.expect_punct(Punct::RParen)?;
+                Ok(Expr::new(
+                    ExprKind::Paren(Box::new(inner)),
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Punct(Punct::Slash) | TokenKind::Punct(Punct::SlashEq) => {
+                self.parse_regex_literal(start)
+            }
+            _ => self.parse_primary_complex(start),
+        }
+    }
+
+    /// The primary expressions that need a lot of code: literals with structure,
+    /// functions, classes, `import`, `super`, `#x in y`.
+    #[inline(never)]
+    fn parse_primary_complex(&mut self, start: Position) -> Result<Expr> {
+        match self.current.kind.clone() {
+            TokenKind::BigInt(literal) => {
+                self.bump()?;
+                Ok(Expr::new(
+                    ExprKind::BigInt {
+                        digits: literal.digits,
+                        radix: literal.radix,
+                    },
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Template(_) => {
+                let template = self.parse_template()?;
+                Ok(Expr::new(
+                    ExprKind::Template(Box::new(template)),
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Keyword(Keyword::Function) => {
+                let func = self.parse_function(FunctionForm::Expression, false)?;
+                Ok(Expr::new(
+                    ExprKind::Function(Box::new(func)),
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Keyword(Keyword::Class) => {
+                let class = self.parse_class(true)?;
+                Ok(Expr::new(
+                    ExprKind::Class(Box::new(class)),
+                    self.span_from(start),
+                ))
+            }
+            TokenKind::Keyword(Keyword::Import) => self.parse_import_expression(),
+            TokenKind::Keyword(Keyword::Super) => self.parse_super(),
+            TokenKind::Punct(Punct::LBracket) => self.parse_array_literal(),
+            TokenKind::Punct(Punct::LBrace) => self.parse_object_literal(),
+            TokenKind::Punct(Punct::Hash) => self.parse_private_in(start),
+            _ => Err(self.unexpected()),
+        }
+    }
+
+    /// `super` or `super(...)`.
+    #[inline(never)]
+    fn parse_super(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.bump()?;
+        if self.at_punct(Punct::LParen) {
+            if !self.ctx.in_derived_constructor {
+                return Err(self.error_at(
+                    "invalid use of 'super' in a non-derived constructor",
+                    self.span_from(start),
+                ));
+            }
+            let arguments = self.parse_arguments()?;
+            return Ok(Expr::new(
+                ExprKind::SuperCall(arguments),
+                self.span_from(start),
+            ));
+        }
+        if !self.ctx.in_method {
+            return Err(self.error_at(
+                "invalid use of 'super' outside of a method",
+                self.span_from(start),
+            ));
+        }
+        Ok(Expr::new(ExprKind::SuperProp, self.span_from(start)))
+    }
+
+    /// `#name in object`.
+    #[inline(never)]
+    fn parse_private_in(&mut self, start: Position) -> Result<Expr> {
+        self.bump()?;
+        let ident = self.expect_ident()?;
+        if !self.private.iter().any(|env| env.contains(&ident.name)) {
+            return Err(self.error_at(
+                format!(
+                    "private field '#{}' must be declared in an enclosing class",
+                    ident.name
+                ),
+                ident.span,
+            ));
+        }
+        if !self.at_keyword(Keyword::In) {
+            return Err(self.error("expecting 'in' after a private name"));
+        }
+        self.bump()?;
+        let object = self.parse_unary()?;
+        Ok(Expr::new(
+            ExprKind::PrivateIn {
+                name: ident,
+                object: Box::new(object),
+            },
+            self.span_from(start),
+        ))
+    }
+
+    /// A regular expression literal: the lexer produced `/` (or `/=`), so the
+    /// token has to be re-scanned from that position.
+    #[inline(never)]
+    fn parse_regex_literal(&mut self, start: Position) -> Result<Expr> {
+        let token = self.lexer.re_scan_regex(self.current.span.start)?;
+        self.current = token;
+        let TokenKind::RegExp { pattern, flags } = self.current.kind.clone() else {
+            unreachable!("re_scan_regex returns a RegExp token")
+        };
+        self.bump()?;
+        Ok(Expr::new(
+            ExprKind::RegExp { pattern, flags },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_import_expression(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.bump()?; // import
+        if self.at_punct(Punct::Dot) {
+            if !self.module {
+                return Err(self.error_at(
+                    "invalid use of 'import.meta' outside of a module",
+                    self.span_from(start),
+                ));
+            }
+            self.bump()?;
+            if !self.at_ident("meta") {
+                return Err(self.error("expecting 'meta' after 'import.'"));
+            }
+            self.bump()?;
+            return Ok(Expr::new(ExprKind::ImportMeta, self.span_from(start)));
+        }
+        if self.at_punct(Punct::LParen) {
+            self.bump()?;
+            let specifier = self.parse_assignment(true)?;
+            if self.at_punct(Punct::Comma) {
+                return Err(self.error("import() takes exactly one argument"));
+            }
+            self.expect_punct(Punct::RParen)?;
+            return Ok(Expr::new(
+                ExprKind::ImportCall(Box::new(specifier)),
+                self.span_from(start),
+            ));
+        }
+        Err(self.unexpected())
+    }
+
+    fn parse_array_literal(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.expect_punct(Punct::LBracket)?;
+        let mut elements = Vec::new();
+        while !self.at_punct(Punct::RBracket) {
+            if self.at_punct(Punct::Comma) {
+                self.bump()?;
+                elements.push(None);
+                continue;
+            }
+            if self.at_punct(Punct::Ellipsis) {
+                let spread_start = self.current.span.start;
+                self.bump()?;
+                let argument = self.parse_assignment(true)?;
+                elements.push(Some(ArrayElement::Spread(Box::new(Expr::new(
+                    ExprKind::Spread(Box::new(argument)),
+                    self.span_from(spread_start),
+                )))));
+            } else {
+                let expr = self.parse_assignment(true)?;
+                elements.push(Some(ArrayElement::Expr(Box::new(expr))));
+            }
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBracket)?;
+        Ok(Expr::new(
+            ExprKind::Array { elements },
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_object_literal(&mut self) -> Result<Expr> {
+        let start = self.current.span.start;
+        self.expect_punct(Punct::LBrace)?;
+        let mut properties: Vec<ObjectProperty> = Vec::new();
+        let mut proto_count = 0;
+        while !self.at_punct(Punct::RBrace) {
+            let property_start = self.current.span.start;
+            if self.at_punct(Punct::Ellipsis) {
+                self.bump()?;
+                let argument = self.parse_assignment(true)?;
+                properties.push(ObjectProperty::Spread(Box::new(argument)));
+            } else {
+                let mut is_async = false;
+                let mut is_generator = false;
+                let mut accessor: Option<MethodKind> = None;
+                if self.at_ident("async") {
+                    let peek = self.peek()?;
+                    let is_modifier = !matches!(
+                        peek.kind,
+                        TokenKind::Punct(Punct::LParen)
+                            | TokenKind::Punct(Punct::Colon)
+                            | TokenKind::Punct(Punct::Comma)
+                            | TokenKind::Punct(Punct::RBrace)
+                            | TokenKind::Punct(Punct::Eq)
+                    ) && !peek.newline_before;
+                    if is_modifier {
+                        self.bump()?;
+                        is_async = true;
+                    }
+                }
+                if self.at_punct(Punct::Star) {
+                    self.bump()?;
+                    is_generator = true;
+                }
+                if accessor.is_none() && (self.at_ident("get") || self.at_ident("set")) {
+                    let is_get = self.at_ident("get");
+                    let peek = self.peek()?;
+                    if is_property_key_start(&peek.kind) {
+                        self.bump()?;
+                        accessor = Some(if is_get {
+                            MethodKind::Get
+                        } else {
+                            MethodKind::Set
+                        });
+                    }
+                }
+                let key = self.parse_property_key()?;
+                let is_computed = matches!(key, PropName::Computed(_));
+                if self.at_punct(Punct::LParen) {
+                    let saved = self.ctx;
+                    self.ctx = FnCtx {
+                        in_function: true,
+                        in_generator: is_generator,
+                        in_async: is_async,
+                        in_method: true,
+                        in_derived_constructor: false,
+                    };
+                    let saved_top = self.top_level;
+                    self.top_level = false;
+                    let func_result = (|| -> Result<Function> {
+                        let params = self.parse_formal_parameters()?;
+                        let (params, params_span, body) =
+                            self.parse_function_body(params, is_generator, is_async)?;
+                        Ok(Function {
+                            name: None,
+                            params,
+                            body,
+                            is_async,
+                            is_generator,
+                            is_arrow: false,
+                            span: self.span_from(property_start),
+                            params_span,
+                        })
+                    })();
+                    self.ctx = saved;
+                    self.top_level = saved_top;
+                    let func = func_result?;
+                    let kind = match accessor {
+                        Some(kind) => {
+                            if is_generator || is_async {
+                                return Err(self.error_at(
+                                    "accessors may not be generators or async",
+                                    func.span,
+                                ));
+                            }
+                            if kind == MethodKind::Get && !func.params.is_empty() {
+                                return Err(
+                                    self.error_at("getter must have no arguments", func.span)
+                                );
+                            }
+                            if kind == MethodKind::Set && func.params.len() != 1 {
+                                return Err(self
+                                    .error_at("setter must have exactly one argument", func.span));
+                            }
+                            kind
+                        }
+                        None => MethodKind::Method,
+                    };
+                    let span = self.span_from(property_start);
+                    properties.push(ObjectProperty::Property {
+                        key,
+                        value: Box::new(Expr::new(ExprKind::Function(Box::new(func)), span)),
+                        kind,
+                        shorthand: false,
+                        span,
+                    });
+                } else if self.eat_punct(Punct::Colon)? {
+                    let value = self.parse_assignment(true)?;
+                    if !is_computed {
+                        if let Some(PropKeyRef::Str("__proto__")) = key.static_name() {
+                            proto_count += 1;
+                            if proto_count > 1 {
+                                return Err(self.error_at(
+                                    "duplicate __proto__ fields are not allowed in object literals",
+                                    self.span_from(property_start),
+                                ));
+                            }
+                        }
+                    }
+                    properties.push(ObjectProperty::Property {
+                        key,
+                        value: Box::new(value),
+                        kind: MethodKind::Method,
+                        shorthand: false,
+                        span: self.span_from(property_start),
+                    });
+                } else {
+                    // Shorthand `{a}` / `{a = 1}` (the latter only inside a
+                    // destructuring pattern).
+                    let PropName::Literal(PropKey::Str(name)) = &key else {
+                        return Err(self.error("expecting ':' after a property name"));
+                    };
+                    let ident_span = self.span_from(property_start);
+                    let ident = Ident {
+                        name: name.clone(),
+                        span: ident_span,
+                    };
+                    self.check_identifier(&ident.name, ident.span)?;
+                    let mut value = Expr::new(ExprKind::Ident(ident.clone()), ident_span);
+                    if self.at_punct(Punct::Eq) {
+                        // CoverInitializedName: only legal once the object turns
+                        // out to be a destructuring pattern.
+                        self.cover_inits.push(ident_span);
+                        self.bump()?;
+                        let default = self.parse_assignment(true)?;
+                        let target = Pattern::new(PatternKind::Ident(ident), ident_span);
+                        value = Expr::new(
+                            ExprKind::Assign {
+                                op: AssignOp::Assign,
+                                target: Box::new(target),
+                                value: Box::new(default),
+                            },
+                            ident_span,
+                        );
+                    }
+                    properties.push(ObjectProperty::Property {
+                        key,
+                        value: Box::new(value),
+                        kind: MethodKind::Method,
+                        shorthand: true,
+                        span: ident_span,
+                    });
+                }
+            }
+            if !self.eat_punct(Punct::Comma)? {
+                break;
+            }
+        }
+        self.expect_punct(Punct::RBrace)?;
+        Ok(Expr::new(
+            ExprKind::Object(properties),
+            self.span_from(start),
+        ))
+    }
+
+    fn parse_template(&mut self) -> Result<TemplateLiteral> {
+        let mut quasis = Vec::new();
+        let mut expressions = Vec::new();
+        loop {
+            let (cooked, raw, kind) = match self.current.kind.clone() {
+                TokenKind::Template(chunk) => (chunk.cooked, chunk.raw, chunk.kind),
+                _ => return Err(self.error("expecting a template literal")),
+            };
+            let tail = matches!(kind, TemplateKind::NoSubstitution | TemplateKind::Tail);
+            quasis.push(TemplateChunk { cooked, raw, tail });
+            if tail {
+                self.bump()?;
+                break;
+            }
+            self.bump()?; // move to the first token of the substitution
+            let expr = self.parse_expression(true)?;
+            expressions.push(expr);
+            if !self.at_punct(Punct::RBrace) {
+                return Err(self.error("expecting '}' in a template substitution"));
+            }
+            let brace = self.current.span.start;
+            let token = self.lexer.re_scan_template_continue(brace)?;
+            self.current = token;
+        }
+        Ok(TemplateLiteral {
+            quasis,
+            expressions,
+        })
+    }
+}
+
+/// Which kind of function is being parsed (affects whether a name is required).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionForm {
+    Declaration,
+    Expression,
+}
+
+/// Names of the parameters that participate in declaration-conflict checks.
+///
+/// Engines only check *simple* (identifier) parameters against the body's
+/// lexical declarations: `function f(a) { let a; }` is an early error, but
+/// `function f({a}) { let a; }` is not (QuickJS behaves the same way, so this
+/// deliberately follows the reference rather than ES2025 §10.2.1).
+fn simple_parameter_names(params: &[Pattern]) -> Vec<String> {
+    params
+        .iter()
+        .filter_map(|param| match &param.kind {
+            PatternKind::Ident(id) => Some(id.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Collect the names a top-level module item declares, for the exported-name
+/// check.
+fn collect_module_binding(stmt: &Stmt, out: &mut Vec<String>) {
+    match &stmt.kind {
+        StmtKind::VarDecl(decl) => {
+            for declarator in &decl.declarators {
+                let mut names = Vec::new();
+                declarator.target.bound_names(&mut names);
+                out.extend(names.into_iter().map(|n| n.name));
+            }
+        }
+        StmtKind::FuncDecl(func) => {
+            if let Some(name) = &func.name {
+                out.push(name.name.clone());
+            }
+        }
+        StmtKind::ClassDecl(class) => {
+            if let Some(name) = &class.name {
+                out.push(name.name.clone());
+            }
+        }
+        StmtKind::Import(decl) => {
+            for specifier in &decl.specifiers {
+                match specifier {
+                    ImportSpecifier::Default(id) => out.push(id.name.clone()),
+                    ImportSpecifier::Namespace(id) => out.push(id.name.clone()),
+                    ImportSpecifier::Named { local, .. } => out.push(local.name.clone()),
+                }
+            }
+        }
+        StmtKind::Export(decl) => match &decl.kind {
+            ExportKind::Declaration(inner) => collect_module_binding(inner, out),
+            ExportKind::Default(expr) => match &expr.unparen().kind {
+                ExprKind::Function(func) => {
+                    if let Some(name) = &func.name {
+                        out.push(name.name.clone());
+                    }
+                }
+                ExprKind::Class(class) => {
+                    if let Some(name) = &class.name {
+                        out.push(name.name.clone());
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Whether `inner` is fully inside `outer` (byte offset comparison only).
+fn span_contains(outer: Span, inner: Span) -> bool {
+    inner.start.offset >= outer.start.offset && inner.end.offset <= outer.end.offset
+}
+
+fn is_property_key_start(kind: &TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Ident(_)
+            | TokenKind::Keyword(_)
+            | TokenKind::String(_)
+            | TokenKind::Number(_)
+            | TokenKind::Punct(Punct::LBracket)
+            | TokenKind::Punct(Punct::Hash)
+    )
+}
+
+/// A binary operator with its precedence, as consumed by [`Parser::parse_binary`].
+#[derive(Debug, Clone, Copy)]
+enum BinOp {
+    Binary(BinaryOp),
+    Logical(LogicalOp),
+}
+
+impl BinOp {
+    fn is_right_associative(self) -> bool {
+        matches!(self, BinOp::Binary(BinaryOp::Pow))
+    }
+}
+
+fn binary_operator(kind: &TokenKind, allow_in: bool) -> Option<(u8, BinOp)> {
+    use BinaryOp as B;
+    use LogicalOp as L;
+    let result = match kind {
+        TokenKind::Punct(Punct::QuestionQuestion) => (1, BinOp::Logical(L::Coalesce)),
+        TokenKind::Punct(Punct::PipePipe) => (2, BinOp::Logical(L::Or)),
+        TokenKind::Punct(Punct::AmpAmp) => (3, BinOp::Logical(L::And)),
+        TokenKind::Punct(Punct::Pipe) => (4, BinOp::Binary(B::BitOr)),
+        TokenKind::Punct(Punct::Caret) => (5, BinOp::Binary(B::BitXor)),
+        TokenKind::Punct(Punct::Amp) => (6, BinOp::Binary(B::BitAnd)),
+        TokenKind::Punct(Punct::EqEq) => (7, BinOp::Binary(B::Eq)),
+        TokenKind::Punct(Punct::NotEq) => (7, BinOp::Binary(B::NotEq)),
+        TokenKind::Punct(Punct::EqEqEq) => (7, BinOp::Binary(B::StrictEq)),
+        TokenKind::Punct(Punct::NotEqEq) => (7, BinOp::Binary(B::StrictNotEq)),
+        TokenKind::Punct(Punct::Lt) => (8, BinOp::Binary(B::Lt)),
+        TokenKind::Punct(Punct::LtEq) => (8, BinOp::Binary(B::LtEq)),
+        TokenKind::Punct(Punct::Gt) => (8, BinOp::Binary(B::Gt)),
+        TokenKind::Punct(Punct::GtEq) => (8, BinOp::Binary(B::GtEq)),
+        TokenKind::Keyword(Keyword::Instanceof) => (8, BinOp::Binary(B::Instanceof)),
+        TokenKind::Keyword(Keyword::In) if allow_in => (8, BinOp::Binary(B::In)),
+        TokenKind::Punct(Punct::Shl) => (9, BinOp::Binary(B::Shl)),
+        TokenKind::Punct(Punct::Shr) => (9, BinOp::Binary(B::Shr)),
+        TokenKind::Punct(Punct::UShr) => (9, BinOp::Binary(B::UShr)),
+        TokenKind::Punct(Punct::Plus) => (10, BinOp::Binary(B::Add)),
+        TokenKind::Punct(Punct::Minus) => (10, BinOp::Binary(B::Sub)),
+        TokenKind::Punct(Punct::Star) => (11, BinOp::Binary(B::Mul)),
+        TokenKind::Punct(Punct::Slash) => (11, BinOp::Binary(B::Div)),
+        TokenKind::Punct(Punct::Percent) => (11, BinOp::Binary(B::Mod)),
+        TokenKind::Punct(Punct::StarStar) => (12, BinOp::Binary(B::Pow)),
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn build_binary(op: BinOp, left: Expr, right: Expr, span: Span) -> Result<Expr> {
+    match op {
+        BinOp::Binary(op) => Ok(Expr::new(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            span,
+        )),
+        BinOp::Logical(op) => {
+            // `??` may not be mixed with `&&`/`||` without parentheses.
+            // A parenthesised operand is visibly a different production, so the
+            // check must look at the raw node, not through `Paren`.
+            let mixes = |expr: &Expr, op: LogicalOp| {
+                matches!(&expr.kind, ExprKind::Logical { op: inner, .. }
+                    if (op == LogicalOp::Coalesce) != (*inner == LogicalOp::Coalesce))
+            };
+            if mixes(&left, op) || mixes(&right, op) {
+                return Err(SyntaxError::new(
+                    "cannot mix '??' with '&&' or '||' without parentheses",
+                    span,
+                ));
+            }
+            Ok(Expr::new(
+                ExprKind::Logical {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                span,
+            ))
+        }
+    }
+}
+
+/// Rebuild an expression from a pattern (used when a pattern has to go back
+/// through [`Parser::expr_to_pattern`], e.g. `{a: [b = 1]}`).
+fn pattern_to_expr(pattern: Pattern, span: Span) -> Expr {
+    match pattern.kind {
+        PatternKind::Ident(ident) => Expr::new(ExprKind::Ident(ident), span),
+        PatternKind::Assign { target, default } => Expr::new(
+            ExprKind::Assign {
+                op: AssignOp::Assign,
+                target,
+                value: default,
+            },
+            span,
+        ),
+        PatternKind::Array { elements, rest } => {
+            let mut out = Vec::new();
+            for element in elements {
+                match element {
+                    Some(PatternElement::Pattern(pattern)) => {
+                        let span = pattern.span;
+                        out.push(Some(ArrayElement::Expr(Box::new(pattern_to_expr(
+                            pattern, span,
+                        )))));
+                    }
+                    Some(PatternElement::Property { .. }) | None => out.push(None),
+                }
+            }
+            if let Some(rest) = rest {
+                let RestElement::Pattern(pattern) = *rest else {
+                    return Expr::new(ExprKind::Null, span);
+                };
+                let span = pattern.span;
+                out.push(Some(ArrayElement::Spread(Box::new(pattern_to_expr(
+                    pattern, span,
+                )))));
+            }
+            Expr::new(ExprKind::Array { elements: out }, span)
+        }
+        _ => Expr::new(ExprKind::Null, span),
+    }
+}
+
+impl Pattern {
+    /// Pattern kind, ignoring `Paren` wrappers (patterns never have any, but
+    /// this keeps call sites uniform with [`Expr::unparen`]).
+    fn unparen_kind(&self) -> &PatternKind {
+        &self.kind
+    }
+}
