@@ -9,7 +9,7 @@
 //! Format reference: `js_dump_function_bytecode` and `dump_byte_code` in
 //! `quickjs.c`.
 
-use crate::bytecode::{ClosureType, Constant, Function, Instruction, Operand};
+use crate::bytecode::{Atom, ClosureType, Constant, Function, Instruction, Operand};
 use crate::opcode::{OpFormat, Opcode};
 use std::fmt::Write;
 
@@ -265,16 +265,22 @@ fn print_var_name(out: &mut String, function: &Function, slot: Slot) {
     };
     if let Some(name) = name {
         // The reference prints variable names as atoms, so `<ret>` comes out
-        // quoted and `a` does not.
-        let _ = write!(out, "{}", print_atom(name));
+        // quoted and `a` does not. A variable can never be named with a bare
+        // index, so the string form is always the right one here.
+        let _ = write!(out, "{}", print_atom(&Atom::Str(name.to_string())));
     }
 }
 
-/// Print an atom or string value the way `js_print_atom2` does.
+/// Print an atom the way `js_print_atom2` does.
 ///
-/// An ASCII identifier is printed bare; anything else is double-quoted with the
-/// reference's escape sequences.
-pub fn print_atom(text: &str) -> String {
+/// A tagged array index prints as a bare number — that is the whole point of
+/// tagging it — while a string atom prints bare only if it is an ASCII
+/// identifier, and double-quoted otherwise.
+pub fn print_atom(atom: &Atom) -> String {
+    if let Atom::Index(index) = atom {
+        return index.to_string();
+    }
+    let text = atom.as_str().unwrap_or_default();
     if is_ascii_ident(text) {
         return text.to_string();
     }
@@ -367,7 +373,7 @@ pub fn decode_operands(format: OpFormat, payload: &[u8], out: &mut Vec<Operand>)
 
 impl Instruction {
     /// The atom named by operand `index`, looked up in the function's table.
-    pub fn atom(&self, function: &Function, index: usize) -> Option<String> {
+    pub fn atom(&self, function: &Function, index: usize) -> Option<Atom> {
         let Some(Operand::U32(atom)) = self.operands.get(index) else {
             return None;
         };

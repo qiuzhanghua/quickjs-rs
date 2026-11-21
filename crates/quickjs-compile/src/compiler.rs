@@ -22,7 +22,7 @@
 //! an unnecessary `dup` or a differently chosen short form shows up immediately.
 
 use crate::bytecode::{
-    ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
+    Atom, ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
@@ -44,7 +44,7 @@ enum Op {
     /// A constant pool index.
     Const(u32),
     /// An atom, before interning.
-    Atom(String),
+    Atom(Atom),
     /// An interned atom, as an index into [`Function::atoms`].
     AtomId(u32),
     /// A resolved slot.
@@ -140,6 +140,66 @@ struct JumpTarget {
     has_iterator: bool,
 }
 
+/// `copy_data_properties` flags for an object-literal spread.
+///
+/// The byte packs three fields: the low bits are the stack offset of the source,
+/// the next three the offset of the exclusion list, and bit 2 asks for symbol keys
+/// as well as string keys. A spread passes a literal `null` exclusion list right
+/// below the source, so that field stays zero and only the source offset and the
+/// symbol bit are set — hence `{...v}` copies symbols, which the flag name says.
+const COPY_ALL_PROPERTIES: i32 = 2 | (1 << 2);
+
+/// The expression a `...` introduces.
+///
+/// The parser marks the spread in two places — the element/property variant and an
+/// [`ExprKind::Spread`] wrapper around the argument — so the wrapper has to be
+/// stepped through before the argument can be compiled.
+fn spread_argument(spread: &Expr) -> &Expr {
+    match &spread.kind {
+        ExprKind::Spread(inner) => inner,
+        _ => spread,
+    }
+}
+
+/// The flag byte `define_method` takes.
+///
+/// The low two bits pick value/getter/setter; bit 2 marks the property
+/// enumerable, which every object-literal method is.
+fn define_method_flags(kind: PropertyKind) -> i32 {
+    let base = match kind {
+        PropertyKind::Value | PropertyKind::Method => 0,
+        PropertyKind::Get => 1,
+        PropertyKind::Set => 2,
+    };
+    base | 4
+}
+
+/// Convert a numeric property key to the text an atom would be made from.
+///
+/// Only the range where Rust and JavaScript agree on the spelling is accepted.
+/// Both print the shortest representation that round-trips, so plain decimal
+/// digits match; they diverge at the extremes, where JavaScript switches to an
+/// exponent (`1e-7`, `1e+21`) and Rust does not. Rather than emit an atom that
+/// differs from the reference, those keys are rejected.
+fn numeric_key_text(value: f64, span: Span) -> Result<String, SyntaxError> {
+    if !value.is_finite() {
+        return Err(SyntaxError::new(
+            "a non-finite numeric property key is not supported by the compiler yet",
+            span,
+        ));
+    }
+    if value == value.trunc() && value.abs() < 1e21 {
+        return Ok(format!("{}", value as i64));
+    }
+    if value.abs() >= 1e-6 && value.abs() < 1e21 {
+        return Ok(format!("{value}"));
+    }
+    Err(SyntaxError::new(
+        "a numeric property key outside [1e-6, 1e21) is not supported by the compiler yet",
+        span,
+    ))
+}
+
 /// Whether a loop enumerates keys or values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForLoopKind {
@@ -186,7 +246,7 @@ struct FnState {
     vars: Vec<VarDef>,
     closure_vars: Vec<ClosureVar>,
     cpool: Vec<Constant>,
-    atoms: Vec<String>,
+    atoms: Vec<Atom>,
     /// Every lexical scope, in creation order.
     blocks: Vec<Block>,
     /// The block currently being parsed or compiled.
@@ -1748,7 +1808,7 @@ impl Compiler {
                 self.expr(object)?;
                 match property {
                     MemberProp::Ident(name) => {
-                        self.emit(Opcode::GetField, &[Op::Atom(name.name.clone())]);
+                        self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text(&name.name))]);
                     }
                     MemberProp::Computed(index) => {
                         self.expr(index)?;
@@ -1763,6 +1823,7 @@ impl Compiler {
                 }
             }
             ExprKind::Array { elements } => self.array_literal(elements, expr.span)?,
+            ExprKind::Object(properties) => self.object_literal(properties, expr.span)?,
             ExprKind::Arrow(func) => {
                 let function = self.compile_function(func)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
@@ -1781,6 +1842,134 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Compile an object literal.
+    ///
+    /// The object is built in place: `object` pushes it, and each property leaves it
+    /// on the stack with one field more, so no temporary is needed and later
+    /// properties can overwrite earlier ones.
+    ///
+    /// The instruction depends on *how* the property was written, not on what kind
+    /// of value it holds:
+    ///
+    /// | source | instruction |
+    /// |---|---|
+    /// | `{ a: v }` | `define_field a` |
+    /// | `{ __proto__: v }` | `set_proto` |
+    /// | `{ [k]: v }` | `to_propkey` … `define_array_el` + `drop` |
+    /// | `{ m() {} }` | `define_method m,4` |
+    /// | `{ get m() {} }` / `{ set m(v) {} }` | `define_method m,5` / `,6` |
+    /// | `{ [k]() {} }` | `define_method_computed 4` |
+    /// | `{ ...v }` | `null` … `copy_data_properties 6` + two `drop`s |
+    ///
+    /// A computed *method* skips `to_propkey`: `define_method_computed` converts the
+    /// key itself, which is why the trailing `drop` is absent there too.
+    fn object_literal(
+        &mut self,
+        properties: &[ObjectProperty],
+        span: Span,
+    ) -> Result<(), SyntaxError> {
+        self.emit(Opcode::Object, &[]);
+        for property in properties {
+            match property {
+                ObjectProperty::Spread(value) => {
+                    // `copy_data_properties` takes the target, the source and an
+                    // exclusion list; a literal `null` means "exclude nothing".
+                    // Flag bit 1 copies symbols, bits 2/5 pick the source and the
+                    // exclusion list by stack offset.
+                    self.expr(spread_argument(value))?;
+                    self.emit(Opcode::Null, &[]);
+                    self.emit(Opcode::CopyDataProperties, &[Op::Int(COPY_ALL_PROPERTIES)]);
+                    self.emit(Opcode::Drop, &[]);
+                    self.emit(Opcode::Drop, &[]);
+                }
+                ObjectProperty::Property {
+                    key,
+                    value,
+                    kind,
+                    shorthand,
+                    span: property_span,
+                } => match key {
+                    PropName::Computed(key_expr) => {
+                        self.expr(key_expr)?;
+                        match kind {
+                            PropertyKind::Value => {
+                                self.emit(Opcode::ToPropkey, &[]);
+                                self.expr(value)?;
+                                self.set_name_if_anonymous_computed(value);
+                                self.emit(Opcode::DefineArrayEl, &[]);
+                                // `define_array_el` leaves the object and the key;
+                                // the key is no longer needed.
+                                self.emit(Opcode::Drop, &[]);
+                            }
+                            PropertyKind::Method | PropertyKind::Get | PropertyKind::Set => {
+                                self.emit_method_function(value)?;
+                                self.emit(
+                                    Opcode::DefineMethodComputed,
+                                    &[Op::Int(define_method_flags(*kind))],
+                                );
+                            }
+                        }
+                    }
+                    PropName::Literal(key) => {
+                        let name = self.property_key_text(key, *property_span)?;
+                        match kind {
+                            PropertyKind::Method | PropertyKind::Get | PropertyKind::Set => {
+                                self.emit_method_function(value)?;
+                                self.emit(
+                                    Opcode::DefineMethod,
+                                    &[
+                                        Op::Atom(Atom::from_text(&name)),
+                                        Op::Int(define_method_flags(*kind)),
+                                    ],
+                                );
+                            }
+                            PropertyKind::Value => {
+                                self.expr(value)?;
+                                // `{__proto__: x}` sets the prototype instead of
+                                // creating a property; the shorthand `{__proto__}`
+                                // is an ordinary property and does not.
+                                if name == "__proto__" && !shorthand {
+                                    self.emit(Opcode::SetProto, &[]);
+                                } else {
+                                    self.set_name_if_anonymous(value, &name);
+                                    self.emit(
+                                        Opcode::DefineField,
+                                        &[Op::Atom(Atom::from_text(&name))],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    PropName::Private(_) => {
+                        return Err(SyntaxError::new(
+                            "private names are not valid in object literals",
+                            *property_span,
+                        ));
+                    }
+                },
+            }
+        }
+        let _ = span;
+        Ok(())
+    }
+
+    /// Emit the function a method/accessor property defines.
+    fn emit_method_function(&mut self, value: &Expr) -> Result<(), SyntaxError> {
+        self.expr(value)
+    }
+
+    /// The name a literal property key contributes.
+    ///
+    /// String keys are used as written. A numeric key is converted the way
+    /// `ToString` would convert it, because the atom is made from that spelling:
+    /// `{ 1e2: x }` and `{ 0x10: x }` both become `define_field 100` / `16`.
+    fn property_key_text(&self, key: &PropKey, span: Span) -> Result<String, SyntaxError> {
+        match key {
+            PropKey::Str(text) => Ok(text.clone()),
+            PropKey::Num(value) => numeric_key_text(*value, span),
+        }
     }
 
     fn push_number(&mut self, value: f64) {
@@ -1812,7 +2001,7 @@ impl Compiler {
             self.emit(Opcode::PushEmptyString, &[]);
             return;
         }
-        self.emit(Opcode::PushAtomValue, &[Op::Atom(text.to_string())]);
+        self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(text))]);
     }
 
     /// Name an anonymous function from the binding it is assigned to.
@@ -1822,7 +2011,15 @@ impl Compiler {
     /// before the store. `set_name` carries the name across.
     fn set_name_if_anonymous(&mut self, value: &Expr, name: &str) {
         if value.is_anonymous_function_definition() {
-            self.emit(Opcode::SetName, &[Op::Atom(name.to_string())]);
+            self.emit(Opcode::SetName, &[Op::Atom(Atom::from_text(name))]);
+        }
+    }
+
+    /// The same, for a computed key: the name comes from the value on the stack
+    /// rather than from an atom, so a different instruction carries it.
+    fn set_name_if_anonymous_computed(&mut self, value: &Expr) {
+        if value.is_anonymous_function_definition() {
+            self.emit(Opcode::SetNameComputed, &[]);
         }
     }
 
@@ -1922,7 +2119,10 @@ impl Compiler {
                     MemberProp::Ident(property) => {
                         self.expr(value)?;
                         self.emit(Opcode::Insert2, &[]);
-                        self.emit(Opcode::PutField, &[Op::Atom(property.name.clone())]);
+                        self.emit(
+                            Opcode::PutField,
+                            &[Op::Atom(Atom::from_text(&property.name))],
+                        );
                     }
                     MemberProp::Computed(index) => {
                         self.expr(index)?;
@@ -1968,31 +2168,110 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile an array literal.
+    ///
+    /// The reference splits this into three phases, and the split is load-bearing
+    /// rather than an optimisation detail:
+    ///
+    /// 1. **A leading run of plain elements** becomes `array_from n`, which builds
+    ///    the array in one instruction.
+    /// 2. **Everything up to the first spread** is appended with explicit indices
+    ///    (`define_field <index>`), because a hole has no element to pass to
+    ///    `array_from`. A hole here is what makes `length` need fixing up: an
+    ///    explicit index does not extend the array the way a pushed element does.
+    /// 3. **From the first spread on** the index lives on the stack, so `append` and
+    ///    `define_array_el` can consume it and `inc` advances it.
+    ///
+    /// So `[1,,3]` and `[1,2,3]` are not two spellings of one program: the hole
+    /// forces phase 2, and `[...a]` forces phase 3.
     fn array_literal(
         &mut self,
         elements: &[Option<ArrayElement>],
         span: Span,
     ) -> Result<(), SyntaxError> {
-        if elements.iter().any(|e| e.is_none()) {
-            return Err(SyntaxError::new(
-                "array elisions are not supported by the compiler yet",
-                span,
-            ));
-        }
-        for element in elements {
-            match element {
-                Some(ArrayElement::Expr(expr)) => self.expr(expr)?,
-                Some(ArrayElement::Spread(_)) => {
-                    return Err(SyntaxError::new(
-                        "array spread is not supported by the compiler yet",
-                        span,
-                    ));
-                }
-                None => unreachable!("elisions were rejected above"),
+        let _ = span;
+        let mut index: u32 = 0;
+        let mut cursor = 0usize;
+
+        // Phase 1: a leading run of plain elements, at most 32 of them.
+        while let Some(Some(ArrayElement::Expr(element))) = elements.get(cursor) {
+            if index >= 32 {
+                break;
             }
+            self.expr(element)?;
+            index += 1;
+            cursor += 1;
         }
-        self.emit(Opcode::ArrayFrom, &[Op::Int(elements.len() as i32)]);
+        self.emit(Opcode::ArrayFrom, &[Op::Int(index as i32)]);
+
+        // Phase 2: explicit indices, up to the first spread.
+        let mut need_length = false;
+        while let Some(element) = elements.get(cursor) {
+            if matches!(element, Some(ArrayElement::Spread(_))) {
+                break;
+            }
+            need_length = true;
+            if let Some(ArrayElement::Expr(expression)) = element {
+                self.expr(expression)?;
+                self.emit_define_index(index);
+                need_length = false;
+            }
+            index += 1;
+            cursor += 1;
+        }
+
+        if cursor >= elements.len() {
+            if need_length {
+                // `define_field` cannot set `length`, which is not configurable.
+                self.emit(Opcode::Dup, &[]);
+                self.push_number(index as f64);
+                self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text("length"))]);
+            }
+            return Ok(());
+        }
+
+        // Phase 3: the index moves onto the stack for the spreading tail.
+        //
+        // `need_length` deliberately carries over from phase 2: a hole before the
+        // first spread still has to be reflected in `length`, and only the final
+        // check can do it because the array is not finished until the tail is
+        // appended.
+        self.push_number(index as f64);
+        while let Some(element) = elements.get(cursor) {
+            match element {
+                Some(ArrayElement::Spread(expression)) => {
+                    // `append` copies an iterable and leaves the next index behind,
+                    // so no `inc` is needed here.
+                    self.expr(spread_argument(expression))?;
+                    self.emit(Opcode::Append, &[]);
+                }
+                None | Some(ArrayElement::Expr(_)) => {
+                    need_length = true;
+                    if let Some(ArrayElement::Expr(expression)) = element {
+                        self.expr(expression)?;
+                        self.emit(Opcode::DefineArrayEl, &[]);
+                        need_length = false;
+                    }
+                    self.emit(Opcode::Inc, &[]);
+                }
+            }
+            cursor += 1;
+        }
+        if need_length {
+            self.emit(Opcode::Dup1, &[]);
+            self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text("length"))]);
+        } else {
+            self.emit(Opcode::Drop, &[]);
+        }
         Ok(())
+    }
+
+    /// `define_field` with an array-index atom, which is how phase 2 stores elements.
+    fn emit_define_index(&mut self, index: u32) {
+        self.emit(
+            Opcode::DefineField,
+            &[Op::Atom(Atom::from_text(&index.to_string()))],
+        );
     }
 
     // -- functions ---------------------------------------------------------
@@ -2202,7 +2481,9 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
                 let operands = operands
                     .iter()
                     .map(|operand| match operand {
-                        Op::Atom(text) => Op::AtomId(intern_atom(&mut stack[current], text)),
+                        Op::Atom(atom) => {
+                            Op::AtomId(intern_atom(&mut stack[current], &atom.to_string()))
+                        }
                         other => other.clone(),
                     })
                     .collect();
@@ -2933,11 +3214,16 @@ fn get_form_of(op: Opcode) -> Opcode {
 }
 
 /// Atom interning, per function.
+///
+/// Everything the reference interns goes through `JS_NewAtomStr`, including plain
+/// identifiers, so the array-index rule applies here rather than at the handful of
+/// call sites that build property keys.
 fn intern_atom(state: &mut FnState, name: &str) -> u32 {
-    if let Some(index) = state.atoms.iter().position(|a| a == name) {
+    let atom = Atom::from_text(name);
+    if let Some(index) = state.atoms.iter().position(|a| *a == atom) {
         return index as u32;
     }
-    state.atoms.push(name.to_string());
+    state.atoms.push(atom);
     state.atoms.len() as u32 - 1
 }
 
@@ -3579,12 +3865,35 @@ fn encode_operands(
                 write_slot(code, *slot);
             }
         }
-        Atom => {
+        Atom | AtomU8 | AtomU16 | AtomLabelU8 | AtomLabelU16 => {
             if let Some(Op::AtomId(index)) = operands.first() {
                 code.extend_from_slice(&index.to_be_bytes());
             }
+            // The trailing immediate means different things per format, and the
+            // atom forms that carry a *label* have to resolve it like any other
+            // jump, so they cannot share the `U8`/`U16` arms above.
+            match info.format {
+                AtomU8 | AtomLabelU8 => {
+                    if let Some(value) = operands.get(1).and_then(operand_uint) {
+                        code.push(value as u8);
+                    }
+                }
+                AtomU16 | AtomLabelU16 => {
+                    if let Some(value) = operands.get(1).and_then(operand_uint) {
+                        code.extend_from_slice(&(value as u16).to_be_bytes());
+                    }
+                }
+                _ => {}
+            }
         }
-        Label | Label8 | Label16 => {
+        NpopU16 => {
+            for operand in operands.iter().take(2) {
+                if let Some(value) = operand_uint(operand) {
+                    code.extend_from_slice(&(value as u16).to_be_bytes());
+                }
+            }
+        }
+        Label | Label8 | Label16 | LabelU16 => {
             if let Some(Op::Label(label)) = operands.first() {
                 // Labels were already remapped to kept-instruction indices.
                 let Some(&target) = offsets.get(label.0 as usize) else {
@@ -3595,11 +3904,17 @@ fn encode_operands(
                 match info.format {
                     Label8 => code.push(relative as i8 as u8),
                     Label16 => code.extend_from_slice(&(relative as i16 as u16).to_be_bytes()),
+                    // `label_u16` stores the target followed by an unrelated u16.
+                    LabelU16 => {
+                        code.extend_from_slice(&(relative as i32).to_be_bytes());
+                        if let Some(value) = operands.get(1).and_then(operand_uint) {
+                            code.extend_from_slice(&(value as u16).to_be_bytes());
+                        }
+                    }
                     _ => code.extend_from_slice(&(relative as i32).to_be_bytes()),
                 }
             }
         }
-        _ => {}
     }
 }
 

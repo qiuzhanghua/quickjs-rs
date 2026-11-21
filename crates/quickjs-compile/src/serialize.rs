@@ -29,14 +29,16 @@
 //! A version bump is required for any change to this layout; [`MAGIC`] plus
 //! [`VERSION`] make a stale blob fail loudly instead of being misinterpreted.
 
-use crate::bytecode::{ClosureType, ClosureVar, Constant, Function, FunctionKind, VarDef, VarKind};
+use crate::bytecode::{
+    Atom, ClosureType, ClosureVar, Constant, Function, FunctionKind, VarDef, VarKind,
+};
 use std::fmt;
 
 /// File magic.
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +51,8 @@ pub enum DecodeError {
     Truncated,
     /// A discriminant is out of range.
     BadTag(&'static str, u8),
+    /// An atom entry has an unknown kind tag.
+    BadAtomTag(u8),
 }
 
 impl fmt::Display for DecodeError {
@@ -58,6 +62,7 @@ impl fmt::Display for DecodeError {
             DecodeError::BadVersion(v) => write!(f, "unsupported bytecode version {v}"),
             DecodeError::Truncated => f.write_str("truncated bytecode"),
             DecodeError::BadTag(what, tag) => write!(f, "invalid {what} tag {tag}"),
+            DecodeError::BadAtomTag(tag) => write!(f, "invalid atom kind tag {tag}"),
         }
     }
 }
@@ -84,6 +89,29 @@ pub fn deserialize(bytes: &[u8]) -> Result<Function, DecodeError> {
         return Err(DecodeError::BadVersion(version));
     }
     read_function(&mut reader)
+}
+
+/// One atom, tagged by kind so a canonical array index survives the round trip as
+/// a number rather than turning back into its decimal spelling.
+fn write_atom(out: &mut Vec<u8>, atom: &Atom) {
+    match atom {
+        Atom::Str(text) => {
+            out.push(0);
+            write_string(out, text);
+        }
+        Atom::Index(index) => {
+            out.push(1);
+            out.extend_from_slice(&index.to_be_bytes());
+        }
+    }
+}
+
+fn read_atom(reader: &mut Reader<'_>) -> Result<Atom, DecodeError> {
+    match reader.u8()? {
+        0 => Ok(Atom::Str(reader.string()?)),
+        1 => Ok(Atom::Index(u32::from_be_bytes(reader.array::<4>()?))),
+        tag => Err(DecodeError::BadAtomTag(tag)),
+    }
 }
 
 fn write_string(out: &mut Vec<u8>, text: &str) {
@@ -148,7 +176,7 @@ fn write_function(out: &mut Vec<u8>, function: &Function) {
 
     out.extend_from_slice(&(function.atoms.len() as u32).to_be_bytes());
     for atom in &function.atoms {
-        write_string(out, atom);
+        write_atom(out, atom);
     }
 
     out.extend_from_slice(&(function.cpool.len() as u32).to_be_bytes());
@@ -301,7 +329,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let atom_count = reader.u32()? as usize;
     let mut atoms = Vec::with_capacity(atom_count);
     for _ in 0..atom_count {
-        atoms.push(reader.string()?);
+        atoms.push(read_atom(reader)?);
     }
 
     let cpool_count = reader.u32()? as usize;
@@ -463,7 +491,8 @@ mod tests {
                 var_idx: 0,
             }],
             cpool: vec![Constant::Number(1.5), Constant::String("s".to_string())],
-            atoms: vec!["a".to_string(), "b".to_string()],
+            // One of each kind, so the round trip covers the atom tag.
+            atoms: vec![Atom::from_text("a"), Atom::from_text("2")],
             code: vec![0x2c, 0x00, 0x00],
             stack_size: 3,
             var_ref_count: 0,

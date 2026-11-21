@@ -4,6 +4,41 @@
 
 ## 未发布
 
+### 对象与数组字面量
+
+- **对象字面量** — `define_field` / `define_array_el` / `define_method` /
+  `define_method_computed` / `set_proto` / `copy_data_properties`。指令取决于属性
+  **怎么写**而不是值是什么：`{a: 1}` 是 `define_field`，`{a(){}}` 是 `define_method`，
+  `{__proto__: p}` 是 `set_proto`（`{__proto__}` 简写不是），计算键先用
+  `to_propkey` 而计算方法不用（`define_method_computed` 自己转换）。
+- **数组字面量** — 参考实现的三阶段：前 32 个连续普通元素走 `array_from`；遇到洞
+  或前 32 个之后改用显式索引 `define_field <i>`；遇到 spread 后索引上栈，用
+  `append` / `define_array_el` / `inc`。洞会让 `length` 需要单独修补，因为显式索引
+  不会像压入元素那样延长数组。
+
+### 修正
+
+- **AST 增加 `PropertyKind`**：`MethodKind::Method` 原先同时表示 `{m(){}}` 和
+  `{a: 1}`，编译器无法区分二者，而它们编译出的指令不同。现在对象字面量用独立的
+  `PropertyKind::{Value, Method, Get, Set}` —— `MethodKind::Constructor` 本来也不可能
+  出现在对象字面量里，共用这个枚举本身就是类型在说谎。顺带修掉了
+  `expr_to_pattern_inner` 里一个恒真的判断（四个分支全过，等于没有判断）。
+- **`Atom` 区分字符串与数组索引**：参考实现把「规范数组索引」（无符号、无前导零、
+  ≤ 2^31−1）做成 tagged int 原子而不是字符串，所以 `{2: x}` 反汇编成
+  `define_field 2`，而 `{1.5: x}` 是 `define_field "1.5"`。现在 `Function::atoms` 是
+  `Vec<Atom>`，序列化加了种类标签（字节码格式版本 2 → 3），索引原子按数字往返。
+- **`encode_operands` 补全 `AtomU8`/`AtomU16`/`AtomLabelU8`/`AtomLabelU16`/`LabelU16`/
+  `NpopU16`**。此前这些格式落到 `_ => {}`，静默不写任何操作数 —— 写出来的字节码看着
+  合理却是另一条指令。这一条是 `define_method` 暴露出来的：没有它，`AtomU8` 的原子
+  和标志位一个都不会被编码。
+
+### 测试
+
+167 个测试，24 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
+
+字节码逐 opcode 差分增至 **292 条**用例（新增对象与数组字面量 56 条），
+另有 11 条字面量结构不变量测试。
+
 ### 包名与发布准备（行为无变化）
 
 crates.io 上 `quickjs`、`qjs`、`quickjs-rs` 三个名字都已被他人占用，其中

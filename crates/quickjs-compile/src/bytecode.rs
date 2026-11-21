@@ -14,6 +14,74 @@
 use crate::opcode::Opcode;
 use std::fmt;
 
+/// One entry of a function's atom table.
+///
+/// The reference keeps two kinds of atom in one namespace, and the distinction is
+/// visible in the bytecode: an *array-index* atom is not a string at all but a
+/// tagged `uint32`, which is why `{ 2: x }` disassembles as `define_field 2` while
+/// `{ "1.5": x }` prints `define_field "1.5"`. Collapsing the two would make the
+/// disassembly wrong and lose information on the way back in, so the kind is
+/// carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Atom {
+    /// An interned string.
+    Str(String),
+    /// A canonical array index, held as a number rather than a string.
+    Index(u32),
+}
+
+impl Atom {
+    /// The atom the reference's `JS_NewAtomStr` would make of `text`.
+    ///
+    /// A canonical array index no greater than `2^31 - 1` is never interned as a
+    /// string: the reference returns a tagged integer instead. Anything else —
+    /// `"007"`, `"1e2"`, `"-0"`, or an index past the tag range — stays a string.
+    pub fn from_text(text: &str) -> Atom {
+        match canonical_array_index(text) {
+            Some(index) => Atom::Index(index),
+            None => Atom::Str(text.to_string()),
+        }
+    }
+
+    /// The text form, for callers that only care about the name.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Atom::Str(text) => Some(text),
+            Atom::Index(_) => None,
+        }
+    }
+}
+
+impl fmt::Display for Atom {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Atom::Str(text) => write!(f, "{text}"),
+            Atom::Index(index) => write!(f, "{index}"),
+        }
+    }
+}
+
+/// `is_num_string` from the reference: the canonical decimal spelling of an index
+/// small enough to be tagged (at most `2^31 - 1`).
+///
+/// Canonical means no sign, no leading zeros and no other characters, so `"10"`
+/// qualifies while `"007"`, `"-0"` and `"1e2"` do not.
+fn canonical_array_index(text: &str) -> Option<u32> {
+    // `2^31 - 1` has ten digits, which bounds how long a canonical index can be.
+    if text.is_empty() || text.len() > 10 {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    if !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if bytes[0] == b'0' && bytes.len() != 1 {
+        return None;
+    }
+    let value: u32 = text.parse().ok()?;
+    (value <= 0x7fff_ffff).then_some(value)
+}
+
 /// How a function was declared. Determines the calling convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionKind {
@@ -400,7 +468,7 @@ pub struct Function {
     /// Atom table: the names this function mentions. The runtime shares one
     /// interned table across the whole program; indexing it per function keeps
     /// the bytecode self-contained and makes disassembly readable.
-    pub atoms: Vec<String>,
+    pub atoms: Vec<Atom>,
     /// Resolved bytecode.
     pub code: Vec<u8>,
     /// Maximum value-stack depth.

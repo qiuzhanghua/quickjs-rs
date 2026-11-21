@@ -2458,17 +2458,10 @@ impl<'a> Parser<'a> {
                         ObjectProperty::Property {
                             key,
                             value,
-                            kind: prop_kind,
+                            kind: _,
                             shorthand,
                             span,
                         } => {
-                            if prop_kind != MethodKind::Method
-                                && !matches!(prop_kind, MethodKind::Constructor)
-                                && prop_kind != MethodKind::Get
-                                && prop_kind != MethodKind::Set
-                            {
-                                return Ok(Pattern::new(PatternKind::Ident(Ident::new("")), span));
-                            }
                             let pattern = self.expr_to_pattern_inner(*value, kind, true)?;
                             out.push(Some(PatternElement::Property {
                                 key,
@@ -3600,9 +3593,15 @@ impl<'a> Parser<'a> {
                                 return Err(self
                                     .error_at("setter must have exactly one argument", func.span));
                             }
-                            kind
+                            match kind {
+                                MethodKind::Get => PropertyKind::Get,
+                                MethodKind::Set => PropertyKind::Set,
+                                MethodKind::Method | MethodKind::Constructor => {
+                                    PropertyKind::Method
+                                }
+                            }
                         }
-                        None => MethodKind::Method,
+                        None => PropertyKind::Method,
                     };
                     let span = self.span_from(property_start);
                     properties.push(ObjectProperty::Property {
@@ -3628,7 +3627,7 @@ impl<'a> Parser<'a> {
                     properties.push(ObjectProperty::Property {
                         key,
                         value: Box::new(value),
-                        kind: MethodKind::Method,
+                        kind: PropertyKind::Value,
                         shorthand: false,
                         span: self.span_from(property_start),
                     });
@@ -3664,7 +3663,7 @@ impl<'a> Parser<'a> {
                     properties.push(ObjectProperty::Property {
                         key,
                         value: Box::new(value),
-                        kind: MethodKind::Method,
+                        kind: PropertyKind::Value,
                         shorthand: true,
                         span: ident_span,
                     });

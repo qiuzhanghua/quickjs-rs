@@ -266,6 +266,9 @@ fn unsupported_constructs_fail_loudly() {
         "async function f() { }",
         "let [a] = x;",
         "with (a) b;",
+        // `??` and optional chaining are still outstanding.
+        "function f(a, b) { return a ?? b; }",
+        "function f(a) { return a?.b; }",
     ] {
         let program = parse_script(source).expect("parses");
         let error =
@@ -468,6 +471,10 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
         "function f(c){ o: for(;;){ i: while(c2){ break o; } } }",
         "function f(c){ o: for(;;){ i: while(c2){ break i; a(); } } }",
         "function f(c){ o: for(;;){ i: while(c2){ continue i; } } }",
+        // `.length` is its own opcode: the reference folds `get_field length` into
+        // `get_length`, for any object, not just freshly built arrays.
+        "function f(a){ return a.length; }",
+        "function f(){ return [1,2].length; }",
     ];
     assert_cases(&cases);
 }
@@ -593,6 +600,85 @@ fn for_in_of_matches_the_reference() {
         // Nesting, and a loop inside a `try`.
         "function f(o){ for (var k in o) for (var v of o) a(k, v); }",
         "function f(o){ try { for (var v of o) a(v); } finally { b(); } }",
+    ];
+    assert_cases(&cases);
+}
+
+/// Object and array literals.
+#[test]
+fn literals_build_in_place() {
+    require_oracle!();
+    let cases = [
+        // The object stays on the stack while properties are added.
+        "function f(){ return {}; }",
+        "function f(){ return {a:1}; }",
+        "function f(){ return {a:1, a:2}; }",
+        "function f(a){ return {a}; }",
+        "function f(){ return {a:1, b:2, c:3}; }",
+        // `__proto__` sets the prototype; the shorthand is a plain property.
+        "function f(p){ return {__proto__:p}; }",
+        "function f(){ return {\"__proto__\":x}; }",
+        "function f(){ return {__proto__}; }",
+        // A method is not a field with a function in it.
+        "function f(){ return {m(){return 1}}; }",
+        "function f(){ return {get a(){return 1}}; }",
+        "function f(){ return {set a(v){}}; }",
+        "function f(){ return {a:function(){}}; }",
+        "function f(){ return {a:function b(){}}; }",
+        // Computed keys: `to_propkey` then `define_array_el`, and the key is
+        // dropped; a computed method lets `define_method_computed` convert.
+        "function f(k){ return {[k]:1}; }",
+        "function f(){ return {[\"a\"]:1}; }",
+        "function f(k){ return {[k](){}}; }",
+        "function f(k){ return {get [k](){return 1}}; }",
+        "function f(k){ return {[k]:function(){}}; }",
+        // Spread copies with an exclusion list.
+        "function f(b){ return {...b}; }",
+        "function f(){ return {a:1, ...b, c:2}; }",
+        "function f(){ return {...a, ...b}; }",
+        // Numeric keys: a canonical index becomes a tagged atom, which prints
+        // bare; anything else stays a string atom.
+        "function f(x){ return {2:x}; }",
+        "function f(x){ return {\"x\":1, 2:3}; }",
+        "function f(x){ return {2147483647:x}; }",
+        "function f(x){ return {2147483648:x}; }",
+        "function f(x){ return {\"007\":x}; }",
+        "function f(x){ return {\"1e2\":x}; }",
+        "function f(x){ return {1e2:x}; }",
+        "function f(x){ return {0x10:x}; }",
+        "function f(x){ return {1.5:x}; }",
+        "function f(x){ return {4294967296:x}; }",
+        "function f(x){ return {0:x}; }",
+        "function f(x){ return {\"10\":x}; }",
+        // Arrays, including the index phase and spread.
+        "function f(){ return []; }",
+        "function f(){ return [1,2,3]; }",
+        "function f(b){ return [1,...b]; }",
+        "function f(){ return [1,,3]; }",
+        "function f(){ return [,,]; }",
+        "function f(){ return [1,]; }",
+        "function f(){ return [...a, ...b]; }",
+        // Nesting.
+        "function f(){ return {a:[1,{b:2}]}; }",
+        "function f(){ return [{a:1},{b:2}]; }",
+        "function f(){ return {a:{b:{c:1}}}; }",
+        "function f(){ return [[[1]]]; }",
+        // The three array phases meet at these boundaries.
+        "function f(){ return [,,1]; }",
+        "function f(){ return [,,,...a]; }",
+        "function f(){ return [1,,...a]; }",
+        "function f(){ return [...a,,1]; }",
+        "function f(){ return [1,...,,]; }",
+        // 33 elements crosses the 32-element limit on phase 1.
+        "function f(){ var a = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33]; }",
+        "function f(){ var a = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32]; }",
+        // Literals as operands of other constructs.
+        "function f(o){ return o[{a:1}]; }",
+        "function f(){ for (var k in [1,2]) a(k); }",
+        "function f(){ return {a:1}.a; }",
+        // A literal inside a call and as a default-ish argument.
+        "function f(){ g({a:1}, [2]); }",
+        "function f(){ return typeof {}; }",
     ];
     assert_cases(&cases);
 }

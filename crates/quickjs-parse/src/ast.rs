@@ -799,6 +799,24 @@ pub enum ArrayElement {
     Spread(Box<Expr>),
 }
 
+/// What an object-literal property does with its value.
+///
+/// Distinct from [`MethodKind`] on purpose: an object literal can never contain a
+/// `constructor`, and the compiler needs to tell `{a: 1}` from `{a() {}}` — the two
+/// compile to different instructions (`define_field` vs `define_method`), even though
+/// both hold a value on the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyKind {
+    /// `key: value` or the `{key}` shorthand — stores a data property.
+    Value,
+    /// `m() {}` — defines a method.
+    Method,
+    /// `get m() {}` — the value is the getter.
+    Get,
+    /// `set m(v) {}` — the value is the setter.
+    Set,
+}
+
 /// One property of an object literal.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ObjectProperty {
@@ -808,8 +826,8 @@ pub enum ObjectProperty {
         key: PropName,
         /// Value expression; for `get`/`set` it is the function.
         value: Box<Expr>,
-        /// `get`/`set`/ordinary.
-        kind: MethodKind,
+        /// Whether this stores a value or defines an accessor/method.
+        kind: PropertyKind,
         /// Whether the source used shorthand (`{a}` / `{a = 1}`).
         shorthand: bool,
         /// Source range.
