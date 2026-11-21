@@ -1,0 +1,10 @@
+[package]
+name = "quickjs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Embeddable JavaScript engine written in pure Rust (QuickJS-compatible)"
+
+[dependencies]
+js-gc.workspace = true

@@ -1,6 +1,19 @@
-[package]
-name = "quickjs-rs"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "crates/js-gc",
+    "crates/quickjs",
+    "crates/qjs",
+    "crates/quickjs-conformance",
+]
 
-[dependencies]
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+js-gc = { path = "crates/js-gc" }
+quickjs = { path = "crates/quickjs" }
+quickjs-conformance = { path = "crates/quickjs-conformance" }

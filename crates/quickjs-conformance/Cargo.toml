@@ -1,0 +1,9 @@
+[package]
+name = "quickjs-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Differential test harness: pure-Rust qjs vs the C reference implementation"
+
+[dependencies]
