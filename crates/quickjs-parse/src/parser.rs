@@ -1738,7 +1738,6 @@ impl<'a> Parser<'a> {
         // enclosing script was compiled as strict, and a later `function g(){}` lost its
         // declaration status — `typeof g` then raised instead of answering, because an
         // implicit global is not a declaration.
-        let saved_strict = self.strict;
         let params_result = self.parse_formal_parameters();
         let result = match params_result {
             Ok(params) => self.parse_function_body(params, is_generator, is_async),
@@ -1746,15 +1745,14 @@ impl<'a> Parser<'a> {
         };
         self.ctx = saved;
         self.top_level = saved_top;
-        self.strict = saved_strict;
-        self.lexer.set_strict(saved_strict);
-        let (params, params_span, body) = result?;
+        let (params, params_span, body, strict) = result?;
         Ok(Function {
             name,
             params,
             body,
             is_async,
             is_generator,
+            strict,
             is_arrow: false,
             span: self.span_from(start),
             params_span,
@@ -1807,8 +1805,13 @@ impl<'a> Parser<'a> {
         params: Vec<Pattern>,
         is_generator: bool,
         is_async: bool,
-    ) -> Result<(Vec<Pattern>, Span, FunctionBody)> {
+    ) -> Result<(Vec<Pattern>, Span, FunctionBody, bool)> {
         let params_span = self.prev_end;
+        // Strictness is per function, so the body saves and restores it itself rather
+        // than trusting every caller to do so: `function f(){ "use strict" }` must
+        // leave the code after it sloppy, and the enclosing scope may well have been
+        // strict too. The returned flag is the body's own mode.
+        let saved_strict = self.strict;
         if !self.at_punct(Punct::LBrace) {
             return Err(self.unexpected());
         }
@@ -1840,6 +1843,9 @@ impl<'a> Parser<'a> {
         }
         self.pop_scope();
         self.bump()?; // }
+        // The body's own mode, still in force while the early errors below are
+        // checked; the enclosing mode is restored once they are done.
+        let body_strict = self.strict;
         if strict_seen && !simple_params {
             return Err(self.error_at(
                 "'use strict' directive is not allowed with non-simple parameters",
@@ -1848,7 +1854,7 @@ impl<'a> Parser<'a> {
         }
         // Duplicate parameter names: always illegal for non-simple lists and in
         // strict mode; in sloppy simple lists they are allowed (last wins).
-        if self.strict || !simple_params || is_generator || is_async {
+        if body_strict || !simple_params || is_generator || is_async {
             let mut seen: Vec<String> = Vec::new();
             for param in &params {
                 let mut names = Vec::new();
@@ -1865,7 +1871,14 @@ impl<'a> Parser<'a> {
             }
         }
         let params_span_value = Span::new(params_span, params_span);
-        Ok((params, params_span_value, FunctionBody::Block(body)))
+        self.strict = saved_strict;
+        self.lexer.set_strict(saved_strict);
+        Ok((
+            params,
+            params_span_value,
+            FunctionBody::Block(body),
+            body_strict,
+        ))
     }
 
     // -- classes -----------------------------------------------------------
@@ -2040,7 +2053,7 @@ impl<'a> Parser<'a> {
             self.top_level = false;
             let result = (|| -> Result<Function> {
                 let params = self.parse_formal_parameters()?;
-                let (params, params_span, body) =
+                let (params, params_span, body, strict) =
                     self.parse_function_body(params, is_generator, is_async)?;
                 Ok(Function {
                     name: None,
@@ -2048,6 +2061,7 @@ impl<'a> Parser<'a> {
                     body,
                     is_async,
                     is_generator,
+                    strict,
                     is_arrow: false,
                     span: self.span_from(start),
                     params_span,
@@ -2731,13 +2745,15 @@ impl<'a> Parser<'a> {
         self.switch_depth = 0;
         self.top_level = false;
         let body_start = self.current.span.start;
-        let body = if self.at_punct(Punct::LBrace) {
-            let block = self.parse_arrow_block(&head.params)?;
-            (block, self.prev_end)
+        let (body, strict) = if self.at_punct(Punct::LBrace) {
+            let (block, strict) = self.parse_arrow_block(&head.params)?;
+            (block, (self.prev_end, strict))
         } else {
             let expr = self.parse_assignment(allow_in)?;
             let end = expr.span.end;
-            (FunctionBody::Expr(Box::new(expr)), end)
+            // An expression body has no directive prologue, so it inherits.
+            let strict = self.strict;
+            (FunctionBody::Expr(Box::new(expr)), (end, strict))
         };
         self.ctx = saved_ctx;
         self.loop_depth = saved_loop;
@@ -2745,7 +2761,7 @@ impl<'a> Parser<'a> {
         self.labels = saved_labels;
         self.top_level = saved_top;
         let _ = body_start;
-        let (body, end) = body;
+        let (body, (end, strict)) = (body, strict);
         let span = Span::new(head.span.start, end);
         Ok(Some(Expr::new(
             ExprKind::Arrow(Box::new(Function {
@@ -2754,6 +2770,7 @@ impl<'a> Parser<'a> {
                 body,
                 is_async: head.is_async,
                 is_generator: false,
+                strict,
                 is_arrow: true,
                 span,
                 params_span: head.params_span,
@@ -2763,7 +2780,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the `{ … }` body of an arrow, honouring a `"use strict"` prologue.
-    fn parse_arrow_block(&mut self, params: &[Pattern]) -> Result<FunctionBody> {
+    fn parse_arrow_block(&mut self, params: &[Pattern]) -> Result<(FunctionBody, bool)> {
+        // Like a function body: the arrow's own directive governs the arrow, and the
+        // enclosing scope's mode is restored afterwards.
+        let saved_strict = self.strict;
         self.expect_punct(Punct::LBrace)?;
         self.push_scope(Scope::function(simple_parameter_names(params)));
         let result = (|| -> Result<Vec<Stmt>> {
@@ -2786,9 +2806,12 @@ impl<'a> Parser<'a> {
             Ok(body)
         })();
         self.pop_scope();
+        let body_strict = self.strict;
+        self.strict = saved_strict;
+        self.lexer.set_strict(saved_strict);
         let body = result?;
         self.bump()?;
-        Ok(FunctionBody::Block(body))
+        Ok((FunctionBody::Block(body), body_strict))
     }
 
     /// Whether the parenthesis at the current token is the parameter list of an
@@ -3614,7 +3637,7 @@ impl<'a> Parser<'a> {
                     self.top_level = false;
                     let func_result = (|| -> Result<Function> {
                         let params = self.parse_formal_parameters()?;
-                        let (params, params_span, body) =
+                        let (params, params_span, body, strict) =
                             self.parse_function_body(params, is_generator, is_async)?;
                         Ok(Function {
                             name: None,
@@ -3622,6 +3645,7 @@ impl<'a> Parser<'a> {
                             body,
                             is_async,
                             is_generator,
+                            strict,
                             is_arrow: false,
                             span: self.span_from(property_start),
                             params_span,

@@ -56,11 +56,21 @@ pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
     );
 }
 
-fn constructor(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    Ok(match args.first() {
+fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let number = match args.first() {
         None => Value::Int(0),
         Some(value) => Value::Float(value.to_number()),
-    })
+    };
+    // `new Number(1)` is a wrapper object, so the number has to be stored on the
+    // receiver: without it `Number.prototype.valueOf` finds no `_value` and every
+    // `ToPrimitive` step on a wrapper throws. Called as a plain function there is no
+    // receiver and the primitive is the answer.
+    if let Value::Object(object) = &this {
+        object.define("_value", Property::with_attributes(number, false, false));
+        return Ok(this);
+    }
+    let _ = interp;
+    Ok(number)
 }
 
 /// The receiver as a number, unboxing a wrapper object.
@@ -496,8 +506,15 @@ pub fn install_boolean(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
     );
 }
 
-fn boolean_constructor(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    Ok(Value::Bool(arg(args, 0).to_boolean()))
+fn boolean_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let flag = Value::Bool(arg(args, 0).to_boolean());
+    // Same wrapper rule as `Number`: `new Boolean(true)` stores the primitive.
+    if let Value::Object(object) = &this {
+        object.define("_value", Property::with_attributes(flag, false, false));
+        return Ok(this);
+    }
+    let _ = interp;
+    Ok(flag)
 }
 
 fn boolean_receiver(interp: &Interp<'_>, this: &Value) -> Result<bool, crate::interp::Signal> {

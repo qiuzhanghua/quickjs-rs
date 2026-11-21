@@ -67,7 +67,7 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
     );
 }
 
-fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     // `String(x)` converts; `new String(x)` boxes. The constructor is reached both
     // ways, and the difference is whether `this` is an object.
     //
@@ -78,7 +78,14 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
         Some(value) => interp.to_js_string(value)?,
         None => String::new(),
     };
-    Ok(interp.string(text))
+    let value = interp.string(text);
+    // `new String(x)` boxes, so the text is stored on the receiver for
+    // `String.prototype.valueOf` and the boxing path in `this_object` to find.
+    if let Value::Object(object) = &this {
+        object.define("_value", Property::with_attributes(value, false, false));
+        return Ok(this);
+    }
+    Ok(value)
 }
 
 fn from_char_code(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {

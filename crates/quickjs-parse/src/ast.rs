@@ -309,6 +309,13 @@ pub struct Function {
     pub is_async: bool,
     /// `function*` / `*method` / `async function*`
     pub is_generator: bool,
+    /// Whether the body is strict: either an enclosing strict context or the
+    /// function's own `"use strict"` directive.
+    ///
+    /// Recorded per function because strictness is not a property of the source but of
+    /// the enclosing context: a `"use strict"` inside one function body leaves the code
+    /// after it sloppy, so the compiler cannot infer a body's mode from the program's.
+    pub strict: bool,
     /// `=>`
     pub is_arrow: bool,
     /// Source range.

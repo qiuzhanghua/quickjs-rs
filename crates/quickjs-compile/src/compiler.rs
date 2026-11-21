@@ -24,6 +24,7 @@
 use crate::bytecode::LineCol;
 use crate::bytecode::{
     Atom, ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
+    VarKind,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
@@ -365,6 +366,14 @@ struct FnState {
     is_arrow: bool,
     /// The name a *named function expression* binds inside its own body.
     self_name: Option<String>,
+    /// Whether the self-name prologue (`special_object 2` then the store) has been
+    /// emitted for this function.
+    ///
+    /// A *nested* function's lookup declares the binding early (see
+    /// [`resolve_slot`]), so `provide_self_name` cannot decide on its own whether the
+    /// prologue is still needed — the binding existing is not the same as it being
+    /// initialised.
+    self_name_initialized: bool,
     /// Whether the code emitted so far leaves the program's result on the stack.
     /// The reference tracks this for the hidden `<ret>` local of an eval script.
     leaves_value: bool,
@@ -419,6 +428,7 @@ impl FnState {
             is_script: false,
             is_arrow: false,
             self_name: None,
+            self_name_initialized: false,
             leaves_value: false,
             stmt_depth: 0,
             hoisted: Vec::new(),
@@ -1333,10 +1343,17 @@ impl Compiler {
         let Some(name) = self.stack[current].self_name.clone() else {
             return;
         };
-        if !self.mentions(&name) {
+        if self.stack[current].self_name_initialized {
             return;
         }
-        self.prepend_binding(&name, 2);
+        // Either the body refers to the name, or a nested function already forced the
+        // binding into existence while being resolved.
+        let declared = self.stack[current].vars.iter().any(|v| v.name == name);
+        if !declared && !self.mentions(&name) {
+            return;
+        }
+        self.stack[current].self_name_initialized = true;
+        self.prepend_binding_with(&name, 2, VarKind::FunctionName);
     }
 
     /// Insert `special_object magic` plus the store to `name` at the top of the body.
@@ -1344,15 +1361,37 @@ impl Compiler {
     /// Prepending shifts every label that has been placed, so they are all moved by
     /// the number of instructions inserted.
     fn prepend_binding(&mut self, name: &str, magic: i32) {
+        self.prepend_binding_with(name, magic, VarKind::Normal);
+    }
+
+    /// [`Compiler::prepend_binding`] for a binding that is more than a plain local.
+    fn prepend_binding_with(&mut self, name: &str, magic: i32, kind: VarKind) {
         let current = self.stack.len() - 1;
-        self.declare_var(name, VarDef::var(name));
+        // A function-expression's own name is immutable in strict mode, which is what
+        // makes `f = 1` inside a strict body throw instead of being dropped.
+        let is_const = kind == VarKind::FunctionName && self.stack[current].strict;
+        self.declare_var(
+            name,
+            VarDef {
+                kind,
+                is_const,
+                ..VarDef::var(name)
+            },
+        );
         let init = [
             Insn::Fixed {
                 op: Opcode::SpecialObject,
                 operands: vec![Op::Int(magic)],
             },
             Insn::Var {
-                action: VarAction::Put,
+                // An initialisation, not an assignment: sloppy mode drops stores to a
+                // function-expression's own name, and the prologue is what puts the
+                // value there in the first place.
+                action: if kind == VarKind::FunctionName {
+                    VarAction::PutInit
+                } else {
+                    VarAction::Put
+                },
                 name: name.to_string(),
                 block: 0,
             },
@@ -3113,7 +3152,10 @@ impl Compiler {
                 .unwrap_or_default(),
             kind,
         );
-        state.strict = self.cur().strict;
+        // The function's own mode, recorded by the parser. Inheriting the enclosing
+        // function's instead let a nested `"use strict"` directive be ignored, so the
+        // body ran with sloppy `this`, sloppy `arguments` and no const checks.
+        state.strict = func.strict;
         state.is_arrow = func.is_arrow;
         // A named *expression* binds its own name; a declaration's name is already
         // bound in the enclosing scope.
@@ -3381,6 +3423,27 @@ fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) 
                 block,
             } => {
                 let slot = resolve_slot(stack, current, name, *block);
+                // A store to the name of a named function expression is special: the
+                // reference drops it in sloppy mode and throws in strict mode, because
+                // the binding is immutable but only *checked* when the body is strict.
+                if matches!(action, VarAction::Put | VarAction::Set)
+                    && let Slot::Loc(index) = slot
+                    && let Some(var) = stack[current].vars.get(index as usize)
+                    && var.kind == VarKind::FunctionName
+                {
+                    out.push(Some(if var.is_const {
+                        (
+                            Opcode::ThrowError,
+                            vec![
+                                Op::AtomId(intern_atom(&mut stack[current], name)),
+                                Op::Int(0),
+                            ],
+                        )
+                    } else {
+                        (Opcode::Drop, Vec::new())
+                    }));
+                    continue;
+                }
                 out.push(Some(variable_instruction(stack, current, *action, slot)));
             }
             Insn::CloseCaptured { name, block } => {
@@ -3532,6 +3595,24 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
                 var.is_const,
                 var.is_lexical,
             ))
+        } else if stack[owner].self_name.as_deref() == Some(name) {
+            // A named function expression's own name. The reference declares it here,
+            // on the first lookup that fails, rather than up front — and that is what
+            // makes it reachable from a *nested* function: the nested lookup is what
+            // walks out and creates the binding. A direct reference in the body is
+            // caught the same way, which is why `provide_self_name` only has to add
+            // the prologue.
+            let strict = stack[owner].strict;
+            stack[owner].var_block.push(FUNCTION_SCOPE);
+            stack[owner].vars.push(VarDef {
+                kind: VarKind::FunctionName,
+                // In strict mode the name is immutable, so a store raises; sloppy
+                // mode drops the store instead (see `variable_instruction`).
+                is_const: strict,
+                ..VarDef::var(name)
+            });
+            let index = stack[owner].vars.len() as u32 - 1;
+            Some(Found::Local(ClosureType::Local, index, strict, false))
         } else if let Some(index) = stack[owner]
             .closure_vars
             .iter()

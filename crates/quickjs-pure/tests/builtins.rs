@@ -883,4 +883,50 @@ fn eval_sees_the_calling_scope() {
         throws("'use strict'; eval('undeclared_thing = 1')"),
         "ReferenceError: undeclared_thing is not defined"
     );
+    // A *sloppy* eval has no variable environment of its own, so its `var` lands in
+    // the caller's — for a top-level eval, the global object. The split is on
+    // strictness alone, not on being called from a function.
+    assert_eq!(
+        eval("eval('var sloppy = 1'); print(typeof sloppy)"),
+        "number\n"
+    );
+    // A sloppy assignment to a non-writable global is a silent no-op; strict mode
+    // reports the same refusal as a TypeError.
+    assert_eq!(
+        eval(
+            "(1, eval)('var ro = 1');\n\
+             Object.defineProperty(globalThis, 'ro', { writable: false });\n\
+             ro = 2;\n\
+             print(ro)"
+        ),
+        "1\n"
+    );
+    assert_eq!(
+        throws(
+            "'use strict'; (1, eval)('var ro = 1');\n\
+             Object.defineProperty(globalThis, 'ro', { writable: false });\n\
+             ro = 2;"
+        ),
+        "TypeError: 'ro' is read-only"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The wrapper constructors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn new_number_string_boolean_store_their_primitive() {
+    // `new Number(1)` is a wrapper object, so every `ToPrimitive` step on it runs
+    // the prototype's `valueOf`, which reads the primitive the constructor stored
+    // on the receiver. Without that store the whole boxed family throws.
+    assert_eq!(eval("print(new Number(1) == 1)"), "true\n");
+    assert_eq!(eval("print(new String('ab') == 'ab')"), "true\n");
+    assert_eq!(eval("print(new Boolean(true) == true)"), "true\n");
+    // Called as a plain function there is no receiver to store into, and the
+    // primitive comes back unwrapped.
+    assert_eq!(
+        eval("print(new Number(1) + 1, Number(5), String(new String('x')))"),
+        "2 5 x\n"
+    );
 }

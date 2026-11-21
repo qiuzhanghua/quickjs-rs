@@ -171,6 +171,11 @@ pub struct Interp<'a> {
     /// the frame captured) when the eval finishes. That is what makes
     /// `f("a = 3")` visible to the caller as `a === 3`.
     eval_bindings: Vec<EvalBinding>,
+    /// The calling frame's `arguments`, while an `eval` runs.
+    ///
+    /// Kept apart from [`Interp::eval_scope`] because a sloppy eval has no scope of its
+    /// own yet still has to see the caller's `arguments`.
+    eval_arguments: Option<Value>,
     /// Names of the native functions currently executing, outermost first.
     ///
     /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
@@ -220,6 +225,7 @@ impl<'a> Interp<'a> {
             frames: Vec::new(),
             eval_scope: None,
             eval_bindings: Vec::new(),
+            eval_arguments: None,
             native_frames: Vec::new(),
             output: String::new(),
             max_frames: 4096,
@@ -348,7 +354,8 @@ impl<'a> Interp<'a> {
             }
         };
         compiled.set_filename(EVAL_FILE);
-        self.run_eval_script(compiled)
+        let strict = compiled.strict;
+        self.run_eval_script(compiled, strict)
     }
 
     /// Run an `eval`'d script in the caller's scope.
@@ -364,7 +371,7 @@ impl<'a> Interp<'a> {
     ///
     /// Locals of the calling function are *not* reachable: that needs the compiler to
     /// hand its variable environment over, which this milestone does not do.
-    fn run_eval_script(&mut self, code: CompiledFunction) -> JsResult<Value> {
+    fn run_eval_script(&mut self, code: CompiledFunction, code_strict: bool) -> JsResult<Value> {
         // `this` and `arguments` come from the innermost frame only — those are not
         // lexical — while the name bindings come from the whole chain of frames, part
         // of it being ordinary scope resolution.
@@ -403,10 +410,17 @@ impl<'a> Interp<'a> {
         // elements is all the spec's ordinary uses need.
         let arguments = Value::Object(self.new_array(passed));
 
-        let mut scope = BTreeMap::new();
-        scope.insert("arguments".to_string(), arguments);
-
-        let previous_scope = self.eval_scope.replace(scope);
+        // Only a *strict* eval gets a variable environment of its own. A sloppy one
+        // declares its `var`s in the caller's — which for a top-level eval is the global
+        // object, so `eval("var gv=1")` leaves `gv` globally visible. Deciding this on
+        // strictness alone is the spec's rule; getting it wrong made every sloppy `var`
+        // vanish into a scope nobody reads back from.
+        let previous_scope = if code_strict {
+            self.eval_scope.replace(BTreeMap::new())
+        } else {
+            None
+        };
+        let previous_arguments = self.eval_arguments.replace(arguments);
         let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
         let compiled = Gc::new(self.heap, CompiledCode::new(code));
         let closure_vars = compiled.code.closure_vars.clone();
@@ -414,6 +428,7 @@ impl<'a> Interp<'a> {
         let callee = Value::Undefined;
         let result = self.execute(compiled, env, this, Vec::new(), callee);
         self.eval_scope = previous_scope;
+        self.eval_arguments = previous_arguments;
         self.eval_bindings = previous_bindings;
         result
     }
@@ -731,6 +746,11 @@ impl<'a> Interp<'a> {
 
     fn get_global(&mut self, slot: usize) -> JsResult<Value> {
         let (name, lexical, _) = self.global_binding(slot);
+        if name == "arguments"
+            && let Some(arguments) = &self.eval_arguments
+        {
+            return Ok(arguments.clone());
+        }
         // The frame that called `eval` is the innermost scope the eval'd code sees, so
         // its local `a` wins over a global `a`.
         if let Some(value) = self.eval_binding_value(&name) {
@@ -803,8 +823,18 @@ impl<'a> Interp<'a> {
         let global = self.realm.global.clone();
         match global.own_property(&name) {
             // A `var` global is writable, so the store goes straight through — but
-            // through the property, so `globalThis.v = 3` and `v = 3` agree.
-            Some(_) => self.set_property_with(&global, &name, value, DeleteFailure::Throw),
+            // through the property, so `globalThis.v = 3` and `v = 3` agree. A failed
+            // store (a non-writable or accessor-without-setter global) is a silent
+            // no-op in sloppy mode and a `TypeError` in strict mode, which is the same
+            // split every other assignment has.
+            Some(_) => {
+                let on_failure = if self.current_strict() {
+                    DeleteFailure::Throw
+                } else {
+                    DeleteFailure::Ignore
+                };
+                self.set_property_with(&global, &name, value, on_failure)
+            }
             // Only an implicit global reaches here. In sloppy mode `x = 1` with no
             // declaration creates a *configurable* property, which is what makes it
             // deletable and is the one way a global differs from a declared `var`.
@@ -875,18 +905,27 @@ impl<'a> Interp<'a> {
                     }
                 }
             },
-            EvalSlot::Local => match owner.code.loc_cell.get(index).copied().unwrap_or(-1) {
-                cell if cell >= 0 => {
-                    if let Some(cell) = owner.cells.get(cell as usize) {
-                        cell.set(value.clone());
+            EvalSlot::Local => {
+                // A sloppy `eval("m = 1")` where `m` is the name of a named function
+                // expression is ignored, the same as a direct store would be.
+                if owner.code.code.vars.get(index).is_some_and(|var| {
+                    var.kind == js_compile::VarKind::FunctionName && !var.is_const
+                }) {
+                    return true;
+                }
+                match owner.code.loc_cell.get(index).copied().unwrap_or(-1) {
+                    cell if cell >= 0 => {
+                        if let Some(cell) = owner.cells.get(cell as usize) {
+                            cell.set(value.clone());
+                        }
+                    }
+                    _ => {
+                        if let Some(slot) = owner.locals.get_mut(index) {
+                            *slot = value.clone();
+                        }
                     }
                 }
-                _ => {
-                    if let Some(slot) = owner.locals.get_mut(index) {
-                        *slot = value.clone();
-                    }
-                }
-            },
+            }
         }
         true
     }
@@ -2804,11 +2843,25 @@ impl<'a> Interp<'a> {
         source: &Value,
         _exclusion: &Value,
     ) -> JsResult<()> {
-        let (Some(target), Value::Object(source)) = (target.as_object(), source) else {
-            // Spreading `undefined`/`null` is a no-op, and spreading a primitive
-            // copies nothing that a script can observe here.
+        // `CopyDataProperties` starts with `ToObject(source)`, so a *string* primitive
+        // does contribute: its index properties are own, enumerable and writable, which
+        // is why `{..."ab"}` is `{"0":"a","1":"b"}`. Numbers and booleans box to objects
+        // with no own properties, so they copy nothing, and spreading `undefined`/`null`
+        // is a no-op.
+        let Some(target) = target.as_object() else {
             return Ok(());
         };
+        let source_object = match source {
+            Value::Object(object) => object.clone(),
+            Value::String(text) => {
+                for (index, character) in text.as_str().chars().enumerate() {
+                    target.define_data(&index.to_string(), self.string(character.to_string()));
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        let source = &source_object;
         let mut keys = source.own_enumerable_keys();
         if let Some(length) = source.array_length() {
             keys.retain(|key| key != "length");
