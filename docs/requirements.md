@@ -273,7 +273,11 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 
 ### 发布策略
 
-**结论：发布门槛（M4）已跨过，可以发；具体时点待定**（决策 5，经 M3/M4 两次修订）。
+**结论：已发布 v0.2.0**（决策 5，经 M3/M4 两次修订）。
+
+2026-11-21 按 `scripts/publish.sh` 的顺序发布到 crates.io：`quickjs-gc` → `quickjs-parse`
+→ `quickjs-compile` → `quickjs-pure`，四个都是 `0.2.0`。发布后用独立项目依赖
+`quickjs = { package = "quickjs-pure", version = "0.2" }` 验证过能拉取、编译并执行 JS。
 
 M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`、`JSON.stringify`、
 `Math.sumPrecise`、`Reflect.apply`、`Object.freeze` 的冻结语义都按参考实现的行为工作。

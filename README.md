@@ -45,7 +45,17 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**尚未发布到 crates.io**。M3（能执行 JS）与 M4（标准库第一波）都已达成：
+**已发布到 crates.io（v0.2.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
+`quickjs-gc`/`quickjs-parse`/`quickjs-compile` 是其依赖。`quickjs-cli` 与
+`quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
+只是 dev-dependency。用法：
+
+```toml
+[dependencies]
+quickjs = { package = "quickjs-pure", version = "0.2" }
+```
+
+M3（能执行 JS）与 M4（标准库第一波）都已达成：
 `Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、
 `Reflect` 与错误类均可用，`qjs` 能跑通参考实现的 `test_builtin.js` 中 M4 覆盖的部分。
 `error.stack` 可用：位置来自编译期为每条指令记录的表，所以栈帧能报到
