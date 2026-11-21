@@ -369,6 +369,18 @@ struct FnState {
     defined_args: u32,
     /// Parameters that are not a plain name, with the argument slot each came from.
     param_prologue: Vec<(usize, Pattern)>,
+    /// Whether this function needs the hidden `this` local, because an arrow inside it
+    /// refers to `this`.
+    ///
+    /// An arrow has no `this` of its own, so the reference materialises the enclosing
+    /// function's receiver into a local and lets the arrow capture it as an ordinary
+    /// closure variable. Declaring the local is not enough on its own: the store that
+    /// fills it has to be prepended to the body, which is what this flag arranges.
+    needs_this_local: bool,
+    /// The same, for `arguments`.
+    needs_arguments_local: bool,
+    /// The same, for `new.target`.
+    needs_new_target_local: bool,
     /// Hidden locals of the `with` blocks currently open, innermost last.
     with_names: Vec<String>,
     /// Set while a with-guard is being emitted, so the guard's own accesses are not
@@ -438,6 +450,9 @@ impl FnState {
             is_arrow: false,
             defined_args: 0,
             param_prologue: Vec::new(),
+            needs_this_local: false,
+            needs_arguments_local: false,
+            needs_new_target_local: false,
             with_names: Vec::new(),
             emitting_with_guard: false,
             self_name: None,
@@ -1423,10 +1438,18 @@ impl Compiler {
     /// `special_object`; that is the reference's shape, so the disassembly agrees.
     fn provide_arguments(&mut self) {
         let current = self.stack.len() - 1;
-        if self.stack[current].is_script || self.stack[current].is_arrow {
+        if self.stack[current].is_script {
             return;
         }
-        if !self.mentions("arguments") {
+        // An arrow has no `arguments` of its own: the binding belongs to the enclosing
+        // function, which is why `() => arguments` sees the caller's arguments.
+        if self.stack[current].is_arrow {
+            if self.mentions("arguments") {
+                self.ensure_enclosing_arguments();
+            }
+            return;
+        }
+        if !self.mentions("arguments") && !self.stack[current].needs_arguments_local {
             return;
         }
         // 0 is strict `arguments`, 1 is sloppy (mapped) `arguments`. The mapping
@@ -1452,6 +1475,28 @@ impl Compiler {
     /// The value is `special_object 2`, the function currently running, so the binding
     /// is the closure itself and not a copy. It is a local of this function, which is
     /// what keeps `g` out of the enclosing scope.
+    /// Give the function a local `this`, for an arrow inside it to capture.
+    fn provide_this_local(&mut self) {
+        let current = self.stack.len() - 1;
+        if !self.stack[current].needs_this_local {
+            return;
+        }
+        if !self.stack[current]
+            .vars
+            .iter()
+            .any(|var| var.name == "this")
+        {
+            self.declare_hidden_local("this", VarKind::Normal);
+        }
+        self.prepend_initialiser(
+            "this",
+            Insn::Fixed {
+                op: Opcode::PushThis,
+                operands: vec![],
+            },
+        );
+    }
+
     fn provide_self_name(&mut self) {
         let current = self.stack.len() - 1;
         let Some(name) = self.stack[current].self_name.clone() else {
@@ -2476,7 +2521,8 @@ impl Compiler {
             ExprKind::Null => self.emit(Opcode::Null, &[]),
             ExprKind::String(text) => self.push_string(text),
             ExprKind::Ident(name) => self.emit_var(VarAction::Get, &name.name),
-            ExprKind::This => self.push_this(),
+            ExprKind::This => self.this_expression(),
+            ExprKind::NewTarget => self.new_target_expression(),
             ExprKind::Paren(inner) => self.expr(inner)?,
             ExprKind::Binary { op, left, right } => {
                 self.expr(left)?;
@@ -3080,6 +3126,112 @@ impl Compiler {
 
     fn push_this(&mut self) {
         self.emit(Opcode::PushThis, &[]);
+    }
+
+    /// `this`, which an arrow does not have of its own.
+    ///
+    /// The reference gives the enclosing function a local named `this`, initialised from
+    /// `push_this` at the top of its body, and the arrow then reads it as a captured
+    /// variable. That is why `(() => this)()` inside `f` yields `f`'s receiver even when
+    /// the arrow is called with none.
+    fn this_expression(&mut self) {
+        if !self.cur().is_arrow {
+            self.push_this();
+            return;
+        }
+        if let Some(target) = self.enclosing_function() {
+            self.state_at(target).needs_this_local = true;
+            self.declare_at(target, "this");
+        }
+        self.emit_var(VarAction::Get, "this");
+    }
+
+    /// `new.target`, which an arrow likewise does not own.
+    fn new_target_expression(&mut self) {
+        if !self.cur().is_arrow {
+            self.emit(Opcode::SpecialObject, &[Op::Int(3)]);
+            return;
+        }
+        if let Some(target) = self.enclosing_function() {
+            self.state_at(target).needs_new_target_local = true;
+            self.declare_at(target, "new_target");
+        }
+        self.emit_var(VarAction::Get, "new_target");
+    }
+
+    /// Give the function a local `new.target`, for an arrow inside it to capture.
+    fn provide_new_target_local(&mut self) {
+        let current = self.stack.len() - 1;
+        if !self.stack[current].needs_new_target_local {
+            return;
+        }
+        if !self.stack[current]
+            .vars
+            .iter()
+            .any(|var| var.name == "new_target")
+        {
+            self.declare_hidden_local("new_target", VarKind::Normal);
+        }
+        self.prepend_initialiser(
+            "new_target",
+            Insn::Fixed {
+                op: Opcode::SpecialObject,
+                operands: vec![Op::Int(3)],
+            },
+        );
+    }
+
+    /// `arguments` reached from an arrow, which likewise belongs to the enclosing
+    /// function.
+    fn ensure_enclosing_arguments(&mut self) {
+        if let Some(target) = self.enclosing_function() {
+            self.state_at(target).needs_arguments_local = true;
+            self.declare_at(target, "arguments");
+        }
+    }
+
+    /// The innermost enclosing frame that is a real function — an arrow inherits from it
+    /// rather than starting a scope of its own.
+    fn enclosing_function(&self) -> Option<usize> {
+        (0..self.stack.len())
+            .rev()
+            .find(|index| !self.stack[*index].is_arrow && !self.stack[*index].is_script)
+    }
+
+    fn state_at(&mut self, index: usize) -> &mut FnState {
+        &mut self.stack[index]
+    }
+
+    /// Declare a `var` binding directly in a specific frame.
+    fn declare_at(&mut self, index: usize, name: &str) {
+        let state = &mut self.stack[index];
+        if state.vars.iter().any(|var| var.name == name) {
+            return;
+        }
+        state.var_block.push(FUNCTION_SCOPE);
+        state.vars.push(VarDef::var(name));
+    }
+
+    /// Prepend `<value-producing insn>; put <name>` to the body, which is how a binding
+    /// the reference calls a `special_object` gets initialised on entry.
+    fn prepend_initialiser(&mut self, name: &str, producer: Insn) {
+        let current = self.stack.len() - 1;
+        let init = [
+            producer,
+            Insn::Var {
+                action: VarAction::Put,
+                name: name.to_string(),
+                block: 0,
+            },
+        ];
+        let inserted = init.len();
+        for (index, instruction) in init.into_iter().enumerate() {
+            self.stack[current].insns.insert(index, instruction);
+        }
+        for placed in self.stack[current].labels.iter_mut().flatten() {
+            *placed += inserted;
+        }
+        self.stack[current].label_since_insn = true;
     }
 
     fn push_constant(&mut self, constant: Constant) -> u32 {
@@ -3784,6 +3936,8 @@ impl Compiler {
     /// it.
     fn finish_current(&mut self) -> CompiledFunction {
         self.provide_arguments();
+        self.provide_this_local();
+        self.provide_new_target_local();
         self.provide_self_name();
         let (mut resolved, resolved_pos) = resolve(&mut self.stack);
         // Captured bindings need a reference cell; the count goes in the header so
@@ -3810,6 +3964,7 @@ impl Compiler {
             name: state.name,
             kind: state.kind,
             strict: state.strict,
+            is_arrow: state.is_arrow,
             args: state.args,
             defined_args: state.defined_args,
             vars: state.vars,

@@ -488,6 +488,12 @@ pub struct Function {
     pub kind: FunctionKind,
     /// Whether the body is strict.
     pub strict: bool,
+    /// Whether this came from an arrow function.
+    ///
+    /// An arrow has no `this` and no `new.target` of its own, so the runtime has to know
+    /// to look outward for both — an `eval` inside an arrow sees the enclosing function's
+    /// receiver, not the arrow's.
+    pub is_arrow: bool,
     /// Parameters.
     pub args: Vec<VarDef>,
     /// How many parameters count towards `Function.prototype.length`.

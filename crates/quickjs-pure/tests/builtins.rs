@@ -1099,3 +1099,63 @@ fn eval_inside_with_sees_the_object() {
         "c b\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Arrows inherit `this`, `arguments` and `new.target`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_arrow_reads_the_enclosing_functions_bindings() {
+    // An arrow has no `this` of its own, so the enclosing function materialises its
+    // receiver into a local and the arrow captures it.
+    assert_eq!(
+        eval("'use strict'; function f(){return (()=>this)()} print(f.call('t'))"),
+        "t\n"
+    );
+    assert_eq!(
+        eval("var o={m(){return (()=>this)()}}; print(o.m()===o)"),
+        "true\n"
+    );
+    // Two levels deep is still the outermost function's receiver.
+    assert_eq!(
+        eval("'use strict'; function f(){return (()=>()=>this)()()} print(f.call('x'))"),
+        "x\n"
+    );
+    // The same holds for `arguments`, which is likewise the enclosing function's.
+    assert_eq!(
+        eval("function f(){return (()=>arguments.length)()} print(f(1,2))"),
+        "2\n"
+    );
+    // `new.target` is lexical too, and `undefined` for an ordinary call.
+    assert_eq!(
+        eval("function f(){return new.target} print(f(), new f()===f)"),
+        "undefined true\n"
+    );
+    assert_eq!(
+        eval("function f(){return (()=>new.target)()} print(new f()===f)"),
+        "true\n"
+    );
+}
+
+#[test]
+fn eval_inherits_the_callers_this_and_new_target() {
+    // A direct eval runs in the caller's function context, so both are visible even
+    // though the eval'd source is a bare script.
+    assert_eq!(
+        eval("'use strict'; function f(){return eval('this')} print(f.call('v'))"),
+        "v\n"
+    );
+    assert_eq!(
+        eval("function f(){return eval('new.target')} print(new f()===f)"),
+        "true\n"
+    );
+    // Through an arrow the lookup skips the arrow's own frame, which has neither.
+    assert_eq!(
+        eval("'use strict'; function f(){return (()=>eval('this'))()} print(f.call('v'))"),
+        "v\n"
+    );
+    assert_eq!(
+        eval("'use strict'; function f(){return (()=>eval('new.target'))()} print(new f()===f)"),
+        "true\n"
+    );
+}

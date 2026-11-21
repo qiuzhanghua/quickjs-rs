@@ -139,6 +139,8 @@ struct Frame {
     at: usize,
     /// The callee, so a native builtin can tell which constructor it is.
     callee: Value,
+    /// `new.target`: the constructor under `new`, `undefined` for a plain call.
+    new_target: Value,
     /// Whether this frame's body ended in a `tail_call`.
     ///
     /// The reference's `tail_call` is not a frame-reusing tail call: it calls the callee
@@ -181,6 +183,16 @@ pub struct Interp<'a> {
     /// `None` outside an eval, which is what keeps a finished block's object from
     /// shadowing ordinary bytecode reads.
     eval_with: Option<Vec<Gc<JsObject>>>,
+    /// The caller's `new.target`, while an `eval` runs.
+    ///
+    /// The eval'd code is a script with no constructor of its own, so it inherits the
+    /// one the enclosing function was called with.
+    eval_new_target: Option<Value>,
+    /// `new.target` for the frame about to be pushed.
+    ///
+    /// `construct` parks the constructor here and `push_frame` takes it, which is how the
+    /// value reaches the frame without threading a parameter through every call site.
+    pending_new_target: Option<Value>,
     /// Names of the native functions currently executing, outermost first.
     ///
     /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
@@ -232,6 +244,8 @@ impl<'a> Interp<'a> {
             eval_bindings: Vec::new(),
             eval_arguments: None,
             eval_with: None,
+            pending_new_target: None,
+            eval_new_target: None,
             native_frames: Vec::new(),
             output: String::new(),
             max_frames: 4096,
@@ -329,11 +343,9 @@ impl<'a> Interp<'a> {
         // implicit global. The caller's frame is the innermost one here, because a
         // native function does not push a frame of its own.
         let strict = self.current_strict();
-        let parsed = if strict {
-            js_parse::parse_script_strict(source)
-        } else {
-            js_parse::parse_script(source)
-        };
+        // `eval` runs in the caller's function context, so `new.target` is legal here
+        // even though the source is a bare script.
+        let parsed = js_parse::parse_eval_script(source, strict);
         let program = match parsed {
             Ok(program) => program,
             Err(error) => {
@@ -381,7 +393,16 @@ impl<'a> Interp<'a> {
         // `this` and `arguments` come from the innermost frame only — those are not
         // lexical — while the name bindings come from the whole chain of frames, part
         // of it being ordinary scope resolution.
-        let (this, passed) = match self.frames.last() {
+        // An arrow has no `this` of its own, so an `eval` inside one inherits the
+        // enclosing function's receiver — the lexical `this` the arrow was compiled to
+        // read from its closure.
+        let caller = self
+            .frames
+            .iter()
+            .rev()
+            .find(|frame| !frame.code.code.is_arrow)
+            .or_else(|| self.frames.last());
+        let (this, passed) = match caller {
             Some(frame) => (frame.this.clone(), frame.passed.clone()),
             // No frame at all: the eval is running at the top level, so there is
             // nothing to inherit and the global receiver is right.
@@ -428,6 +449,15 @@ impl<'a> Interp<'a> {
         };
         let previous_arguments = self.eval_arguments.replace(arguments);
         let previous_with = self.eval_with.replace(self.with_objects());
+        let inherited_new_target = self
+            .frames
+            .iter()
+            .rev()
+            .find(|frame| !frame.code.code.is_arrow)
+            .map(|frame| frame.new_target.clone());
+        let previous_new_target = self
+            .eval_new_target
+            .replace(inherited_new_target.unwrap_or(Value::Undefined));
         let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
         let compiled = Gc::new(self.heap, CompiledCode::new(code));
         let closure_vars = compiled.code.closure_vars.clone();
@@ -437,6 +467,7 @@ impl<'a> Interp<'a> {
         self.eval_scope = previous_scope;
         self.eval_arguments = previous_arguments;
         self.eval_with = previous_with;
+        self.eval_new_target = previous_new_target;
         self.eval_bindings = previous_bindings;
         result
     }
@@ -656,6 +687,7 @@ impl<'a> Interp<'a> {
             pc: 0,
             at: 0,
             callee,
+            new_target: self.pending_new_target.take().unwrap_or(Value::Undefined),
             tail: false,
         });
         Ok(())
@@ -1372,6 +1404,12 @@ impl<'a> Interp<'a> {
             2 => Ok(self
                 .current_callee()
                 .map_or(Value::Undefined, Value::Object)),
+            // `new.target`: set by `construct`, `undefined` for an ordinary call, and
+            // inherited from the caller inside an `eval`.
+            3 => Ok(self
+                .eval_new_target
+                .clone()
+                .unwrap_or_else(|| self.frame().new_target.clone())),
             other => Err(Signal::Throw(self.make_error(
                 "InternalError",
                 &format!("special_object {other} is not implemented yet"),
@@ -1443,7 +1481,7 @@ impl<'a> Interp<'a> {
     pub fn construct(
         &mut self,
         callee: Value,
-        _new_target: Value,
+        new_target: Value,
         args: Vec<Value>,
     ) -> JsResult<Value> {
         // `new` on a bound function constructs its *target*, prepending the arguments
@@ -1487,7 +1525,11 @@ impl<'a> Interp<'a> {
             _ => Some(self.realm.object_proto.clone()),
         };
         let this = Value::Object(self.new_object(prototype));
+        // `new.target` inside the body is the constructor that was written, so a bound
+        // function's target sees itself rather than the bound wrapper.
+        self.pending_new_target = Some(new_target);
         let result = self.call_value(callee, this.clone(), args)?;
+        self.pending_new_target = None;
         // A constructor that returns an object overrides `this`; any other return
         // value (including `undefined`) is ignored.
         Ok(match result {

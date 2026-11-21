@@ -263,6 +263,21 @@ pub fn parse_script_strict(src: &str) -> Result<Program> {
     parser.parse_program()
 }
 
+/// Parse `src` as a direct `eval` body, inheriting `new.target` from the caller.
+///
+/// `eval("new.target")` is legal inside a function because the eval'd code runs in the
+/// caller's function context, even though the source being parsed is a bare script with
+/// no function of its own. `strict` is the caller's mode, which a sloppy eval does not
+/// derive from its own text.
+pub fn parse_eval_script(src: &str, strict: bool) -> Result<Program> {
+    let mut parser = Parser::new(src, false)?;
+    parser.ctx.in_function = true;
+    if strict {
+        parser.enter_strict()?;
+    }
+    parser.parse_program()
+}
+
 /// Parse `src` as a single `Expression` (used by tests and by `eval`-like entry
 /// points that need the expression grammar only).
 pub fn parse_expression(src: &str) -> Result<Expr> {

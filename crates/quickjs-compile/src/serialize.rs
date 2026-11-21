@@ -15,7 +15,7 @@
 //! function record:
 //!   name        string (u32 length + UTF-8 bytes)
 //!   kind        u8
-//!   flags       u8    bit 0 = strict
+//!   flags       u8    bit 0 = strict, bit 1 = arrow
 //!   line, column u32 each
 //!   defined_args u32  arity that counts towards `.length`
 //!   args        u32 count, then name/flags records
@@ -40,7 +40,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,7 @@ fn write_var(out: &mut Vec<u8>, var: &VarDef) {
 fn write_function(out: &mut Vec<u8>, function: &Function) {
     write_string(out, &function.name);
     out.push(kind_tag(function.kind));
-    out.push(u8::from(function.strict));
+    out.push(u8::from(function.strict) | (u8::from(function.is_arrow) << 1));
     out.extend_from_slice(&function.line.to_be_bytes());
     out.extend_from_slice(&function.column.to_be_bytes());
 
@@ -310,7 +310,9 @@ fn read_var(reader: &mut Reader<'_>) -> Result<VarDef, DecodeError> {
 fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let name = reader.string()?;
     let kind = kind_from_tag(reader.u8()?)?;
-    let strict = reader.u8()? != 0;
+    let flags = reader.u8()?;
+    let strict = flags & 1 != 0;
+    let is_arrow = flags & 2 != 0;
     let line = reader.u32()?;
     let column = reader.u32()?;
 
@@ -371,6 +373,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         name,
         kind,
         strict,
+        is_arrow,
         args,
         defined_args,
         vars,
@@ -515,6 +518,7 @@ mod tests {
             name: "<eval>".to_string(),
             kind: FunctionKind::Normal,
             strict: false,
+            is_arrow: false,
             args: vec![],
             defined_args: 0,
             vars: vec![VarDef::var("<ret>"), VarDef::constant("k")],
