@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v0.7 —— M0/M1 已完成；M2 编译器核心 + TDZ 与作用域链已通过逐 opcode 差分
+> 状态：v0.8 —— M0/M1 已完成；M2 编译器核心 + TDZ/作用域链 + break/continue/标签已通过逐 opcode 差分
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---

@@ -88,6 +88,27 @@ enum Insn {
     Fixed { op: Opcode, operands: Vec<Op> },
     /// A variable access, resolved in the second pass.
     Var { action: VarAction, name: String },
+    /// An instruction that dead-code elimination removed. It keeps its slot so
+    /// that label indices stay valid, and resolves to no bytecode.
+    Dead,
+}
+
+/// Where `break` and `continue` jump to.
+///
+/// Targets are stacked as the compiler enters loops and labelled statements, so a
+/// bare `break` needs no analysis: it is simply the innermost target. A labelled
+/// one searches outward by name.
+#[derive(Debug, Clone)]
+struct JumpTarget {
+    /// The labels attached to this target. `l: for(;;)` gives one name; a bare
+    /// loop gives none; `a: b: for(;;)` gives two, because both labels name the
+    /// same statement and `break a` must reach the same place as `break b`.
+    names: Vec<String>,
+    /// Where `break` lands.
+    break_label: Label,
+    /// Where `continue` lands. `None` for a labelled non-loop statement, which
+    /// `break` may leave but `continue` may not target.
+    continue_label: Option<Label>,
 }
 
 /// A lexical scope, identified while hoisting and numbered at the end.
@@ -127,6 +148,8 @@ struct FnState {
     /// Head of each scope's binding chain, indexed by level. Filled in by
     /// [`rebuild_scope_chain`]; the scope chain is only needed at run time.
     block_heads: Vec<i32>,
+    /// Enclosing `break`/`continue` targets, innermost last.
+    jump_targets: Vec<JumpTarget>,
     insns: Vec<Insn>,
     labels: Vec<Option<usize>>,
     /// Captured locals, which need a reference cell.
@@ -174,6 +197,7 @@ impl FnState {
             var_block: Vec::new(),
             body_block: 0,
             block_heads: Vec::new(),
+            jump_targets: Vec::new(),
             insns: Vec::new(),
             labels: Vec::new(),
             var_ref_count: 0,
@@ -426,12 +450,20 @@ impl Compiler {
     // -- statements --------------------------------------------------------
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
+        self.stmt_labelled(stmt, &[])
+    }
+
+    /// Compile a statement that a chain of labels names.
+    ///
+    /// Only a loop consumes `labels`; every other statement ignores them (the
+    /// parser has already rejected a label on a statement that cannot use it).
+    fn stmt_labelled(&mut self, stmt: &Stmt, labels: &[String]) -> Result<(), SyntaxError> {
         // Only a *top-level* expression statement supplies the program's value.
         let saved = self.cur().leaves_value;
         self.state().leaves_value =
             matches!(stmt.kind, StmtKind::Expr(_)) && self.cur().stmt_depth == 0;
         self.state().stmt_depth += 1;
-        let result = self.stmt_inner(stmt);
+        let result = self.stmt_inner(stmt, labels);
         self.state().stmt_depth -= 1;
         // A nested statement never contributes the program's value, so the flag
         // the wrapper set above is what survives.
@@ -441,7 +473,7 @@ impl Compiler {
         result
     }
 
-    fn stmt_inner(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
+    fn stmt_inner(&mut self, stmt: &Stmt, labels: &[String]) -> Result<(), SyntaxError> {
         match &stmt.kind {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(expr) => {
@@ -495,8 +527,10 @@ impl Compiler {
                 let end = self.new_label();
                 self.place_label(top);
                 self.expr(test)?;
+                // The condition's false branch and `break` share one target,
+                // which is why a `while` loop needs only one end label.
                 self.emit_jump(Opcode::IfFalse, end, &[]);
-                self.loop_body(body, top, end)?;
+                self.loop_body(body, labels, top, end)?;
                 self.emit_jump(Opcode::Goto, top, &[]);
                 self.place_label(end);
             }
@@ -506,7 +540,9 @@ impl Compiler {
                 let cont = self.new_label();
                 let end = self.new_label();
                 self.place_label(top);
-                self.loop_body(body, cont, end)?;
+                // `continue` in a `do…while` runs the test, so it lands on `cont`
+                // rather than on the loop head.
+                self.loop_body(body, labels, cont, end)?;
                 self.place_label(cont);
                 self.expr(test)?;
                 self.emit_jump(Opcode::IfTrue, top, &[]);
@@ -542,7 +578,9 @@ impl Compiler {
                     self.expr(test)?;
                     self.emit_jump(Opcode::IfFalse, end, &[]);
                 }
-                self.loop_body(body, cont, end)?;
+                // `continue` runs the update expression first, so it lands on
+                // `cont`, which sits just before the update.
+                self.loop_body(body, labels, cont, end)?;
                 self.place_label(cont);
                 if let Some(update) = update {
                     self.expr(update)?;
@@ -805,28 +843,117 @@ impl Compiler {
         });
     }
 
-    /// Compile a loop body, registering the labels `break` and `continue` jump to.
+    /// Compile a loop body with a `break`/`continue` target pushed for it.
     fn loop_body(
         &mut self,
         body: &Stmt,
-        _continue: Label,
-        _break: Label,
+        labels: &[String],
+        continue_label: Label,
+        break_label: Label,
     ) -> Result<(), SyntaxError> {
-        self.stmt(body)
+        self.push_jump_target(JumpTarget {
+            names: labels.to_vec(),
+            break_label,
+            continue_label: Some(continue_label),
+        });
+        let result = self.stmt(body);
+        self.pop_jump_target();
+        result
     }
 
-    fn control_transfer(&mut self, _stmt: &Stmt) -> Result<(), SyntaxError> {
-        Err(SyntaxError::new(
-            "break/continue are not supported by the compiler yet",
-            _stmt.span,
-        ))
+    fn push_jump_target(&mut self, target: JumpTarget) {
+        self.state().jump_targets.push(target);
     }
 
-    fn labeled(&mut self, _label: &Ident, _body: &Stmt, stmt: &Stmt) -> Result<(), SyntaxError> {
-        Err(SyntaxError::new(
-            "labelled statements are not supported by the compiler yet",
-            stmt.span,
-        ))
+    fn pop_jump_target(&mut self) {
+        self.state().jump_targets.pop();
+    }
+
+    /// The target a `break`/`continue` refers to: the innermost one, or the
+    /// nearest enclosing one with that label.
+    fn jump_target(&self, label: Option<&Ident>) -> Option<&JumpTarget> {
+        let targets = &self.cur().jump_targets;
+        match label {
+            None => targets.last(),
+            Some(label) => targets
+                .iter()
+                .rev()
+                .find(|target| target.names.contains(&label.name)),
+        }
+    }
+
+    fn control_transfer(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
+        let (label, is_break) = match &stmt.kind {
+            StmtKind::Break(label) => (label.as_ref(), true),
+            StmtKind::Continue(label) => (label.as_ref(), false),
+            _ => unreachable!("control_transfer is only called for break and continue"),
+        };
+        let Some(target) = self.jump_target(label) else {
+            // The parser rejects a break/continue with no target, so reaching
+            // here means the compiler's own bookkeeping is wrong.
+            return Err(SyntaxError::new(
+                "break/continue has no enclosing loop",
+                stmt.span,
+            ));
+        };
+        let destination = if is_break {
+            target.break_label
+        } else {
+            match target.continue_label {
+                Some(label) => label,
+                None => {
+                    return Err(SyntaxError::new("continue must target a loop", stmt.span));
+                }
+            }
+        };
+        self.emit_jump(Opcode::Goto, destination, &[]);
+        Ok(())
+    }
+
+    /// Compile a labelled statement.
+    ///
+    /// `a: b: for(…)` is a chain of labels on one loop; every name has to reach
+    /// that loop's targets, so the chain is collected and handed to the loop. A
+    /// label on a non-loop statement only provides a `break` target, because
+    /// `continue` may not target it.
+    fn labeled(&mut self, label: &Ident, body: &Stmt, stmt: &Stmt) -> Result<(), SyntaxError> {
+        let mut names = vec![label.name.clone()];
+        let mut inner = body;
+        while let StmtKind::Labeled {
+            label: next,
+            body: deeper,
+        } = &inner.kind
+        {
+            names.push(next.name.clone());
+            inner = deeper;
+        }
+        if Self::is_loop(inner) {
+            return self.stmt_labelled(inner, &names);
+        }
+        let end = self.new_label();
+        self.push_jump_target(JumpTarget {
+            names,
+            break_label: end,
+            continue_label: None,
+        });
+        let result = self.stmt(inner);
+        self.pop_jump_target();
+        result?;
+        self.place_label(end);
+        let _ = stmt;
+        Ok(())
+    }
+
+    /// Whether a statement is a loop, i.e. a valid target for `continue`.
+    fn is_loop(stmt: &Stmt) -> bool {
+        matches!(
+            stmt.kind,
+            StmtKind::While { .. }
+                | StmtKind::DoWhile { .. }
+                | StmtKind::For { .. }
+                | StmtKind::ForIn { .. }
+                | StmtKind::ForOf { .. }
+        )
     }
 
     fn switch(&mut self, _discriminant: &Expr, _cases: &[SwitchCase]) -> Result<(), SyntaxError> {
@@ -1320,55 +1447,11 @@ impl Compiler {
     /// Whether the current position in the instruction stream can be reached.
     ///
     /// A walk over the control-flow graph, using labels as instruction indices.
-    /// The reference does the same thing to drop dead code; here it decides
-    /// whether an implicit `return_undef` needs emitting.
+    /// The reference does the same thing to decide whether an implicit
+    /// `return_undef` is needed.
     fn end_is_reachable(&self) -> bool {
         let state = self.cur();
-        let count = state.insns.len();
-        let mut seen = vec![false; count + 1];
-        let mut worklist = vec![0usize];
-        while let Some(index) = worklist.pop() {
-            if index > count || seen[index] {
-                continue;
-            }
-            seen[index] = true;
-            if index == count {
-                continue;
-            }
-            let (op, operands) = match &state.insns[index] {
-                Insn::Fixed { op, operands } => (*op, operands.as_slice()),
-                // A variable access never transfers control.
-                Insn::Var { .. } => {
-                    worklist.push(index + 1);
-                    continue;
-                }
-            };
-            match op {
-                Opcode::Return | Opcode::ReturnUndef | Opcode::Throw => {}
-                Opcode::Goto => {
-                    if let Some(target) = self.label_position(operands) {
-                        worklist.push(target);
-                    }
-                }
-                Opcode::IfTrue | Opcode::IfFalse => {
-                    if let Some(target) = self.label_position(operands) {
-                        worklist.push(target);
-                    }
-                    worklist.push(index + 1);
-                }
-                _ => worklist.push(index + 1),
-            }
-        }
-        seen[count]
-    }
-
-    /// The instruction index a jump operand points at.
-    ///
-    /// Label ids are handed out in creation order, which has nothing to do with
-    /// where the label ends up, so the id has to go through the placement table.
-    fn label_position(&self, operands: &[Op]) -> Option<usize> {
-        let id = label_id(operands)?;
-        self.cur().labels.get(id as usize).copied().flatten()
+        reachable_instructions(state, state.insns.len())[state.insns.len()]
     }
 
     /// Resolve and assemble the function on top of the compiler stack, then pop
@@ -1391,7 +1474,7 @@ impl Compiler {
         self.stack[current].var_ref_count = captured as u32;
         // The scope chain is only final now that every binding is known.
         rebuild_scope_chain(&mut self.stack[current]);
-        let (code, stack_size) = assemble(&mut resolved, &self.stack[current]);
+        let (code, stack_size) = assemble(&mut resolved, &mut self.stack[current]);
         let _ = &mut resolved;
         let state = self.stack.pop().expect("a function is being compiled");
         CompiledFunction {
@@ -1491,6 +1574,12 @@ fn rebuild_scope_chain(state: &mut FnState) {
 /// indices remain valid; [`Assembler`] maps them to byte offsets.
 fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
     let current = stack.len() - 1;
+    // Dead-code elimination, on the symbolic form where labels are still
+    // instruction indices. A `break` inside a loop leaves the trailing `goto`
+    // unreachable, and a `return` leaves everything after it unreachable; the
+    // reference drops both. Doing it here means the emitter never has to think
+    // about reachability.
+    eliminate_dead_code(stack, current);
     let insns = std::mem::take(&mut stack[current].insns);
     let mut out: Vec<Option<(Opcode, Vec<Op>)>> = Vec::with_capacity(insns.len());
     for insn in &insns {
@@ -1509,16 +1598,21 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
                 let slot = resolve_slot(stack, current, name);
                 out.push(Some(variable_instruction(stack, current, *action, slot)));
             }
+            Insn::Dead => out.push(None),
         }
     }
-    let label_positions: Vec<bool> = {
-        let mut marks = vec![false; out.len() + 1];
-        for placed in stack[current].labels.iter().flatten() {
-            marks[*placed] = true;
+    // Which label (if any) sits on each instruction, so the jump patterns can
+    // tell whether they would cross a jump target.
+    let mut label_at: Vec<Option<u32>> = vec![None; out.len() + 1];
+    for (id, placed) in stack[current].labels.iter().enumerate() {
+        if let Some(index) = *placed
+            && index < label_at.len()
+            && label_at[index].is_none()
+        {
+            label_at[index] = Some(id as u32);
         }
-        marks
-    };
-    peephole(&mut out, &label_positions);
+    }
+    peephole(&mut out, &label_at, &stack[current].labels);
     out
 }
 
@@ -1784,8 +1878,12 @@ fn variable_instruction(
 /// constructs this compiler supports can produce. Each entry is a comment on the
 /// bytecode it removes, because the whole point is that the result is one
 /// instruction shorter than the literal translation of the AST.
-fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
-    fold_dup_patterns(insns, label_positions);
+fn peephole(
+    insns: &mut [Option<(Opcode, Vec<Op>)>],
+    label_at: &[Option<u32>],
+    placed: &[Option<usize>],
+) {
+    fold_dup_patterns(insns, label_at);
 
     // `drop` before `return_undef` is dead: the return discards the whole frame
     // anyway. This runs *after* the `dup` folds, because a `dup; put; drop` there
@@ -1798,10 +1896,10 @@ fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
         // Skip over a run of drops, but stop at a jump target: removing code on
         // one side of a label would silently retarget the jump.
         let mut next = index + 1;
-        while opcode_at(insns, next) == Some(Opcode::Drop) && !is_label_at(label_positions, next) {
+        while opcode_at(insns, next) == Some(Opcode::Drop) && !is_label_at(label_at, next) {
             next += 1;
         }
-        if is_label_at(label_positions, next) {
+        if is_label_at(label_at, next) {
             continue;
         }
         if opcode_at(insns, next) == Some(Opcode::ReturnUndef) {
@@ -1810,6 +1908,8 @@ fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
             }
         }
     }
+
+    fold_conditional_jumps(insns, label_at, placed);
 
     // `put_x(n) get_x(n)` -> `set_x(n)`, which is what a declaration followed by
     // a use of the same variable boils down to.
@@ -1820,7 +1920,7 @@ fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
         if !is_foldable_put(put_op) {
             continue;
         }
-        if is_label_at(label_positions, index + 1) {
+        if is_label_at(label_at, index + 1) {
             continue;
         }
         let Some((get_op, get_operands)) = insns.get(index + 1).cloned().flatten() else {
@@ -1838,6 +1938,68 @@ fn peephole(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
     }
 }
 
+/// Replace unreachable instructions with [`Insn::Dead`].
+fn eliminate_dead_code(stack: &mut [FnState], current: usize) {
+    let reachable = reachable_instructions(&stack[current], stack[current].insns.len());
+    for (index, insn) in stack[current].insns.iter_mut().enumerate() {
+        if !reachable[index] {
+            *insn = Insn::Dead;
+        }
+    }
+}
+
+/// Mark every instruction index reachable from the entry, plus the index one past
+/// the last instruction.
+///
+/// `seen[len]` answers "can control reach the end of this function", and the
+/// entries before it identify dead code. Both DCE and the implicit-return decision
+/// read the same result, which keeps them from disagreeing.
+fn reachable_instructions(state: &FnState, count: usize) -> Vec<bool> {
+    let mut seen = vec![false; count + 1];
+    let mut worklist = vec![0usize];
+    while let Some(index) = worklist.pop() {
+        if index > count || seen[index] {
+            continue;
+        }
+        seen[index] = true;
+        if index == count {
+            continue;
+        }
+        let (op, operands) = match &state.insns[index] {
+            Insn::Fixed { op, operands } => (*op, operands.as_slice()),
+            // A variable access never transfers control, and a removed
+            // instruction is only reachable if it is already marked.
+            Insn::Var { .. } | Insn::Dead => {
+                worklist.push(index + 1);
+                continue;
+            }
+        };
+        match op {
+            Opcode::Return | Opcode::ReturnUndef | Opcode::Throw => {}
+            Opcode::Goto => {
+                if let Some(target) = placed_label(state, operands) {
+                    worklist.push(target);
+                }
+            }
+            Opcode::IfTrue | Opcode::IfFalse => {
+                if let Some(target) = placed_label(state, operands) {
+                    worklist.push(target);
+                }
+                worklist.push(index + 1);
+            }
+            _ => worklist.push(index + 1),
+        }
+    }
+    seen
+}
+
+/// The instruction index a jump operand points at, resolved through the label
+/// placement table.
+fn placed_label(state: &FnState, operands: &[Op]) -> Option<usize> {
+    let id = label_id(operands)?;
+    state.labels.get(id as usize).copied().flatten()
+}
+
 /// The label an instruction refers to.
 fn label_id(operands: &[Op]) -> Option<u32> {
     operands.iter().find_map(|operand| match operand {
@@ -1846,12 +2008,56 @@ fn label_id(operands: &[Op]) -> Option<u32> {
     })
 }
 
-/// Whether a jump target is placed at this instruction index.
-fn is_label_at(label_positions: &[bool], index: usize) -> bool {
-    label_positions.get(index).copied().unwrap_or(false)
+/// Turn `if_false L; goto M; L:` into `if_true M`.
+///
+/// A conditional whose alternate branch is an unconditional jump needs one jump,
+/// not two. This is the shape `if (c) break;` produces, so folding it removes an
+/// instruction and a label from every conditional `break`.
+fn fold_conditional_jumps(
+    insns: &mut [Option<(Opcode, Vec<Op>)>],
+    label_at: &[Option<u32>],
+    placed: &[Option<usize>],
+) {
+    for index in 0..insns.len() {
+        let Some((op, operands)) = insns[index].clone() else {
+            continue;
+        };
+        let inverted = match op {
+            Opcode::IfFalse => Opcode::IfTrue,
+            Opcode::IfTrue => Opcode::IfFalse,
+            _ => continue,
+        };
+        // Next must be an unconditional jump that is not itself a target, and the
+        // instruction after it must be exactly where the conditional goes.
+        let Some((next_op, next_operands)) = insns.get(index + 1).cloned().flatten() else {
+            continue;
+        };
+        if !is_goto(next_op) || is_label_at(label_at, index + 1) {
+            continue;
+        }
+        // The conditional must land on the instruction *after* the jump. Several
+        // labels can share a position, so this asks where *this* label was put
+        // rather than what label happens to sit there.
+        let Some(taken) = label_id(&operands) else {
+            continue;
+        };
+        if placed.get(taken as usize).copied().flatten() != Some(index + 2) {
+            continue;
+        }
+        let Some(destination) = next_operands.first().cloned() else {
+            continue;
+        };
+        insns[index] = Some((inverted, vec![destination]));
+        insns[index + 1] = None;
+    }
 }
 
-fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &[bool]) {
+/// Whether a jump target is placed at this instruction index.
+fn is_label_at(label_at: &[Option<u32>], index: usize) -> bool {
+    label_at.get(index).copied().flatten().is_some()
+}
+
+fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_at: &[Option<u32>]) {
     // `dup put_x(n)` -> `set_x(n)`
     // `dup put_x(n) drop` -> `put_x(n)`
     // `dup put_x(n) drop get_x(n)` -> `set_x(n)`
@@ -1859,7 +2065,7 @@ fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &
         if opcode_at(insns, index) != Some(Opcode::Dup) {
             continue;
         }
-        if is_label_at(label_positions, index + 1) {
+        if is_label_at(label_at, index + 1) {
             continue;
         }
         let Some((put_op, put_operands)) = insns[index + 1].clone() else {
@@ -1873,7 +2079,7 @@ fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_positions: &
         };
         let mut new_op = set_form_of(put_op);
         let mut end = index + 2;
-        if is_label_at(label_positions, end) {
+        if is_label_at(label_at, end) {
             // The `put` has to stay as it is; only the `dup` can be folded.
             insns[index] = Some((set_form_of(put_op), vec![Op::Slot(slot)]));
             insns[index + 1] = None;
@@ -1995,15 +2201,121 @@ fn compound_opcode(op: AssignOp) -> Opcode {
 /// stay valid. A label names an *instruction index*, and an index that was
 /// deleted has to resolve to the next surviving instruction, which is what
 /// [`resolve_label`] does before the byte offsets are known.
-fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &FnState) -> (Vec<u8>, u32) {
+fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Vec<u8>, u32) {
     // Compaction: surviving instructions in order, plus the index mapping.
-    let mut kept: Vec<(usize, Opcode, Vec<Op>)> = Vec::with_capacity(insns.len());
+    let mut kept: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(insns.len());
     let mut original_to_kept: Vec<Option<usize>> = vec![None; insns.len()];
     for (original, entry) in insns.iter_mut().enumerate() {
         if let Some((op, operands)) = entry.take() {
             original_to_kept[original] = Some(kept.len());
-            kept.push((original, op, operands));
+            kept.push((op, operands));
         }
+    }
+
+    // Give every surviving instruction a label of its own. Jump cleanup below
+    // redirects jumps to arbitrary instructions, and a jump target has to be a
+    // label; pre-allocating one per index means a redirect never has to invent
+    // anything.
+    let existing = state.labels.len();
+    let base = kept.len();
+    let mut index_label: Vec<Label> = Vec::with_capacity(kept.len() + 1);
+    for offset in 0..=kept.len() {
+        state.labels.push(Some(0));
+        index_label.push(Label((existing + offset) as u32));
+    }
+    // Point each pre-allocated label at its instruction, reusing the count from
+    // `original_to_kept` so the mapping survives compaction.
+    let place_index_labels = |state: &mut FnState,
+                              original_to_kept: &[Option<usize>],
+                              kept_len: usize,
+                              index_label: &[Label]| {
+        for (original, mapped) in original_to_kept.iter().enumerate() {
+            if let Some(kept_index) = mapped {
+                let label = index_label[*kept_index].0 as usize;
+                state.labels[label] = Some(original);
+            }
+        }
+        state.labels[index_label[kept_len].0 as usize] = Some(usize::MAX);
+    };
+    place_index_labels(state, &original_to_kept, base, &index_label);
+
+    // Resolve every label to a kept index once; the placement table maps labels
+    // to original indices, so a second hop lands in kept space.
+    let mut label_kept: Vec<Option<usize>> = vec![None; state.labels.len()];
+    for (id, placed) in state.labels.iter().enumerate() {
+        let Some(original) = placed else { continue };
+        label_kept[id] = if *original == usize::MAX {
+            Some(base)
+        } else {
+            (*original..original_to_kept.len()).find_map(|i| original_to_kept[i])
+        };
+    }
+
+    // A label that lands on an unconditional jump stands for wherever that jump
+    // goes, so retarget it once and every jump to the label follows for free.
+    // This is what makes `continue` in a `for` head reach the loop top instead of
+    // stopping at the update's trailing jump.
+    let folded: Vec<Option<usize>> = label_kept
+        .iter()
+        .map(|slot| slot.map(|target| follow_jump_chain(&kept, &label_kept, target)))
+        .collect();
+    label_kept = folded;
+
+    // Jump cleanup, in compacted index space. Two rewrites the reference also
+    // applies while it resolves labels:
+    //   * a jump whose destination is the very next instruction does nothing;
+    //   * a jump to a jump is redirected to its final destination.
+    // The second can expose the first, so this repeats until it settles.
+    loop {
+        let mut delete = vec![false; kept.len()];
+        let mut changed = false;
+        for index in 0..kept.len() {
+            let (op, operands) = &kept[index];
+            if !is_goto(*op) {
+                continue;
+            }
+            let Some(immediate) = target_kept_index(operands, &label_kept) else {
+                continue;
+            };
+            let target = follow_jump_chain(&kept, &label_kept, immediate);
+            if target == index + 1 {
+                delete[index] = true;
+                changed = true;
+            } else if target != immediate {
+                // Redirect to the end of the chain.
+                let label = index_label[target];
+                kept[index].1 = vec![Op::Label(label)];
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+        if !delete.iter().any(|deleted| *deleted) {
+            break;
+        }
+        // Drop the deleted instructions and renumber everything.
+        let mut next: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
+        let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
+        for (old, entry) in kept.into_iter().enumerate() {
+            if delete[old] {
+                continue;
+            }
+            moved[old] = Some(next.len());
+            next.push(entry);
+        }
+        for (id, slot) in label_kept.iter_mut().enumerate() {
+            let Some(old) = *slot else { continue };
+            *slot = match moved.get(old).copied().flatten() {
+                Some(new) => Some(new),
+                // The target was deleted: the jump now lands on whatever follows.
+                None => (old..moved.len())
+                    .find_map(|i| moved[i])
+                    .or(Some(next.len())),
+            };
+            let _ = id;
+        }
+        kept = next;
     }
 
     // Choose an opcode for each instruction and its size, so label offsets can be
@@ -2011,7 +2323,7 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &FnState) -> (Vec<u8
     let mut chosen = Vec::with_capacity(kept.len());
     let mut offsets = Vec::with_capacity(kept.len() + 1);
     let mut offset = 0usize;
-    for (_, op, operands) in &kept {
+    for (op, operands) in &kept {
         let op = choose_short_form(*op, operands);
         offsets.push(offset);
         chosen.push(op);
@@ -2020,47 +2332,72 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &FnState) -> (Vec<u8
     offsets.push(offset);
 
     let mut code = Vec::with_capacity(offset);
-    for (position, (_, _, operands)) in kept.iter().enumerate() {
+    for (position, (_, operands)) in kept.iter().enumerate() {
         let op = chosen[position];
         code.push(op as u8);
-        let operands = remap_label(operands, &state.labels, &original_to_kept, kept.len());
+        let operands = retarget_labels(operands, &label_kept, kept.len());
         encode_operands(&mut code, op, &operands, offsets[position], &offsets);
     }
     let stack_size = compute_stack_size(&code);
     (code, stack_size)
 }
 
-/// Rewrite a label operand from an original instruction index to the kept index
-/// of the first instruction at or after it that survived the peephole pass.
-fn remap_label(
-    operands: &[Op],
-    placed: &[Option<usize>],
-    original_to_kept: &[Option<usize>],
-    kept_len: usize,
-) -> Vec<Op> {
+fn is_goto(op: Opcode) -> bool {
+    matches!(op, Opcode::Goto | Opcode::Goto8 | Opcode::Goto16)
+}
+
+/// The kept index a jump operand points at.
+fn target_kept_index(operands: &[Op], label_kept: &[Option<usize>]) -> Option<usize> {
+    let id = label_id(operands)?;
+    label_kept.get(id as usize).copied().flatten()
+}
+
+/// Follow a chain of unconditional jumps to its first real destination.
+fn follow_jump_chain(
+    kept: &[(Opcode, Vec<Op>)],
+    label_kept: &[Option<usize>],
+    start: usize,
+) -> usize {
+    let mut current = start;
+    // `for(;;)` jumps to itself, so the walk has to be bounded.
+    for _ in 0..kept.len() {
+        let Some((op, operands)) = kept.get(current) else {
+            return current;
+        };
+        if !is_goto(*op) {
+            return current;
+        }
+        let Some(next) = target_kept_index(operands, label_kept) else {
+            return current;
+        };
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+    current
+}
+
+/// Rewrite label operands from label ids to kept instruction indices.
+fn retarget_labels(operands: &[Op], label_kept: &[Option<usize>], kept_len: usize) -> Vec<Op> {
     operands
         .iter()
         .map(|operand| match operand {
             Op::Label(label) => {
-                // Label id -> instruction index -> index after compaction. A
-                // target whose instruction the peephole deleted resolves to the
-                // next surviving one, which is the instruction that now does the
-                // same work.
-                let target = placed
+                let target = label_kept
                     .get(label.0 as usize)
                     .copied()
                     .flatten()
-                    .unwrap_or(original_to_kept.len());
-                let remapped = (target..original_to_kept.len())
-                    .find_map(|index| original_to_kept[index])
                     .unwrap_or(kept_len);
-                Op::Label(Label(remapped as u32))
+                Op::Label(Label(target as u32))
             }
             other => other.clone(),
         })
         .collect()
 }
 
+/// Encode the resolved instruction stream, choosing short forms where possible.
+///
 /// Compute the maximum value-stack depth by exploring the control-flow graph.
 ///
 /// This is a breadth-first walk from the first instruction, tracking the stack

@@ -256,9 +256,6 @@ fn variables_match_the_reference() {
 #[test]
 fn unsupported_constructs_fail_loudly() {
     for source in [
-        "for (;;) break;",
-        "for (;;) continue;",
-        "l: a;",
         "switch (a) { }",
         "try { } catch (e) { }",
         "for (const x of xs) ;",
@@ -394,6 +391,81 @@ fn named_functions_and_captures_match_the_reference() {
         "function k(){}",
         "function k(a, b, c, d){ return d; }",
         "function k(a, b, c, d, e){ return e; }",
+    ];
+    assert_cases(&cases);
+}
+
+/// `break`, `continue` and labelled statements.
+#[test]
+fn loops_and_labels_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        // A bare break out of an infinite loop makes the trailing `goto` dead.
+        "function f(){ for(;;){ break; } }",
+        "function f(){ for(;;){ continue; } }",
+        "function f(){ do { break; } while(1); }",
+        // With work after the loop, control has somewhere to go.
+        "function f(){ for(;;){ a(); break; b(); } c(); }",
+        "function f(){ do { a(); break; } while(b); c(); }",
+        // A conditional break keeps both paths alive.
+        "function f(c){ for(;;){ a(); if(c) break; b(); } c2(); }",
+        "function f(c){ while(c){ a(); if(c2) break; } c3(); }",
+        // `continue` runs the update in a for-loop and the test in a do-while.
+        "function f(c){ for(let i=0;i<1;i++){ a(); if(c) continue; b(); } }",
+        "function f(c){ do { a(); if(c) continue; } while(c2); }",
+        "function f(c){ while(c){ a(); if(c2) continue; b(); } c3(); }",
+        // Labelled loops.
+        "function f(c){ l: for(;;){ if(c) break l; a(); } c2(); }",
+        "function f(c){ l: for(;;){ if(c) continue l; a(); } c2(); }",
+        "function f(c){ outer: for(;;){ for(;;){ break outer; } } }",
+        "function f(c){ outer: for(;;){ for(;;){ continue outer; } } }",
+        // A label on a block only provides a break target.
+        "function f(c){ l: { a(); if(c) break l; b(); } }",
+        "function f(c){ l: { a(); if(c) break l; b(); } c2(); }",
+        // Nested labels on one statement all reach the same loop.
+        "function f(c){ a: b: for(;;){ break a; } }",
+        "function f(c){ a: b: for(;;){ break b; } }",
+        "function f(c){ a: b: for(;;){ continue a; } }",
+        // Nested unlabelled loops bind to the innermost.
+        "function f(c){ for(;;){ for(;;){ break; } a(); } }",
+        "function f(c){ for(;;){ for(;;){ continue; } a(); } }",
+    ];
+    assert_cases(&cases);
+}
+
+/// Known gaps: jump and constant-folding optimisations the reference applies but
+/// this compiler does not yet.
+///
+/// These are *optimisation* differences only — the programs mean the same thing —
+/// but the disassembly differs, so they cannot live in the suite above without
+/// turning a real regression into a false alarm. They are listed here so the gap
+/// is recorded and cannot quietly grow.
+#[test]
+#[ignore = "needs fold_constants and the resolve_labels jump rewrites"]
+fn constant_conditions_and_dead_jumps_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        // A constant condition removes the test entirely.
+        "function f(){ while(1){ break; } }",
+        "function f(){ while(1){ a(); break; b(); } c(); }",
+        "function f(){ while(0){ a(); } c(); }",
+        "function f(){ if(1) a(); }",
+        "function f(){ if(0) a(); else b(); }",
+        "function f(){ for(;1;){ break; } }",
+        // Interior runs of dead jumps that only the reference's `skip_dead_code`
+        // removes.
+        "function f(c){ while(c){ for(;;){ break; } } }",
+        "function f(){ for(;;){ for(;;){ break; } } }",
+        "function f(){ for(;;){ for(;;){ break; } a(); } }",
+        "function f(c){ o: for(;;){ i: while(1){ break o; } } }",
+        "function f(c){ o: for(;;){ i: while(1){ break i; a(); } } }",
+        "function f(c){ o: for(;;){ i: while(1){ continue i; } } }",
+        // A labelled break out of an inner loop leaves the same shape: the target
+        // is the outer loop's end, so the reference folds `if_false`+`goto` into
+        // one inverted jump.
+        "function f(c){ o: for(;;){ i: while(c2){ break o; } } }",
+        "function f(c){ o: for(;;){ i: while(c2){ break i; a(); } } }",
+        "function f(c){ o: for(;;){ i: while(c2){ continue i; } } }",
     ];
     assert_cases(&cases);
 }

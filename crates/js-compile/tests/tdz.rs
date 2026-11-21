@@ -314,3 +314,154 @@ fn a_terminating_loop_still_has_an_implicit_return() {
         disassemble(inner)
     );
 }
+
+/// `break` and `continue` land on the right instruction.
+///
+/// The differential test proves this for the cases it lists; these checks state
+/// the rule so a new case cannot silently target the wrong place. A `continue` in
+/// a `for` loop must reach the update expression, which is the detail most likely
+/// to drift.
+/// Byte offset of the first instruction whose opcode matches.
+fn offset_of(function: &Function, op: Opcode) -> Option<usize> {
+    function
+        .instructions()
+        .into_iter()
+        .find(|(_, instruction)| general_form(instruction.op) == op)
+        .map(|(pc, _)| pc)
+}
+
+#[test]
+fn a_break_leaves_the_loop() {
+    // The loop's exit is past the trailing back-jump, so `break` must jump
+    // further than that jump does.
+    let compiled = compile("function f(c){ while(c){ if(c) break; } d(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let back_jump = instructions
+        .iter()
+        .find(|(_, i)| general_form(i.op) == Opcode::Goto)
+        .map(|(pc, i)| (*pc, i.jump_target(*pc).unwrap() as usize))
+        .expect("a loop has a back jump");
+    let after = offset_of(inner, Opcode::GetVar).expect("the call after the loop");
+    assert!(
+        back_jump.1 < back_jump.0,
+        "the loop's own jump goes backwards\n{}",
+        disassemble(inner)
+    );
+    assert!(
+        back_jump.1 < after,
+        "the loop exit is after the loop\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn a_continue_in_a_for_loop_reaches_the_update() {
+    // `continue` skips the rest of the body but must still run the update
+    // expression, so its target sits after the body and at or before the update.
+    let compiled = compile("function f(c){ for(let i = 0; i < 2; i++){ if(c) continue; d(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+
+    let update_pc = instructions
+        .iter()
+        .find(|(_, i)| matches!(i.op, Opcode::PostInc | Opcode::Inc))
+        .map(|(pc, _)| *pc)
+        .expect("the update expression");
+    let call_pc = instructions
+        .iter()
+        .find(|(_, i)| general_form(i.op) == Opcode::Call)
+        .map(|(pc, _)| *pc)
+        .expect("the call in the body");
+
+    let continues: Vec<usize> = instructions
+        .iter()
+        .filter(|(_, i)| {
+            matches!(
+                general_form(i.op),
+                Opcode::Goto | Opcode::IfTrue | Opcode::IfFalse
+            )
+        })
+        .filter_map(|(pc, i)| i.jump_target(*pc).map(|t| (*pc, t as usize)))
+        // Forward jumps only: `continue` moves towards the update.
+        .filter(|(pc, target)| target > pc)
+        .map(|(_, target)| target)
+        .collect();
+
+    assert!(
+        continues
+            .iter()
+            .any(|target| *target > call_pc && *target <= update_pc),
+        "continue must skip the body and reach the update (call at {call_pc}, update at {update_pc})\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn a_labelled_break_reaches_the_outer_loop() {
+    // `break outer` leaves both loops, so it lands exactly where the outer loop
+    // ends: on the statement after it.
+    let compiled =
+        compile("function f(c){ outer: for(;;){ for(;;){ if(c) break outer; } d(); } e(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    // The first instruction of `e()`: the loop's exit lands on it, not on the
+    // call inside it.
+    let call_index = instructions
+        .iter()
+        .rposition(|(_, i)| general_form(i.op) == Opcode::Call)
+        .expect("the call after the outer loop");
+    let after_outer = instructions[call_index - 1].0;
+
+    let forward_jumps: Vec<usize> = instructions
+        .iter()
+        .filter(|(_, i)| matches!(general_form(i.op), Opcode::Goto | Opcode::IfTrue))
+        .filter_map(|(pc, i)| i.jump_target(*pc).map(|t| (*pc, t as usize)))
+        .filter(|(pc, target)| target > pc)
+        .map(|(_, target)| target)
+        .collect();
+
+    assert!(
+        forward_jumps.contains(&after_outer),
+        "break outer must land on the statement after the outer loop (offset {after_outer})\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn every_jump_lands_on_an_instruction_boundary() {
+    // A jump into the middle of an instruction would be a codegen bug that a
+    // disassembly diff might not show, because the disassembler stops at the
+    // first bad opcode.
+    for source in [
+        "function f(c){ while(c){ if(c) break; else continue; } }",
+        "function f(c){ l: for(;;){ for(;;){ break l; } } }",
+        "function f(c){ do { if(c) continue; } while(c); }",
+        "function f(c){ for(let i = 0; i < 3; i++){ if(c) break; } }",
+    ] {
+        let compiled = compile(source);
+        let inner = functions(&compiled)
+            .into_iter()
+            .find(|f| f.name == "f")
+            .unwrap();
+        let boundaries: Vec<usize> = inner.instructions().into_iter().map(|(pc, _)| pc).collect();
+        for (pc, instruction) in inner.instructions() {
+            if let Some(target) = instruction.jump_target(pc) {
+                assert!(
+                    boundaries.contains(&(target as usize)),
+                    "{source:?}: jump at {pc} targets {target}, which is not an instruction\n{}",
+                    disassemble(inner)
+                );
+            }
+        }
+    }
+}
