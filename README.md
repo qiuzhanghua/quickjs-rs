@@ -93,6 +93,15 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 这些用例被单独列出而不是混在通过列表里，是为了让差距可见且不会悄悄扩大。
 
+## 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。
+
+上游归因：本项目是对 [bellard/quickjs](https://github.com/bellard/quickjs) 的 Rust 重写，
+原实现同样以 MIT 许可发布，版权归 Fabrice Bellard 与 Charlie Gordon 所有。
+`scripts/setup-oracle.sh` 会把上游源码下载到 `/tmp` 用作差分测试的对照实现，
+该副本仅用于测试，不进入本仓库、也不参与构建。
+
 ## 提交约定
 
 每个里程碑（M0、M1、…）单独提交，提交前必须 `./scripts/check.sh` 全绿；
