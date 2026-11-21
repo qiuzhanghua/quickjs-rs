@@ -500,3 +500,170 @@ fn an_uncaught_error_names_its_class() {
         "TypeError: cannot read property 'x' of null"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Language semantics that the builtins exposed
+// ---------------------------------------------------------------------------
+
+#[test]
+fn block_scoped_bindings_do_not_leak_or_shadow() {
+    // A `let` belongs to its block. Regressing this made `{ let x }` shadow the
+    // outer `x` for the rest of the function, which is worse than not supporting
+    // blocks at all: the program kept running with the wrong answer.
+    assert_eq!(eval("var x=1; { let x=2; } print(x)"), "1\n");
+    assert_eq!(eval("{ let y=2; } print(typeof y)"), "undefined\n");
+    assert_eq!(eval("let z=1; { let z=2; } print(z)"), "1\n");
+    assert_eq!(
+        eval("for (let i=0;i<1;i++){} print(typeof i)"),
+        "undefined\n"
+    );
+    assert_eq!(
+        eval("{ let s=1; { let s=2; print(s) } print(s) }"),
+        "2\n1\n"
+    );
+    // …and an inner block still sees the outer binding shadowed by its own.
+    assert_eq!(eval("var x=1; { let x=2; print(x) } print(x)"), "2\n1\n");
+    assert_eq!(
+        eval("function f(){ { let a=1 } return typeof a } print(f())"),
+        "undefined\n"
+    );
+}
+
+#[test]
+fn const_is_read_only_after_initialisation() {
+    assert_eq!(
+        eval("try{ const c=1; c=2 }catch(e){print(e.name, e.message)}"),
+        "TypeError 'c' is read-only\n"
+    );
+    // A closure writing it is caught too, which needs the realm to remember the
+    // declaration: the closure's own entry does not carry the `const` flag.
+    assert_eq!(
+        eval("const c=1; var f=function(){c=2}; try{f()}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+    // The initialiser itself must go through, and so must mutating the value.
+    assert_eq!(eval("const o={}; o.x=1; print(o.x)"), "1\n");
+}
+
+#[test]
+fn var_globals_are_properties_of_the_global_object() {
+    // The observable half of the split between `var` (on the global object) and
+    // `let` (in the global lexical environment, invisible there).
+    assert_eq!(eval("var v=1; print(globalThis.v)"), "1\n");
+    assert_eq!(eval("var v=1; globalThis.v=3; print(v)"), "3\n");
+    assert_eq!(
+        eval("let n=2; print(globalThis.n, 'n' in globalThis)"),
+        "undefined false\n"
+    );
+    // Writable and enumerable, but not configurable.
+    assert_eq!(eval("var v=1; print(delete globalThis.v, v)"), "false 1\n");
+    // Hoisted: it exists, holding `undefined`, before its initialiser runs.
+    assert_eq!(eval("print(v); var v=1"), "undefined\n");
+    assert_eq!(
+        eval("function f(){} print(typeof globalThis.f)"),
+        "function\n"
+    );
+    // An implicit global is the one that *is* configurable.
+    assert_eq!(eval("x=1; print(x, delete globalThis.x)"), "1 true\n");
+}
+
+#[test]
+fn delete_removes_properties_and_leaves_holes() {
+    assert_eq!(
+        eval("var o={a:1}; print(delete o.a, o.a)"),
+        "true undefined\n"
+    );
+    // An array index becomes a hole: the length stays and `in` starts answering false.
+    assert_eq!(
+        eval("var a=[1,2,3]; delete a[1]; print(a.length, 1 in a, a[1])"),
+        "3 false undefined\n"
+    );
+    // A non-configurable property refuses and says so.
+    assert_eq!(
+        eval("var o={}; Object.defineProperty(o,'x',{value:1}); print(delete o.x)"),
+        "false\n"
+    );
+    // Deleting a binding always fails; nothing to do at run time.
+    assert_eq!(
+        eval("function f(x){return delete x} print(f(1))"),
+        "false\n"
+    );
+}
+
+#[test]
+fn loose_equality_converts_objects_but_not_object_to_object() {
+    assert_eq!(
+        eval("print([]=='', [1]=='1', [1,2]=='1,2')"),
+        "true true true\n"
+    );
+    assert_eq!(
+        eval("var a={},b={}; print(a===b, a==b, a==a)"),
+        "false false true\n"
+    );
+    assert_eq!(
+        eval("print(null==undefined, null===undefined)"),
+        "true false\n"
+    );
+    assert_eq!(eval("print([0]==false, '0'==false)"), "true true\n");
+}
+
+#[test]
+fn unsigned_shift_produces_a_non_negative_number() {
+    // `>>>` is the unsigned shift, so its result can exceed `i32::MAX` and must not
+    // be squeezed back into a negative int.
+    assert_eq!(
+        eval("print(1<<31, (1<<31)>>>0)"),
+        "-2147483648 2147483648\n"
+    );
+    assert_eq!(eval("print(-1>>>0, -1>>0)"), "4294967295 -1\n");
+    assert_eq!(eval("print(7>>>1, 0xdeadbeef>>>0)"), "3 3735928559\n");
+}
+
+#[test]
+fn spread_appends_whatever_the_iterable_yields() {
+    assert_eq!(eval(r#"print([..."ab"])"#), "[ \"a\", \"b\" ]\n");
+    assert_eq!(eval("print([0,...[1,2],3])"), "[ 0, 1, 2, 3 ]\n");
+    assert_eq!(eval("print([...[]].length)"), "0\n");
+    // A hole is yielded as `undefined`, so the spread fills it in for real.
+    assert_eq!(eval("print([...[1,,3]])"), "[ 1, undefined, 3 ]\n");
+}
+
+#[test]
+fn named_function_expressions_bind_their_own_name() {
+    assert_eq!(
+        eval("var f=function g(){return typeof g}; print(f(), typeof g)"),
+        "function undefined\n"
+    );
+    // Recursion through the self-binding works even when the outer name is rebound.
+    assert_eq!(
+        eval("print((function f(n){return n<2?1:n*f(n-1)})(5))"),
+        "120\n"
+    );
+    assert_eq!(
+        eval("var f=function g(){return g===f}; print(f())"),
+        "true\n"
+    );
+}
+
+#[test]
+fn array_constructor_validates_its_length_argument() {
+    assert_eq!(
+        eval("try{new Array(-1)}catch(e){print(e.name)}"),
+        "RangeError\n"
+    );
+    assert_eq!(
+        eval("try{new Array(1.5)}catch(e){print(e.name)}"),
+        "RangeError\n"
+    );
+    assert_eq!(eval("print(Array(3).length, Array(3,4).length)"), "3 2\n");
+    assert_eq!(eval("print(2 in new Array(3))"), "false\n");
+}
+
+#[test]
+fn string_conversion_runs_to_primitive() {
+    assert_eq!(
+        eval(r#"print(String({toString:function(){return "T"}}))"#),
+        "T\n"
+    );
+    assert_eq!(eval(r#"print(String(new Error("m")))"#), "Error: m\n");
+}

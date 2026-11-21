@@ -70,8 +70,12 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
 fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     // `String(x)` converts; `new String(x)` boxes. The constructor is reached both
     // ways, and the difference is whether `this` is an object.
+    //
+    // The conversion has to be `ToString`, not the built-in's own `to_js_string`:
+    // an object argument goes through `ToPrimitive`, so `String(err)` gives
+    // `"Error: m"` — `Error.prototype.toString` — instead of `[object Object]`.
     let text = match args.first() {
-        Some(value) => value.to_js_string(),
+        Some(value) => interp.to_js_string(value)?,
         None => String::new(),
     };
     Ok(interp.string(text))

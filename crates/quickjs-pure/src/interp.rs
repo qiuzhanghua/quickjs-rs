@@ -15,7 +15,7 @@
 //! for the innermost one. There is no side table, which is why a `try` inside a
 //! loop costs nothing until it throws.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use js_compile::bytecode::{Atom, ClosureType, Constant, Function as CompiledFunction};
 use js_compile::opcode::{OpFormat, Opcode};
@@ -69,6 +69,13 @@ pub struct Realm {
     /// Names of the globals that came from a *declaration*, which are
     /// non-configurable properties of the global object.
     pub declared: Vec<String>,
+    /// Names among the lexical globals that are `const`.
+    ///
+    /// `const`-ness cannot be read back off the bytecode in every case: a closure that
+    /// refers to a global `const` gets a `GlobalRef` entry whose flags the forwarding
+    /// path does not carry, so a store through it would look like a plain `let`. The
+    /// realm records it once, at declaration, and answers for every reader.
+    pub lexical_consts: BTreeSet<String>,
     /// The error constructors by class name, so a runtime error can throw a real
     /// `TypeError` instance rather than a look-alike object.
     pub errors: BTreeMap<&'static str, Gc<JsObject>>,
@@ -146,6 +153,7 @@ impl<'a> Interp<'a> {
                 array_proto,
                 globals: BTreeMap::new(),
                 declared: Vec::new(),
+                lexical_consts: BTreeSet::new(),
                 errors: BTreeMap::new(),
                 string_proto: None,
                 number_proto: None,
@@ -262,11 +270,26 @@ impl<'a> Interp<'a> {
         let mut cells = Vec::with_capacity(closure_vars.len());
         for closure_var in closure_vars {
             let cell = match closure_var.closure_type {
-                ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport => {
-                    // A declaration: the cell is created here, which is what makes
-                    // the binding exist before its initialiser runs.
-                    self.declare_global(&closure_var.name);
+                ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport
+                    if closure_var.is_lexical =>
+                {
+                    // A lexical declaration: the cell is created here holding the
+                    // dead-zone marker, which is what makes the binding exist and
+                    // unreadable before its initialiser runs.
+                    self.declare_global(&closure_var.name, closure_var.is_const);
                     self.realm.globals[&closure_var.name].clone()
+                }
+                ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport => {
+                    // A `var` or function declaration becomes a property of the global
+                    // object, and it exists from here on — which is why
+                    // `print(v); var v = 1` prints `undefined` instead of raising.
+                    // Declaring it at instantiation time (rather than at the
+                    // initialiser) is also what makes it non-configurable: the store
+                    // then lands on an existing property instead of creating one.
+                    self.declare_var_global(&closure_var.name);
+                    // The cell is a placeholder that nothing indexes; it cannot be
+                    // omitted because the slot has to hold something.
+                    self.new_cell(Value::Undefined)
                 }
                 _ => {
                     // An undeclared global is read by name; the cell is a
@@ -486,29 +509,122 @@ impl<'a> Interp<'a> {
             .unwrap_or_default()
     }
 
-    fn get_global(&mut self, slot: usize) -> JsResult<Value> {
+    /// The facts about a global binding that decide where it lives.
+    ///
+    /// A script's globals split in two, and the split is observable: `var` and
+    /// function declarations become properties of the global object (`globalThis.v`
+    /// works, `delete` refuses, `for-in` lists them), while `let`/`const`/`class`
+    /// declarations live in the global *lexical* environment and are invisible there
+    /// (`"c" in globalThis` is false). Keeping the difference in the closure var's
+    /// `is_lexical` flag means the answer is already in the bytecode.
+    fn global_binding(&self, slot: usize) -> (String, bool, bool) {
         let name = self.global_name(slot);
-        if let Some(cell) = self.realm.globals.get(&name) {
-            let value = cell.get();
-            if matches!(value, Value::Uninitialized) {
-                return Err(self.throw_reference(&name));
+        // "Lexical" is *not* read from the closure var's flag: a `GlobalRef` created
+        // while forwarding a reference through a nested function is built with the
+        // flags cleared, so `const c` would look like an ordinary `var` from inside a
+        // closure. Presence in the realm's lexical table is the same fact, recorded
+        // once, and every slot sees it.
+        let lexical = self.realm.globals.contains_key(&name);
+        let is_const = self.realm.lexical_consts.contains(&name);
+        (name, lexical, is_const)
+    }
+
+    fn get_global(&mut self, slot: usize) -> JsResult<Value> {
+        let (name, lexical, _) = self.global_binding(slot);
+        if lexical {
+            // A lexical global is a binding in a side table, so the dead zone is
+            // visible and it is nowhere on the global object.
+            if let Some(cell) = self.realm.globals.get(&name) {
+                let value = cell.get();
+                if matches!(value, Value::Uninitialized) {
+                    return Err(self.throw_reference(&name));
+                }
+                return Ok(value);
             }
-            return Ok(value);
+            return Err(self.throw_reference(&name));
         }
+        // A `var` global is an ordinary property, so the prototype chain and the
+        // global object's own builtins are all reachable through it.
         match self.get_property(&self.realm.global.clone(), &name)? {
             Some(value) => Ok(value),
             None => Err(self.throw_reference(&name)),
         }
     }
 
-    fn put_global(&mut self, slot: usize, value: Value) {
-        let name = self.global_name(slot);
-        if let Some(cell) = self.realm.globals.get(&name).cloned() {
-            cell.set(value);
-            return;
+    /// Store to a global binding.
+    ///
+    /// Returns a signal when the store is refused: a `const` global may only be
+    /// written by its initialiser, and a non-configurable `var` global may not be
+    /// deleted but is always writable.
+    fn put_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
+        let (name, lexical, is_const) = self.global_binding(slot);
+        if lexical {
+            if let Some(cell) = self.realm.globals.get(&name).cloned() {
+                if is_const && !matches!(cell.get(), Value::Uninitialized) {
+                    return Err(self.read_only_global(&name));
+                }
+                cell.set(value);
+                return Ok(());
+            }
+            // Writing an undeclared lexical global is a `ReferenceError` in strict
+            // mode and a silent global creation otherwise; creating the cell here
+            // keeps both paths from losing the value.
+            let cell = self.new_cell(value);
+            self.realm.globals.insert(name, cell);
+            return Ok(());
         }
         let global = self.realm.global.clone();
-        global.define_data(&name, value);
+        match global.own_property(&name) {
+            // A `var` global is writable, so the store goes straight through — but
+            // through the property, so `globalThis.v = 3` and `v = 3` agree.
+            Some(_) => self.set_property_with(&global, &name, value, DeleteFailure::Throw),
+            // Only an implicit global reaches here: `x = 1` with no declaration
+            // creates a *configurable* property, which is what makes it deletable and
+            // is the one way a global differs from a declared `var`.
+            None => {
+                global.define_data(&name, value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Initialise a declared global, which is what ends its dead zone.
+    ///
+    /// A `var` global becomes a property of the global object: writable, so a later
+    /// assignment goes through, and non-configurable, so `delete` refuses.
+    fn init_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
+        let (name, lexical, _) = self.global_binding(slot);
+        if lexical {
+            // The cell exists (created at declaration time) holding the dead-zone
+            // marker; storing the value is what makes the binding readable.
+            if let Some(cell) = self.realm.globals.get(&name).cloned() {
+                cell.set(value);
+                return Ok(());
+            }
+            let cell = self.new_cell(value);
+            self.realm.globals.insert(name, cell);
+            return Ok(());
+        }
+        let global = self.realm.global.clone();
+        // Writable and enumerable, but *not* configurable: `delete globalThis.v` has
+        // to answer `false` and leave the binding in place. `with_attributes` ties
+        // `configurable` to `writable`, so the property is built field by field.
+        global.define(
+            &name,
+            Property {
+                value: Some(value),
+                writable: true,
+                enumerable: true,
+                configurable: false,
+                ..Property::default()
+            },
+        );
+        Ok(())
+    }
+
+    /// The `TypeError` a store to a `const` global raises.
+    fn read_only_global(&self, name: &str) -> Signal {
+        Signal::Throw(self.make_error("TypeError", &format!("'{name}' is read-only")))
     }
 
     // -- properties ---------------------------------------------------------
@@ -649,9 +765,19 @@ impl<'a> Interp<'a> {
             // An inherited *data* property is shadowed by an own property on the
             // receiver; a non-writable one is not.
             if owner.ptr_eq(object) && !property.writable {
+                return match on_failure {
+                    DeleteFailure::Throw => Err(self.type_error(format!("'{key}' is read-only"))),
+                    DeleteFailure::Ignore => Ok(()),
+                };
+            }
+            // An existing writable own property keeps its attributes: only the value
+            // moves. Redefining instead would reset them, which is how a
+            // non-configurable global `var` used to become deletable.
+            if owner.ptr_eq(object) && object.write_value(key, value.clone()) {
                 return Ok(());
             }
         }
+        // No own data property: create one, shadowing whatever the prototype holds.
         object.define_data(key, value);
         Ok(())
     }
@@ -662,8 +788,12 @@ impl<'a> Interp<'a> {
             if let Some(elements) = object.array_elements()
                 && (index as usize) < elements.len()
             {
-                // A hole rather than a shift: `delete a[0]` leaves `length` alone.
-                object.array_set(index as usize, Value::Undefined);
+                // A hole rather than a shift: `delete a[0]` leaves `length` alone and
+                // the index stops answering `in`.
+                if object.element_is_locked(index) {
+                    return false;
+                }
+                object.array_set(index as usize, Value::Hole);
                 return true;
             }
         }
@@ -752,6 +882,10 @@ impl<'a> Interp<'a> {
                 }
                 Ok(Value::Object(object))
             }
+            // `this function`: what a named function expression binds its own name to.
+            2 => Ok(self
+                .current_callee()
+                .map_or(Value::Undefined, Value::Object)),
             other => Err(Signal::Throw(self.make_error(
                 "InternalError",
                 &format!("special_object {other} is not implemented yet"),
@@ -886,6 +1020,60 @@ impl<'a> Interp<'a> {
     }
 
     /// The `ReferenceError` a read of an uninitialised binding raises.
+    /// The name of the binding `slot` refers to, for an error message.
+    fn binding_name(&self, slot: usize, kind: VarSlot) -> String {
+        match kind {
+            VarSlot::Loc => self
+                .frame()
+                .code
+                .code
+                .vars
+                .get(slot)
+                .map(|v| v.name.clone()),
+            VarSlot::Closure => self
+                .frame()
+                .code
+                .code
+                .closure_vars
+                .get(slot)
+                .map(|c| c.name.clone()),
+        }
+        .unwrap_or_default()
+    }
+
+    /// Whether `slot` names a `const` binding, which rejects every store after its
+    /// initialiser.
+    fn is_read_only(&self, slot: usize, kind: VarSlot) -> bool {
+        match kind {
+            VarSlot::Loc => self
+                .frame()
+                .code
+                .code
+                .vars
+                .get(slot)
+                .is_some_and(|v| v.is_const),
+            VarSlot::Closure => self
+                .frame()
+                .code
+                .code
+                .closure_vars
+                .get(slot)
+                .is_some_and(|c| c.is_const),
+        }
+    }
+
+    /// The `TypeError` a store to a `const` binding raises.
+    ///
+    /// `const` is enforced here rather than at compile time because the binding can be
+    /// assigned from a place the compiler cannot classify — `c = 2` inside a closure
+    /// is just a `put_var_ref_check`. `PutLocCheck`/`PutVarRefCheck` therefore check
+    /// both halves of what "checked store" means: the dead zone is over, and the
+    /// binding is writable.
+    fn read_only(&self, slot: usize, kind: VarSlot) -> Signal {
+        let name = self.binding_name(slot, kind);
+        Signal::Throw(self.make_error("TypeError", &format!("'{name}' is read-only")))
+    }
+
     fn dead_zone(&self, slot: usize, kind: VarSlot) -> Signal {
         let name = match kind {
             VarSlot::Loc => self
@@ -1078,6 +1266,11 @@ impl<'a> Interp<'a> {
                 if matches!(value, Value::Uninitialized) {
                     return Err(self.dead_zone(slot, VarSlot::Loc));
                 }
+                // The initialiser goes through `put_loc`, not this, so any store that
+                // reaches here is a later assignment — which a `const` refuses.
+                if self.is_read_only(slot, VarSlot::Loc) {
+                    return Err(self.read_only(slot, VarSlot::Loc));
+                }
                 if op == SetLocCheck {
                     self.put_loc(slot, value.clone());
                     self.push(value);
@@ -1113,12 +1306,12 @@ impl<'a> Interp<'a> {
             // -- closure variables ------------------------------------------
             GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 => {
                 let slot = self.slot_operand(op, a);
-                let value = self.cell_value(slot);
+                let value = self.cell_value(slot)?;
                 self.push(value);
             }
             GetVarRefCheck => {
                 let slot = self.slot_operand(op, a);
-                let value = self.cell_value(slot);
+                let value = self.cell_value(slot)?;
                 if matches!(value, Value::Uninitialized) {
                     return Err(self.dead_zone(slot, VarSlot::Closure));
                 }
@@ -1127,12 +1320,17 @@ impl<'a> Interp<'a> {
             PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3 | PutVarRefCheck => {
                 let slot = self.slot_operand(op, a);
                 let value = self.pop();
-                self.set_cell(slot, value);
+                // Same rule as `PutLocCheck`: a checked store to a captured binding
+                // refuses a `const` once its initialiser has run.
+                if op == PutVarRefCheck && self.is_read_only(slot, VarSlot::Closure) {
+                    return Err(self.read_only(slot, VarSlot::Closure));
+                }
+                self.set_cell(slot, value)?;
             }
             SetVarRef | SetVarRef0 | SetVarRef1 | SetVarRef2 | SetVarRef3 => {
                 let slot = self.slot_operand(op, a);
                 let value = self.pop();
-                self.set_cell(slot, value.clone());
+                self.set_cell(slot, value.clone())?;
                 self.push(value);
             }
 
@@ -1142,30 +1340,19 @@ impl<'a> Interp<'a> {
                 self.push(value);
             }
             GetVarUndef => {
-                let name = self.global_name(a as usize);
-                let value = if let Some(cell) = self.realm.globals.get(&name) {
-                    cell.get()
-                } else {
-                    let global = self.realm.global.clone();
-                    self.get_property(&global, &name)?
-                        .unwrap_or(Value::Undefined)
-                };
+                let value = self
+                    .get_global(a as usize)
+                    .or_else(|_| Ok(Value::Undefined))?;
                 self.push(value);
             }
             PutVar => {
                 let value = self.pop();
-                self.put_global(a as usize, value);
+                self.put_global(a as usize, value)?;
             }
             PutVarInit => {
                 let slot = a as usize;
                 let value = self.pop();
-                // A declared global gets its cell here, which is what makes later
-                // `put_var_ref` stores and `get_var` reads agree.
-                let name = self.global_name(slot);
-                if !self.realm.globals.contains_key(&name) {
-                    self.declare_global(&name);
-                }
-                self.put_global(slot, value);
+                self.init_global(slot, value)?;
             }
 
             // -- arithmetic -------------------------------------------------
@@ -1229,15 +1416,11 @@ impl<'a> Interp<'a> {
                 let left = self.pop();
                 self.push(compare(op, left, right, self));
             }
-            Eq => {
+            Eq | Neq => {
                 let right = self.pop();
                 let left = self.pop();
-                self.push(Value::Bool(left.loose_equals(&right)));
-            }
-            Neq => {
-                let right = self.pop();
-                let left = self.pop();
-                self.push(Value::Bool(!left.loose_equals(&right)));
+                let equal = self.abstract_equals(left, right)?;
+                self.push(Value::Bool(if op == Eq { equal } else { !equal }));
             }
             StrictEq => {
                 let right = self.pop();
@@ -1577,6 +1760,32 @@ impl<'a> Interp<'a> {
                 ));
             }
 
+            Delete => {
+                // `delete obj[key]`, where the key was just pushed. Deleting an array
+                // index leaves a *hole* rather than closing the gap, and a
+                // non-configurable property answers `false` and stays.
+                let key = self.pop();
+                let target = self.pop();
+                let key = self.propkey_of(&key);
+                let deleted = match &target {
+                    Value::Object(object) => {
+                        let object = object.clone();
+                        self.delete_property(&object, &key)
+                    }
+                    // A string's `length` and its index properties are
+                    // non-configurable, so deleting one answers `false`.
+                    Value::String(text) => {
+                        !(key == "length"
+                            || array_index(&key)
+                                .is_some_and(|index| (index as usize) < text.utf16_len()))
+                    }
+                    // Any other primitive has no own properties; deleting nothing
+                    // succeeds.
+                    _ => true,
+                };
+                self.push(Value::Bool(deleted));
+            }
+
             // -- exceptions and bookkeeping ---------------------------------
             Fclosure | Fclosure8 => {
                 let value = self.closure(a as usize)?;
@@ -1671,37 +1880,50 @@ impl<'a> Interp<'a> {
         self.frame().env.cells.get(slot).cloned()
     }
 
-    fn cell_value(&self, slot: usize) -> Value {
-        self.var_ref_cell(slot)
-            .map(|cell| cell.get())
-            .unwrap_or(Value::Undefined)
-    }
-
-    fn set_cell(&mut self, slot: usize, value: Value) {
-        if let Some(cell) = self.var_ref_cell(slot) {
-            cell.set(value);
-            return;
-        }
-        // A store through a declared-global reference is also what *creates* the
-        // binding: function declarations are hoisted by storing into it before the
-        // body runs.
-        if let Some(name) = self
-            .frame()
+    /// Whether `slot` refers to a global binding through the reference table.
+    ///
+    /// A global's cell in the closure environment only exists so the slot has
+    /// something to point at; the binding itself lives on the global object (a `var`)
+    /// or in the realm's lexical table (a `let`). Reads and writes therefore have to
+    /// be routed, not performed on the placeholder.
+    fn is_global_slot(&self, slot: usize) -> bool {
+        self.frame()
             .code
             .code
             .closure_vars
             .get(slot)
-            .map(|c| c.name.clone())
-            && matches!(
-                self.frame().code.code.closure_vars[slot].closure_type,
-                ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport
-            )
-        {
-            self.declare_global(&name);
-            if let Some(cell) = self.realm.globals.get(&name) {
-                cell.set(value);
-            }
+            .is_some_and(|c| {
+                matches!(
+                    c.closure_type,
+                    ClosureType::GlobalDecl
+                        | ClosureType::Global
+                        | ClosureType::GlobalRef
+                        | ClosureType::ModuleDecl
+                        | ClosureType::ModuleImport
+                )
+            })
+    }
+
+    fn cell_value(&mut self, slot: usize) -> JsResult<Value> {
+        if self.is_global_slot(slot) {
+            return self.get_global(slot);
         }
+        Ok(self
+            .var_ref_cell(slot)
+            .map(|cell| cell.get())
+            .unwrap_or(Value::Undefined))
+    }
+
+    fn set_cell(&mut self, slot: usize, value: Value) -> JsResult<()> {
+        // A function declaration is hoisted by storing into a global reference before
+        // the body runs, so this path is also what puts it on the global object.
+        if self.is_global_slot(slot) {
+            return self.put_global(slot, value);
+        }
+        if let Some(cell) = self.var_ref_cell(slot) {
+            cell.set(value);
+        }
+        Ok(())
     }
 
     // -- closures -----------------------------------------------------------
@@ -1943,6 +2165,38 @@ impl<'a> Interp<'a> {
         self.set_property_with(object, key, value, on_failure)
     }
 
+    /// `a == b`, the coercing comparison.
+    ///
+    /// An object operand is converted with `ToPrimitive` *through the interpreter*,
+    /// which is what makes `[] == ""` true: `[]` becomes `""` via
+    /// `Array.prototype.toString`. [`Value::loose_equals`] cannot do that on its own
+    /// because the conversion is allowed to call script code, so the two primitive
+    /// operands are handed back to it.
+    fn abstract_equals(&mut self, left: Value, right: Value) -> JsResult<bool> {
+        if !matches!(left, Value::Object(_)) && !matches!(right, Value::Object(_)) {
+            return Ok(left.loose_equals(&right));
+        }
+        // `null == undefined` holds even though neither is an object.
+        if matches!(left, Value::Undefined | Value::Null)
+            && matches!(right, Value::Undefined | Value::Null)
+        {
+            return Ok(true);
+        }
+        if matches!(left, Value::Undefined | Value::Null)
+            || matches!(right, Value::Undefined | Value::Null)
+        {
+            return Ok(false);
+        }
+        // Two objects compare by identity. Only an object *against a primitive* is
+        // converted, which is why `{} == {}` is false while `[] == ""` is true.
+        if let (Value::Object(a), Value::Object(b)) = (&left, &right) {
+            return Ok(a.ptr_eq(b));
+        }
+        let left = self.to_primitive(left, Hint::Default)?;
+        let right = self.to_primitive(right, Hint::Default)?;
+        Ok(left.loose_equals(&right))
+    }
+
     fn has_property(&mut self, key: &Value, object: &Value) -> JsResult<bool> {
         let Value::Object(object) = object else {
             return Err(Signal::Throw(
@@ -1953,9 +2207,12 @@ impl<'a> Interp<'a> {
         if object.own_property(&text).is_some() {
             return Ok(true);
         }
-        if object
-            .array_get(array_index(&text).unwrap_or(u32::MAX) as usize)
-            .is_some()
+        // An array hole is an index that exists as a slot but not as a property, so
+        // `1 in [1,,3]` is `false` even though reading `a[1]` yields `undefined`.
+        if let Some(index) = array_index(&text)
+            && object
+                .array_get(index as usize)
+                .is_some_and(|value| !matches!(value, Value::Hole))
         {
             return Ok(true);
         }
@@ -2162,30 +2419,40 @@ impl<'a> Interp<'a> {
             return Ok((Value::Undefined, true));
         }
         object.define_data("__index", Value::Int(index + 1));
+        // Iteration yields `undefined` for a hole — `[...[1,,3]]` is
+        // `[1, undefined, 3]` with a real element in the middle, because the spread
+        // stores whatever the iterator produced.
         Ok((
-            sequence
-                .array_get(index as usize)
-                .unwrap_or(Value::Undefined),
+            match sequence.array_get(index as usize) {
+                Some(Value::Hole) | None => Value::Undefined,
+                Some(value) => value,
+            },
             false,
         ))
     }
 
     /// Append every element of `iterable` to `array`, returning how many.
+    /// `[...iterable]`: append everything the iterator yields, and answer the next
+    /// index.
+    ///
+    /// This goes through the same iterator machinery `for-of` uses rather than copying
+    /// an array's elements, because a spread source is any iterable: a string spreads
+    /// into its characters and an array iterator spreads into its results. Handling
+    /// only arrays made `[..."ab"]` come out empty with no error at all.
     fn append_enumerate(&mut self, array: &Value, iterable: &Value) -> JsResult<i32> {
-        let Some(target) = array.as_object() else {
+        let Some(target) = array.as_object().cloned() else {
             return Ok(0);
         };
         let start = target.array_length().unwrap_or(0);
         let mut added = 0;
-        if let Value::Object(source) = iterable
-            && source.is_array()
-        {
-            for index in 0..source.array_length().unwrap_or(0) {
-                if let Some(value) = source.array_get(index) {
-                    target.array_set(start + added, value);
-                    added += 1;
-                }
+        let iterator = self.get_iterator(iterable)?;
+        loop {
+            let (value, done) = self.iterator_step(&iterator)?;
+            if done {
+                break;
             }
+            target.array_set(start + added, value);
+            added += 1;
         }
         Ok((start + added) as i32)
     }
@@ -2231,9 +2498,41 @@ impl<'a> Interp<'a> {
     // -- global declarations -----------------------------------------------
 
     /// Declare a global binding, creating its reference cell.
-    pub fn declare_global(&mut self, name: &str) {
+    /// Declare a `var` or function global, whose home is the global object.
+    ///
+    /// Writable and enumerable but not configurable: `globalThis.v` reads it,
+    /// `for-in` lists it, `delete` refuses. A name that is already there — a built-in
+    /// such as `print`, or a redeclaration — is left alone.
+    pub fn declare_var_global(&mut self, name: &str) {
+        let global = self.realm.global.clone();
+        if global.own_property(name).is_some() {
+            return;
+        }
+        global.define(
+            name,
+            Property {
+                value: Some(Value::Undefined),
+                writable: true,
+                enumerable: true,
+                configurable: false,
+                ..Property::default()
+            },
+        );
+    }
+
+    /// Declare a *lexical* global binding, which starts in its dead zone.
+    ///
+    /// Only `let`/`const`/`class` need this: a `var` global is a property of the
+    /// global object and is created when its initialiser runs.
+    pub fn declare_global(&mut self, name: &str, is_const: bool) {
+        if is_const {
+            self.realm.lexical_consts.insert(name.to_string());
+        }
         if !self.realm.globals.contains_key(name) {
-            let cell = self.new_cell(Value::Undefined);
+            // `Uninitialized` rather than `Undefined`: the binding exists but is not
+            // readable until its initialiser runs, and that is what `let x` before
+            // `x = 1` has to observe.
+            let cell = self.new_cell(Value::Uninitialized);
             self.realm.globals.insert(name.to_string(), cell);
             self.realm.declared.push(name.to_string());
         }
@@ -2649,7 +2948,17 @@ fn arithmetic(op: Opcode, left: Value, right: Value) -> JsResult<Value> {
         Xor => Value::Int(left.to_int32() ^ right.to_int32()),
         Shl => Value::Int(left.to_int32().wrapping_shl(right.to_uint32() & 31)),
         Sar => Value::Int(left.to_int32().wrapping_shr(right.to_uint32() & 31)),
-        Shr => Value::Int((left.to_uint32() >> (right.to_uint32() & 31)) as i32),
+        // `>>>` is the *unsigned* shift, so its result is a uint32 and can exceed
+        // `i32::MAX`: `(1<<31) >>> 0` is `2147483648`, not `-2147483648`. A value that
+        // fits the small-integer representation stays an `Int`; the rest become a
+        // float, which is how the reference keeps `n >>> 0` non-negative.
+        Shr => {
+            let shifted = left.to_uint32() >> (right.to_uint32() & 31);
+            match i32::try_from(shifted) {
+                Ok(value) => Value::Int(value),
+                Err(_) => Value::Float(shifted as f64),
+            }
+        }
         _ => Value::Float(a),
     })
 }

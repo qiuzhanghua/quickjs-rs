@@ -34,6 +34,28 @@ use js_parse::ast::{self, *};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Label(u32);
 
+/// The `var_block` sentinel for a binding that lives at function scope.
+///
+/// It has to be a value a *real* block key can never take. Block keys are source
+/// offsets, so `0` is a perfectly ordinary key — the first block statement of a file
+/// gets it — and using `0` as the sentinel made `{ let y = 2 }` at offset zero look
+/// like a function-scoped `var`, which is how a top-level block's `let` leaked out of
+/// its block. The body block already uses `u64::MAX` to stay clear of offsets, so the
+/// sentinel takes the slot below it.
+const FUNCTION_SCOPE: u64 = u64::MAX - 3;
+
+/// The `blocks` parent sentinel for "this block has no enclosing block".
+///
+/// Same reasoning as [`FUNCTION_SCOPE`]: `0` is a legal block key, and when it was
+/// also the terminator the chain walk from the script body reached the file's
+/// offset-zero block and treated it as an *enclosing* block — so that block's `let`
+/// leaked into the body scope.
+const NO_PARENT: u64 = u64::MAX - 2;
+
+/// The block key for a script body. Distinct from both sentinels and unreachable from
+/// any source offset.
+const SCRIPT_BODY: u64 = u64::MAX - 1;
+
 /// An operand of a symbolic instruction.
 #[derive(Debug, Clone, PartialEq)]
 enum Op {
@@ -325,6 +347,8 @@ struct FnState {
     is_script: bool,
     /// Whether the function is an arrow, which never gets its own `arguments`.
     is_arrow: bool,
+    /// The name a *named function expression* binds inside its own body.
+    self_name: Option<String>,
     /// Whether the code emitted so far leaves the program's result on the stack.
     /// The reference tracks this for the hidden `<ret>` local of an eval script.
     leaves_value: bool,
@@ -373,6 +397,7 @@ impl FnState {
             column: 1,
             is_script: false,
             is_arrow: false,
+            self_name: None,
             leaves_value: false,
             stmt_depth: 0,
             hoisted: Vec::new(),
@@ -433,15 +458,15 @@ impl Compiler {
         // the script's own blocks. A function frame has no `<ret>`, which is why
         // the misalignment only showed up at the top level.
         state.vars.push(VarDef::var("<ret>"));
-        state.var_block.push(0);
+        state.var_block.push(FUNCTION_SCOPE);
         self.stack.push(state);
         // The body is its own scope, keyed by the position of the program.
         // The script body needs a key no statement can produce. Statement keys are
         // source offsets, and the program's own start offset is `0` — which is also
         // the offset of the first statement, so a top-level `{ let x }` or
         // `for (let i …)` used to share the body's block and lose its scope.
-        let body_key = u64::MAX;
-        self.push_block(body_key, 0);
+        let body_key = SCRIPT_BODY;
+        self.push_block(body_key, NO_PARENT);
         self.state().body_block = body_key;
         self.hoist(&program.body, body_key)?;
         self.emit_scope_enter(body_key);
@@ -1176,7 +1201,7 @@ impl Compiler {
             return;
         }
         // A `var` belongs to the function scope, never to the enclosing block.
-        state.var_block.push(0);
+        state.var_block.push(FUNCTION_SCOPE);
         state.vars.push(def);
     }
 
@@ -1195,33 +1220,58 @@ impl Compiler {
         if self.stack[current].is_script || self.stack[current].is_arrow {
             return;
         }
-        let mentions = self.stack[current]
-            .insns
-            .iter()
-            .any(|insn| matches!(insn, Insn::Var { name, .. } if name == "arguments"));
-        if !mentions
-            || self.stack[current]
-                .vars
-                .iter()
-                .any(|v| v.name == "arguments")
-        {
+        if !self.mentions("arguments") {
             return;
         }
-        let slot = self.stack[current].vars.len() as u32;
-        self.declare_var("arguments", VarDef::var("arguments"));
-        // The binding has to be initialised before anything reads it, so the two
-        // instructions go in front — which shifts every label that has been placed.
+        // 0 is strict `arguments`, 1 is sloppy (mapped) `arguments`. The mapping
+        // itself is not implemented, so the two behave alike for now.
+        let magic = if self.stack[current].strict { 0 } else { 1 };
+        self.prepend_binding("arguments", magic);
+    }
+
+    /// Whether the function body's instruction stream refers to `name`.
+    fn mentions(&self, name: &str) -> bool {
+        let current = self.stack.len() - 1;
+        if self.stack[current].vars.iter().any(|v| v.name == name) {
+            return false;
+        }
+        self.stack[current]
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Var { name: used, .. } if used == name))
+    }
+
+    /// Bind the name a named function expression uses to refer to itself.
+    ///
+    /// The value is `special_object 2`, the function currently running, so the binding
+    /// is the closure itself and not a copy. It is a local of this function, which is
+    /// what keeps `g` out of the enclosing scope.
+    fn provide_self_name(&mut self) {
+        let current = self.stack.len() - 1;
+        let Some(name) = self.stack[current].self_name.clone() else {
+            return;
+        };
+        if !self.mentions(&name) {
+            return;
+        }
+        self.prepend_binding(&name, 2);
+    }
+
+    /// Insert `special_object magic` plus the store to `name` at the top of the body.
+    ///
+    /// Prepending shifts every label that has been placed, so they are all moved by
+    /// the number of instructions inserted.
+    fn prepend_binding(&mut self, name: &str, magic: i32) {
+        let current = self.stack.len() - 1;
+        self.declare_var(name, VarDef::var(name));
         let init = [
             Insn::Fixed {
                 op: Opcode::SpecialObject,
-                // 1 is `mapped arguments`, which is what sloppy mode uses; the
-                // mapping itself (writes reaching the parameters) is not implemented,
-                // so the object behaves like the strict one.
-                operands: vec![Op::Int(if self.stack[current].strict { 0 } else { 1 })],
+                operands: vec![Op::Int(magic)],
             },
             Insn::Var {
                 action: VarAction::Put,
-                name: "arguments".to_string(),
+                name: name.to_string(),
                 block: 0,
             },
         ];
@@ -1232,8 +1282,9 @@ impl Compiler {
         for placed in self.stack[current].labels.iter_mut().flatten() {
             *placed += inserted;
         }
+        // A store sits at the insertion point now, so the `put`/`get` fold must not
+        // reach across it.
         self.stack[current].label_since_insn = true;
-        let _ = slot;
     }
 
     /// Record a top-level script declaration as a global.
@@ -1998,7 +2049,7 @@ impl Compiler {
                 self.emit(Opcode::Fclosure, &[Op::Const(index)]);
             }
             ExprKind::Function(func) => {
-                let function = self.compile_function(func)?;
+                let function = self.compile_function_with_name(func, true)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
                 self.emit(Opcode::Fclosure, &[Op::Const(index)]);
             }
@@ -2427,7 +2478,35 @@ impl Compiler {
                 self.emit(Opcode::Typeof, &[]);
             }
             UnaryOp::Delete => {
-                self.emit(Opcode::PushTrue, &[]);
+                // `delete obj.prop` really deletes, and answers whether it could.
+                // Deleting a *binding* is always `false`: a local, an argument and a
+                // declared global are all non-configurable, which the reference encodes
+                // as a constant `push_false` rather than a runtime check. Only a
+                // property access has anything to do at run time.
+                match &argument.kind {
+                    ExprKind::Member {
+                        object, property, ..
+                    } => {
+                        self.expr(object)?;
+                        match property {
+                            MemberProp::Ident(name) => {
+                                self.emit(
+                                    Opcode::PushAtomValue,
+                                    &[Op::Atom(Atom::from_text(&name.name))],
+                                );
+                            }
+                            MemberProp::Computed(index) => self.expr(index)?,
+                            MemberProp::Private(_) => {
+                                return Err(SyntaxError::new(
+                                    "deleting a private field is not allowed",
+                                    argument.span,
+                                ));
+                            }
+                        }
+                        self.emit(Opcode::Delete, &[]);
+                    }
+                    _ => self.emit(Opcode::PushFalse, &[]),
+                }
             }
             UnaryOp::Void => {
                 self.expr(argument)?;
@@ -2766,6 +2845,20 @@ impl Compiler {
     // -- functions ---------------------------------------------------------
 
     fn compile_function(&mut self, func: &ast::Function) -> Result<CompiledFunction, SyntaxError> {
+        self.compile_function_with_name(func, false)
+    }
+
+    /// Compile a function, recording whether it is a *named function expression*.
+    ///
+    /// `var f = function g(){ return g }` has to see `g` inside its own body, but `g`
+    /// must not leak outside. The reference does that by declaring `g` as a local of
+    /// the function itself and initialising it with `special_object 2` (the current
+    /// function), which is why this has to be known at compile time.
+    fn compile_function_with_name(
+        &mut self,
+        func: &ast::Function,
+        is_expression: bool,
+    ) -> Result<CompiledFunction, SyntaxError> {
         if func.is_generator || func.is_async {
             return Err(SyntaxError::new(
                 "generators and async functions are not supported by the compiler yet",
@@ -2782,6 +2875,13 @@ impl Compiler {
         );
         state.strict = self.cur().strict;
         state.is_arrow = func.is_arrow;
+        // A named *expression* binds its own name; a declaration's name is already
+        // bound in the enclosing scope.
+        state.self_name = if is_expression && !func.is_arrow {
+            func.name.as_ref().map(|n| n.name.clone())
+        } else {
+            None
+        };
         state.line = func.span.start.line;
         state.column = func.span.start.column;
         // A function body has no hidden `<ret>` local; the value comes back on
@@ -2813,7 +2913,7 @@ impl Compiler {
         func: &ast::Function,
     ) -> Result<CompiledFunction, SyntaxError> {
         let body_key = func.params_span.end.offset as u64;
-        self.push_block(body_key, 0);
+        self.push_block(body_key, NO_PARENT);
         self.state().body_block = body_key;
         // An arrow with an expression body has no statements; the expression is
         // its `return`. Building the statement here keeps one code path below, and
@@ -2867,6 +2967,7 @@ impl Compiler {
     /// it.
     fn finish_current(&mut self) -> CompiledFunction {
         self.provide_arguments();
+        self.provide_self_name();
         let mut resolved = resolve(&mut self.stack);
         // Captured bindings need a reference cell; the count goes in the header so
         // the runtime knows how many cells to allocate on entry.
@@ -2917,8 +3018,10 @@ impl Compiler {
 /// The links cannot be filled in while hoisting: `{ let a } let b` needs `a` to
 /// point at `b`, which is declared later in the source but earlier in the chain.
 fn rebuild_scope_chain(state: &mut FnState) {
-    // Block key -> level. Level 0 is the function scope.
-    let mut levels: Vec<u64> = vec![0];
+    // Block key -> level. Level 0 is the function scope, keyed by the sentinel so a
+    // real block that happens to start at offset zero keeps its own level instead of
+    // being merged into the function scope.
+    let mut levels: Vec<u64> = vec![FUNCTION_SCOPE];
     for block in &state.blocks {
         if !levels.contains(&block.key) {
             levels.push(block.key);
@@ -2935,14 +3038,20 @@ fn rebuild_scope_chain(state: &mut FnState) {
             .iter()
             .find(|b| b.key == key)
             .map(|b| b.parent)
-            .unwrap_or(0);
+            .unwrap_or(FUNCTION_SCOPE);
         level_of(parent)
     };
 
     // Own bindings per level, in declaration order.
     let mut own: Vec<Vec<usize>> = vec![Vec::new(); levels.len()];
     let keys: Vec<u64> = (0..state.vars.len())
-        .map(|index| state.var_block.get(index).copied().unwrap_or(0))
+        .map(|index| {
+            state
+                .var_block
+                .get(index)
+                .copied()
+                .unwrap_or(FUNCTION_SCOPE)
+        })
         .collect();
     for (index, key) in keys.into_iter().enumerate() {
         let level = level_of(key);
@@ -3062,8 +3171,11 @@ fn block_chain(state: &FnState, block: u64) -> Vec<u64> {
     let mut chain = Vec::new();
     let mut current = Some(block);
     while let Some(key) = current {
-        if chain.contains(&key) {
-            break; // a malformed chain must not loop forever
+        // `NO_PARENT` is not a block, so the walk ends here. Stopping on the sentinel
+        // explicitly (rather than on "no block with this key") is what keeps a block
+        // that happens to sit at offset zero from being mistaken for the terminator.
+        if key == NO_PARENT || chain.contains(&key) {
+            break;
         }
         chain.push(key);
         current = state.blocks.iter().find(|b| b.key == key).map(|b| b.parent);
@@ -3095,7 +3207,25 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
             return Slot::Loc(index as u32);
         }
     }
-    if let Some(index) = stack[current].vars.iter().position(|v| v.name == name) {
+    // Function-scope bindings — `var` and function declarations — are recorded with
+    // the sentinel block `0`, which no real scope uses, so the walk above cannot see
+    // them. They are reachable from anywhere in the function, which is exactly what
+    // the sentinel means.
+    //
+    // This pass is *only* for those. A lexical binding has to be found through the
+    // chain or not at all, and looking a name up without its block is precisely how
+    // `var x = 1; { let x = 2; } x` used to see the inner `x`, and how a `let` in a
+    // block leaked out of it.
+    let function_scoped = stack[current]
+        .vars
+        .iter()
+        .enumerate()
+        .find(|(index, var)| {
+            var.name == name
+                && stack[current].var_block.get(*index).copied() == Some(FUNCTION_SCOPE)
+        })
+        .map(|(index, _)| index);
+    if let Some(index) = function_scoped {
         return Slot::Loc(index as u32);
     }
     if let Some(index) = stack[current]
@@ -3159,7 +3289,14 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
         };
         for level in owner + 1..=current {
             let kind = match (previous.0, level) {
-                (ClosureType::Global | ClosureType::GlobalDecl, _) => ClosureType::GlobalRef,
+                // A global stays a global at *every* level. Without `GlobalRef` in
+                // this arm the second nested function over the same global got a
+                // `Ref` to a cell no frame ever held, so the innermost closure read
+                // `undefined` — which is how a two-deep getter lost its outer
+                // variable.
+                (ClosureType::Global | ClosureType::GlobalDecl | ClosureType::GlobalRef, _) => {
+                    ClosureType::GlobalRef
+                }
                 (ClosureType::Arg | ClosureType::Local, level) if level == owner + 1 => previous.0,
                 _ => ClosureType::Ref,
             };

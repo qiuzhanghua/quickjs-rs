@@ -106,23 +106,34 @@ fn decode_uri_component(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &text[index + 1..index + 3];
-            match u8::from_str_radix(hex, 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    index += 3;
-                    continue;
-                }
-                Err(_) => {
-                    return Err(crate::interp::Signal::Throw(
-                        interp.make_error("URIError", "malformed URI sequence"),
-                    ));
-                }
-            }
+        if bytes[index] != b'%' {
+            out.push(bytes[index]);
+            index += 1;
+            continue;
         }
-        out.push(bytes[index]);
-        index += 1;
+        // A `%` has to be followed by exactly two hex digits. Slicing the *bytes*
+        // rather than the `&str` matters: a `%` inside multi-byte text would not sit
+        // on a character boundary, and slicing by index would panic.
+        let Some(hex) = bytes.get(index + 1..index + 3) else {
+            return Err(uri_error(interp));
+        };
+        let Ok(hex) = std::str::from_utf8(hex) else {
+            return Err(uri_error(interp));
+        };
+        let Ok(byte) = u8::from_str_radix(hex, 16) else {
+            return Err(uri_error(interp));
+        };
+        out.push(byte);
+        index += 3;
     }
-    Ok(interp.string(String::from_utf8_lossy(&out).into_owned()))
+    // The percent-decoded bytes have to spell valid UTF-8; a truncation such as
+    // `decodeURIComponent("%E4%B8")` is a URI error, not replacement characters.
+    String::from_utf8(out)
+        .map(|text| interp.string(text))
+        .map_err(|_| uri_error(interp))
+}
+
+/// The `URIError` a malformed percent-escape raises.
+fn uri_error(interp: &Interp<'_>) -> crate::interp::Signal {
+    crate::interp::Signal::Throw(interp.make_error("URIError", "malformed URI sequence"))
 }

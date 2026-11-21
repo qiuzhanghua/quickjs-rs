@@ -490,9 +490,30 @@ impl JsObject {
         }
     }
 
-    /// Define an own data property.
+    /// Define an own data property, with the default attributes.
+    ///
+    /// This *creates*: on an existing property it overwrites the attributes too, so
+    /// it is the wrong call for a plain assignment. Use [`Self::write_value`] for that.
     pub fn define_data(&self, name: &str, value: Value) {
         self.define(name, Property::data(value));
+    }
+
+    /// Store a value into an existing own data property, keeping its attributes.
+    ///
+    /// Returns `false` when the property is absent, is an accessor, or is not
+    /// writable. An assignment has to go through this rather than
+    /// [`Self::define_data`], because redefining is how a non-configurable global
+    /// silently became configurable again and started answering `delete` with `true`.
+    pub fn write_value(&self, name: &str, value: Value) -> bool {
+        let mut data = self.data.borrow_mut();
+        let Some((_, property)) = data.props.iter_mut().find(|(key, _)| key == name) else {
+            return false;
+        };
+        if property.is_accessor() || !property.writable {
+            return false;
+        }
+        property.value = Some(value);
+        true
     }
 
     /// Delete an own property, reporting whether it was there and removable.

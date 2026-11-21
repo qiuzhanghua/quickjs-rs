@@ -78,11 +78,19 @@ pub fn install(interp: &mut Interp<'_>, array_proto: &Gc<JsObject>) {
 
 /// `Array(n)` makes `n` holes; `Array(a, b)` makes a two-element array.
 fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    // One numeric argument is a *length*, so it has to be a whole number in range:
+    // `new Array(-1)` and `new Array(1.5)` are both `RangeError`, and the limit is the
+    // spec's `2^32 - 1`.
     if args.len() == 1
         && let Some(length) = args[0].as_f64()
     {
-        let length = length as usize;
-        let array = interp.new_array(vec![Value::Undefined; length]);
+        if length < 0.0 || length.fract() != 0.0 || length > 4294967295.0 {
+            return Err(interp.range_error("invalid array length"));
+        }
+        let array = interp.new_array(Vec::new());
+        // Holes, not `undefined`: `new Array(3)` has three empty slots, so
+        // `2 in new Array(3)` is false while `new Array(3).length` is 3.
+        array.array_set_length(length as usize);
         return Ok(Value::Object(array));
     }
     let array = interp.new_array(args.to_vec());
