@@ -2,7 +2,14 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
-## 未发布
+## v0.2.0 — 2026-11-21
+
+首次发布到 crates.io：`quickjs-gc`、`quickjs-parse`、`quickjs-compile`、`quickjs-pure`
+（`quickjs-cli` 与 `quickjs-conformance` 标了 `publish = false` —— CLI 会跟 C 版 `qjs`
+抢同一个命令名，conformance 只是 dev-dependency）。
+
+**可用性边界**：`qjs` 能真正执行 JavaScript，并带标准库第一波。
+`qjs -e 'print([1,2,3].map(x=>x*2).join())'` 打印 `2,4,6`。
 
 ### M4：标准库第一波
 
