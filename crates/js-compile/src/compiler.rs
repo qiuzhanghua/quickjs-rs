@@ -132,6 +132,21 @@ struct JumpTarget {
     /// Whether this is a labelled non-loop statement, which an unlabelled `break`
     /// does not reach.
     is_regular_stmt: bool,
+    /// Whether leaving this construct has to close an iterator.
+    ///
+    /// A `for`/`of` loop keeps an iterator on the value stack, and leaving early has
+    /// to run its `return` method. `for`/`in` keeps only an enumeration object, which
+    /// is dropped rather than closed.
+    has_iterator: bool,
+}
+
+/// Whether a loop enumerates keys or values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForLoopKind {
+    /// `for (x in o)` — the keys of an object.
+    In,
+    /// `for (x of o)` — the values of an iterable.
+    Of,
 }
 
 /// Which part of a `try` statement a block key refers to.
@@ -681,7 +696,7 @@ impl Compiler {
                 self.try_stmt(stmt, block, handler, finalizer.as_deref())?;
             }
             StmtKind::ForIn { left, right, body } => {
-                self.for_in_of(left, right, body, false, false)?;
+                self.for_in_of(stmt, left, right, body, ForLoopKind::In)?;
             }
             StmtKind::ForOf {
                 left,
@@ -689,7 +704,13 @@ impl Compiler {
                 body,
                 is_await,
             } => {
-                self.for_in_of(left, right, body, true, *is_await)?;
+                if *is_await {
+                    return Err(SyntaxError::new(
+                        "for await is not supported by the compiler yet",
+                        stmt.span,
+                    ));
+                }
+                self.for_in_of(stmt, left, right, body, ForLoopKind::Of)?;
             }
             StmtKind::With { .. } => {
                 // `with` is sloppy-mode only and needs the object scope chain at
@@ -728,17 +749,26 @@ impl Compiler {
         }
         let targets = self.cur().jump_targets.clone();
         for target in targets.iter().rev() {
-            let Some(finally) = target.finally_label else {
+            if target.finally_label.is_none() && !target.has_iterator {
                 continue;
-            };
+            }
             if !has_value {
-                // The finalizer expects a value to pass through; with nothing to
+                // The cleanup expects a value to pass through; with nothing to
                 // return, `undefined` stands in.
                 self.emit(Opcode::Undefined, &[]);
                 has_value = true;
             }
             self.emit(Opcode::NipCatch, &[]);
-            self.emit_jump(Opcode::Gosub, finally, &[]);
+            if target.has_iterator {
+                // Rewind to the loop's own slots, then rotate the return value out
+                // of the way and hand `iterator_close` a dummy catch offset: the
+                // loop is being abandoned, so there is nothing left to catch.
+                self.emit(Opcode::Rot3r, &[]);
+                self.emit(Opcode::Undefined, &[]);
+                self.emit(Opcode::IteratorClose, &[]);
+            } else if let Some(finally) = target.finally_label {
+                self.emit_jump(Opcode::Gosub, finally, &[]);
+            }
         }
         if has_value {
             self.emit(Opcode::Return, &[]);
@@ -1003,6 +1033,7 @@ impl Compiler {
             drop_count: 0,
             finally_label: None,
             is_regular_stmt: false,
+            has_iterator: false,
         });
         let result = self.stmt(body);
         self.pop_jump_target();
@@ -1047,7 +1078,15 @@ impl Compiler {
                 return Ok(());
             }
 
-            for _ in 0..target.drop_count {
+            // Closing the iterator consumes the three slots the loop keeps on the
+            // stack (iterator, next method, catch offset), so those are not dropped
+            // again below.
+            let mut remaining = target.drop_count;
+            if target.has_iterator {
+                self.emit(Opcode::IteratorClose, &[]);
+                remaining = remaining.saturating_sub(3);
+            }
+            for _ in 0..remaining {
                 self.emit(Opcode::Drop, &[]);
             }
             if let Some(finally) = target.finally_label {
@@ -1100,6 +1139,7 @@ impl Compiler {
             drop_count: 0,
             finally_label: None,
             is_regular_stmt: true,
+            has_iterator: false,
         });
         let result = self.stmt(inner);
         self.pop_jump_target();
@@ -1160,6 +1200,7 @@ impl Compiler {
             drop_count: 1,
             finally_label: None,
             is_regular_stmt: false,
+            has_iterator: false,
         });
 
         // Runs of tests. `case 1: case 2: body` is one run: the empty clause hands
@@ -1320,6 +1361,7 @@ impl Compiler {
             drop_count: 1,
             finally_label: Some(finally_label),
             is_regular_stmt: false,
+            has_iterator: false,
         });
 
         let block_key = Self::try_block_key(stmt, TryPart::Block);
@@ -1377,6 +1419,7 @@ impl Compiler {
                 drop_count: 1,
                 finally_label: Some(finally_label),
                 is_regular_stmt: false,
+                has_iterator: false,
             });
             let catch_key = Self::try_block_key(stmt, TryPart::Catch);
             let catch_parent = self.cur().current_block;
@@ -1419,6 +1462,7 @@ impl Compiler {
             drop_count: 2,
             finally_label: None,
             is_regular_stmt: false,
+            has_iterator: false,
         });
         if let Some(finalizer) = finalizer {
             let finally_key = Self::try_block_key(stmt, TryPart::Finally);
@@ -1435,18 +1479,123 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile `for`/`in` and `for`/`of`.
+    ///
+    /// Both keep an enumeration record on the value stack for the whole loop, which
+    /// is what makes leaving early expensive: the record has to be dropped, or the
+    /// iterator closed. The layout is
+    ///
+    /// ```text
+    ///   <iterated expression>
+    ///   for_in_start | for_of_start      <- pushes the record
+    ///   goto TEST
+    /// NEXT:
+    ///   <bind the loop variable>
+    ///   <body>
+    /// TEST:
+    ///   for_in_next | for_of_next 0
+    ///   if_false NEXT                    <- not finished: next iteration
+    ///   drop                             <- finished: discard the leftover value
+    /// BREAK:
+    ///   drop | iterator_close            <- the one cleanup `break` also uses
+    /// ```
+    ///
+    /// `BREAK` sits *on* the cleanup rather than after it, so an early exit and the
+    /// normal exit share one copy — which is why `break` inside the loop emits nothing
+    /// of its own, and only a jump that passes *through* the loop pays for its record.
     fn for_in_of(
         &mut self,
-        _left: &ForHead,
-        _right: &Expr,
-        _body: &Stmt,
-        _is_of: bool,
-        _is_await: bool,
+        stmt: &Stmt,
+        left: &ForHead,
+        right: &Expr,
+        body: &Stmt,
+        kind: ForLoopKind,
     ) -> Result<(), SyntaxError> {
-        Err(SyntaxError::new(
-            "for-in/of is not supported by the compiler yet",
-            Span::start(),
-        ))
+        self.reset_value();
+
+        let loop_key = stmt.span.start.offset as u64;
+        let loop_parent = self.cur().current_block;
+        self.push_block(loop_key, loop_parent);
+        self.emit_scope_enter(loop_key);
+
+        // The iterated expression is evaluated inside the loop's scope, after the
+        // bindings exist in the temporal dead zone.
+        self.expr(right)?;
+
+        let next = self.new_label();
+        let test = self.new_label();
+        let break_target = self.new_label();
+
+        let has_iterator = kind == ForLoopKind::Of;
+        match kind {
+            ForLoopKind::In => self.emit(Opcode::ForInStart, &[]),
+            ForLoopKind::Of => self.emit(Opcode::ForOfStart, &[]),
+        }
+        self.emit_jump(Opcode::Goto, test, &[]);
+
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label: Some(break_target),
+            continue_label: Some(test),
+            // Passing through the loop has to dispose of its record. A `for`/`of`
+            // record is three slots, and closing the iterator consumes all of them.
+            drop_count: if has_iterator { 3 } else { 1 },
+            finally_label: None,
+            is_regular_stmt: false,
+            has_iterator,
+        });
+
+        self.place_label(next);
+        self.bind_loop_variable(left)?;
+        // The reference marks the body with its own label here. Nothing jumps to it
+        // once the loop is laid out, but it is not decoration: a label between the
+        // store and the body is why `put_loc v; get_loc v` does *not* fold into
+        // `set_loc v` when the body starts by reading the loop variable.
+        let body_label = self.new_label();
+        self.place_label(body_label);
+        self.stmt(body)?;
+
+        self.place_label(test);
+        match kind {
+            ForLoopKind::In => self.emit(Opcode::ForInNext, &[]),
+            ForLoopKind::Of => self.emit(Opcode::ForOfNext, &[Op::Int(0)]),
+        }
+        self.emit_jump(Opcode::IfFalse, next, &[]);
+        // The loop is finished; `for_xx_next` left an `undefined` behind.
+        self.emit(Opcode::Drop, &[]);
+
+        self.pop_jump_target();
+        self.place_label(break_target);
+        if has_iterator {
+            self.emit(Opcode::IteratorClose, &[]);
+        } else {
+            self.emit(Opcode::Drop, &[]);
+        }
+
+        self.emit_scope_leave(loop_key);
+        self.state().current_block = loop_parent;
+        Ok(())
+    }
+
+    /// Store the value `for_xx_next` left on the stack into the loop variable.
+    fn bind_loop_variable(&mut self, left: &ForHead) -> Result<(), SyntaxError> {
+        // A declaration *initialises* the binding, which is what takes a `let` out of
+        // the temporal dead zone, so the store is the unchecked form. Assigning to a
+        // binding declared elsewhere is an ordinary write and keeps its check.
+        let (pattern, action) = match left {
+            ForHead::VarDecl(decl) => (&decl.declarators[0].target, VarAction::PutInit),
+            ForHead::Assign(pattern) => (pattern.as_ref(), VarAction::Put),
+        };
+        match &pattern.kind {
+            PatternKind::Ident(name) => {
+                self.emit_var(action, &name.name);
+                Ok(())
+            }
+            _ => Err(SyntaxError::new(
+                "destructuring loop targets are not supported by the compiler yet",
+                pattern.span,
+            )),
+        }
     }
 
     fn var_decl(&mut self, decl: &VarDecl) -> Result<(), SyntaxError> {
@@ -3273,6 +3422,16 @@ fn compute_stack_size(code: &[u8]) -> u32 {
                     worklist.push((target, depth, catch_levels.clone()));
                 }
                 catch_levels.push(depth_before);
+                worklist.push((next, depth, catch_levels));
+            }
+            // A `for`/`of` loop keeps its own catch offset, and `nip_catch` has to
+            // rewind past it too. Its level sits one slot higher than a `catch`'s:
+            // the iterator and next-method slots occupy the offset's place.
+            Opcode::ForOfStart | Opcode::ForAwaitOfStart => {
+                if let Some(target) = target {
+                    worklist.push((target, depth, catch_levels.clone()));
+                }
+                catch_levels.push(depth_before + 1);
                 worklist.push((next, depth, catch_levels));
             }
             // `gosub` calls a subroutine with the return address on top. The opcode

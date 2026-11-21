@@ -770,3 +770,149 @@ fn leaving_a_switch_inside_a_try_discards_the_discriminant() {
         disassemble(inner)
     );
 }
+
+#[test]
+fn a_for_of_loop_closes_its_iterator_exactly_once() {
+    // The loop keeps an iterator record on the stack for its whole life, so both exits
+    // funnel through one `iterator_close` — the label `break` targets is placed *on*
+    // it, which is why a `break` inside the loop emits none of its own.
+    let compiled = compile("function f(o){ for (var v of o) { if (v) break; } a(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let closes: Vec<usize> = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::IteratorClose)
+        .map(|(pc, _)| *pc)
+        .collect();
+    assert_eq!(
+        closes.len(),
+        1,
+        "one cleanup shared by both exits\n{}",
+        disassemble(inner)
+    );
+    // The `break` jumps straight to it, so no `iterator_close` precedes that jump.
+    let break_target = instructions
+        .iter()
+        .filter_map(|(pc, i)| i.jump_target(*pc).map(|t| (*pc, t as usize)))
+        .filter(|(pc, target)| *target > *pc)
+        .map(|(_, target)| target)
+        .find(|target| *target == closes[0]);
+    assert!(
+        break_target.is_some(),
+        "break must land on the single cleanup\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn a_for_in_loop_drops_its_record_instead_of_closing() {
+    // `for`/`in` enumerates keys, so there is no iterator to close: the record is
+    // dropped.
+    let compiled = compile("function f(o){ for (var k in o) { break; } a(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    assert!(
+        !instructions
+            .iter()
+            .any(|(_, i)| general_form(i.op) == Opcode::IteratorClose),
+        "for-in has no iterator\n{}",
+        disassemble(inner)
+    );
+    assert!(
+        instructions
+            .iter()
+            .any(|(_, i)| general_form(i.op) == Opcode::ForInStart),
+        "for-in uses the enumeration opcodes\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn leaving_a_for_of_loop_disposes_of_its_record() {
+    // Jumping *past* the loop cannot use its cleanup, so the record has to be disposed
+    // of on the way out: dropped for `for`/`in`, closed for `for`/`of`.
+    let compiled = compile("function f(x){ o: while(c){ for (var v of x){ break o; } } a(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    // One close for the loop's own exit, one for the jump out of it.
+    let closes = instructions
+        .iter()
+        .filter(|(_, i)| general_form(i.op) == Opcode::IteratorClose)
+        .count();
+    assert_eq!(
+        closes,
+        2,
+        "the loop's cleanup plus the exit path\n{}",
+        disassemble(inner)
+    );
+
+    let compiled = compile("function f(x){ o: while(c){ for (var k in x){ break o; } } a(); }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let inner_instructions = inner.instructions();
+    // `for`/`in` pays one `drop` for its record on the exit path; there is no close.
+    assert!(
+        !inner_instructions
+            .iter()
+            .any(|(_, i)| general_form(i.op) == Opcode::IteratorClose),
+        "for-in never closes\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn a_return_from_a_for_of_loop_unwinds_and_closes() {
+    // Returning out of `for`/`of` cannot leave the iterator open: `nip_catch` rewinds
+    // the frame, then the iterator is closed with a dummy catch offset.
+    let compiled = compile("function f(o){ for (var v of o) return v; }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let ops: Vec<Opcode> = inner
+        .instructions()
+        .iter()
+        .map(|(_, i)| general_form(i.op))
+        .collect();
+    let nip = ops
+        .iter()
+        .position(|op| *op == Opcode::NipCatch)
+        .unwrap_or_else(|| panic!("no nip_catch\n{}", disassemble(inner)));
+    assert_eq!(
+        &ops[nip..nip + 4],
+        &[
+            Opcode::NipCatch,
+            Opcode::Rot3r,
+            Opcode::Undefined,
+            Opcode::IteratorClose
+        ],
+        "unwind then close\n{}",
+        disassemble(inner)
+    );
+
+    // `for`/`in` has nothing to close, so a return is plain.
+    let compiled = compile("function f(o){ for (var k in o) return k; }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    assert!(
+        !inner
+            .instructions()
+            .iter()
+            .any(|(_, i)| matches!(i.op, Opcode::NipCatch | Opcode::IteratorClose)),
+        "for-in returns directly\n{}",
+        disassemble(inner)
+    );
+}

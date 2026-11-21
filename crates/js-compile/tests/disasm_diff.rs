@@ -258,7 +258,9 @@ fn unsupported_constructs_fail_loudly() {
     for source in [
         // A destructuring catch parameter is not wired up yet.
         "function f(){ try { a(); } catch ([e]) { } }",
-        "for (const x of xs) ;",
+        // Destructuring targets and `for await` are not wired up yet.
+        "for (const [x] of xs) ;",
+        "async function f(xs){ for await (const x of xs) ; }",
         "class A { }",
         "function* g() { }",
         "async function f() { }",
@@ -553,6 +555,44 @@ fn try_catch_finally_matches_the_reference() {
         // `break` out of a `finally` has to drop both its slots.
         // `return` inside a `finally`.
         "function f(){ try { a(); } finally { return 1; } }",
+    ];
+    assert_cases(&cases);
+}
+
+/// `for`/`in` and `for`/`of`.
+#[test]
+fn for_in_of_matches_the_reference() {
+    require_oracle!();
+    let cases = [
+        // The record stays on the value stack; `for`/`of` closes its iterator on the
+        // way out, `for`/`in` only drops the enumeration object.
+        "function f(o){ for (var k in o) a(k); }",
+        "function f(o){ for (var v of o) a(v); }",
+        // Lexical loop variables live in the loop's own scope.
+        "function f(o){ for (let k in o) a(k); }",
+        "function f(o){ for (const v of o) a(v); }",
+        // `break` lands on the single cleanup, so it emits nothing of its own.
+        "function f(o){ for (var k in o) { break; } a(); }",
+        "function f(o){ for (var v of o) { break; } a(); }",
+        "function f(o){ for (var k in o) { a(); break; } b(); }",
+        "function f(o){ for (var v of o) { if (v) break; } a(); }",
+        // `continue` goes straight to the test.
+        "function f(o){ for (var k in o) { if (k) continue; a(); } b(); }",
+        "function f(o){ for (var v of o) { if (v) continue; a(); } b(); }",
+        // Passing *through* the loop is what costs: the record has to go.
+        "function f(x){ o: while(c){ for (var k in x){ break o; } } a(); }",
+        "function f(x){ o: while(c){ for (var v of x){ break o; } } a(); }",
+        "function f(x){ o: while(c){ for (var k in x){ continue o; } } a(); }",
+        "function f(x){ o: while(c){ for (var v of x){ continue o; } } a(); }",
+        // `return` from inside: no cleanup for `for`/`in`, an iterator close for
+        // `for`/`of`.
+        "function f(o){ for (var k in o) return k; }",
+        "function f(o){ for (var v of o) return v; }",
+        "function f(o){ for (var v of o) { if (v) return 1; } }",
+        "function f(o){ for (var k in o) { if (k) return; } }",
+        // Nesting, and a loop inside a `try`.
+        "function f(o){ for (var k in o) for (var v of o) a(k, v); }",
+        "function f(o){ try { for (var v of o) a(v); } finally { b(); } }",
     ];
     assert_cases(&cases);
 }
