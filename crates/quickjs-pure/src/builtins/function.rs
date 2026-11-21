@@ -76,9 +76,16 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
     // The script's own last expression is the function literal, so running it yields
     // the closure. That reuses the whole compile-and-run path instead of duplicating
     // the constant-pool plumbing here.
-    let name = interp.string("anonymous");
-    let _ = name;
-    interp.run_function_source(compiled)
+    let function = interp.run_function_source(compiled)?;
+    // The reference names a dynamically created function `anonymous`; without this the
+    // compiled expression has no name and `f.name` reads `undefined`.
+    if let Value::Object(object) = &function {
+        object.define(
+            "name",
+            Property::with_attributes(interp.string("anonymous"), false, false),
+        );
+    }
+    Ok(function)
 }
 
 fn call(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {

@@ -130,10 +130,21 @@ fn error_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> Js
             Property::with_attributes(interp.string(class.clone()), true, false),
         );
     }
+    // Every error instance shares the class name `Error`, whatever its constructor:
+    // `Object.prototype.toString` answers `[object Error]` even for a `TypeError`,
+    // and the print formatter uses it to choose `Name: message` + trace.
+    if !target.has_own("_class") {
+        target.define(
+            "_class",
+            Property::with_attributes(interp.string("Error"), false, false),
+        );
+    }
     // The trace is taken here, in the constructor, exactly as the reference does
     // (`JS_NewError` calls `build_backtrace`): an error object carries its stack from
     // the moment it exists, whether or not it is ever thrown.
-    interp.add_stack(&target);
+    // The reference builds this trace with `JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL`, so
+    // the constructor's own frame is not the first line of every error's stack.
+    interp.add_stack_skipping(&target, 1);
     Ok(Value::Object(target))
 }
 

@@ -179,7 +179,11 @@ fn legacy_octal_does_not_swallow_a_fraction() {
         vec![int(63), float(0.5)],
         "`077.5` is two tokens; upstream rejects it at parse time"
     );
-    assert_eq!(kinds("018.5"), vec![float(18.5)], "non-octal decimal takes it");
+    assert_eq!(
+        kinds("018.5"),
+        vec![float(18.5)],
+        "non-octal decimal takes it"
+    );
     assert_eq!(kinds("019.e1"), vec![float(190.0)]);
     assert_eq!(error_message("018.a"), "invalid number literal");
 }
@@ -191,7 +195,11 @@ fn numeric_separator_needs_a_digit_first() {
     assert_eq!(error_message("0_1"), "invalid number literal");
     assert_eq!(error_message("077_1"), "invalid number literal");
     assert_eq!(error_message("018_1"), "invalid number literal");
-    assert_eq!(kinds("1_0"), vec![int(10)], "ordinary separators still work");
+    assert_eq!(
+        kinds("1_0"),
+        vec![int(10)],
+        "ordinary separators still work"
+    );
 }
 
 #[test]

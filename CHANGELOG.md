@@ -16,12 +16,45 @@
 `Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、`Reflect`
 与八个错误类，外加精确到 `file:line:column` 的栈回溯。
 
-参考实现的 `test_builtin.js` 里 M4 范围的测试函数全部通过：`test`、`test_function`、
-`test_enum`、`test_array`、`test_array_extension`、`test_array_iterator`、`test_string`、
-`test_math`、`test_number`、`test_json`、`test_line_column_numbers`。用
+参考实现的 `test_builtin.js` 里 M4 范围的测试函数**全部通过**（14 个）：
+`test`、`test_function`、`test_enum`、`test_array`、`test_array_extension`、
+`test_array_iterator`、`test_string`、`test_math`、`test_number`、`test_json`、
+`test_line_column_numbers`、`test_eval`、`test_eval2`、`test_date`。用
 `scripts/slice-builtin-test.py` 可以复现（它把每个测试函数单独切出来，这样一个测试
-失败不会因为整文件编译失败而掩盖其余）。尚未通过的三项都在下面的已知缺口里：
-`test_eval`/`test_eval2`（直接 eval 的作用域、spread 调用参数）、`test_date`（`Date`）。
+失败不会因为整文件编译失败而掩盖其余；`test_eval` 依赖 `test_eval2`、
+`test_array` 依赖 `test_array_extension`，切片时要把依赖一起保留）。
+
+余下的 11 个不在 M4 范围，分属后面几个里程碑：`test_regexp`（M7）、`test_symbol`/
+`test_typed_array`/`test_map`/`test_map1`/`test_weak_map`/`test_weak_map_cycles`/
+`test_weak_ref`/`test_finalization_registry`（M8）、`test_generator`（M5）、
+`test_rope`（M11：语义正确，10 万次拼接慢）。
+
+### M4 收尾：`Date`、直接 `eval` 的作用域、spread 调用
+
+**`Date`** —— 全部构造形式、`now`/`parse`/`UTC`、22 个 getter/setter、
+六种字符串格式与 `toJSON`。两处不能照规范正文写，必须照参考实现逐句移植：
+
+- `MakeTime`/`MakeDay` 的运算**顺序**是规范的一部分。参考实现用 `volatile`
+  中间变量阻止编译器重排与 FMA 合并，`Date.UTC(1970, 0, 1, 80063993375, 29, 1,
+  -288230376151711740)` 只有在那个顺序下才等于 `29312`。这里用同样的分步写法。
+- **本地时区**由 `crates/quickjs-pure/src/tzif.rs` 直接读平台 TZif 数据库
+  （`/etc/localtime` 或 `$TZ`），取 64 位转换块。参考实现叫 `localtime_r`；
+  本 crate 不加外部依赖，所以自己解。`getTimezoneOffset` 按参考返回**整数**，
+  否则 UTC 下会打印 `-0`。
+
+**直接 `eval` 的作用域** —— eval 的代码现在能读写调用者的绑定，而不再只看全局：
+
+- `this` 与 `arguments` 取自最内层调用者。
+- 名字绑定沿**整个帧链**解析，所以内层函数里的 eval 能看到外层函数的局部变量；
+  写回落到原来的槽位或闭包单元，因此 `f("a = 3")` 对调用者可见。
+- strict 下 eval 有自己的变量环境：`eval("var v = 1")` 不再泄漏成全局，
+  而对未声明名字的**赋值**仍然是 `ReferenceError` —— 声明与赋值是两条路。
+- 已知边界：`let`/`const` 的暂时性死区、以及 eval 内声明的函数对调用者的可见性
+  都还没有按规范细化。
+
+**spread 调用参数** —— `f(...args)`、`o.m(...args)`、`new C(...args)` 编译为
+「构造一个实参数组 + `apply`」。为此补了 VM 的 `apply`、`swap`、`perm3` 三条指令。
+混合形式（`g(0, ...v, 3)`）走同一条路径，不需要额外特例。
 
 几处容易写错、都按参考行为实现的语义：
 
@@ -111,11 +144,7 @@
 
 ### 已知缺口（记录，不隐藏）
 
-- `Date`、`RegExp`、`Symbol`、`Map`/`Set`、TypedArray、生成器/async。
-- **直接 `eval` 的变量作用域**：`eval` 在全局作用域里跑，所以函数内的
-  `eval("var v = 1")` 泄漏到全局。间接 eval 与 `1+1` 这类用法是正确的。
-- **spread 调用参数**：`f(...args)` 需要新增 `apply` 指令，编译器现在明确报
-  "not supported"，不生成错码。
+- `RegExp`、`Symbol`、`Map`/`Set`、TypedArray、生成器/async。
 - **`Function.prototype.toString`** 返回 `[native code]` 而不是源码，需要保留源码
   与函数自身的 span。
 - **字符串拼接是 O(n²)**：`test_rope` 的 10 万次拼接要几十秒（参考有 rope）。

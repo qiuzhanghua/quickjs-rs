@@ -715,3 +715,172 @@ fn a_for_let_loop_binds_freshly_each_iteration() {
     // A loop variable that no closure captures needs no per-iteration cell at all.
     assert_eq!(eval("var n=0;for(let i=0;i<3;i++)n++;print(n)"), "3\n");
 }
+
+// ---------------------------------------------------------------------------
+// Date
+// ---------------------------------------------------------------------------
+
+#[test]
+fn date_parses_both_grammars() {
+    // ISO form, then the lenient one the reference also accepts.
+    assert_eq!(value("Date.parse('1970-01-01T00:30:00Z')"), "1800000");
+    assert_eq!(value("Date.parse('1970-01-01T00:30:00+00:30')"), "0");
+    // An explicit zone wins over the local one, whatever this machine's zone is.
+    assert_eq!(value("Date.parse('Jan 1 1970 00:30:00 UTC')"), "1800000");
+    // Out-of-range fields are not repaired.
+    assert_eq!(value("Date.parse('1970-13-01')"), "NaN");
+    assert_eq!(value("Date.parse('1970-01-01T24:00:01Z')"), "NaN");
+    // The fractional part is truncated to milliseconds, not rounded.
+    assert_eq!(
+        value("new Date('2020-01-01T01:01:01.9999Z').toISOString()"),
+        "2020-01-01T01:01:01.999Z"
+    );
+}
+
+#[test]
+fn date_make_time_keeps_the_specified_operation_order() {
+    // test262's fp-evaluation-order case: the products in `MakeTime` may not be
+    // fused or reordered, or these two answers change.
+    assert_eq!(
+        value("Date.UTC(1970, 0, 1, 80063993375, 29, 1, -288230376151711740)"),
+        "29312"
+    );
+    assert_eq!(
+        value("Date.UTC(1970, 0, 213503982336, 0, 0, 0, -18446744073709552000)"),
+        "34447360"
+    );
+}
+
+#[test]
+fn date_local_and_utc_halves_agree_at_the_epoch() {
+    // Whatever this machine's zone is, breaking a time into local fields and putting
+    // those fields back through the local-time constructor must return the same
+    // instant. This is the round trip the two halves have to agree on.
+    assert_eq!(
+        eval(
+            "var d = new Date(0)\n\
+              var e = new Date(d.getFullYear(), d.getMonth(), d.getDate(),\n\
+                               d.getHours(), d.getMinutes(), d.getSeconds(),\n\
+                               d.getMilliseconds())\n\
+              print(e.getTime() === d.getTime())"
+        ),
+        "true\n"
+    );
+    // The UTC half is zone-independent.
+    assert_eq!(
+        value("new Date(0).toISOString()"),
+        "1970-01-01T00:00:00.000Z"
+    );
+}
+
+#[test]
+fn date_printing_and_serialisation() {
+    assert_eq!(
+        value("String(new Date(0).toISOString())"),
+        "1970-01-01T00:00:00.000Z"
+    );
+    // `print` shows a Date as its ISO string, the way the reference's value printer
+    // does, and `JSON.stringify` goes through `toJSON`.
+    assert_eq!(eval("print(new Date(0))"), "1970-01-01T00:00:00.000Z\n");
+    assert_eq!(
+        value("JSON.stringify({d: new Date(0)})"),
+        "{\"d\":\"1970-01-01T00:00:00.000Z\"}"
+    );
+    // An invalid Date prints as an object and serialises to `null`, because
+    // `toJSON` answers `null` for a non-finite time value.
+    assert_eq!(value("new Date(NaN).toJSON()"), "null");
+    assert_eq!(value("new Date(NaN).toString()"), "Invalid Date");
+    assert_eq!(
+        throws("new Date(NaN).toISOString()"),
+        "RangeError: Date value is NaN"
+    );
+}
+
+#[test]
+fn date_is_tagged_and_its_default_hint_is_json_safe() {
+    assert_eq!(
+        value("Object.prototype.toString.call(new Date(0))"),
+        "[object Date]"
+    );
+    assert_eq!(
+        value("Object.prototype.toString.call(new Error('x'))"),
+        "[object Error]"
+    );
+    // The default hint converts a Date to a *string*, so `"" + d` is not the number.
+    assert_eq!(
+        value("'' + new Date(0).toISOString()"),
+        "1970-01-01T00:00:00.000Z"
+    );
+    assert_eq!(value("typeof ('' + new Date(0))"), "string");
+    // A Date method on a non-Date is a TypeError, not a silent coercion.
+    assert_eq!(
+        throws("Date.prototype.getTime.call({})"),
+        "TypeError: not a Date object"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Spread calls and eval
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spread_arguments_reach_the_callee() {
+    assert_eq!(
+        eval("function g(a,b){print(a+b)} var v=[1,2]; g(...v)"),
+        "3\n"
+    );
+    // Mixed forms build one argument array, in order.
+    assert_eq!(
+        eval("function g(){print([].slice.call(arguments).join())} g(0,...[1,2],3)"),
+        "0,1,2,3\n"
+    );
+    // A method keeps its receiver, which is what `apply` has to carry through.
+    assert_eq!(
+        eval("var o={n:7,f:function(a){print(this.n+a)}}; o.f(...[1])"),
+        "8\n"
+    );
+    // `new` with spread still constructs and still sets the prototype.
+    assert_eq!(
+        eval("function C(a,b){this.s=a+b} var c=new C(...[3,4]); print(c.s, c instanceof C)"),
+        "7 true\n"
+    );
+}
+
+#[test]
+fn eval_sees_the_calling_scope() {
+    // `this` and `arguments` come from the callee, not from global scope. Strict
+    // mode is needed for `this` to stay the primitive: a sloppy function boxes it.
+    assert_eq!(
+        eval("'use strict'; function f(b){return eval(b)} print(f.call(1,'this'))"),
+        "1\n"
+    );
+    assert_eq!(
+        eval("function f(b){return eval(b)} print(f('arguments.length', 1))"),
+        "2\n"
+    );
+    // A local of the calling function is readable *and* writable.
+    assert_eq!(
+        eval("function f(){var x=1,y=2; eval('x = x + y'); return x} print(f())"),
+        "3\n"
+    );
+    // The scope chain is followed outwards, not just the immediate caller.
+    assert_eq!(
+        eval(
+            "function inner(){return eval('a')}\n\
+              function outer(){var a=5; return inner()}\n\
+              print(outer())"
+        ),
+        "5\n"
+    );
+    // A strict eval's `var` does not leak into the global object.
+    assert_eq!(
+        eval("'use strict'; eval('var leaked = 1'); print(typeof leaked)"),
+        "undefined\n"
+    );
+    // An *assignment* to an undeclared name is still a ReferenceError in strict mode;
+    // only a declaration creates a binding of the eval's own.
+    assert_eq!(
+        throws("'use strict'; eval('undeclared_thing = 1')"),
+        "ReferenceError: undeclared_thing is not defined"
+    );
+}

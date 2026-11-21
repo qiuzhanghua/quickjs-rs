@@ -102,11 +102,15 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),
             other => {
-                // An arguments object, a Date, a RegExp and so on are distinguished
-                // by an internal tag; until those exist every other object answers
-                // `Object`, which is what a plain `{}` does.
+                // An arguments object, a RegExp and so on are distinguished by an
+                // internal tag; `_class` carries it for the classes that have one
+                // (Date, the error classes), and everything else answers `Object`,
+                // which is what a plain `{}` does.
                 let _ = interp;
-                other.to_string()
+                match object.own_property("_class").and_then(|p| p.value) {
+                    Some(class) => class.to_js_string(),
+                    None => other.to_string(),
+                }
             }
         },
         _ => "Object".to_string(),

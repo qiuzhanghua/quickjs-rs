@@ -2145,6 +2145,13 @@ impl Compiler {
                 self.expr(callee)?;
                 self.emit(Opcode::Dup, &[]);
                 let args = arguments.as_deref().unwrap_or(&[]);
+                if Self::has_spread(args) {
+                    // `C C array`: the duplicated callee is already both the target
+                    // and `new.target`, so no reordering is needed before `apply 1`.
+                    self.argument_array(args)?;
+                    self.emit(Opcode::Apply, &[Op::Int(1)]);
+                    return Ok(());
+                }
                 for argument in args {
                     self.expr(argument)?;
                 }
@@ -2168,6 +2175,27 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Build one array holding the evaluated call arguments, which is how a call
+    /// containing a spread is compiled: the reference does the same, building the
+    /// list on the stack and handing it to `apply`.
+    fn argument_array(&mut self, arguments: &[Expr]) -> Result<(), SyntaxError> {
+        let elements: Vec<Option<ArrayElement>> = arguments
+            .iter()
+            .map(|argument| match &argument.unparen().kind {
+                ExprKind::Spread(inner) => Some(ArrayElement::Spread(inner.clone())),
+                _ => Some(ArrayElement::Expr(Box::new(argument.clone()))),
+            })
+            .collect();
+        self.array_literal(&elements, Span::default())
+    }
+
+    /// Whether any argument is a spread, which is what selects the `apply` form.
+    fn has_spread(arguments: &[Expr]) -> bool {
+        arguments
+            .iter()
+            .any(|argument| matches!(argument.unparen().kind, ExprKind::Spread(_)))
     }
 
     /// Compile `a${x}b`.
@@ -2440,6 +2468,14 @@ impl Compiler {
                             ));
                         }
                     }
+                    if Self::has_spread(arguments) {
+                        // Stack is `obj func`; the array goes on top, then `perm3`
+                        // reorders to the `func this array` that `apply` wants.
+                        self.argument_array(arguments)?;
+                        self.emit(Opcode::Perm3, &[]);
+                        self.emit(Opcode::Apply, &[Op::Int(0)]);
+                        return Ok(());
+                    }
                     for argument in arguments {
                         self.expr(argument)?;
                     }
@@ -2449,6 +2485,15 @@ impl Compiler {
                 self.chain_link(callee, end)?;
                 if *optional {
                     self.optional_guard(end);
+                }
+                if Self::has_spread(arguments) {
+                    // `func array -> func undefined array`, which is the plain-call
+                    // form of `apply`: the receiver is `undefined`.
+                    self.argument_array(arguments)?;
+                    self.emit(Opcode::Undefined, &[]);
+                    self.emit(Opcode::Swap, &[]);
+                    self.emit(Opcode::Apply, &[Op::Int(0)]);
+                    return Ok(());
                 }
                 for argument in arguments {
                     self.expr(argument)?;

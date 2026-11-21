@@ -27,6 +27,18 @@ pub fn install(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
     ] {
         define_method(&global, name, length, func, interp);
     }
+    // `eval` is special-cased in the reference: a *direct* `eval(...)` compiles to an
+    // opcode rather than a call, so it never appears as a frame in a stack trace.
+    // Ours reaches the same native through an ordinary call, so the marker tells the
+    // interpreter to leave that frame out and keep the trace identical.
+    if let Some(property) = global.own_property("eval")
+        && let Some(Value::Object(eval_fn)) = property.value
+    {
+        eval_fn.define(
+            "_frame_less",
+            Property::with_attributes(Value::Bool(true), false, false),
+        );
+    }
 
     // `print` and `console` are what the CLI adds; nothing in the language needs
     // them, but every script in the reference's test suite uses them.

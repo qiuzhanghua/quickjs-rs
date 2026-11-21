@@ -87,6 +87,31 @@ pub struct Realm {
     pub boolean_proto: Option<Gc<JsObject>>,
     /// `Error.prototype`, the prototype of every error instance.
     pub error_proto: Gc<JsObject>,
+    /// `Date.prototype`, so the constructor can build an instance in the
+    /// function-call form (`Date()` returns a string) without going through `new`.
+    pub date_proto: Gc<JsObject>,
+}
+
+/// One binding of the frame that called `eval`, so the eval'd code can read and
+/// write it by name.
+struct EvalBinding {
+    /// The name it was declared with.
+    name: String,
+    /// Which entry of [`Interp::frames`] owns it. An `eval` sees the whole chain of
+    /// calling frames, not only the innermost one: `function f(){ eval("a") }` inside
+    /// a function that declares `a` must find that `a`.
+    frame: usize,
+    /// Which table of that frame it lives in.
+    slot: EvalSlot,
+    /// The slot index within that table.
+    index: usize,
+}
+
+/// Which table of a frame an [`EvalBinding`] indexes.
+#[derive(Clone, Copy)]
+enum EvalSlot {
+    Arg,
+    Local,
 }
 
 /// One activation record.
@@ -133,6 +158,25 @@ pub struct Interp<'a> {
     pub realm: Realm,
     /// Active frames, outermost first.
     frames: Vec<Frame>,
+    /// A strict-mode `eval`'s own variable scope, while its script runs.
+    ///
+    /// Strict eval gets a *fresh* variable environment, so a `var` inside it does not
+    /// become a global. Name lookups still fall through to the realm, which is why
+    /// `eval("a")` sees a global `a` and `eval("a = 3")` writes it.
+    eval_scope: Option<BTreeMap<String, Value>>,
+    /// The calling frame's own bindings, which the running `eval` can read and write.
+    ///
+    /// Held separately from [`Interp::eval_scope`] because these already exist: reads
+    /// come from the frame, and a write is applied back to the frame (or to the cell
+    /// the frame captured) when the eval finishes. That is what makes
+    /// `f("a = 3")` visible to the caller as `a === 3`.
+    eval_bindings: Vec<EvalBinding>,
+    /// Names of the native functions currently executing, outermost first.
+    ///
+    /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
+    /// trace still names it with `(native)` instead of a position, so the names are
+    /// tracked separately and stitched into [`Interp::stack_trace`].
+    native_frames: Vec<String>,
     /// Text written by `print` and friends, in order.
     ///
     /// Buffered rather than streamed so a test can inspect it; the CLI flushes it
@@ -171,8 +215,12 @@ impl<'a> Interp<'a> {
                 number_proto: None,
                 boolean_proto: None,
                 error_proto: JsObject::ordinary(heap, None),
+                date_proto: JsObject::ordinary(heap, None),
             },
             frames: Vec::new(),
+            eval_scope: None,
+            eval_bindings: Vec::new(),
+            native_frames: Vec::new(),
             output: String::new(),
             max_frames: 4096,
         };
@@ -300,7 +348,74 @@ impl<'a> Interp<'a> {
             }
         };
         compiled.set_filename(EVAL_FILE);
-        self.run_script(compiled)
+        self.run_eval_script(compiled)
+    }
+
+    /// Run an `eval`'d script in the caller's scope.
+    ///
+    /// Three things have to come from the calling frame, because the eval'd code is a
+    /// script and would otherwise see only the global object:
+    ///
+    /// * `this`, so `f.call(1, "this")` evaluates to `1`;
+    /// * `arguments`, exposed as a binding of the eval's own scope, so
+    ///   `f("arguments.length", 1)` sees the caller's arguments;
+    /// * a fresh variable environment for `var`, so a strict `eval` does not leak
+    ///   `eval("var v = 1")` into the global object.
+    ///
+    /// Locals of the calling function are *not* reachable: that needs the compiler to
+    /// hand its variable environment over, which this milestone does not do.
+    fn run_eval_script(&mut self, code: CompiledFunction) -> JsResult<Value> {
+        // `this` and `arguments` come from the innermost frame only — those are not
+        // lexical — while the name bindings come from the whole chain of frames, part
+        // of it being ordinary scope resolution.
+        let (this, passed) = match self.frames.last() {
+            Some(frame) => (frame.this.clone(), frame.passed.clone()),
+            // No frame at all: the eval is running at the top level, so there is
+            // nothing to inherit and the global receiver is right.
+            None => (Value::Object(self.realm.global.clone()), Vec::new()),
+        };
+        // Innermost frame first, so the first binding found for a name is the one that
+        // shadows the rest. A script frame (`<eval>`) contributes nothing.
+        let mut bindings: Vec<EvalBinding> = Vec::new();
+        for frame_index in (0..self.frames.len()).rev() {
+            let frame = &self.frames[frame_index];
+            for (index, arg) in frame.code.code.args.iter().enumerate() {
+                bindings.push(EvalBinding {
+                    name: arg.name.clone(),
+                    frame: frame_index,
+                    slot: EvalSlot::Arg,
+                    index,
+                });
+            }
+            for (index, local) in frame.code.code.vars.iter().enumerate() {
+                bindings.push(EvalBinding {
+                    name: local.name.clone(),
+                    frame: frame_index,
+                    slot: EvalSlot::Local,
+                    index,
+                });
+            }
+        }
+        let mut seen = BTreeSet::new();
+        bindings.retain(|binding| seen.insert(binding.name.clone()));
+
+        // The caller's `arguments`, as an array-like. Reading `length` and the indexed
+        // elements is all the spec's ordinary uses need.
+        let arguments = Value::Object(self.new_array(passed));
+
+        let mut scope = BTreeMap::new();
+        scope.insert("arguments".to_string(), arguments);
+
+        let previous_scope = self.eval_scope.replace(scope);
+        let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
+        let compiled = Gc::new(self.heap, CompiledCode::new(code));
+        let closure_vars = compiled.code.closure_vars.clone();
+        let env = self.global_env(&closure_vars);
+        let callee = Value::Undefined;
+        let result = self.execute(compiled, env, this, Vec::new(), callee);
+        self.eval_scope = previous_scope;
+        self.eval_bindings = previous_bindings;
+        result
     }
 
     /// A `SyntaxError` that reports where in the source it happened.
@@ -616,6 +731,18 @@ impl<'a> Interp<'a> {
 
     fn get_global(&mut self, slot: usize) -> JsResult<Value> {
         let (name, lexical, _) = self.global_binding(slot);
+        // The frame that called `eval` is the innermost scope the eval'd code sees, so
+        // its local `a` wins over a global `a`.
+        if let Some(value) = self.eval_binding_value(&name) {
+            return Ok(value);
+        }
+        // A binding declared by the strict `eval` currently running shadows anything
+        // further out, so `eval("var v = 1")`'s `v` is found before `globalThis.v`.
+        if let Some(scope) = &self.eval_scope
+            && let Some(value) = scope.get(&name)
+        {
+            return Ok(value.clone());
+        }
         if lexical {
             // A lexical global is a binding in a side table, so the dead zone is
             // visible and it is nowhere on the global object.
@@ -643,6 +770,21 @@ impl<'a> Interp<'a> {
     /// deleted but is always writable.
     fn put_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
         let (name, lexical, is_const) = self.global_binding(slot);
+        // A binding of the frame that called `eval` takes the write, which is what
+        // makes `f("a = 3")` change the caller's `a`.
+        if self.set_eval_binding(&name, &value) {
+            return Ok(());
+        }
+        // Inside a strict `eval`, a name it declared itself is stored there. An
+        // *assignment* to a name nobody declared is not a declaration, so it falls
+        // through: strict mode raises `ReferenceError` for it, which is what
+        // `eval("1 + (@not_def = 1)")` has to do.
+        if let Some(scope) = self.eval_scope.as_mut()
+            && scope.contains_key(&name)
+        {
+            scope.insert(name, value);
+            return Ok(());
+        }
         if lexical {
             if let Some(cell) = self.realm.globals.get(&name).cloned() {
                 if is_const && !matches!(cell.get(), Value::Uninitialized) {
@@ -679,6 +821,89 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The value of a binding of the frame that called `eval`, if there is one.
+    fn eval_binding_value(&self, name: &str) -> Option<Value> {
+        let binding = self
+            .eval_bindings
+            .iter()
+            .find(|binding| binding.name == name)?;
+        let owner = self.frames.get(binding.frame)?;
+        let (slot, index) = (binding.slot, binding.index);
+        Some(match slot {
+            EvalSlot::Arg => match owner.code.arg_cell.get(index).copied().unwrap_or(-1) {
+                cell if cell >= 0 => owner
+                    .cells
+                    .get(cell as usize)
+                    .map(|cell| cell.get())
+                    .unwrap_or(Value::Undefined),
+                _ => owner.args.get(index).cloned().unwrap_or(Value::Undefined),
+            },
+            EvalSlot::Local => match owner.code.loc_cell.get(index).copied().unwrap_or(-1) {
+                cell if cell >= 0 => owner
+                    .cells
+                    .get(cell as usize)
+                    .map(|cell| cell.get())
+                    .unwrap_or(Value::Undefined),
+                _ => owner.locals.get(index).cloned().unwrap_or(Value::Undefined),
+            },
+        })
+    }
+
+    /// Write to a binding of the frame that called `eval`. Returns whether one matched.
+    fn set_eval_binding(&mut self, name: &str, value: &Value) -> bool {
+        let Some(binding) = self
+            .eval_bindings
+            .iter()
+            .find(|binding| binding.name == name)
+        else {
+            return false;
+        };
+        let (slot, index, frame) = (binding.slot, binding.index, binding.frame);
+        let Some(owner) = self.frames.get_mut(frame) else {
+            return false;
+        };
+        match slot {
+            EvalSlot::Arg => match owner.code.arg_cell.get(index).copied().unwrap_or(-1) {
+                cell if cell >= 0 => {
+                    if let Some(cell) = owner.cells.get(cell as usize) {
+                        cell.set(value.clone());
+                    }
+                }
+                _ => {
+                    if let Some(slot) = owner.args.get_mut(index) {
+                        *slot = value.clone();
+                    }
+                }
+            },
+            EvalSlot::Local => match owner.code.loc_cell.get(index).copied().unwrap_or(-1) {
+                cell if cell >= 0 => {
+                    if let Some(cell) = owner.cells.get(cell as usize) {
+                        cell.set(value.clone());
+                    }
+                }
+                _ => {
+                    if let Some(slot) = owner.locals.get_mut(index) {
+                        *slot = value.clone();
+                    }
+                }
+            },
+        }
+        true
+    }
+
+    /// Whether the realm already has a binding for `name`, lexically or as an *own*
+    /// property of the global object. Used to decide whether a store inside an
+    /// `eval` writes through to the realm or declares a binding of its own.
+    ///
+    /// Own rather than inherited: `eval("var toString = 1")` must not be taken for a
+    /// write to `Object.prototype.toString`, and must not shadow it either.
+    fn global_knows(&mut self, name: &str) -> bool {
+        if self.realm.globals.contains_key(name) {
+            return true;
+        }
+        self.realm.global.own_property(name).is_some()
+    }
+
     /// Whether the code currently running is strict.
     ///
     /// Read off the frame's function, which is where the parser's answer ended up; a
@@ -696,6 +921,23 @@ impl<'a> Interp<'a> {
     /// assignment goes through, and non-configurable, so `delete` refuses.
     fn init_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
         let (name, lexical, _) = self.global_binding(slot);
+        // A `var` declared by the strict `eval` currently running belongs to the
+        // eval's scope, not to the global object: `eval("var v = 1")` must not make
+        // `typeof v` answer `"number"` afterwards. A name the realm already has is
+        // initialised in place, which is what a re-declaration inside eval does.
+        if self.eval_scope.is_some() && !lexical && !self.global_knows(&name) {
+            self.eval_scope
+                .as_mut()
+                .expect("checked above")
+                .insert(name, value);
+            return Ok(());
+        }
+        if let Some(scope) = self.eval_scope.as_mut()
+            && scope.contains_key(&name)
+        {
+            scope.insert(name, value);
+            return Ok(());
+        }
         if lexical {
             // The cell exists (created at declaration time) holding the dead-zone
             // marker; storing the value is what makes the binding readable.
@@ -932,7 +1174,27 @@ impl<'a> Interp<'a> {
             _ => None,
         });
         match callable {
-            Some(NativeCall::Native(func)) => func(self, this, &args),
+            Some(NativeCall::Native(func)) => {
+                // A function marked `_frame_less` is one the reference implements
+                // without a call frame — `eval` is the only one so far.
+                let frame_less = function
+                    .own_property("_frame_less")
+                    .and_then(|property| property.value)
+                    .is_some_and(|value| value.to_boolean());
+                let name = function
+                    .own_property("name")
+                    .and_then(|property| property.value)
+                    .map(|value| value.to_js_string())
+                    .unwrap_or_default();
+                if !frame_less {
+                    self.native_frames.push(name);
+                }
+                let result = func(self, this, &args);
+                if !frame_less {
+                    self.native_frames.pop();
+                }
+                result
+            }
             Some(NativeCall::Bound {
                 target,
                 this: bound_this,
@@ -1006,6 +1268,34 @@ impl<'a> Interp<'a> {
     ///
     /// `Ok(None)` means a frame was pushed: the caller must not push a result,
     /// because the returning frame will.
+    /// The elements of an array-like value, as a call argument list.
+    ///
+    /// `apply` accepts any array-like, not only a real array: the reference reads
+    /// `length` and then each index, so `{length: 2, 0: "a", 1: "b"}` works too.
+    fn array_like_to_args(&mut self, value: &Value) -> JsResult<Vec<Value>> {
+        let Some(object) = value.as_object().cloned() else {
+            if value.is_nullish() {
+                // `f.apply(this, null)` passes no arguments at all.
+                return Ok(Vec::new());
+            }
+            return Err(self.type_error("createListFromArrayLike called on non-object"));
+        };
+        let length = match self.get_property(&object, "length")? {
+            Some(length) => length.to_number(),
+            None => 0.0,
+        };
+        if !length.is_finite() || length <= 0.0 {
+            return Ok(Vec::new());
+        }
+        let length = (length as usize).min(1_000_000);
+        let mut args = Vec::with_capacity(length);
+        for index in 0..length {
+            let element = self.get_property(&object, &index.to_string())?;
+            args.push(element.unwrap_or(Value::Undefined));
+        }
+        Ok(args)
+    }
+
     fn call_or_push(
         &mut self,
         callee: Value,
@@ -1122,10 +1412,20 @@ impl<'a> Interp<'a> {
     /// already has a `stack` keeps it, so an error caught and rethrown, or one whose
     /// `stack` a script set, is not rewritten.
     pub fn add_stack(&self, object: &Gc<JsObject>) {
+        self.add_stack_skipping(object, 0);
+    }
+
+    /// [`Interp::add_stack`], omitting the `skip` innermost frames.
+    ///
+    /// An `Error` constructor passes 1: the reference builds those traces with
+    /// `JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL`, so `new Error()` does not report the
+    /// constructor itself, while a `RangeError` raised inside `toISOString` does
+    /// report `at toISOString (native)`.
+    pub fn add_stack_skipping(&self, object: &Gc<JsObject>, skip: usize) {
         if object.has_own("stack") {
             return;
         }
-        let trace = self.stack_trace();
+        let trace = self.stack_trace_skipping(skip);
         let text = self.string(trace);
         object.define("stack", Property::with_attributes(text, true, true));
     }
@@ -1333,6 +1633,24 @@ impl<'a> Interp<'a> {
             Dup => {
                 let value = self.peek(0);
                 self.push(value);
+            }
+            Swap => {
+                // `a b -> b a`
+                let bottom = self.pop();
+                let top = self.pop();
+                self.push(bottom);
+                self.push(top);
+            }
+            Perm3 => {
+                // `a b c -> b a c`, the reference's reordering for a spread method
+                // call: `obj func array` becomes the `func this array` that `apply`
+                // takes.
+                let c = self.pop();
+                let b = self.pop();
+                let a = self.pop();
+                self.push(b);
+                self.push(a);
+                self.push(c);
             }
             Dup1 => {
                 let value = self.peek(1);
@@ -1728,6 +2046,21 @@ impl<'a> Interp<'a> {
                 let callee = self.pop();
                 let this = self.pop();
                 if let Some(result) = self.call_or_push(callee, this, args)? {
+                    self.push(result);
+                }
+            }
+            Apply => {
+                // `func this array -> result`, the spread-call form: the compiler
+                // builds one array of arguments, and all that is left here is to
+                // unpack it. Magic 1 is `new` (`apply 1`), which constructs.
+                let array = self.pop();
+                let this = self.pop();
+                let callee = self.pop();
+                let args = self.array_like_to_args(&array)?;
+                if a & 1 != 0 {
+                    let result = self.construct(callee, this, args)?;
+                    self.push(result);
+                } else if let Some(result) = self.call_or_push(callee, this, args)? {
                     self.push(result);
                 }
             }
@@ -2273,6 +2606,14 @@ impl<'a> Interp<'a> {
         let Value::Object(object) = &value else {
             return Ok(value);
         };
+        // A Date overrides the default hint to mean "string", which is what
+        // `Date.prototype[Symbol.toPrimitive]` does with hint `"default"`. Without
+        // this, `"" + new Date()` would print the milliseconds, not the date.
+        let hint = if hint == Hint::Default && is_date_object(object) {
+            Hint::String
+        } else {
+            hint
+        };
         let order: [&str; 2] = match hint {
             Hint::String => ["toString", "valueOf"],
             Hint::Number | Hint::Default => ["valueOf", "toString"],
@@ -2703,8 +3044,30 @@ impl<'a> Interp<'a> {
     /// A frame whose code has no positions prints just `(file)`, matching the
     /// reference's output for stripped bytecode.
     pub fn stack_trace(&self) -> String {
+        self.stack_trace_skipping(0)
+    }
+
+    /// [`Interp::stack_trace`] with the `skip` innermost frames left out.
+    fn stack_trace_skipping(&self, skip: usize) -> String {
         let mut out = String::new();
+        let mut skip = skip;
+        // Natives run on the Rust stack, so they sit innermost. They never re-enter
+        // JavaScript, which is what makes it correct to emit them all before the
+        // bytecode frames rather than interleaved.
+        for name in self.native_frames.iter().rev() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            out.push_str("    at ");
+            out.push_str(name);
+            out.push_str(" (native)\n");
+        }
         for frame in self.frames.iter().rev() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
             let code = &frame.code.code;
             let file = code.filename.as_deref().unwrap_or("<input>");
             // The name comes from the function *object*, not from the compiled code:
@@ -2767,6 +3130,13 @@ impl<'a> Interp<'a> {
     /// `for-in` lists it, `delete` refuses. A name that is already there — a built-in
     /// such as `print`, or a redeclaration — is left alone.
     pub fn declare_var_global(&mut self, name: &str) {
+        // A strict `eval`'s `var` belongs to the eval's own scope: declaring it on the
+        // global object is exactly the leak `typeof my_var === "undefined"` after
+        // `eval("var my_var=2")` rules out.
+        if let Some(scope) = self.eval_scope.as_mut() {
+            scope.entry(name.to_string()).or_insert(Value::Undefined);
+            return;
+        }
         let global = self.realm.global.clone();
         if global.own_property(name).is_some() {
             return;
@@ -2830,6 +3200,17 @@ pub enum DeleteFailure {
     Throw,
     /// Ignore the write, which is what a sloppy-mode assignment does.
     Ignore,
+}
+
+/// Whether `object` is a `Date` instance, by the class tag it carries.
+///
+/// Lives here rather than in `builtins::date` so `ToPrimitive` can ask without the
+/// builtins module depending on the interpreter's conversion order.
+fn is_date_object(object: &Gc<JsObject>) -> bool {
+    object
+        .own_property("_class")
+        .and_then(|property| property.value)
+        .is_some_and(|value| value.to_js_string() == "Date")
 }
 
 /// Which type `ToPrimitive` prefers when it converts an object.
@@ -3012,6 +3393,32 @@ pub fn debug_display(interp: &Interp<'_>, value: &Value) -> String {
     printer.out
 }
 
+/// The internal class name an object carries, when it has one.
+fn class_of(object: &Gc<JsObject>) -> Option<String> {
+    object
+        .own_property("_class")
+        .and_then(|property| property.value)
+        .map(|value| value.to_js_string())
+}
+
+/// A string property, looked up the way `GetProperty` does: own first, then the
+/// prototype chain. Needed because the print formatter holds the interpreter
+/// immutably and so cannot run getters.
+fn inherited(object: &Gc<JsObject>, name: &str) -> Option<String> {
+    let mut current = Some(object.clone());
+    // Bounded, because a prototype cycle would otherwise loop forever.
+    for _ in 0..100 {
+        let node = current?;
+        if let Some(property) = node.own_property(name)
+            && let Some(value) = property.value
+        {
+            return Some(value.to_js_string());
+        }
+        current = node.with(|data| data.proto.clone());
+    }
+    None
+}
+
 /// The `JS_PrintValue` state: output, and the objects currently being printed.
 struct Printer<'a, 'rt> {
     /// Kept for the class-name lookups that typed arrays and `Date` will need.
@@ -3070,6 +3477,18 @@ impl Printer<'_, '_> {
             self.out.push_str(&format!("[{class}]"));
             return;
         }
+        // `Date` and `Error` print as themselves rather than as bags of properties:
+        // the ISO string, and `Name: message` followed by the trace.
+        if let Some(class) = class_of(object) {
+            if class == "Date" {
+                self.date(object);
+                return;
+            }
+            if class == "Error" {
+                self.error(object);
+                return;
+            }
+        }
         self.stack.push(object.clone());
         if object.is_array() {
             self.array(object, level);
@@ -3077,6 +3496,35 @@ impl Printer<'_, '_> {
             self.plain_object(object, level);
         }
         self.stack.pop();
+    }
+
+    /// A Date prints as its ISO string; an invalid one falls through to the plain
+    /// object form, the way the reference falls back when `toISOString` throws.
+    fn date(&mut self, object: &Gc<JsObject>) {
+        let value = object
+            .own_property("_date_value")
+            .and_then(|property| property.value)
+            .map(|value| value.to_number());
+        match value.and_then(crate::builtins::date::iso_string) {
+            Some(text) => self.out.push_str(&text),
+            None => self.plain_object(object, 0),
+        }
+    }
+
+    /// `Name: message`, then the trace with its trailing newline removed.
+    fn error(&mut self, object: &Gc<JsObject>) {
+        let name = inherited(object, "name").unwrap_or_else(|| "Error".to_string());
+        self.out.push_str(&name);
+        if let Some(message) = inherited(object, "message")
+            && !message.is_empty()
+        {
+            self.out.push_str(": ");
+            self.out.push_str(&message);
+        }
+        if let Some(stack) = inherited(object, "stack") {
+            self.out.push('\n');
+            self.out.push_str(stack.trim_end_matches('\n'));
+        }
     }
 
     fn array(&mut self, object: &Gc<JsObject>, level: usize) {

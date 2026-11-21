@@ -47,7 +47,7 @@ fn stringify(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
         _ => String::new(),
     };
     let mut out = String::new();
-    match write_value(interp, &value, &indent, &mut out, 0)? {
+    match write_value(interp, &value, "", &indent, &mut out, 0)? {
         // `undefined`, a function and a symbol serialise to nothing at the top level.
         true => Ok(interp.string(out)),
         false => Ok(Value::Undefined),
@@ -56,13 +56,21 @@ fn stringify(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 
 /// Serialise `value` into `out`. Returns whether anything was written, which is how
 /// a top-level `undefined` becomes the value `undefined` rather than `"undefined"`.
+///
+/// `key` is the property name the value was read from, which `toJSON` receives; the
+/// root value is passed the empty string, as the spec's wrapper object does.
 fn write_value(
     interp: &mut Interp<'_>,
     value: &Value,
+    key: &str,
     indent: &str,
     out: &mut String,
     depth: usize,
 ) -> JsResult<bool> {
+    // A value carrying a `toJSON` method is replaced by whatever that returns, and
+    // the replacement is not asked for `toJSON` again. This is how a `Date`
+    // serialises to its ISO string.
+    let value = &call_to_json(interp, value, key)?;
     match value {
         Value::Undefined
         | Value::Uninitialized
@@ -105,6 +113,20 @@ fn write_value(
     }
 }
 
+/// `SerializeJSONProperty`'s `toJSON` step, applied once.
+fn call_to_json(interp: &mut Interp<'_>, value: &Value, key: &str) -> JsResult<Value> {
+    let Value::Object(object) = value else {
+        return Ok(value.clone());
+    };
+    let Some(method) = interp.get_property(object, "toJSON")? else {
+        return Ok(value.clone());
+    };
+    if !matches!(&method, Value::Object(function) if function.is_callable()) {
+        return Ok(value.clone());
+    }
+    interp.call_value(method, value.clone(), vec![interp.string(key)])
+}
+
 fn write_array(
     interp: &mut Interp<'_>,
     array: &Gc<JsObject>,
@@ -126,7 +148,7 @@ fn write_array(
         let element = array.array_get(index).unwrap_or(Value::Undefined);
         // A hole or an unserialisable element becomes `null`, because an array's
         // positions are part of its meaning.
-        if !write_value(interp, &element, indent, out, depth + 1)? {
+        if !write_value(interp, &element, &index.to_string(), indent, out, depth + 1)? {
             out.push_str("null");
         }
     }
@@ -161,7 +183,7 @@ fn write_object(
         };
         let mut piece = String::new();
         // Render the value first so an unrepresentable one can be skipped whole.
-        if !write_value(interp, &value, indent, &mut piece, depth + 1)? {
+        if !write_value(interp, &value, &key, indent, &mut piece, depth + 1)? {
             continue;
         }
         if written > 0 {

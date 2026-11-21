@@ -12,6 +12,7 @@
 //!   test suite asserts on `instanceof` and on `e.name`.
 
 mod array;
+pub(crate) mod date;
 mod error;
 mod function;
 mod global;
@@ -51,6 +52,7 @@ pub fn install(interp: &mut Interp<'_>) {
     math::install(interp);
     json::install(interp);
     reflect::install(interp);
+    date::install(interp);
     global::install(interp, &boolean_proto);
 }
 
