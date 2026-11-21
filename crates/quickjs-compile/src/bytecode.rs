@@ -309,8 +309,17 @@ pub enum Constant {
     },
     /// A nested function, referenced by `fclosure`.
     Function(Box<Function>),
-    /// A template object: the cooked strings of one call site.
-    Template(Vec<Option<String>>),
+    /// A template object: one call site's chunks.
+    ///
+    /// The *raw* text is carried as well as the cooked text because `String.raw` reads
+    /// it back verbatim, and a tagged template may legally contain an invalid escape
+    /// sequence whose cooked form is `undefined`.
+    Template {
+        /// Cooked text; `None` for a chunk with an invalid escape sequence.
+        cooked: Vec<Option<String>>,
+        /// Source text of each chunk, verbatim.
+        raw: Vec<String>,
+    },
 }
 
 impl Constant {
@@ -331,8 +340,8 @@ impl Constant {
                     format!("[bytecode {}]", f.name)
                 }
             }
-            Constant::Template(quasis) => {
-                let parts: Vec<String> = quasis
+            Constant::Template { cooked, .. } => {
+                let parts: Vec<String> = cooked
                     .iter()
                     .map(|q| q.clone().unwrap_or_else(|| "undefined".to_string()))
                     .collect();
@@ -475,6 +484,11 @@ pub struct Function {
     pub strict: bool,
     /// Parameters.
     pub args: Vec<VarDef>,
+    /// How many parameters count towards `Function.prototype.length`.
+    ///
+    /// A parameter with a default or a rest parameter ends the count, because `.length`
+    /// is the arity the function can be called with before anything is substituted.
+    pub defined_args: u32,
     /// Locals, including the implicit return-value slot named `<ret>`.
     pub vars: Vec<VarDef>,
     /// Captured variables of enclosing functions.

@@ -17,6 +17,7 @@
 //!   kind        u8
 //!   flags       u8    bit 0 = strict
 //!   line, column u32 each
+//!   defined_args u32  arity that counts towards `.length`
 //!   args        u32 count, then name/flags records
 //!   vars        u32 count, then name/flags/scope records
 //!   closures    u32 count, then name/flags/type/index records
@@ -39,7 +40,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +152,7 @@ fn write_function(out: &mut Vec<u8>, function: &Function) {
     out.extend_from_slice(&function.line.to_be_bytes());
     out.extend_from_slice(&function.column.to_be_bytes());
 
+    out.extend_from_slice(&function.defined_args.to_be_bytes());
     out.extend_from_slice(&(function.args.len() as u32).to_be_bytes());
     for arg in &function.args {
         write_var(out, arg);
@@ -218,10 +220,10 @@ fn write_constant(out: &mut Vec<u8>, constant: &Constant) {
             out.push(3);
             write_function(out, function);
         }
-        Constant::Template(quasis) => {
+        Constant::Template { cooked, raw } => {
             out.push(4);
-            out.extend_from_slice(&(quasis.len() as u32).to_be_bytes());
-            for quasi in quasis {
+            out.extend_from_slice(&(cooked.len() as u32).to_be_bytes());
+            for quasi in cooked {
                 match quasi {
                     Some(text) => {
                         out.push(1);
@@ -229,6 +231,10 @@ fn write_constant(out: &mut Vec<u8>, constant: &Constant) {
                     }
                     None => out.push(0),
                 }
+            }
+            out.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+            for text in raw {
+                write_string(out, text);
             }
         }
     }
@@ -308,6 +314,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let line = reader.u32()?;
     let column = reader.u32()?;
 
+    let defined_args = reader.u32()?;
     let arg_count = reader.u32()? as usize;
     let mut args = Vec::with_capacity(arg_count);
     for _ in 0..arg_count {
@@ -365,6 +372,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         kind,
         strict,
         args,
+        defined_args,
         vars,
         closure_vars,
         cpool,
@@ -394,15 +402,20 @@ fn read_constant(reader: &mut Reader<'_>) -> Result<Constant, DecodeError> {
         3 => Ok(Constant::Function(Box::new(read_function(reader)?))),
         4 => {
             let count = reader.u32()? as usize;
-            let mut quasis = Vec::with_capacity(count);
+            let mut cooked = Vec::with_capacity(count);
             for _ in 0..count {
-                quasis.push(match reader.u8()? {
+                cooked.push(match reader.u8()? {
                     0 => None,
                     1 => Some(reader.string()?),
                     other => return Err(DecodeError::BadTag("template", other)),
                 });
             }
-            Ok(Constant::Template(quasis))
+            let raw_count = reader.u32()? as usize;
+            let mut raw = Vec::with_capacity(raw_count);
+            for _ in 0..raw_count {
+                raw.push(reader.string()?);
+            }
+            Ok(Constant::Template { cooked, raw })
         }
         other => Err(DecodeError::BadTag("constant", other)),
     }
@@ -501,6 +514,7 @@ mod tests {
             kind: FunctionKind::Normal,
             strict: false,
             args: vec![],
+            defined_args: 0,
             vars: vec![VarDef::var("<ret>"), VarDef::constant("k")],
             closure_vars: vec![ClosureVar {
                 name: "g".to_string(),

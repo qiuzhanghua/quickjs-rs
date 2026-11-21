@@ -258,13 +258,13 @@ fn unsupported_constructs_fail_loudly() {
     for source in [
         // A destructuring catch parameter is not wired up yet.
         "function f(){ try { a(); } catch ([e]) { } }",
-        // Destructuring targets and `for await` are not wired up yet.
+        // A destructuring `for` head, `for await`, classes and generators are still
+        // gaps, in that order of cost.
         "for (const [x] of xs) ;",
         "async function f(xs){ for await (const x of xs) ; }",
         "class A { }",
         "function* g() { }",
         "async function f() { }",
-        "let [a] = x;",
         "with (a) b;",
     ] {
         let program = parse_script(source).expect("parses");

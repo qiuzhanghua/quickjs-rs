@@ -365,6 +365,10 @@ struct FnState {
     /// Whether the function is an arrow, which never gets its own `arguments`.
     is_arrow: bool,
     /// The name a *named function expression* binds inside its own body.
+    /// How many parameters count towards `.length`.
+    defined_args: u32,
+    /// Parameters that are not a plain name, with the argument slot each came from.
+    param_prologue: Vec<(usize, Pattern)>,
     self_name: Option<String>,
     /// Whether the self-name prologue (`special_object 2` then the store) has been
     /// emitted for this function.
@@ -427,6 +431,8 @@ impl FnState {
             column: 1,
             is_script: false,
             is_arrow: false,
+            defined_args: 0,
+            param_prologue: Vec::new(),
             self_name: None,
             self_name_initialized: false,
             leaves_value: false,
@@ -2025,11 +2031,14 @@ impl Compiler {
                 // `var x;` stays `undefined`. A lexical binding is different: it
                 // has to be *initialised* to leave the temporal dead zone, so the
                 // compiler supplies an explicit `undefined`.
-                if decl.kind.is_lexical()
-                    && let PatternKind::Ident(name) = &declarator.target.kind
-                {
+                if decl.kind.is_lexical() {
+                    // A lexical binding has to be *initialised* to leave the temporal
+                    // dead zone, and a destructuring one is no different — `let {a}`
+                    // with no initialiser is a syntax error, but `let [a] = []` still
+                    // needs `a` to be initialised from an empty source, which the
+                    // pattern does on its own.
                     self.emit(Opcode::Undefined, &[]);
-                    self.emit_var(VarAction::PutInit, &name.name);
+                    self.destructure(&declarator.target, Some(decl.kind))?;
                 }
                 continue;
             };
@@ -2045,14 +2054,265 @@ impl Compiler {
                     }
                 }
                 _ => {
-                    return Err(SyntaxError::new(
-                        "destructuring declarations are not supported by the compiler yet",
-                        declarator.span,
-                    ));
+                    // A destructuring declaration keeps nothing on the stack: the
+                    // pattern consumes the initialiser.
+                    self.expr(init)?;
+                    self.destructure(&declarator.target, Some(decl.kind))?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Bind a destructuring pattern from the value on top of the stack.
+    ///
+    /// `decl` picks the mode. `Some(kind)` is a *declaration*: every target is an
+    /// identifier and the store is a binding write, `put_*` for `var` and `put_*_init`
+    /// for `let`/`const` so the binding leaves its dead zone. `None` is a destructuring
+    /// *assignment*, where a member expression is a legal target and the store is an
+    /// ordinary property write.
+    ///
+    /// The value is consumed. An assignment expression's own result is the right-hand
+    /// side, which the caller keeps separately — the spec does not make the pattern's
+    /// last store produce it.
+    fn destructure(
+        &mut self,
+        pattern: &Pattern,
+        decl: Option<VarDeclKind>,
+    ) -> Result<(), SyntaxError> {
+        match &pattern.kind {
+            PatternKind::Ident(name) => {
+                match decl {
+                    Some(VarDeclKind::Var) | None => {
+                        self.emit_var(VarAction::Put, &name.name);
+                    }
+                    Some(_) => self.emit_var(VarAction::PutInit, &name.name),
+                }
+                Ok(())
+            }
+            PatternKind::Assign { target, default } => {
+                // A default only applies to `undefined`, not to `null`: `[a = 1] = [null]`
+                // keeps `null`.
+                let use_default = self.new_label();
+                let done = self.new_label();
+                self.emit(Opcode::Dup, &[]);
+                self.emit(Opcode::IsUndefined, &[]);
+                self.emit_jump(Opcode::IfTrue, use_default, &[]);
+                self.destructure(target, decl)?;
+                self.emit_jump(Opcode::Goto, done, &[]);
+                self.place_label(use_default);
+                self.emit(Opcode::Drop, &[]);
+                self.expr(default)?;
+                // `var {f = function(){}} = {}` names the function `f`, like a plain
+                // `var f = function(){}` does.
+                self.destructure(target, decl)?;
+                self.place_label(done);
+                Ok(())
+            }
+            PatternKind::Array { elements, rest } => self.destructure_array(elements, rest, decl),
+            PatternKind::Object { properties, rest } => {
+                self.destructure_object(properties, rest, decl, pattern)
+            }
+            PatternKind::Member(member) if decl.is_none() => {
+                // An assignment pattern may store into a property. The value is on the
+                // stack, so the receiver and the key go above it and `rot3l`/`swap2`
+                // put the three in the order `put_array_el`/`put_field` expect.
+                self.expr(&member.object)?;
+                match &member.property {
+                    MemberProp::Ident(name) => {
+                        // `value obj` -> `obj value`, the order `put_field` takes.
+                        // Nothing needs to be left behind: a pattern element's value is
+                        // consumed by its own store.
+                        self.emit(Opcode::Swap, &[]);
+                        self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text(&name.name))]);
+                    }
+                    MemberProp::Computed(index) => {
+                        self.expr(index)?;
+                        // `value obj key` -> `obj key value`.
+                        self.emit(Opcode::Rot3l, &[]);
+                        self.emit(Opcode::PutArrayEl, &[]);
+                    }
+                    MemberProp::Private(_) => {
+                        return Err(SyntaxError::new(
+                            "private fields are not supported by the compiler yet",
+                            member.span,
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            PatternKind::Rest(inner) => self.destructure(inner, decl),
+            PatternKind::Invalid(expr) => {
+                Err(SyntaxError::new("invalid assignment target", expr.span))
+            }
+            _ => Err(SyntaxError::new(
+                "this destructuring target is not supported by the compiler yet",
+                pattern.span,
+            )),
+        }
+    }
+
+    /// `[…]` on the left: drain an iterator, binding one target per element.
+    fn destructure_array(
+        &mut self,
+        elements: &[Option<PatternElement>],
+        rest: &Option<Box<RestElement>>,
+        decl: Option<VarDeclKind>,
+    ) -> Result<(), SyntaxError> {
+        // The iterator protocol is the same one `for (… of …)` uses, so a destructuring
+        // pattern accepts any iterable and closes the iterator when the pattern ends
+        // early. `for_of_next` pushes the value and a `done` flag; the flag comes off
+        // first because it is on top.
+        self.emit(Opcode::ForOfStart, &[]);
+        for element in elements {
+            self.emit(Opcode::ForOfNext, &[Op::Int(0)]);
+            self.emit(Opcode::Drop, &[]);
+            match element {
+                Some(PatternElement::Pattern(pattern)) => self.destructure(pattern, decl)?,
+                Some(PatternElement::Property { span, .. }) => {
+                    return Err(SyntaxError::new(
+                        "a property pattern is not a valid array element",
+                        *span,
+                    ));
+                }
+                // An elision skips the value, which is already on the stack.
+                None => self.emit(Opcode::Drop, &[]),
+            }
+        }
+        if let Some(rest) = rest {
+            // The remaining values go into a fresh array. The target and its running
+            // index stay on the stack above the iterator, which is what the operand of
+            // `for_of_next` accounts for: two values sit above the iterator triple.
+            self.emit(Opcode::ArrayFrom, &[Op::Int(0)]);
+            self.emit(Opcode::Push0, &[]);
+            let top = self.new_label();
+            self.place_label(top);
+            self.emit(Opcode::ForOfNext, &[Op::Int(2)]);
+            let done = self.new_label();
+            self.emit_jump(Opcode::IfTrue, done, &[]);
+            self.emit(Opcode::DefineArrayEl, &[]);
+            self.emit(Opcode::Inc, &[]);
+            self.emit_jump(Opcode::Goto, top, &[]);
+            self.place_label(done);
+            self.emit(Opcode::Drop, &[]);
+            self.emit(Opcode::Drop, &[]);
+            self.destructure_rest(rest, decl)?;
+        }
+        self.emit(Opcode::IteratorClose, &[]);
+        Ok(())
+    }
+
+    /// `{…}` on the left: read properties off one boxed source object.
+    fn destructure_object(
+        &mut self,
+        properties: &[Option<PatternElement>],
+        rest: &Option<Box<RestElement>>,
+        decl: Option<VarDeclKind>,
+        pattern: &Pattern,
+    ) -> Result<(), SyntaxError> {
+        // `ToObject` is what refuses `null`/`undefined`, and it also puts the source
+        // aside for the rest element below.
+        self.emit(Opcode::ToObject, &[]);
+        let mut taken: Vec<String> = Vec::new();
+        // Whether any key was computed, which a rest element cannot exclude.
+        let mut computed = false;
+        for property in properties {
+            let Some(PatternElement::Property {
+                key, value, span, ..
+            }) = property
+            else {
+                return Err(SyntaxError::new(
+                    "a bare pattern is not a valid object property",
+                    properties
+                        .iter()
+                        .flatten()
+                        .map(|element| match element {
+                            PatternElement::Pattern(pattern) => pattern.span,
+                            PatternElement::Property { span, .. } => *span,
+                        })
+                        .next()
+                        .unwrap_or(pattern.span),
+                ));
+            };
+            // Every read needs the source twice: once to read from, once to keep for
+            // the next property. `get_field2` is not used here because the value has to
+            // come off a stack that also holds the source.
+            self.emit(Opcode::Dup, &[]);
+            match key {
+                PropName::Literal(literal) => {
+                    let name = self.property_key_text(literal, *span)?;
+                    taken.push(name.clone());
+                    self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text(&name))]);
+                }
+                PropName::Computed(index) => {
+                    // A computed key has no name to exclude ahead of time, so a rest
+                    // element that has to skip it is refused below rather than silently
+                    // copying the property into the rest object.
+                    computed = true;
+                    self.expr(index)?;
+                    self.emit(Opcode::GetArrayEl, &[]);
+                }
+                PropName::Private(_) => {
+                    return Err(SyntaxError::new(
+                        "private fields are not supported by the compiler yet",
+                        value.span,
+                    ));
+                }
+            }
+            self.destructure(value, decl)?;
+        }
+        match rest {
+            Some(rest) => {
+                if computed {
+                    return Err(SyntaxError::new(
+                        "a computed key with a rest element is not supported by the compiler yet",
+                        Self::rest_span(rest),
+                    ));
+                }
+                // `target src exclude`: the exclusion list is an array of the keys the
+                // literal part already took, so the rest object gets only the others.
+                self.emit(Opcode::Object, &[]);
+                self.emit(Opcode::Swap, &[]);
+                for name in &taken {
+                    self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(name))]);
+                }
+                self.emit(Opcode::ArrayFrom, &[Op::Int(taken.len() as i32)]);
+                self.emit(Opcode::CopyDataProperties, &[Op::Int(COPY_ALL_PROPERTIES)]);
+                self.emit(Opcode::Drop, &[]);
+                self.emit(Opcode::Drop, &[]);
+                self.destructure_rest(rest, decl)?;
+            }
+            // The source was only kept for a rest element.
+            None => self.emit(Opcode::Drop, &[]),
+        }
+        Ok(())
+    }
+
+    /// The pattern a rest element binds, as a target [`Self::destructure`] takes.
+    fn destructure_rest(
+        &mut self,
+        rest: &RestElement,
+        decl: Option<VarDeclKind>,
+    ) -> Result<(), SyntaxError> {
+        match rest {
+            RestElement::Pattern(pattern) => self.destructure(pattern, decl),
+            // `[...a.b] = c` stores into a property.
+            RestElement::Member(member) => {
+                let pattern = Pattern {
+                    kind: PatternKind::Member(member.clone()),
+                    span: member.span,
+                };
+                self.destructure(&pattern, decl)
+            }
+        }
+    }
+
+    /// The source range of a rest element, for error messages.
+    fn rest_span(rest: &RestElement) -> Span {
+        match rest {
+            RestElement::Pattern(pattern) => pattern.span,
+            RestElement::Member(member) => member.span,
+        }
     }
 
     /// Compile a function declaration and queue it for instantiation at scope
@@ -2176,6 +2436,7 @@ impl Compiler {
             ExprKind::Array { elements } => self.array_literal(elements, expr.span)?,
             ExprKind::Object(properties) => self.object_literal(properties, expr.span)?,
             ExprKind::Template(template) => self.template_literal(template)?,
+            ExprKind::TaggedTemplate { tag, quasi } => self.tagged_template(tag, quasi)?,
             ExprKind::New { callee, arguments } => {
                 // `new C(args)` compiles to `C; dup; args…; call_constructor n`.
                 // The `dup` is not redundant: `call_constructor` takes the
@@ -2298,6 +2559,59 @@ impl Compiler {
     ///
     /// A computed *method* skips `to_propkey`: `define_method_computed` converts the
     /// key itself, which is why the trailing `drop` is absent there too.
+    /// `tag`…``: a call whose first argument is the call site's template object.
+    ///
+    /// The template object is a frozen array of the cooked chunks with a frozen `raw`
+    /// array beside it, so `String.raw` can read the source text back. It is a constant
+    /// because its contents never change; the reference builds one per call site and
+    /// reuses it, while this builds one per evaluation, which only `tag` code that
+    /// compares template objects across calls could tell apart.
+    fn tagged_template(&mut self, tag: &Expr, quasi: &TemplateLiteral) -> Result<(), SyntaxError> {
+        let cooked = quasi
+            .quasis
+            .iter()
+            .map(|chunk| chunk.cooked.clone())
+            .collect();
+        let raw = quasi.quasis.iter().map(|chunk| chunk.raw.clone()).collect();
+        let index = self.push_constant(Constant::Template { cooked, raw });
+        let count = quasi.expressions.len() + 1;
+        // `o.m`…`` passes `o` as `this`, exactly as `o.m(…)` does.
+        if let ExprKind::Member {
+            object, property, ..
+        } = &tag.unparen().kind
+        {
+            self.expr(object)?;
+            match property {
+                MemberProp::Ident(name) => {
+                    self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text(&name.name))]);
+                }
+                MemberProp::Computed(key) => {
+                    self.expr(key)?;
+                    self.emit(Opcode::GetArrayEl2, &[]);
+                }
+                MemberProp::Private(_) => {
+                    return Err(SyntaxError::new(
+                        "private fields are not supported by the compiler yet",
+                        tag.span,
+                    ));
+                }
+            }
+            self.emit(Opcode::PushConst, &[Op::Const(index)]);
+            for expression in &quasi.expressions {
+                self.expr(expression)?;
+            }
+            self.emit(Opcode::CallMethod, &[Op::Int(count as i32)]);
+            return Ok(());
+        }
+        self.expr(tag)?;
+        self.emit(Opcode::PushConst, &[Op::Const(index)]);
+        for expression in &quasi.expressions {
+            self.expr(expression)?;
+        }
+        self.emit(Opcode::Call, &[Op::Int(count as i32)]);
+        Ok(())
+    }
+
     fn object_literal(
         &mut self,
         properties: &[ObjectProperty],
@@ -2969,6 +3283,17 @@ impl Compiler {
                 self.state().cur_pos = saved;
                 Ok(())
             }
+            // A destructuring assignment: the right-hand side is the expression's own
+            // value, so it is evaluated once and kept under the pattern's stores.
+            PatternKind::Array { .. } | PatternKind::Object { .. } => {
+                self.expr(value)?;
+                if keep {
+                    self.emit(Opcode::Dup, &[]);
+                }
+                self.destructure(target, None)?;
+                self.state().no_value = !keep;
+                Ok(())
+            }
             _ => Err(SyntaxError::new(
                 "this assignment target is not supported by the compiler yet",
                 target.span,
@@ -3222,15 +3547,36 @@ impl Compiler {
         state.column = func.span.start.column;
         // A function body has no hidden `<ret>` local; the value comes back on
         // the stack. Only a script keeps one.
-        for param in &func.params {
-            let PatternKind::Ident(name) = &param.kind else {
-                return Err(SyntaxError::new(
-                    "destructuring parameters are not supported by the compiler yet",
-                    param.span,
-                ));
-            };
-            state.args.push(VarDef::var(name.name.clone()));
+        // Parameters are positional, so even a pattern occupies one argument slot. A
+        // simple name is that slot itself; anything else (a pattern, a default, a rest
+        // parameter) takes an anonymous slot and is unpicked into locals at the top of
+        // the body, which is the only way one argument can bind several names.
+        let mut prologue: Vec<(usize, Pattern)> = Vec::new();
+        // `.length` stops at the first parameter that can be substituted: a default
+        // fills a missing argument in, and a rest parameter absorbs the rest.
+        let mut defined_args = func.params.len() as u32;
+        for (index, param) in func.params.iter().enumerate() {
+            match &param.kind {
+                PatternKind::Ident(name) => state.args.push(VarDef::var(name.name.clone())),
+                _ => {
+                    state.args.push(VarDef::var("<null>"));
+                    prologue.push((index, param.clone()));
+                }
+            }
         }
+        // A default anywhere before the end also ends the count, which the loop above
+        // only catches for the parameter that carries it; `(a, b = 1, c)` is arity 1.
+        for (position, param) in func.params.iter().enumerate() {
+            if matches!(
+                param.kind,
+                PatternKind::Assign { .. } | PatternKind::Rest(_)
+            ) {
+                defined_args = position as u32;
+                break;
+            }
+        }
+        state.defined_args = defined_args;
+        state.param_prologue = prologue;
         let depth = self.stack.len();
         self.stack.push(state);
         let result = self.compile_function_body(func);
@@ -3270,8 +3616,31 @@ impl Compiler {
                 .statements()
                 .ok_or_else(|| SyntaxError::new("unsupported function body", func.span))?,
         };
+        // A pattern parameter binds its names as function-scope locals, so they have to
+        // exist — and be unpicked from the argument — before the body runs.
+        let prologue = std::mem::take(&mut self.state().param_prologue);
+        for (_, pattern) in &prologue {
+            let mut names = Vec::new();
+            pattern.bound_names(&mut names);
+            for name in names {
+                self.declare_var(&name.name.clone(), VarDef::var(name.name.clone()));
+            }
+        }
         self.hoist(body, body_key)?;
         self.emit_scope_enter(body_key);
+        for (index, pattern) in &prologue {
+            match &pattern.kind {
+                // `...rest` collects what is left rather than reading one slot.
+                PatternKind::Rest(inner) => {
+                    self.emit(Opcode::Rest, &[Op::Int(*index as i32)]);
+                    self.destructure(inner, Some(VarDeclKind::Var))?;
+                }
+                _ => {
+                    self.emit(Opcode::GetArg, &[Op::Slot(Slot::Arg(*index as u32))]);
+                    self.destructure(pattern, Some(VarDeclKind::Var))?;
+                }
+            }
+        }
         for stmt in body {
             self.stmt(stmt)?;
             if Self::terminates(stmt) {
@@ -3330,6 +3699,7 @@ impl Compiler {
             kind: state.kind,
             strict: state.strict,
             args: state.args,
+            defined_args: state.defined_args,
             vars: state.vars,
             closure_vars: state.closure_vars,
             cpool: state.cpool,

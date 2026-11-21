@@ -1736,6 +1736,26 @@ impl<'a> Interp<'a> {
                 self.push(key);
                 self.push(value);
             }
+            Swap2 => {
+                // `a b c d -> c d a b`
+                let d = self.pop();
+                let c = self.pop();
+                let b = self.pop();
+                let a = self.pop();
+                self.push(c);
+                self.push(d);
+                self.push(a);
+                self.push(b);
+            }
+            Rot3l => {
+                // `x a b -> a b x`
+                let b = self.pop();
+                let a = self.pop();
+                let x = self.pop();
+                self.push(a);
+                self.push(b);
+                self.push(x);
+            }
             Rot3r => {
                 // `a b c -> c a b`
                 let c = self.pop();
@@ -1744,6 +1764,17 @@ impl<'a> Interp<'a> {
                 self.push(c);
                 self.push(a_value);
                 self.push(b);
+            }
+
+            Rest => {
+                // `...rest` in a parameter list: the arguments from index `a` on, as a
+                // real array. It takes nothing off the stack — the arguments are in the
+                // frame, not on it.
+                let frame = self.frame();
+                let from = a as usize;
+                let collected: Vec<Value> = frame.passed.iter().skip(from).cloned().collect();
+                let array = self.new_array(collected);
+                self.push(Value::Object(array));
             }
 
             // -- slots ------------------------------------------------------
@@ -1980,6 +2011,12 @@ impl<'a> Interp<'a> {
                 let left = self.pop();
                 self.push(Value::Bool(!left.strict_equals(&right)));
             }
+            IsUndefined => {
+                // `=== undefined`, which is what a destructuring default tests. It is
+                // not `IsUndefinedOrNull`: `[a = 1] = [null]` keeps `null`.
+                let value = self.pop();
+                self.push(Value::Bool(matches!(value, Value::Undefined)));
+            }
             IsUndefinedOrNull => {
                 let value = self.pop();
                 self.push(Value::Bool(value.is_nullish()));
@@ -1987,6 +2024,14 @@ impl<'a> Interp<'a> {
             Typeof => {
                 let value = self.pop();
                 self.push(self.string(value.type_of()));
+            }
+            ToObject => {
+                // A destructuring *object* pattern starts here, which is why
+                // `var {} = null` throws. Only `undefined` and `null` are refused; a
+                // primitive is boxed.
+                let value = self.pop();
+                let object = self.object_from(&value)?;
+                self.push(Value::Object(object));
             }
             Instanceof => {
                 let constructor = self.pop();
@@ -2336,13 +2381,15 @@ impl<'a> Interp<'a> {
                 self.push(Value::CatchOffset(0));
             }
             ForOfNext => {
-                let offset = b as usize;
-                let _ = offset;
-                // `iter next catch_offset -> iter next catch_offset value done`
-                // `iter next catch_offset -> iter next catch_offset value done`
+                // `iter next catch_offset -> iter next catch_offset value done`.
+                //
+                // The operand is how many values sit *above* the iterator triple: a
+                // destructuring rest element keeps its target array and running index
+                // there while draining the iterator, so the triple is not at the top.
+                let extra = a as usize;
                 let iterator = Iterator {
-                    object: self.peek(2),
-                    next: self.peek(1),
+                    object: self.peek(2 + extra),
+                    next: self.peek(1 + extra),
                 };
                 let (value, done) = self.iterator_step(&iterator)?;
                 self.push(value);
@@ -2446,15 +2493,37 @@ impl<'a> Interp<'a> {
             .unwrap_or_default()
     }
 
-    fn constant(&self, index: usize) -> JsResult<Value> {
-        let constant = self.frame().code.code.cpool.get(index);
-        Ok(match constant {
+    fn constant(&mut self, index: usize) -> JsResult<Value> {
+        let constant = self.frame().code.code.cpool.get(index).cloned();
+        Ok(match &constant {
             Some(Constant::Number(number)) => Value::Float(*number),
             Some(Constant::String(text)) => self.string(text.clone()),
             Some(Constant::Function(_)) => {
                 return Err(Signal::Throw(
                     self.make_error("InternalError", "a bare function constant"),
                 ));
+            }
+            // A tagged template's call site: a frozen array of the cooked chunks with a
+            // frozen `raw` array beside it, which is what `String.raw` reads back.
+            Some(Constant::Template { cooked, raw }) => {
+                let cooked_values: Vec<Value> = cooked
+                    .iter()
+                    .map(|chunk| match chunk {
+                        Some(text) => self.string(text.clone()),
+                        None => Value::Undefined,
+                    })
+                    .collect();
+                let raw_values: Vec<Value> =
+                    raw.iter().map(|text| self.string(text.clone())).collect();
+                let raw_array = self.new_array(raw_values);
+                raw_array.set_extensible(false);
+                let template = self.new_array(cooked_values);
+                template.define(
+                    "raw",
+                    Property::with_attributes(Value::Object(raw_array), false, false),
+                );
+                template.set_extensible(false);
+                Value::Object(template)
             }
             _ => Value::Undefined,
         })
@@ -2583,7 +2652,9 @@ impl<'a> Interp<'a> {
             cells.push(cell);
         }
         let name = function.name.clone();
-        let length = function.args.len() as u32;
+        // `.length` is the arity before any default or rest parameter, not the number
+        // of slots a pattern parameter needs.
+        let length = function.defined_args;
         let code = Gc::new(self.heap, CompiledCode::new(*function));
         let env = Gc::new(self.heap, ClosureEnv { cells });
         let object = JsObject::function(
@@ -2718,7 +2789,13 @@ impl<'a> Interp<'a> {
 
     // -- object operations used by instructions -----------------------------
 
-    fn read_field(&mut self, object: &Value, key: &str) -> JsResult<Value> {
+    /// Read `object[key]`, returning `undefined` when the property is missing.
+    ///
+    /// Unlike [`Interp::get_property`] this takes a runtime `Value`, so it works on a
+    /// primitive (looking through its prototype) as well as an object — which is what
+    /// `get_field`/`get_array_el` need and what a builtin reading a property off an
+    /// argument needs too.
+    pub fn read_field(&mut self, object: &Value, key: &str) -> JsResult<Value> {
         let Value::Object(object) = object else {
             // Reading a property of `undefined`/`null` is the classic TypeError.
             if object.is_nullish() {
@@ -2775,6 +2852,51 @@ impl<'a> Interp<'a> {
             DeleteFailure::Ignore
         };
         self.set_property_with(object, key, value, on_failure)
+    }
+
+    /// `ToObject`: box a primitive, refuse `undefined` and `null`.
+    ///
+    /// A destructuring *object* pattern starts with this, which is why `var {} = null`
+    /// throws. The wrapper carries its primitive in `_value` — the same slot
+    /// `new Number(x)` and friends fill in — so `valueOf` and the prototype methods work
+    /// on a boxed value no constructor ever built.
+    fn object_from(&mut self, value: &Value) -> JsResult<Gc<JsObject>> {
+        let (prototype, primitive) = match value {
+            Value::Object(object) => return Ok(object.clone()),
+            Value::String(text) => {
+                let object = self.new_object(self.realm.string_proto.clone());
+                // `length` and the index properties are own and enumerable on a String
+                // object, which is what makes `Object.keys(new String("ab"))` list
+                // `0` and `1`.
+                object.define(
+                    "length",
+                    Property::with_attributes(Value::Int(text.utf16_len() as i32), false, false),
+                );
+                for (index, character) in text.as_str().chars().enumerate() {
+                    object.define(
+                        &index.to_string(),
+                        Property::with_attributes(self.string(character.to_string()), false, true),
+                    );
+                }
+                object.define(
+                    "_value",
+                    Property::with_attributes(Value::String(text.clone()), false, false),
+                );
+                return Ok(object);
+            }
+            Value::Int(_) | Value::Float(_) => (self.realm.number_proto.clone(), value.clone()),
+            Value::Bool(_) => (self.realm.boolean_proto.clone(), value.clone()),
+            Value::Undefined | Value::Null => {
+                return Err(Signal::Throw(self.make_error(
+                    "TypeError",
+                    &format!("cannot convert {} to object", value.to_js_string()),
+                )));
+            }
+            _ => (None, value.clone()),
+        };
+        let object = self.new_object(prototype);
+        object.define("_value", Property::with_attributes(primitive, false, false));
+        Ok(object)
     }
 
     /// `a == b`, the coercing comparison.
@@ -2855,7 +2977,7 @@ impl<'a> Interp<'a> {
         &mut self,
         target: &Value,
         source: &Value,
-        _exclusion: &Value,
+        exclusion: &Value,
     ) -> JsResult<()> {
         // `CopyDataProperties` starts with `ToObject(source)`, so a *string* primitive
         // does contribute: its index properties are own, enumerable and writable, which
@@ -2875,6 +2997,20 @@ impl<'a> Interp<'a> {
             }
             _ => return Ok(()),
         };
+        // An object *rest* element passes the keys already taken by the literal part as
+        // an array of strings; a spread passes `null`, which excludes nothing. Only the
+        // string keys of the exclusion array are meaningful, so an array is read by its
+        // elements rather than by its own property names.
+        let mut excluded: Vec<String> = Vec::new();
+        if let Value::Object(list) = exclusion
+            && let Some(length) = list.array_length()
+        {
+            for index in 0..length {
+                if let Some(value) = list.array_get(index) {
+                    excluded.push(self.propkey_of(&value));
+                }
+            }
+        }
         let source = &source_object;
         let mut keys = source.own_enumerable_keys();
         if let Some(length) = source.array_length() {
@@ -2886,6 +3022,9 @@ impl<'a> Interp<'a> {
             }
         }
         for key in keys {
+            if excluded.contains(&key) {
+                continue;
+            }
             if let Some(property) = source.own_property(&key)
                 && let Some(value) = property.value
             {

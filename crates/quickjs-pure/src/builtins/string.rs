@@ -57,6 +57,7 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
     for (name, length, func) in [
         ("fromCharCode", 1, from_char_code as crate::object::NativeFn),
         ("fromCodePoint", 1, from_code_point),
+        ("raw", 1, raw as crate::object::NativeFn),
     ] {
         define_method(&constructor, name, length, func, interp);
     }
@@ -86,6 +87,30 @@ fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult
         return Ok(this);
     }
     Ok(value)
+}
+
+/// `String.raw(template, …values)`.
+///
+/// The leading argument is the call site's template object, and the *raw* chunks are the
+/// source text before escape processing — so `String.raw`a\tb`` keeps the backslash and
+/// the `t`. A substitution is inserted verbatim, with no `ToString` beyond the one the
+/// concatenation does.
+fn raw(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let template = arg(args, 0);
+    // `ToObject` refuses `undefined`/`null`, which is what makes `String.raw()` throw.
+    let chunks = interp.read_field(&template, "raw")?;
+    let length = interp.read_field(&chunks, "length")?.to_number().max(0.0) as usize;
+    let mut out = String::new();
+    for index in 0..length {
+        let chunk = interp.read_field(&chunks, &index.to_string())?;
+        out.push_str(&interp.to_js_string(&chunk)?);
+        if index + 1 < length {
+            if let Some(value) = args.get(index + 1) {
+                out.push_str(&interp.to_js_string(value)?);
+            }
+        }
+    }
+    Ok(interp.string(out))
 }
 
 fn from_char_code(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {

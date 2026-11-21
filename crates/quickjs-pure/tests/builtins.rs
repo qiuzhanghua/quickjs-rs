@@ -953,3 +953,101 @@ fn new_number_string_boolean_store_their_primitive() {
         "2 5 x\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Destructuring
+// ---------------------------------------------------------------------------
+
+/// Every expectation here was read off the reference implementation.
+#[test]
+fn array_patterns_drain_an_iterator() {
+    assert_eq!(eval("var [a,b]=[1,2]; print(a,b)"), "1 2\n");
+    // A hole skips a value rather than binding it.
+    assert_eq!(eval("var [x,,y]=[1,2,3]; print(x,y)"), "1 3\n");
+    // A rest element collects what is left, into a real array.
+    assert_eq!(
+        eval("var [x,,y,...z]=[1,2,3,4]; print(x,y,JSON.stringify(z))"),
+        "1 3 [4]\n"
+    );
+    assert_eq!(
+        eval("var [...all]=[1,2]; print(JSON.stringify(all))"),
+        "[1,2]\n"
+    );
+    // Patterns nest, and any iterable works — a string is one.
+    assert_eq!(eval("var [[p],[q]]=[[7],[8]]; print(p,q)"), "7 8\n");
+    assert_eq!(eval("var [p,q]='ab'; print(p,q)"), "a b\n");
+    // A default fills in only `undefined`, never `null`.
+    assert_eq!(eval("var [a=1,b=2]=[5]; print(a,b)"), "5 2\n");
+    assert_eq!(eval("var [a=1]=[null]; print(a)"), "null\n");
+}
+
+#[test]
+fn object_patterns_box_their_source() {
+    assert_eq!(eval("var {c,d:e=5}={c:3}; print(c,e)"), "3 5\n");
+    // A default may itself be a template, and it is evaluated lazily.
+    assert_eq!(
+        eval("var a='Bar'; var {b=`${a+`a${a}`}baz`}={}; print(b)"),
+        "BaraBarbaz\n"
+    );
+    // A rest element gets the properties the literal part did not take.
+    assert_eq!(
+        eval("var {a,...r}={a:1,b:2}; print(a,JSON.stringify(r))"),
+        "1 {\"b\":2}\n"
+    );
+    // `ToObject` is what makes a null source a TypeError rather than a silent miss.
+    assert_eq!(
+        eval("try{var {} = null}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+    assert_eq!(eval("var {} = {}; print('ok')"), "ok\n");
+}
+
+#[test]
+fn destructuring_assignments_keep_the_right_hand_side() {
+    // The assigned value is the expression's value, and a member target is legal here
+    // even though it is not in a declaration.
+    assert_eq!(eval("var o={}; [o.x,o.y]=[5,6]; print(o.x,o.y)"), "5 6\n");
+    assert_eq!(
+        eval("var a,b; var r=[a,b]=[1,2]; print(JSON.stringify(r),a,b)"),
+        "[1,2] 1 2\n"
+    );
+    assert_eq!(eval("var o={}; var k='z'; [o[k]]=[7]; print(o.z)"), "7\n");
+    assert_eq!(eval("var a,b; ({a,b}={a:3,b:4}); print(a,b)"), "3 4\n");
+}
+
+#[test]
+fn pattern_parameters_bind_locals_and_count_towards_length() {
+    assert_eq!(
+        eval("function f({b},[c]){return b+c} print(f({b:1},[2]))"),
+        "3\n"
+    );
+    assert_eq!(
+        eval("function f(a=1,...r){return a+r.length} print(f(undefined,2,3))"),
+        "3\n"
+    );
+    // `.length` is the arity before the first default or rest parameter, so a
+    // destructuring parameter counts as one and a defaulted one ends the count.
+    assert_eq!(eval("print((([a,b]) => {}).length)"), "1\n");
+    assert_eq!(eval("print(((c,[a,b]=1,d)=>{}).length)"), "1\n");
+    assert_eq!(
+        eval("print(((a,b=1,c)=>{}).length, ((...r)=>{}).length)"),
+        "1 0\n"
+    );
+}
+
+#[test]
+fn a_tagged_template_passes_the_call_site_object() {
+    assert_eq!(eval("print(String.raw `a${1}b`)"), "a1b\n");
+    // `raw` is the source text, so an escape is not expanded.
+    assert_eq!(eval("print(String.raw `x\\ty`)"), "x\\ty\n");
+    // The tag receives the cooked chunks and the substitutions, and a member tag keeps
+    // its receiver as `this`.
+    assert_eq!(
+        eval("function t(s,...v){return s[0]+'|'+s.raw[0]+'|'+v.join()} print(t`x\\ty${2}z`)"),
+        "x\ty|x\\ty|2\n"
+    );
+    assert_eq!(
+        eval("var o={n:5,m(s){return this.n+s[0]}}; print(o.m`!`)"),
+        "5!\n"
+    );
+}
