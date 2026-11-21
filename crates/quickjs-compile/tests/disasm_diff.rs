@@ -266,9 +266,6 @@ fn unsupported_constructs_fail_loudly() {
         "async function f() { }",
         "let [a] = x;",
         "with (a) b;",
-        // `??` and optional chaining are still outstanding.
-        "function f(a, b) { return a ?? b; }",
-        "function f(a) { return a?.b; }",
     ] {
         let program = parse_script(source).expect("parses");
         let error =
@@ -457,6 +454,13 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
         "function f(){ if(1) a(); }",
         "function f(){ if(0) a(); else b(); }",
         "function f(){ for(;1;){ break; } }",
+        // A returned call is a tail call, and a returned method call is
+        // `tail_call_method`; both are a separate optimisation.
+        "function f(a,c){ return a.b(c); }",
+        "function f(a,c){ return g(c); }",
+        // A sequence whose left side is a constant folds away entirely.
+        "function f(a,c){ (0, a.b)(c); }",
+        "function f(a,c){ (0, g)(c); }",
         // Interior runs of dead jumps that only the reference's `skip_dead_code`
         // removes.
         "function f(c){ while(c){ for(;;){ break; } } }",
@@ -475,6 +479,131 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
         // `get_length`, for any object, not just freshly built arrays.
         "function f(a){ return a.length; }",
         "function f(){ return [1,2].length; }",
+    ];
+    assert_cases(&cases);
+}
+
+/// Assignments, in statement *and* value position.
+///
+/// The distinction matters: `put_field`/`put_array_el` consume both the object and
+/// the value, so a store whose value is kept needs `insert2`/`insert3` — and one
+/// whose value is thrown away must not have them. Nothing else in the suite covers
+/// this, which is how a store that silently dropped its operator survived.
+#[test]
+fn assignments_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        // Identifier, plain.
+        "function f(v){ var a; a = v; }",
+        "function f(a,b){ var x = (a = b); }",
+        "function f(v){ g = v; }",
+        "function f(v){ a = b = v; }",
+        // Identifier, compound: every operator reads the place first.
+        "function f(a,b){ a += b; }",
+        "function f(a,b){ var x = (a -= b); }",
+        "function f(a,b){ a *= b; }",
+        "function f(a,b){ a /= b; }",
+        "function f(a,b){ a %= b; }",
+        "function f(a,b){ a **= b; }",
+        "function f(a,b){ a <<= b; }",
+        "function f(a,b){ a >>= b; }",
+        "function f(a,b){ a >>>= b; }",
+        "function f(a,b){ a &= b; }",
+        "function f(a,b){ a |= b; }",
+        "function f(a,b){ a ^= b; }",
+        // Identifier, logical: the right-hand side must not run when the left
+        // already decides the result.
+        "function f(a,b){ a ||= b; }",
+        "function f(a,b){ a &&= b; }",
+        "function f(a,b){ a ??= b; }",
+        "function f(a,b){ var x = (a ||= b); }",
+        "function f(b){ var x = (g ||= b); }",
+        // Member, plain: no `insert2` when the value is discarded.
+        "function f(o,p,v){ o.p = v; }",
+        "function f(o,v){ var x = (o.a = v); }",
+        "function f(o,k,v){ o[k] = v; }",
+        "function f(o,k,v){ var x = (o[k] = v); }",
+        // Member, compound.
+        "function f(o,b){ o.a += b; }",
+        "function f(o,b){ var x = (o.a += b); }",
+        "function f(o,k,b){ o[k] += b; }",
+        "function f(o,k,b){ var x = (o[k] += b); }",
+        "function f(o,b){ o.a -= b; c(); }",
+        // Member, logical: the store path jumps over the cleanup the keep path
+        // needs, so falling through would `nip` a stack holding only the value.
+        "function f(o,b){ o.a ||= b; c(); }",
+        "function f(o,b){ o.a &&= b; c(); }",
+        "function f(o,b){ o.a ??= b; c(); }",
+        "function f(o,k,b){ o[k] ||= b; c(); }",
+        "function f(o,k,b){ o[k] ??= b; c(); }",
+        "function f(o,k,b){ var x = (o[k] ||= b); }",
+    ];
+    assert_cases(&cases);
+}
+
+/// Calls, which have to pass their receiver.
+///
+/// `o.m(args)` is `get_field2` + `call_method`: the object stays under the
+/// function so `this` survives. A plain `get_field` + `call` would drop it.
+#[test]
+fn calls_pass_their_receiver() {
+    require_oracle!();
+    let cases = [
+        "function f(a,c){ a.b(c); }",
+        "function f(a){ a.b(); }",
+        "function f(a,c){ a.b(c,d); }",
+        // Parentheses do not change the receiver.
+        "function f(a,c){ (a.b)(c); }",
+        "function f(a,c){ ((a.b))(c); }",
+        // Only the last link is a method read; the rest are plain reads.
+        "function f(a,c){ a.b.c(d); }",
+        "function f(a,c){ a.b(c)(d); }",
+        "function f(a,c){ a.b()(c); }",
+        // Computed: the key is consumed, so `get_array_el2` not `_3`.
+        "function f(a,c){ a[k](c); }",
+        "function f(a,c){ a[\"b\"](c); }",
+        "function f(a,c){ a.b[k](c); }",
+        // A callee that is not a member has no receiver to pass.
+        "function f(a,c){ g(c); }",
+        "function f(a,c){ a(c); }",
+        "function f(a,c){ (g)(c); }",
+        // Optional forms.
+        "function f(a,c){ a?.b(c); }",
+        "function f(a,c){ a?.[k](c); }",
+    ];
+    assert_cases(&cases);
+}
+
+/// `??` and optional chaining.
+#[test]
+fn nullish_and_optional_chains_match_the_reference() {
+    require_oracle!();
+    let cases = [
+        // `??` keeps a falsy-but-defined value, which is what separates it from
+        // `||`: `0 ?? b` stays `0`.
+        "function f(a,b){ return a ?? b; }",
+        "function f(a,b,c){ return a ?? b ?? c; }",
+        "function f(a,b){ return a || b; }",
+        "function f(a,b,c){ return a || b || c; }",
+        "function f(a,b){ return (a || b) && c; }",
+        "function f(a,b){ return a ?? b || c; }",
+        "function f(a,b){ if (a ?? b) c(); }",
+        // Optional chains: the guard short-circuits the whole spine, so `a?.b.c`
+        // must not read `.c` when `a` is nullish.
+        "function f(a){ return a?.b; }",
+        "function f(a){ return a?.b.c; }",
+        "function f(a){ return a.b?.c; }",
+        "function f(a){ return (a?.b).c; }",
+        "function f(a){ return a?.[k]; }",
+        "function f(a){ return a?.[k]?.l; }",
+        "function f(a){ return a?.b?.[k]; }",
+        "function f(a){ return a?.(); }",
+        "function f(a){ return a?.b(); }",
+        "function f(a){ return a?.[k](); }",
+        "function f(a){ return a?.(); }",
+        "function f(a){ var x = a?.b; }",
+        "function f(a){ return a?.b + 1; }",
+        "function f(a){ if (a?.b) c(); }",
     ];
     assert_cases(&cases);
 }

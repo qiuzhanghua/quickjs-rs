@@ -553,9 +553,20 @@ fn a_switch_discriminant_is_evaluated_once() {
         .find(|f| f.name == "f")
         .unwrap();
     let instructions = inner.instructions();
+    // A method call reads its callee through `get_field2`, a plain read through
+    // `get_field`; either way the discriminant is read exactly once.
     let getters = instructions
         .iter()
-        .filter(|(_, i)| general_form(i.op) == Opcode::GetField)
+        .filter(|(_, i)| {
+            matches!(
+                general_form(i.op),
+                Opcode::GetField
+                    | Opcode::GetField2
+                    | Opcode::GetArrayEl
+                    | Opcode::GetArrayEl2
+                    | Opcode::GetArrayEl3
+            )
+        })
         .count();
     assert_eq!(
         getters,

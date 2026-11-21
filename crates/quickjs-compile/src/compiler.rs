@@ -200,6 +200,38 @@ fn numeric_key_text(value: f64, span: Span) -> Result<String, SyntaxError> {
     ))
 }
 
+/// Collect the operands of a same-operator logical run, in source order.
+///
+/// Recurses down the left spine only: `((a || b) || c)` contributes `a`, `b`, then
+/// the caller appends `c`. A node with a different operator is one operand.
+fn collect_same_operator<'a>(op: LogicalOp, expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Logical {
+        op: inner_op,
+        left,
+        right,
+    } = &expr.kind
+        && *inner_op == op
+    {
+        collect_same_operator(op, left, out);
+        out.push(right);
+        return;
+    }
+    out.push(expr);
+}
+
+/// The jump a logical assignment or `??` takes when the value is kept.
+///
+/// `||` and `&&` branch on truthiness, so the same opcode serves both the operator
+/// and `??` once [`Compiler::emit_logical_test`] has pushed a boolean. `??` keeps
+/// the value when it is *not* null-ish, so it is the `if_false` side.
+fn logical_jump(op: AssignOp) -> Opcode {
+    match op {
+        AssignOp::Or => Opcode::IfTrue,
+        AssignOp::And | AssignOp::Coalesce => Opcode::IfFalse,
+        _ => Opcode::IfFalse,
+    }
+}
+
 /// Whether a loop enumerates keys or values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForLoopKind {
@@ -254,6 +286,19 @@ struct FnState {
     /// The block each local was declared in, parallel to `vars`. `0` means the
     /// function scope, where `var` bindings live.
     var_block: Vec<u64>,
+    /// Set when the expression just compiled left no value on the stack.
+    ///
+    /// Only a store can do that: `put_field` consumes the object and the value, so
+    /// an assignment whose result is unused emits nothing extra. The expression
+    /// statement then has nothing to drop.
+    no_value: bool,
+    /// Whether the value of the expression being compiled is thrown away.
+    ///
+    /// Only an expression *statement* discards its value, and only the outermost
+    /// assignment in it may act on that: in `x = (o.a = 1)` the inner assignment
+    /// still has to produce a value. Consumed by [`Compiler::assign`], which is
+    /// the one construct whose bytecode depends on it.
+    discard_value: bool,
     /// The block that holds the function body.
     body_block: u64,
     /// Head of each scope's binding chain, indexed by level. Filled in by
@@ -306,6 +351,8 @@ impl FnState {
             blocks: Vec::new(),
             current_block: 0,
             var_block: Vec::new(),
+            no_value: false,
+            discard_value: false,
             body_block: 0,
             block_heads: Vec::new(),
             jump_targets: Vec::new(),
@@ -614,8 +661,16 @@ impl Compiler {
         match &stmt.kind {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(expr) => {
-                self.expr(expr)?;
-                if self.cur().is_script {
+                // An expression statement's value is thrown away — except in a
+                // script, where it becomes the program's result. `assign` reads this
+                // and clears it, so a nested assignment still produces a value.
+                self.state().discard_value = !self.cur().is_script;
+                let result = self.expr(expr);
+                self.state().discard_value = false;
+                result?;
+                if std::mem::take(&mut self.state().no_value) {
+                    // A store whose value was discarded left nothing to drop.
+                } else if self.cur().is_script {
                     // The program's value lands in the hidden `<ret>` local.
                     self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(0))]);
                 } else {
@@ -1777,51 +1832,9 @@ impl Compiler {
                     }
                 }
             }
-            ExprKind::Call {
-                callee,
-                arguments,
-                optional,
-            } => {
-                if *optional {
-                    return Err(SyntaxError::new(
-                        "optional calls are not supported by the compiler yet",
-                        expr.span,
-                    ));
-                }
-                self.expr(callee)?;
-                for argument in arguments {
-                    self.expr(argument)?;
-                }
-                self.emit(Opcode::Call, &[Op::Int(arguments.len() as i32)]);
-            }
-            ExprKind::Member {
-                object,
-                property,
-                optional,
-            } => {
-                if *optional {
-                    return Err(SyntaxError::new(
-                        "optional member access is not supported by the compiler yet",
-                        expr.span,
-                    ));
-                }
-                self.expr(object)?;
-                match property {
-                    MemberProp::Ident(name) => {
-                        self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text(&name.name))]);
-                    }
-                    MemberProp::Computed(index) => {
-                        self.expr(index)?;
-                        self.emit(Opcode::GetArrayEl, &[]);
-                    }
-                    MemberProp::Private(_) => {
-                        return Err(SyntaxError::new(
-                            "private fields are not supported by the compiler yet",
-                            expr.span,
-                        ));
-                    }
-                }
-            }
+            ExprKind::Call { .. } => self.chain_link_top(expr)?,
+            ExprKind::Member { .. } => self.chain_link_top(expr)?,
+            ExprKind::OptionalChain(inner) => self.optional_chain(inner)?,
             ExprKind::Array { elements } => self.array_literal(elements, expr.span)?,
             ExprKind::Object(properties) => self.object_literal(properties, expr.span)?,
             ExprKind::Arrow(func) => {
@@ -1972,6 +1985,135 @@ impl Compiler {
         }
     }
 
+    /// Compile an optional chain.
+    ///
+    /// `?.` short-circuits the *whole remaining spine*, not just its own link:
+    /// `a?.b.c` yields `undefined` when `a` is null, it does not read `.c` of
+    /// `undefined`. So the chain is compiled with one end label and every guard
+    /// jumps to it. The parser hands us the extent of that spine as an
+    /// [`ExprKind::OptionalChain`] wrapper around the outermost link, which is
+    /// exactly the scope the label has to cover.
+    fn optional_chain(&mut self, inner: &Expr) -> Result<(), SyntaxError> {
+        let end = self.new_label();
+        self.chain_link(inner, end)?;
+        self.place_label(end);
+        Ok(())
+    }
+
+    /// A member access or call reached from outside any optional chain.
+    ///
+    /// Such a link cannot contain a `?.` — if it did, the parser would have wrapped
+    /// it in [`ExprKind::OptionalChain`] — so there is no guard and no label; one is
+    /// still created because [`Self::chain_link`] takes it, and placing it at the
+    /// end is a no-op that keeps a single code path.
+    fn chain_link_top(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
+        let end = self.new_label();
+        self.chain_link(expr, end)?;
+        self.place_label(end);
+        Ok(())
+    }
+
+    /// One link of a chain, where `end` is the label a `?.` guard jumps to.
+    fn chain_link(&mut self, expr: &Expr, end: Label) -> Result<(), SyntaxError> {
+        match &expr.kind {
+            ExprKind::Member {
+                object,
+                property,
+                optional,
+            } => {
+                self.chain_link(object, end)?;
+                if *optional {
+                    self.optional_guard(end);
+                }
+                match property {
+                    MemberProp::Ident(name) => {
+                        self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text(&name.name))]);
+                    }
+                    MemberProp::Computed(index) => {
+                        self.expr(index)?;
+                        self.emit(Opcode::GetArrayEl, &[]);
+                    }
+                    MemberProp::Private(_) => {
+                        return Err(SyntaxError::new(
+                            "private fields are not supported by the compiler yet",
+                            expr.span,
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            ExprKind::Call {
+                callee,
+                arguments,
+                optional,
+            } => {
+                // `o.m(args)` has to pass `o` as `this`, which a plain `call`
+                // cannot: it reads the function and then calls it with no
+                // receiver at all. The reference's answer is to keep the object
+                // under the function value — `get_field2` reads a field and leaves
+                // its base in place — and to use `call_method`, which takes the
+                // receiver from the stack. Missing this does not just cost an
+                // instruction, it loses the `this` binding.
+                if let ExprKind::Member {
+                    object,
+                    property,
+                    optional: member_optional,
+                } = &callee.unparen().kind
+                {
+                    self.chain_link(object, end)?;
+                    if *member_optional {
+                        self.optional_guard(end);
+                    }
+                    match property {
+                        MemberProp::Ident(name) => {
+                            self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text(&name.name))])
+                        }
+                        MemberProp::Computed(index) => {
+                            self.expr(index)?;
+                            // The key is not needed after the read, so this is the
+                            // two-output form: object, value.
+                            self.emit(Opcode::GetArrayEl2, &[]);
+                        }
+                        MemberProp::Private(_) => {
+                            return Err(SyntaxError::new(
+                                "private fields are not supported by the compiler yet",
+                                expr.span,
+                            ));
+                        }
+                    }
+                    for argument in arguments {
+                        self.expr(argument)?;
+                    }
+                    self.emit(Opcode::CallMethod, &[Op::Int(arguments.len() as i32)]);
+                    return Ok(());
+                }
+                self.chain_link(callee, end)?;
+                if *optional {
+                    self.optional_guard(end);
+                }
+                for argument in arguments {
+                    self.expr(argument)?;
+                }
+                self.emit(Opcode::Call, &[Op::Int(arguments.len() as i32)]);
+                Ok(())
+            }
+            _ => self.expr(expr),
+        }
+    }
+
+    /// The `?.` guard: keep the value if it is neither null nor undefined,
+    /// otherwise replace it with `undefined` and leave the whole chain.
+    fn optional_guard(&mut self, end: Label) {
+        let cont = self.new_label();
+        self.emit(Opcode::Dup, &[]);
+        self.emit(Opcode::IsUndefinedOrNull, &[]);
+        self.emit_jump(Opcode::IfFalse, cont, &[]);
+        self.emit(Opcode::Drop, &[]);
+        self.emit(Opcode::Undefined, &[]);
+        self.emit_jump(Opcode::Goto, end, &[]);
+        self.place_label(cont);
+    }
+
     fn push_number(&mut self, value: f64) {
         // `push_N` / `push_i8` / `push_i32` cover small integers; everything else
         // goes into the constant pool.
@@ -2034,22 +2176,40 @@ impl Compiler {
         index
     }
 
+    /// Compile `a && b`, `a || b`, `a ?? b`.
+    ///
+    /// A run of the *same* operator shares one end label, so `a || b || c` tests
+    /// `a` once and jumps past everything when it is truthy, instead of falling
+    /// into `b`'s test. The parser builds such a run left-associated —
+    /// `((a || b) || c)` — so the operands are collected off the left spine.
+    ///
+    /// A *different* operator starts its own chain: `(a || b) && c` keeps the inner
+    /// `||`'s label, because the inner chain really does end before `&&` begins.
     fn logical(&mut self, op: LogicalOp, left: &Expr, right: &Expr) -> Result<(), SyntaxError> {
+        let mut operands = Vec::new();
+        collect_same_operator(op, left, &mut operands);
+        operands.push(right);
+
         let end = self.new_label();
-        self.expr(left)?;
-        self.emit(Opcode::Dup, &[]);
-        match op {
-            LogicalOp::And => self.emit_jump(Opcode::IfFalse, end, &[]),
-            LogicalOp::Or => self.emit_jump(Opcode::IfTrue, end, &[]),
-            LogicalOp::Coalesce => {
-                return Err(SyntaxError::new(
-                    "'??' is not supported by the compiler yet",
-                    left.span,
-                ));
+        // Every operand but the last decides whether the chain stops here.
+        let last = operands.pop().expect("the right operand is always present");
+        for operand in operands {
+            self.expr(operand)?;
+            self.emit(Opcode::Dup, &[]);
+            match op {
+                LogicalOp::And => self.emit_jump(Opcode::IfFalse, end, &[]),
+                LogicalOp::Or => self.emit_jump(Opcode::IfTrue, end, &[]),
+                // `??` cannot reuse the truthiness jumps: `0 ?? b` is `0` while
+                // `0 || b` is `b`. The dedicated test keeps the value unless it is
+                // null-ish, so the jump is taken on `false`.
+                LogicalOp::Coalesce => {
+                    self.emit(Opcode::IsUndefinedOrNull, &[]);
+                    self.emit_jump(Opcode::IfFalse, end, &[]);
+                }
             }
+            self.emit(Opcode::Drop, &[]);
         }
-        self.emit(Opcode::Drop, &[]);
-        self.expr(right)?;
+        self.expr(last)?;
         self.place_label(end);
         Ok(())
     }
@@ -2093,7 +2253,25 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile an assignment.
+    ///
+    /// Three operator families, three shapes:
+    ///
+    /// * **plain** `=` — evaluate, store. A member needs `insert2`/`insert3` when
+    ///   the value is kept, because `put_field`/`put_array_el` consume both the
+    ///   object and the value: `insert2` is `obj a -> a obj a`, so the store sees
+    ///   the pair it wants and leaves a copy on top.
+    /// * **compound** `+=` … — read the place, apply the operator, store. A member
+    ///   reads through `get_field2`/`get_array_el3`, which leave the object (and
+    ///   index) underneath the value precisely so the store can follow.
+    /// * **logical** `||=`, `&&=`, `??=` — read, test, and only then evaluate the
+    ///   right-hand side. The test *keeps* the current value and skips the store
+    ///   entirely, which is the whole point: `a ||= b` must not evaluate `b` when
+    ///   `a` is already truthy.
     fn assign(&mut self, op: AssignOp, target: &Pattern, value: &Expr) -> Result<(), SyntaxError> {
+        // Reading the flag clears it: only the outermost assignment of an
+        // expression statement may drop its value.
+        let keep = !std::mem::take(&mut self.state().discard_value);
         match &target.kind {
             PatternKind::Ident(name) => {
                 match op {
@@ -2102,6 +2280,18 @@ impl Compiler {
                         self.set_name_if_anonymous(value, &name.name);
                         self.emit(Opcode::Dup, &[]);
                         self.emit_var(VarAction::Put, &name.name);
+                    }
+                    AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
+                        let end = self.new_label();
+                        self.emit_var(VarAction::Get, &name.name);
+                        self.emit(Opcode::Dup, &[]);
+                        self.emit_logical_test(op);
+                        self.emit_jump(logical_jump(op), end, &[]);
+                        self.emit(Opcode::Drop, &[]);
+                        self.expr(value)?;
+                        self.emit(Opcode::Dup, &[]);
+                        self.emit_var(VarAction::Put, &name.name);
+                        self.place_label(end);
                     }
                     _ => {
                         self.emit_var(VarAction::Get, &name.name);
@@ -2117,18 +2307,89 @@ impl Compiler {
                 self.expr(&member.object)?;
                 match &member.property {
                     MemberProp::Ident(property) => {
-                        self.expr(value)?;
-                        self.emit(Opcode::Insert2, &[]);
-                        self.emit(
-                            Opcode::PutField,
-                            &[Op::Atom(Atom::from_text(&property.name))],
-                        );
+                        let atom = Atom::from_text(&property.name);
+                        match op {
+                            AssignOp::Assign => {
+                                self.expr(value)?;
+                                // `put_field` consumes the object and the value, so
+                                // without `insert2` nothing is left over for the
+                                // statement to drop.
+                                self.state().no_value = !keep;
+                                if keep {
+                                    self.emit(Opcode::Insert2, &[]);
+                                }
+                                self.emit(Opcode::PutField, &[Op::Atom(atom.clone())]);
+                            }
+                            AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
+                                // `get_field2` leaves the object under the value, so
+                                // the keep path has an object to dispose of. The store
+                                // path must jump *over* that cleanup: falling into it
+                                // would `nip` a stack that only holds the value.
+                                let (keep_label, end) = (self.new_label(), self.new_label());
+                                self.emit(Opcode::GetField2, &[Op::Atom(atom.clone())]);
+                                self.emit(Opcode::Dup, &[]);
+                                self.emit_logical_test(op);
+                                self.emit_jump(logical_jump(op), keep_label, &[]);
+                                self.emit(Opcode::Drop, &[]);
+                                self.expr(value)?;
+                                self.emit(Opcode::Insert2, &[]);
+                                self.emit(Opcode::PutField, &[Op::Atom(atom.clone())]);
+                                self.emit_jump(Opcode::Goto, end, &[]);
+                                self.place_label(keep_label);
+                                self.emit(Opcode::Nip, &[]);
+                                self.place_label(end);
+                            }
+                            _ => {
+                                self.emit(Opcode::GetField2, &[Op::Atom(atom.clone())]);
+                                self.expr(value)?;
+                                self.emit(compound_opcode(op), &[]);
+                                self.state().no_value = !keep;
+                                if keep {
+                                    self.emit(Opcode::Insert2, &[]);
+                                }
+                                self.emit(Opcode::PutField, &[Op::Atom(atom.clone())]);
+                            }
+                        }
                     }
                     MemberProp::Computed(index) => {
                         self.expr(index)?;
-                        self.expr(value)?;
-                        self.emit(Opcode::Insert3, &[]);
-                        self.emit(Opcode::PutArrayEl, &[]);
+                        match op {
+                            AssignOp::Assign => {
+                                self.expr(value)?;
+                                self.state().no_value = !keep;
+                                if keep {
+                                    self.emit(Opcode::Insert3, &[]);
+                                }
+                                self.emit(Opcode::PutArrayEl, &[]);
+                            }
+                            AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
+                                let (keep_label, end) = (self.new_label(), self.new_label());
+                                self.emit(Opcode::GetArrayEl3, &[]);
+                                self.emit(Opcode::Dup, &[]);
+                                self.emit_logical_test(op);
+                                self.emit_jump(logical_jump(op), keep_label, &[]);
+                                self.emit(Opcode::Drop, &[]);
+                                self.expr(value)?;
+                                self.emit(Opcode::Insert3, &[]);
+                                self.emit(Opcode::PutArrayEl, &[]);
+                                self.emit_jump(Opcode::Goto, end, &[]);
+                                self.place_label(keep_label);
+                                // Both the object and the index are left over.
+                                self.emit(Opcode::Nip, &[]);
+                                self.emit(Opcode::Nip, &[]);
+                                self.place_label(end);
+                            }
+                            _ => {
+                                self.emit(Opcode::GetArrayEl3, &[]);
+                                self.expr(value)?;
+                                self.emit(compound_opcode(op), &[]);
+                                self.state().no_value = !keep;
+                                if keep {
+                                    self.emit(Opcode::Insert3, &[]);
+                                }
+                                self.emit(Opcode::PutArrayEl, &[]);
+                            }
+                        }
                     }
                     MemberProp::Private(_) => {
                         return Err(SyntaxError::new(
@@ -2143,6 +2404,16 @@ impl Compiler {
                 "this assignment target is not supported by the compiler yet",
                 target.span,
             )),
+        }
+    }
+
+    /// The test a logical assignment applies to the current value.
+    ///
+    /// `??=` needs a real opcode rather than a truthiness jump: `0 ??= b` must
+    /// assign, while `0 ||= b` must not.
+    fn emit_logical_test(&mut self, op: AssignOp) {
+        if op == AssignOp::Coalesce {
+            self.emit(Opcode::IsUndefinedOrNull, &[]);
         }
     }
 

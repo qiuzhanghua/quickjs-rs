@@ -69,18 +69,21 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + 55 无效 + 39 模块用例一致 |
 | 声明冲突 | 同上 | 41 个作用域冲突用例一致 |
 | 上游语料 | 同上 | `tests/` + `examples/` 全部 `.js` 一致 |
-| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 292 条用例逐字节一致 |
+| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 365 条用例逐字节一致 |
 | TDZ/作用域 | 同上 + 14 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
 | break/continue/标签 | 同上 | 21 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
 | switch | 同上 | 18 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
 | try/catch/finally | 同上 | 25 条用例一致；异常链、三个作用域、空 finally 消除、跨 try 的 return/break/continue 全对 |
 | for-in / for-of | 同上 | 20 条用例一致；迭代器关闭、穿越循环时的记录释放、跨层 break/continue 全对 |
 | 对象与数组字面量 | 同上 | 56 条用例一致；方法/取值器/计算键/`__proto__`/spread、数组三阶段与索引原子全对 |
+| 赋值 | 同上 | 36 条用例一致；标识符/成员/计算键 × 普通/复合/逻辑三类，含"值是否被丢弃"的 `insert2` 差异 |
+| 方法调用 | 同上 | 16 条用例一致；`get_field2`/`get_array_el2` + `call_method` 保住 `this` |
+| `??` 与可选链 | 同上 | 21 条用例一致；`?.` 短路整条链、`??` 不走真值跳转、同算符链共用 end 标签 |
 
 ### M2 尚未实现
 
 以下语法都返回明确的 `SyntaxError`，不会静默生成错误字节码：
-解构、类、生成器与 async（需要状态机）、`for await`、`with`、模块、可选链、`??`。
+解构、类、生成器与 async（需要状态机）、`for await`、`with`、模块。
 
 ### 已知优化差距
 
@@ -89,7 +92,7 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 - `fold_constants`：常量条件（`while(1)`、`if(0)`）应删除测试指令
 - `skip_dead_code`：跳转之后的连续死跳转应删除
-- `tail_call`：`return f()` 应编译为尾调用
+- `tail_call`：`return f()`、`return o.m()` 应编译为 `tail_call` / `tail_call_method`
 - `get_length`：`a.length` 应改用专门的操作码
 
 这些用例被单独列出而不是混在通过列表里，是为了让差距可见且不会悄悄扩大。
