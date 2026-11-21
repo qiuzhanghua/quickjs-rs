@@ -5,7 +5,7 @@
 //! that have to hold for any program, so a case the reference tests do not cover
 //! still cannot silently lose the dead zone.
 
-use js_compile::{Function, Opcode, compile_script, disassemble};
+use js_compile::{Function, Opcode, VarKind, compile_script, disassemble};
 use js_parse::parse_script;
 
 fn compile(source: &str) -> Function {
@@ -575,6 +575,101 @@ fn a_switch_discriminant_is_evaluated_once() {
         dups,
         comparisons,
         "each test compares against a copy of the discriminant\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn a_catch_parameter_is_a_local_and_never_uninitialised() {
+    // The thrown value is bound before the handler runs, so there is no temporal
+    // dead zone to introduce and no check to emit on the read.
+    let compiled = compile("function f(){ try { a(); } catch(e) { b(e); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    assert!(
+        !instructions
+            .iter()
+            .any(|(_, i)| matches!(i.op, Opcode::SetLocUninitialized)),
+        "a catch parameter must not be marked uninitialised\n{}",
+        disassemble(inner)
+    );
+    assert!(
+        !instructions
+            .iter()
+            .any(|(_, i)| matches!(i.op, Opcode::GetLocCheck)),
+        "a catch parameter must be read without a check\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(
+        inner.vars.len(),
+        1,
+        "the parameter is a local, not a global\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(inner.vars[0].kind, VarKind::Catch);
+}
+
+#[test]
+fn a_try_records_one_exception_edge_per_guarded_region() {
+    // `try`/`catch`/`finally` guards three regions: the block, the handler and the
+    // propagation from the handler. Each needs its own `catch`, and the finalizer has
+    // exactly one copy, reached by `gosub`.
+    let compiled = compile("function f(){ try { a(); } catch(e) { b(e); } finally { c(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let count = |op: Opcode| {
+        instructions
+            .iter()
+            .filter(|(_, i)| general_form(i.op) == op)
+            .count()
+    };
+    assert_eq!(
+        count(Opcode::Catch),
+        2,
+        "block and handler are guarded\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(
+        count(Opcode::Gosub),
+        3,
+        "normal, handler and rethrow paths\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(
+        count(Opcode::Ret),
+        1,
+        "one copy of the finalizer\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(
+        count(Opcode::Throw),
+        1,
+        "the rethrow\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn an_empty_finally_leaves_no_subroutine() {
+    // With no `finally` the finalizer block is empty, so every `gosub` to it calls
+    // nothing: the reference drops them, which removes the whole `ret` machinery.
+    let compiled = compile("function f(){ try { a(); } catch(e) { b(e); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    assert!(
+        !instructions
+            .iter()
+            .any(|(_, i)| matches!(i.op, Opcode::Gosub | Opcode::Ret)),
+        "no finalizer means no subroutine\n{}",
         disassemble(inner)
     );
 }

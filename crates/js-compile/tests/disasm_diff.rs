@@ -256,7 +256,12 @@ fn variables_match_the_reference() {
 #[test]
 fn unsupported_constructs_fail_loudly() {
     for source in [
-        "try { } catch (e) { }",
+        // A transfer out of a `try` needs `nip_catch` to unwind the catch offset;
+        // until that lands it must fail rather than emit a stack that never unwinds.
+        "function f(){ try { return 1; } finally { } }",
+        "function f(){ try { return 1; } catch (e) { } }",
+        "function f(){ while (a) { try { break; } finally { } } }",
+        "function f(){ while (a) { try { continue; } catch (e) { } } }",
         "for (const x of xs) ;",
         "class A { }",
         "function* g() { }",
@@ -501,6 +506,37 @@ fn switch_matches_the_reference() {
         // A different discriminant, and a body that returns.
         "function f(x){ switch(x.y){ case 1: return 1; } }",
         "function f(x){ switch(x){ case 1: return; default: b(); } }",
+    ];
+    assert_cases(&cases);
+}
+
+/// `try`/`catch`/`finally`.
+#[test]
+fn try_catch_finally_matches_the_reference() {
+    require_oracle!();
+    let cases = [
+        // `catch` records an exception edge; the handler binds the thrown value.
+        "function f(){ try { a(); } catch(e) { b(e); } }",
+        "function f(){ try { a(); } catch { b(); } }",
+        "function f(){ try { a(); } catch(e) { } }",
+        // `finally` alone: one copy of the finalizer, reached by `gosub` from the
+        // normal path and from the propagating-exception path.
+        "function f(){ try { a(); } finally { c(); } }",
+        "function f(){ try { a(); } finally { c(); } d(); }",
+        // Both: the finalizer is shared by the normal path, the handler path and
+        // the rethrow path.
+        "function f(){ try { a(); } catch(e) { b(e); } finally { c(); } }",
+        "function f(){ try { a(); } catch(e) { b(e); } finally { c(); } d(); }",
+        // A body that throws ends the block, so no epilogue is emitted for it.
+        "function f(){ try { a(); throw x; } catch(e) { b(e); } }",
+        "function f(){ try { a(); } catch(e) { throw e; } }",
+        // Scopes: `let` in each part is its own scope; the catch parameter is a
+        // local that never sits in the temporal dead zone.
+        "function f(){ try { let x = 1; a(x); } catch(e) { let y = 2; b(e, y); } }",
+        "function f(){ try { a(); } catch(e) { b(); } finally { let z = 3; c(z); } }",
+        // Nesting.
+        "function f(){ try { try { a(); } catch(e) { b(e); } } catch(e) { c(e); } }",
+        "function f(){ try { a(); } catch(e) { try { b(); } finally { c(); } } }",
     ];
     assert_cases(&cases);
 }

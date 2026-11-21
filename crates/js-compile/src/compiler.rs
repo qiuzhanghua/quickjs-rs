@@ -87,7 +87,15 @@ enum Insn {
     /// A fully determined instruction.
     Fixed { op: Opcode, operands: Vec<Op> },
     /// A variable access, resolved in the second pass.
-    Var { action: VarAction, name: String },
+    ///
+    /// `block` is the lexical block the access appears in, which is what makes
+    /// shadowing work: two bindings can share a name, and the one that wins is
+    /// whichever scope encloses the access.
+    Var {
+        action: VarAction,
+        name: String,
+        block: u64,
+    },
     /// An instruction that dead-code elimination removed. It keeps its slot so
     /// that label indices stay valid, and resolves to no bytecode.
     Dead,
@@ -109,6 +117,19 @@ struct JumpTarget {
     /// Where `continue` lands. `None` for a labelled non-loop statement, which
     /// `break` may leave but `continue` may not target.
     continue_label: Option<Label>,
+}
+
+/// Which part of a `try` statement a block key refers to.
+#[derive(Debug, Clone, Copy)]
+enum TryPart {
+    /// The guarded block.
+    Block = 0,
+    /// The handler body, excluding the catch parameter.
+    Catch = 1,
+    /// The finalizer block.
+    Finally = 2,
+    /// The catch parameter's own scope.
+    Param = 3,
 }
 
 /// A lexical scope, identified while hoisting and numbered at the end.
@@ -319,6 +340,7 @@ impl Compiler {
                 && let Some(Insn::Var {
                     action: previous,
                     name: previous_name,
+                    ..
                 }) = self.state().insns.last_mut()
                 && *previous == VarAction::Put
                 && previous_name == name
@@ -327,9 +349,11 @@ impl Compiler {
                 return;
             }
         }
+        let block = self.cur().current_block;
         self.state().insns.push(Insn::Var {
             action,
             name: name.to_string(),
+            block,
         });
     }
 
@@ -390,9 +414,11 @@ impl Compiler {
                 HoistTarget::Global(name) => {
                     // A global binding lives in a reference cell, so the store
                     // goes through `put_var_ref` while reads use `get_var`.
+                    let block = self.cur().current_block;
                     self.state().insns.push(Insn::Var {
                         action: VarAction::PutRef,
                         name,
+                        block,
                     });
                 }
             }
@@ -428,6 +454,27 @@ impl Compiler {
             .collect();
         out.reverse();
         out
+    }
+
+    /// Declare a local, even at the top level of a script.
+    ///
+    /// A `catch` parameter is always a local: the reference puts it in the
+    /// function's own variable list (`1: catch e`), never in the global object,
+    /// because it only exists while the handler runs.
+    fn declare_local(&mut self, _name: &str, def: VarDef) -> u32 {
+        let state = self.state();
+        let index = state.vars.len() as u32;
+        // A `catch` parameter belongs to a scope even though it is not lexical: the
+        // runtime instantiates it per handler entry, but it never sits in the
+        // temporal dead zone.
+        let block = if def.is_lexical || def.kind == crate::bytecode::VarKind::Catch {
+            state.current_block
+        } else {
+            0
+        };
+        state.var_block.push(block);
+        state.vars.push(def);
+        index
     }
 
     fn declare(&mut self, name: &str, def: VarDef) -> u32 {
@@ -624,7 +671,7 @@ impl Compiler {
                 handler,
                 finalizer,
             } => {
-                self.try_stmt(block, handler, finalizer.as_deref())?;
+                self.try_stmt(stmt, block, handler, finalizer.as_deref())?;
             }
             StmtKind::ForIn { left, right, body } => {
                 self.for_in_of(left, right, body, false, false)?;
@@ -749,7 +796,7 @@ impl Compiler {
                     self.declare(&name.name.clone(), VarDef::lexical(name.name.clone()));
                 }
             }
-            StmtKind::Block(inner) => self.hoist_block(stmt, inner)?,
+            StmtKind::Block(inner) => self.hoist_block(stmt.span.start.offset as u64, inner)?,
             StmtKind::If { cons, alt, .. } => {
                 self.hoist_stmt(cons)?;
                 if let Some(alt) = alt {
@@ -789,12 +836,48 @@ impl Compiler {
                 handler,
                 finalizer,
             } => {
-                self.hoist_block(stmt, block)?;
+                self.hoist_block(Self::try_block_key(stmt, TryPart::Block), block)?;
+                let try_parent = self.cur().current_block;
                 if let Some(handler) = handler {
-                    self.hoist_block(stmt, &handler.body)?;
+                    // The catch parameter belongs to the function scope, not to a
+                    // block: it is a `catch` binding rather than a `let`, so it is
+                    // never in the temporal dead zone and `emit_scope_enter` must
+                    // not mark it uninitialised. It still has to be declared before
+                    // the handler body is hoisted, so it takes the slot the
+                    // reference gives it (bindings are numbered in source order).
+                    if let Some(Pattern {
+                        kind: PatternKind::Ident(name),
+                        ..
+                    }) = &handler.param
+                    {
+                        // The parameter gets its own scope, so entering the handler
+                        // does not have to re-declare it. It is not lexical, so it
+                        // is never marked uninitialised.
+                        let key = Self::try_block_key(stmt, TryPart::Param);
+                        let parent = self.cur().current_block;
+                        self.push_block(key, parent);
+                        let def = VarDef {
+                            name: name.name.clone(),
+                            is_const: false,
+                            is_lexical: false,
+                            kind: crate::bytecode::VarKind::Catch,
+                            is_captured: false,
+                            scope_level: 0,
+                            scope_next: None,
+                        };
+                        self.declare_local(&name.name.clone(), def);
+                        // The handler body nests inside the parameter's scope, so the
+                        // body's bindings chain on to the parameter (the reference
+                        // prints `let y [next:1]`, pointing at `e`).
+                        self.state().current_block = key;
+                    }
+                    self.hoist_block(Self::try_block_key(stmt, TryPart::Catch), &handler.body)?;
+                    // Back to the block the `try` itself lives in, so the finalizer
+                    // is a sibling of the handler rather than nested in it.
+                    self.state().current_block = try_parent;
                 }
                 if let Some(finalizer) = finalizer {
-                    self.hoist_block(stmt, finalizer)?;
+                    self.hoist_block(Self::try_block_key(stmt, TryPart::Finally), finalizer)?;
                 }
             }
             StmtKind::Switch { cases, .. } => {
@@ -812,13 +895,22 @@ impl Compiler {
     }
 
     /// Hoist a nested statement list, which is its own lexical scope.
-    fn hoist_block(&mut self, owner: &Stmt, body: &[Stmt]) -> Result<(), SyntaxError> {
-        let key = owner.span.start.offset as u64;
+    fn hoist_block(&mut self, key: u64, body: &[Stmt]) -> Result<(), SyntaxError> {
         let parent = self.cur().current_block;
         self.push_block(key, parent);
         self.hoist_list(body)?;
         self.state().current_block = parent;
         Ok(())
+    }
+
+    /// A block key for one part of a `try` statement.
+    ///
+    /// The three parts are three separate scopes, so they cannot share the key a
+    /// statement's own offset would give them: the try block, the handler body and
+    /// the finalizer would then look like one scope, and their `let` bindings would
+    /// be marked uninitialised only on entering the first of them.
+    fn try_block_key(stmt: &Stmt, part: TryPart) -> u64 {
+        (stmt.span.start.offset as u64) * 4 + part as u64
     }
 
     /// Declare a `var`: it lives in the function's own scope, not the block's.
@@ -1105,16 +1197,198 @@ impl Compiler {
         result
     }
 
+    /// Compile `try`/`catch`/`finally`.
+    ///
+    /// The shape is an exception table built out of `catch` instructions, each of
+    /// which records where control goes if the instructions that follow raise:
+    ///
+    /// ```text
+    /// catch HANDLER            <- if the guarded block throws, jump to HANDLER
+    ///   <guarded block>
+    ///   drop                   <- discard the catch offset
+    ///   undefined; gosub FINALLY; drop
+    ///   goto END
+    /// HANDLER:
+    ///   <bind the catch parameter>
+    ///   catch CATCH2           <- if the handler itself throws, go to CATCH2
+    ///   <handler body>
+    ///   drop; undefined; gosub FINALLY; drop; goto END
+    /// CATCH2:
+    ///   gosub FINALLY; throw   <- run the finalizer, then let the error out
+    /// FINALLY:
+    ///   <finalizer>
+    ///   ret                    <- return to the `gosub`
+    /// END:
+    /// ```
+    ///
+    /// `gosub` is a subroutine call and `ret` returns to it, which is how one copy
+    /// of the finalizer serves the normal path, the handler path and the
+    /// propagating-exception path.
+    ///
+    /// The `undefined` before each `gosub` is a dummy return value: the finalizer
+    /// runs with `ret_value` on the stack, and the normal path has no value to
+    /// keep, so it pushes one to keep the stack depth identical on every path.
     fn try_stmt(
         &mut self,
-        _block: &[Stmt],
-        _handler: &Option<CatchClause>,
-        _finalizer: Option<&[Stmt]>,
+        stmt: &Stmt,
+        block: &[Stmt],
+        handler: &Option<CatchClause>,
+        finalizer: Option<&[Stmt]>,
     ) -> Result<(), SyntaxError> {
-        Err(SyntaxError::new(
-            "try is not supported by the compiler yet",
-            Span::start(),
-        ))
+        self.reset_value();
+
+        // Crossing a `try` needs `nip_catch` to unwind the catch offset, and one
+        // that also has a `finally` has to run it first. Until that is implemented,
+        // refuse rather than emit code whose stack does not unwind.
+        if let Some(transfer) = Self::transfer_out_of_try(block, handler, finalizer) {
+            return Err(SyntaxError::new(
+                format!(
+                    "{} inside a try block is not supported by the compiler yet",
+                    transfer
+                ),
+                stmt.span,
+            ));
+        }
+
+        let catch_label = self.new_label();
+        let catch2_label = self.new_label();
+        let finally_label = self.new_label();
+        let end_label = self.new_label();
+
+        self.emit_jump(Opcode::Catch, catch_label, &[]);
+
+        let block_key = Self::try_block_key(stmt, TryPart::Block);
+        let block_parent = self.cur().current_block;
+        self.push_block(block_key, block_parent);
+        self.emit_scope_enter(block_key);
+        self.stmts(block)?;
+        self.emit_scope_leave(block_key);
+        self.state().current_block = block_parent;
+        // A guarded block that ends in a `return`/`throw` never reaches the
+        // epilogue, so the reference does not emit one.
+        let block_live = !block.last().is_some_and(Self::terminates);
+
+        if block_live {
+            self.emit(Opcode::Drop, &[]);
+            self.emit(Opcode::Undefined, &[]);
+            self.emit_jump(Opcode::Gosub, finally_label, &[]);
+            self.emit(Opcode::Drop, &[]);
+            self.emit_jump(Opcode::Goto, end_label, &[]);
+        }
+
+        if let Some(handler) = handler {
+            self.place_label(catch_label);
+            // The thrown value is on top of the stack: bind it, or discard it for
+            // `catch { }`.
+            match &handler.param {
+                Some(Pattern {
+                    kind: PatternKind::Ident(name),
+                    ..
+                }) => {
+                    // The store resolves the name, so it has to run inside the
+                    // parameter's own scope; otherwise a same-named `catch` further
+                    // out could win.
+                    let param_key = Self::try_block_key(stmt, TryPart::Param);
+                    let param_parent = self.cur().current_block;
+                    self.push_block(param_key, param_parent);
+                    self.emit_var(VarAction::Put, &name.name);
+                    self.state().current_block = param_parent;
+                }
+                Some(other) => {
+                    return Err(SyntaxError::new(
+                        "destructuring catch parameters are not supported by the compiler yet",
+                        other.span,
+                    ));
+                }
+                None => self.emit(Opcode::Drop, &[]),
+            }
+            self.emit_jump(Opcode::Catch, catch2_label, &[]);
+
+            let catch_key = Self::try_block_key(stmt, TryPart::Catch);
+            let catch_parent = self.cur().current_block;
+            self.push_block(catch_key, catch_parent);
+            self.emit_scope_enter(catch_key);
+            self.stmts(&handler.body)?;
+            self.emit_scope_leave(catch_key);
+            self.state().current_block = catch_parent;
+            let handler_live = !handler.body.last().is_some_and(Self::terminates);
+
+            if handler_live {
+                self.emit(Opcode::Drop, &[]);
+                self.emit(Opcode::Undefined, &[]);
+                self.emit_jump(Opcode::Gosub, finally_label, &[]);
+                self.emit(Opcode::Drop, &[]);
+                self.emit_jump(Opcode::Goto, end_label, &[]);
+            }
+
+            // An error raised inside the handler still has to run the finalizer.
+            self.place_label(catch2_label);
+            self.emit_jump(Opcode::Gosub, finally_label, &[]);
+            self.emit(Opcode::Throw, &[]);
+        } else {
+            // `try`/`finally` with no handler: the finalizer runs, then the error
+            // keeps propagating.
+            self.place_label(catch_label);
+            self.emit_jump(Opcode::Gosub, finally_label, &[]);
+            self.emit(Opcode::Throw, &[]);
+        }
+
+        self.place_label(finally_label);
+        if let Some(finalizer) = finalizer {
+            let finally_key = Self::try_block_key(stmt, TryPart::Finally);
+            let finally_parent = self.cur().current_block;
+            self.push_block(finally_key, finally_parent);
+            self.emit_scope_enter(finally_key);
+            self.stmts(finalizer)?;
+            self.emit_scope_leave(finally_key);
+            self.state().current_block = finally_parent;
+        }
+        self.emit(Opcode::Ret, &[]);
+        self.place_label(end_label);
+        Ok(())
+    }
+
+    /// Find a `return`/`break`/`continue` that would have to unwind a `try`.
+    ///
+    /// Only the guarded block and the handler need this: a transfer written in the
+    /// finalizer has already had the finalizer run for it.
+    fn transfer_out_of_try(
+        block: &[Stmt],
+        handler: &Option<CatchClause>,
+        finalizer: Option<&[Stmt]>,
+    ) -> Option<&'static str> {
+        let _ = finalizer;
+        fn find(body: &[Stmt]) -> Option<&'static str> {
+            for stmt in body {
+                let found = match &stmt.kind {
+                    StmtKind::Return(_) => Some("return"),
+                    StmtKind::Break(_) => Some("break"),
+                    StmtKind::Continue(_) => Some("continue"),
+                    // A transfer nested inside these still leaves the `try` unless a
+                    // loop or switch of its own catches it.
+                    StmtKind::Block(inner) => find(inner),
+                    StmtKind::If { cons, alt, .. } => find(std::slice::from_ref(cons))
+                        .or_else(|| alt.as_ref().and_then(|alt| find(std::slice::from_ref(alt)))),
+                    StmtKind::Labeled { body, .. } => find(std::slice::from_ref(body)),
+                    StmtKind::Try {
+                        block,
+                        handler,
+                        finalizer,
+                    } => find(block).or_else(|| {
+                        handler
+                            .as_ref()
+                            .and_then(|handler| find(&handler.body))
+                            .or_else(|| finalizer.as_deref().and_then(find))
+                    }),
+                    _ => None,
+                };
+                if found.is_some() {
+                    return found;
+                }
+            }
+            None
+        }
+        find(block).or_else(|| handler.as_ref().and_then(|handler| find(&handler.body)))
     }
 
     fn for_in_of(
@@ -1679,7 +1953,11 @@ fn rebuild_scope_chain(state: &mut FnState) {
     for (index, key) in keys.into_iter().enumerate() {
         let level = level_of(key);
         state.vars[index].scope_level = level as u32;
-        if state.vars[index].is_lexical {
+        // A `catch` parameter is part of the runtime scope chain even though it is
+        // not lexical: the handler's own bindings chain on to it, which is why the
+        // reference prints `let y [next:1]` with `e` at 1.
+        if state.vars[index].is_lexical || state.vars[index].kind == crate::bytecode::VarKind::Catch
+        {
             own[level].push(index);
         }
     }
@@ -1721,6 +1999,7 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
     // unreachable, and a `return` leaves everything after it unreachable; the
     // reference drops both. Doing it here means the emitter never has to think
     // about reachability.
+    strip_empty_gosubs(stack, current);
     eliminate_dead_code(stack, current);
     let insns = std::mem::take(&mut stack[current].insns);
     let mut out: Vec<Option<(Opcode, Vec<Op>)>> = Vec::with_capacity(insns.len());
@@ -1736,8 +2015,12 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
                     .collect();
                 out.push(Some((*op, operands)));
             }
-            Insn::Var { action, name } => {
-                let slot = resolve_slot(stack, current, name);
+            Insn::Var {
+                action,
+                name,
+                block,
+            } => {
+                let slot = resolve_slot(stack, current, name, *block);
                 out.push(Some(variable_instruction(stack, current, *action, slot)));
             }
             Insn::Dead => out.push(None),
@@ -1753,6 +2036,13 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
         {
             label_at[index] = Some(id as u32);
         }
+    }
+    if std::env::var_os("QJS_DEBUG").is_some() {
+        eprintln!("--- peephole entry ---");
+        for (i, e) in out.iter().enumerate() {
+            eprintln!("{i}: {e:?}");
+        }
+        eprintln!("label_at: {label_at:?}");
     }
     peephole(&mut out, &label_at, &stack[current].labels);
     out
@@ -1771,9 +2061,43 @@ fn resolve(stack: &mut [FnState]) -> Vec<Option<(Opcode, Vec<Op>)>> {
 /// entry and every nested function gets a `[global_ref<n>]` pointing at its
 /// parent's entry, which is why `function f(){ g(); }` shows `[global_ref0]`
 /// rather than `[global]`.
-fn resolve_slot(stack: &mut [FnState], current: usize, name: &str) -> Slot {
+/// The lexical blocks enclosing `block`, innermost first.
+fn block_chain(state: &FnState, block: u64) -> Vec<u64> {
+    let mut chain = Vec::new();
+    let mut current = Some(block);
+    while let Some(key) = current {
+        if chain.contains(&key) {
+            break; // a malformed chain must not loop forever
+        }
+        chain.push(key);
+        current = state.blocks.iter().find(|b| b.key == key).map(|b| b.parent);
+    }
+    chain
+}
+
+fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -> Slot {
     if let Some(index) = stack[current].args.iter().position(|a| a.name == name) {
         return Slot::Arg(index as u32);
+    }
+    // A name can be bound more than once: two `catch` parameters in nested
+    // handlers are two slots. The binding that wins is the one whose scope encloses
+    // the access, and among those the innermost — so the blocks are walked outward
+    // and the first binding found on the way is the one that counts. A binding in
+    // no block (`var`) is reachable from anywhere, which is why the function scope
+    // is the end of the walk.
+    let chain = block_chain(&stack[current], block);
+    for scope in &chain {
+        let found = stack[current]
+            .vars
+            .iter()
+            .enumerate()
+            .find(|(index, var)| {
+                var.name == name && stack[current].var_block.get(*index).copied() == Some(*scope)
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = found {
+            return Slot::Loc(index as u32);
+        }
     }
     if let Some(index) = stack[current].vars.iter().position(|v| v.name == name) {
         return Slot::Loc(index as u32);
@@ -2051,6 +2375,37 @@ fn peephole(
         }
     }
 
+    // The rewrites below all decide against one fixed snapshot, which is what the
+    // reference sees: `code_match` reads the bytecode buffer as it was on entry to
+    // the pass, so a rule never observes what an earlier rule removed. Gathering
+    // every deletion first and applying them together reproduces that.
+    let snapshot: Vec<Option<Opcode>> = insns
+        .iter()
+        .map(|entry| entry.as_ref().map(|(op, _)| *op))
+        .collect();
+    // The next instruction that is still there. Holes left by dead-code
+    // elimination are not instructions, so a rule looks past them.
+    let next_op = |index: usize| -> Option<usize> {
+        (index + 1..snapshot.len()).find(|position| snapshot[*position].is_some())
+    };
+
+    let mut doomed = vec![false; insns.len()];
+    for index in 0..insns.len() {
+        // `undefined` followed by `drop` pushes a value only to throw it away.
+        if snapshot[index] == Some(Opcode::Undefined)
+            && let Some(next) = next_op(index)
+            && snapshot[next] == Some(Opcode::Drop)
+        {
+            doomed[index] = true;
+            doomed[next] = true;
+        }
+    }
+    for (index, entry) in insns.iter_mut().enumerate() {
+        if doomed[index] {
+            *entry = None;
+        }
+    }
+
     // A conditional whose destination is the very next instruction just pops its
     // condition, so it becomes a plain `drop`. This is what an empty `case` clause
     // compiles to.
@@ -2105,6 +2460,58 @@ fn peephole(
     }
 }
 
+/// Drop `gosub`s that call an empty subroutine.
+///
+/// A `gosub` whose target starts with `ret` returns immediately, so the reference
+/// drops the call. This is how `try`/`catch` without a `finally` loses its
+/// finalizer plumbing: the finalizer block is empty, its first instruction is
+/// `ret`, and every `gosub` to it disappears — leaving the `ret` unreachable, which
+/// [`eliminate_dead_code`] then removes.
+fn strip_empty_gosubs(stack: &mut [FnState], current: usize) {
+    let state = &stack[current];
+    let mut targets = Vec::new();
+    for insn in &state.insns {
+        if let Insn::Fixed { op, operands } = insn
+            && *op == Opcode::Gosub
+            && let Some(id) = label_id(operands)
+            && let Some(target) = state.labels.get(id as usize).copied().flatten()
+        {
+            targets.push(target);
+        }
+    }
+    let empty: Vec<usize> = targets
+        .into_iter()
+        .filter(|target| {
+            stack[current]
+                .insns
+                .get(*target)
+                .map(|insn| {
+                    matches!(
+                        insn,
+                        Insn::Fixed {
+                            op: Opcode::Ret,
+                            ..
+                        }
+                    )
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    if empty.is_empty() {
+        return;
+    }
+    for insn in stack[current].insns.iter_mut() {
+        if let Insn::Fixed { op, operands } = insn
+            && *op == Opcode::Gosub
+            && let Some(id) = label_id(operands)
+            && let Some(target) = stack[current].labels.get(id as usize).copied().flatten()
+            && empty.contains(&target)
+        {
+            *insn = Insn::Dead;
+        }
+    }
+}
+
 /// Replace unreachable instructions with [`Insn::Dead`].
 fn eliminate_dead_code(stack: &mut [FnState], current: usize) {
     let reachable = reachable_instructions(&stack[current], stack[current].insns.len());
@@ -2142,7 +2549,31 @@ fn reachable_instructions(state: &FnState, count: usize) -> Vec<bool> {
             }
         };
         match op {
-            Opcode::Return | Opcode::ReturnUndef | Opcode::Throw => {}
+            // A return, a throw and a `ret` all leave this instruction stream: the
+            // first two give control to the caller or the handler, and `ret`
+            // returns to a `gosub` elsewhere.
+            Opcode::Return
+            | Opcode::ReturnUndef
+            | Opcode::Throw
+            | Opcode::ThrowError
+            | Opcode::Ret => {}
+            // A `catch` records where exceptions from the code that follows go.
+            // That code is not reachable through normal control flow, but it is
+            // reachable — through the exception edge — so the walk has to follow
+            // it, or dead-code elimination would delete every handler.
+            Opcode::Catch => {
+                if let Some(target) = placed_label(state, operands) {
+                    worklist.push(target);
+                }
+                worklist.push(index + 1);
+            }
+            // A `gosub` calls a subroutine and then continues, so both edges count.
+            Opcode::Gosub => {
+                if let Some(target) = placed_label(state, operands) {
+                    worklist.push(target);
+                }
+                worklist.push(index + 1);
+            }
             Opcode::Goto => {
                 if let Some(target) = placed_label(state, operands) {
                     worklist.push(target);
@@ -2379,6 +2810,9 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         }
     }
 
+    if std::env::var_os("QJS_DEBUG").is_some() {
+        eprintln!("--- assemble entry --- {kept:?}");
+    }
     // How many labels are real, as opposed to the per-instruction ones allocated
     // just below. Only a real label marks a spot in the source program.
     let real_labels = state.labels.len();
@@ -2431,33 +2865,6 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         .map(|slot| slot.map(|target| follow_jump_chain(&kept, &label_kept, target)))
         .collect();
     label_kept = folded;
-
-    // A `drop` immediately before `return_undef` throws away a value the return
-    // never looks at; `switch`'s discriminant drop is exactly that. Two details
-    // keep this matching the reference:
-    //
-    //   * a label sitting between the drop and the return means they are *not*
-    //     adjacent — labels are real pseudo-instructions, so `l: { … b(); }` keeps
-    //     the drop that discards `b()`'s result, while `switch (x) { }` drops the
-    //     discriminant because nothing separates them;
-    //   * one pass, no cascading: removing a drop must not expose another one, or
-    //     the value the preceding instruction left behind goes with it.
-    let mut label_here = vec![false; kept.len() + 1];
-    for slot in label_kept.iter().take(real_labels).flatten() {
-        if *slot < label_here.len() {
-            label_here[*slot] = true;
-        }
-    }
-    let delete: Vec<bool> = (0..kept.len())
-        .map(|index| {
-            kept[index].0 == Opcode::Drop
-                && kept.get(index + 1).map(|(op, _)| *op) == Some(Opcode::ReturnUndef)
-                && !label_here[index + 1]
-        })
-        .collect();
-    if delete.iter().any(|d| *d) {
-        kept = compact(kept, &mut label_kept, &delete);
-    }
 
     // Jump cleanup, in compacted index space. Two rewrites the reference also
     // applies while it resolves labels:
@@ -2524,6 +2931,50 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         kept = next;
     }
 
+    // Code after an unconditional transfer is unreachable, and the reference drops
+    // it when it walks past that transfer. Stage-wise the removals above happen
+    // later than the walk would, so a trailing run can survive: `try`/`catch`'s
+    // `goto end` becomes a jump to the next instruction and is deleted, leaving the
+    // label at the end of the function with nothing pointing at it.
+    //
+    // Only a real label keeps an instruction alive here. The per-instruction labels
+    // allocated above belong to this pass, not to the program.
+    // Which instructions something still jumps to. Reading the surviving jumps is
+    // what the reference's reference counts amount to: once a jump has been folded
+    // away the label it named is unreferenced, even though the program still has a
+    // label there.
+    let mut references = vec![false; kept.len() + 1];
+    let _ = real_labels;
+    for (_, operands) in &kept {
+        if let Some(target) = target_kept_index(operands, &label_kept)
+            && target < references.len()
+        {
+            references[target] = true;
+        }
+    }
+    let mut end = kept.len();
+    while end > 0 {
+        let last = end - 1;
+        let reachable = references[last] || end < kept.len();
+        if reachable {
+            break;
+        }
+        let after_transfer = last
+            .checked_sub(1)
+            .map(|previous| {
+                matches!(
+                    kept[previous].0,
+                    Opcode::Goto | Opcode::Return | Opcode::ReturnUndef | Opcode::Throw
+                )
+            })
+            .unwrap_or(false);
+        if !after_transfer {
+            break;
+        }
+        end = last;
+    }
+    kept.truncate(end);
+
     // Choose an opcode for each instruction and its size, so label offsets can be
     // computed.
     let mut chosen = Vec::with_capacity(kept.len());
@@ -2546,37 +2997,6 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
     }
     let stack_size = compute_stack_size(&code);
     (code, stack_size)
-}
-
-/// Drop the instructions marked in `delete` and renumber the label table so it
-/// keeps pointing at the same instructions.
-///
-/// A label whose instruction was deleted moves to whatever follows it, since the
-/// reference never leaves a jump with nowhere to land.
-fn compact(
-    kept: Vec<(Opcode, Vec<Op>)>,
-    label_kept: &mut [Option<usize>],
-    delete: &[bool],
-) -> Vec<(Opcode, Vec<Op>)> {
-    let mut next: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
-    let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
-    for (old, entry) in kept.into_iter().enumerate() {
-        if delete[old] {
-            continue;
-        }
-        moved[old] = Some(next.len());
-        next.push(entry);
-    }
-    for slot in label_kept.iter_mut() {
-        let Some(old) = *slot else { continue };
-        *slot = match moved.get(old).copied().flatten() {
-            Some(new) => Some(new),
-            None => (old..moved.len())
-                .find_map(|i| moved[i])
-                .or(Some(next.len())),
-        };
-    }
-    next
 }
 
 fn is_goto(op: Opcode) -> bool {
@@ -2701,7 +3121,33 @@ fn compute_stack_size(code: &[u8]) -> u32 {
                 }
                 worklist.push((next, depth));
             }
-            Opcode::Return | Opcode::ReturnUndef | Opcode::Throw => {}
+            // A `catch` records an exception edge to the handler. The handler is
+            // entered with the thrown value on top of the stack, in the slot the
+            // catch offset occupies on the normal path — which is why the handler's
+            // first instruction can `put_loc` the exception away, and why the depth
+            // is the same on both paths.
+            Opcode::Catch => {
+                if let Some(target) = target {
+                    worklist.push((target, depth));
+                }
+                worklist.push((next, depth));
+            }
+            // `gosub` calls a subroutine with the return address on top. The opcode
+            // table records no push for it — `ret` is what pops the slot — so the
+            // extra one is added here, where the depth of the subroutine's first
+            // instruction is being computed.
+            Opcode::Gosub => {
+                if let Some(target) = target {
+                    worklist.push((target, depth + 1));
+                }
+                worklist.push((next, depth));
+            }
+            // `ret` goes back to a `gosub`; nothing here follows it.
+            Opcode::Ret
+            | Opcode::Return
+            | Opcode::ReturnUndef
+            | Opcode::Throw
+            | Opcode::ThrowError => {}
             _ => worklist.push((next, depth)),
         }
     }
