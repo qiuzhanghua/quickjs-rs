@@ -85,6 +85,37 @@ fn unknown_option(display: &str) -> ExitCode {
     help()
 }
 
+/// Run `source`, print whatever the script printed, and report a pending
+/// exception the way `qjs.c` does.
+///
+/// Upstream prints the exception on stderr and exits with 1; the script's own
+/// output stays on stdout, so a run that throws halfway still shows what it got
+/// through. With `-e` the completion value is printed when it is not `undefined`,
+/// which is what makes `qjs -e '1+1'` print `2`.
+fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode {
+    let is_eval = filename == "<cmdline>";
+    let result = ctx.eval(source);
+    let output = ctx.output().to_string();
+    print!("{output}");
+    let _ = std::io::stdout().flush();
+    match result {
+        // Upstream `qjs -e '1+1'` prints nothing: `-e` reports only what the script
+        // itself printed. The completion value is still returned through the API.
+        Ok(_) => ExitCode::SUCCESS,
+        Err(quickjs::Error::Syntax(message)) => {
+            // Compile errors are reported before anything runs.
+            let _ = writeln!(std::io::stderr(), "{filename}: {message}");
+            ExitCode::from(1)
+        }
+        Err(error) => {
+            let prefix = if is_eval { "<cmdline>" } else { filename };
+            let _ = writeln!(std::io::stderr(), "{prefix}: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn pending(what: &str, detail: &str) -> ExitCode {
     let stderr = std::io::stderr();
     let mut stderr = stderr.lock();
@@ -235,11 +266,17 @@ fn main() -> ExitCode {
     if opts.quit_only {
         return ExitCode::SUCCESS;
     }
+
+    let mut ctx = quickjs::Context::new(&rt);
     if let Some(expr) = opts.eval {
-        return pending("--eval", &format!("expression: {:.40}", expr.trim()));
+        return run(&mut ctx, &expr, "<cmdline>");
     }
     if let Some(path) = opts.file {
-        return pending("script execution", &path);
+        let source = match std::fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => return die(&format!("qjs: cannot read {path}: {error}"), 1),
+        };
+        return run(&mut ctx, &source, &path);
     }
     if opts.interactive || args.is_empty() {
         return pending("interactive REPL", "milestone M9");

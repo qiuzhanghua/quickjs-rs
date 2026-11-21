@@ -4,6 +4,49 @@
 
 ## 未发布
 
+### M3：VM 核心
+
+`qjs` 现在真的执行 JavaScript：`qjs -e 'print(1+1)'` 打印 `2`，
+`function fib(n){…} print(fib(20))` 打印 `6765`。
+
+- **值层** —— `Value` 的 `Int`/`Float` 之分镜像参考实现的 `JS_TAG_INT` /
+  `JS_TAG_FLOAT64`；`ToNumber`/`ToInt32`/`ToString`/`ToBoolean`/`==`/`===`/`typeof`
+  按规范实现，含 `-0`、`NaN`、`"12px"` 不是数字这些细节。数字打印的阈值与指数写法
+  与参考逐字对齐（`1e-7`、`1e+21`、`0.30000000000000004`）。
+- **对象模型** —— 属性表（保留插入顺序，整型键优先升序）、数组元素向量、原型链、
+  访问器、函数对象。引用计数 + 循环回收直接复用 `quickjs-gc`：VM 栈上的 `Gc` 句柄
+  天然是根。
+- **解释器** —— 帧、操作数栈、116 个 opcode 中的执行面。异常不用旁表：`catch`
+  往值栈压一个标记，抛出时向下扫找到最内层的那个，这就是参考实现的做法。
+- **调用与闭包** —— 捕获变量放进堆上的 cell，`var_ref_count` 在入帧时分配；
+  被捕获的**实参**必须从实参槽搬进 cell，否则闭包读到的是空值。
+- **构造** —— `new C(args)` 走 `call_constructor`；函数对象带 `prototype`，其
+  `constructor` 指回去（一个 GC 环，正是循环回收存在的理由）。
+- **内建** —— 仅 `print` / `console` / `undefined` / `NaN` / `Infinity`。
+  完整的 `Object`/`Array`/`String`/`JSON` 属 M4。
+- **`new`** —— 编译器与 VM 两侧补齐（`callee; dup; args…; call_constructor n`）。
+- **箭头函数的简写体** —— `x => x*2` 此前报 "concision bodies are not supported"。
+
+### 修：VM 跑起来之后暴露的五个编译器 bug
+
+这些都不是"字节码不同"，而是**语义错**，差分套件覆盖不到，只有真跑才看得见：
+
+1. **`put`+`get` 折叠穿透了标签** —— `for (var i=0; i<3; i++)` 的初始化与循环头之间
+   有一个跳转目标，把 `put_loc i; get_loc i` 折成 `set_loc i` 会让条件比较上一轮残留
+   在栈上的值。现在标签在中间就不折叠。
+2. **`-0` 被折掉了符号** —— `-0` 常量折成 `push_0`，于是 `1/-0` 变成 `Infinity`。
+   参考只折叠负**整数**，`-0` 与 `-2.5` 都保留 `neg`。
+3. **`var` in `for` 头变成局部变量** —— 全局性判断看的是"游标是否在 body 块"，
+   而 `var` 属于函数作用域。现在按声明种类判。
+4. **脚本 body 块键与 offset 0 撞车** —— 顶层 `{ let x }`、`for (let i…)` 因此丢掉
+   自己的作用域（`let` 变成全局）。body 块改用语句不可能产生的键。
+5. **`<ret>` 槽只 push 了 `vars` 没 push `var_block`** —— 索引从此错位一格，
+   脚本自身块的 `set_loc_uninitialized`（TDZ 标记）全部丢失。函数帧没有 `<ret>`，
+   所以只在顶层暴露。
+
+另外修掉两处**状态泄漏**：`compile_function` 早退时把 `FnState` 留在栈上（后续
+`stmt_depth -= 1` 于是作用到错的状态，表现为"subtract with overflow"崩溃）。
+
 ### 赋值、`??` 与可选链
 
 - **语法错误修复（三处静默错误码）** —— 这三个都不是"字节码不同"，而是编译出来
@@ -62,7 +105,10 @@
 
 ### 测试
 
-179 个测试，26 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
+203 个测试，28 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
+
+VM 侧新增 `tests/run.rs`：17 条行为断言，期望值全部取自参考实现（`qjs -e …`）而不是
+我们自己的输出。另有 36 条 `qjs -e` 端到端差分全对。
 
 字节码逐 opcode 差分增至 **365 条**用例（新增对象与数组字面量 56 条、赋值 36 条、
 方法调用 16 条、`??`/可选链 21 条），另有 11 条字面量与 9 条赋值结构不变量测试。

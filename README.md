@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.1.1** —— 解析器与字节码编译器可用，**运行期尚未开始**（`qjs` 还不能执行 JS）
+- 📌 当前版本：**v0.1.1** —— 解析器、字节码编译器与 **VM 核心**可用：`qjs` 能执行 JS
 - 🚧 当前进度：**M2 进行中**（字节码编译器核心已通过逐 opcode 差分），M0/M1 已完成
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
@@ -25,7 +25,7 @@
 | M1a | 词法分析器（ES2025 全量词法） | ✅ |
 | M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 🚧 核心子集已通过差分（见下） |
-| M3 | VM 核心（调用/对象/异常/闭包/原型） | ⬜ |
+| M3 | VM 核心（调用/对象/异常/闭包/原型） | ✅ `qjs` 能执行 JS |
 | M4–M11 | 内建库、ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
 | M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
 
@@ -35,8 +35,8 @@
 crates/quickjs-gc/           引用计数 + 循环回收（16 个测试）           lib: js_gc
 crates/quickjs-parse/        词法 + AST + 解析器 + 差分测试            lib: js_parse
 crates/quickjs-compile/      字节码编译器 + 反汇编 + 序列化            lib: js_compile
-crates/quickjs-pure/         公共 API 骨架：Runtime / Context / Error  lib: quickjs
-crates/quickjs-cli/          CLI：选项面与上游逐字节一致（--help、-q） bin: qjs
+crates/quickjs-pure/         VM + 对象模型 + Value + 公共 API        lib: quickjs
+crates/quickjs-cli/          CLI：选项面与上游逐字节一致，且真正执行   bin: qjs
 crates/quickjs-conformance/  差分测试 harness（候选 vs C 参考实现）
 scripts/setup-oracle.sh      下载并构建 C 参考实现（oracle）
 scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + test
@@ -44,8 +44,10 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**尚未发布到 crates.io** —— 计划在 M3 之后（见
-[`docs/requirements.md` 的发布策略](docs/requirements.md)）。
+**尚未发布到 crates.io**。M3 的门槛（`qjs` 能真正执行 JS）已经跨过，但内建库还是空的
+——`[1,2,3].map(…)`、`JSON.stringify`、`String`、`Object` 都还不存在，装一个叫
+`quickjs` 的 crate 却发现 `Object` 未定义，与"名字和行为相符"这条尺子仍然冲突。
+发布计划见 [`docs/requirements.md` 的发布策略](docs/requirements.md)。
 
 ## 开发
 

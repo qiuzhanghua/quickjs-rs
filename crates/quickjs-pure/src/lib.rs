@@ -5,22 +5,37 @@
 //! tracked is the upstream release whose version string is
 //! [`COMPAT_VERSION`].
 //!
-//! # Current state (M0)
+//! # Current state (M3)
 //!
-//! Only the foundations exist: [`Runtime`] owns a [`js_gc::Heap`] and the
-//! memory-limit bookkeeping. Parsing, bytecode, the VM and the standard library
-//! land in later milestones (see `docs/requirements.md`), so [`Context::eval`]
-//! returns [`Error::NotImplemented`] for now.
+//! Source is parsed, compiled to bytecode and executed: [`Context::eval`] runs a
+//! script and returns its completion value, and [`Context::output`] holds whatever
+//! `print` wrote.
 //!
 //! ```
 //! let rt = quickjs::Runtime::new();
-//! assert_eq!(rt.heap().live_count(), 0);
+//! let mut ctx = quickjs::Context::new(&rt);
+//! ctx.eval("print(1 + 1)").expect("runs");
+//! assert_eq!(ctx.output(), "2\n");
 //! ```
+//!
+//! Not there yet: the standard library beyond `print`, classes and generators, and
+//! modules. Those are later milestones (see `docs/requirements.md`).
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub use js_compile;
 pub use js_gc::{CollectStats, Gc, Heap, Trace, Tracer, WeakGc};
+pub use js_parse;
+
+pub mod builtins;
+pub mod interp;
+pub mod object;
+pub mod value;
+
+pub use interp::{Interp, Signal};
+pub use object::{Callable, JsObject, ObjectKind, Property};
+pub use value::{Cell, JsString, Value};
 
 /// Version string of the upstream QuickJS release this port tracks.
 pub const COMPAT_VERSION: &str = "2026-06-04";
@@ -28,10 +43,12 @@ pub const COMPAT_VERSION: &str = "2026-06-04";
 /// Error raised by the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
+    /// The source did not parse, or did not compile.
+    Syntax(String),
+    /// The script threw, or the engine raised while running it.
+    Exception(String),
     /// The feature/entry point exists in the API but is not implemented yet.
     NotImplemented(&'static str),
-    /// A JavaScript exception is pending on the context.
-    Exception,
     /// The runtime exceeded its memory limit (`--memory-limit`).
     OutOfMemory,
     /// The runtime exceeded its stack limit (`--stack-size`).
@@ -42,7 +59,8 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NotImplemented(what) => write!(f, "not implemented yet: {what}"),
-            Error::Exception => write!(f, "JavaScript exception"),
+            Error::Syntax(what) => write!(f, "{what}"),
+            Error::Exception(what) => write!(f, "{what}"),
             Error::OutOfMemory => write!(f, "out of memory"),
             Error::StackOverflow => write!(f, "stack overflow"),
         }
@@ -115,12 +133,20 @@ impl Runtime {
 /// Mirrors the role of `JSContext` in the QuickJS C API.
 pub struct Context<'rt> {
     runtime: &'rt Runtime,
+    /// The interpreter, created on first use.
+    interp: Option<Interp<'rt>>,
+    /// The value of the last script, as `qjs` reports it.
+    last_value: Value,
 }
 
 impl<'rt> Context<'rt> {
     /// Create a context on `runtime`.
     pub fn new(runtime: &'rt Runtime) -> Context<'rt> {
-        Context { runtime }
+        Context {
+            runtime,
+            interp: None,
+            last_value: Value::Undefined,
+        }
     }
 
     /// The runtime this context belongs to.
@@ -128,10 +154,42 @@ impl<'rt> Context<'rt> {
         self.runtime
     }
 
-    /// Evaluate `source` as a global script.
+    /// Everything `print` has written.
+    pub fn output(&self) -> &str {
+        self.interp.as_ref().map_or("", |interp| &interp.output)
+    }
+
+    /// The interpreter, creating it and its realm on first use.
+    fn interp(&mut self) -> &mut Interp<'rt> {
+        let heap: &'rt Heap = &self.runtime.heap;
+        self.interp.get_or_insert_with(|| Interp::new(heap))
+    }
+
+    /// Evaluate `source` as a global script and return its completion value.
     ///
-    /// Not available yet: the parser/compiler/VM milestones have not landed.
-    pub fn eval(&mut self, _source: &str) -> Result<()> {
-        Err(Error::NotImplemented("Context::eval (M1-M3)"))
+    /// The value is reported the way `qjs -e` reports it: a string for anything the
+    /// script leaves on the stack, and nothing at all for `undefined`.
+    pub fn eval(&mut self, source: &str) -> Result<Value> {
+        let program =
+            js_parse::parse_script(source).map_err(|error| Error::Syntax(error.to_string()))?;
+        let code = js_compile::compile_script(&program)
+            .map_err(|error| Error::Syntax(error.message.clone()))?;
+        let interp = self.interp();
+        match interp.run_script(code) {
+            Ok(value) => {
+                self.last_value = value.clone();
+                Ok(value)
+            }
+            Err(Signal::Throw(value)) => {
+                let text = interp.describe_exception(&value);
+                Err(Error::Exception(text))
+            }
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// The value of the script that ran last.
+    pub fn last_value(&self) -> &Value {
+        &self.last_value
     }
 }

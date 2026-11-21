@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v0.9 —— M0/M1 已完成；M2 编译器核心（含 switch、try/catch/finally、for-in/of）+ TDZ/作用域链 + break/continue/标签已通过逐 opcode 差分；发布策略已定（M3 之后）
+> 状态：v1.0 —— M0/M1/M2 已完成；**M3 VM 核心已完成**（`qjs` 能执行 JS：调用/对象/异常/闭包/原型/迭代）；发布策略仍定在 M4 内建库之后
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -226,8 +226,8 @@ crates/
 | M1a ✅ | 词法分析器 | 已完成：33 个单元测试；35 个数值字面量与 C 版**逐位相同**（DataView 取位对比）；13 个字符串字面量解码一致 |
 | M1b ✅ | AST + 解析器 + early errors + 作用域分析 | 已完成：上游 `tests/`、`examples/` 全部 `.js` 的接受/拒绝与 `qjsc -c` 一致；104+55 条脚本、39 条模块、41 条声明冲突用例一致 |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 反汇编输出可读；往返稳定 |
-| M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | 能跑递归/fib/数组/闭包脚本 |
-| M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Date） | `tests/test_builtin.js` 大部分通过 |
+| M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | ✅ 能跑递归/fib/数组/闭包脚本 |
+| M4 | 内建库第一波（未开始）（Object/Function/Array/String/Number/Math/JSON/Error/Date） | `tests/test_builtin.js` 大部分通过 |
 | M5 | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | `test_language.js`、`test_closure.js` 通过 |
 | M6 | 模块系统 + 动态 import + JSON 模块 | `test_cyclic_import.js`、`hello_module.js` 通过 |
 | M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
@@ -268,20 +268,27 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 | 2 | 功能范围 | **全量**：核心 ES2025 + 模块 + BigInt/TypedArray/Atomics/WeakRef，**含 Temporal 与 Intl（ECMA-402/CLDR）** | Temporal/Intl 排 M13/M14，独立数据 crate + feature，不阻塞主线 |
 | 3 | 字节码 | **自有稳定格式**（magic + version + 稳定序列化），不与 C 版二进制互通；保留 `write_object`/`read_object` 语义与 qjsc AOT | opcode 布局可自由优化；不能直接执行 C 版编译产物 |
 | 4 | GC 路线 | **`Rc` + 循环回收**（引用计数 + trial-deletion cycle collector），确定性释放，对齐上游语义 | `Gc<T>`/`WeakGc<T>`/finalizer 必须在 M0 先落地并单测 |
-| 5 | 发布时机 | **M3 之后再发布到 crates.io**，不进 v0.x 早期 | 见下方「发布策略」；边界不清的版本不发 |
+| 5 | 发布时机 | ~~M3 之后~~ → **M4 之后**（M3 已达成，见下） | 见下方「发布策略」；边界不清的版本不发 |
 | 6 | 包命名 | 一律 `quickjs-*` 前缀；lib/二进制名保持短名 | `quickjs`/`qjs`/`quickjs-rs` 三个名字在 crates.io 已被他人占用 |
 
 ### 发布策略
 
-**结论：M3 让 `qjs` 能真正执行 JavaScript 之后再发布**（决策 5）。理由与硬约束：
+**结论：M4 让标准库可用之后再发布**（决策 5，由 M3 的完成修订）。
+
+M3 交付后，`qjs -e 'print(1+1)'` 真的打印 `2`，深递归、闭包、`for-of`、`try/finally`
+都能跑，原先"装上来什么都跑不了"的理由消失了。但同一把尺子给出了新的边界：
+`Object is not defined`、`[1,2,3].map(…)` 不存在、没有 `JSON`、没有 `String`。
+**一个叫 `quickjs` 的 crate 连 `Object` 都没有，仍然属于名字与行为不符**，所以发布
+线移到 M4 内建库第一波之后。理由与硬约束：
 
 - **名字被占**：`quickjs`（danclive，2019，FFI 包装）、`qjs`（flier，2019，`qjs-sys`
   绑定）都在 crates.io 上；`quickjs-rs` 亦被占用（2026-04 三个版本全被 yank，
   yank 不等于让名）。因此门面与 CLI 用 `quickjs-pure` / `quickjs-cli` 作包名，
   lib 名与二进制名保持 `quickjs` / `qjs` —— 包名与二进制名不必相同。
-- **现在发等于撒谎**：`qjs -e '1+1'` 仍以 `not implemented yet` 退出。一个叫
-  `quickjs` 的 crate 装上来 eval 什么都不能跑，属于名字与行为不符。
-  与本项目「版本号只表达可用性边界」同一条尺子 —— 边界没动，就没有可发的东西。
+- **现在发仍然太早**：`qjs -e 'print(1+1)'` 打印 `2` 了，但 `qjs -e 'Object.keys({})'`
+  报 `Object is not defined`，`[1,2,3].map(x=>x*2)` 报 `map is not a function`。
+  与本项目「版本号只表达可用性边界」同一条尺子 —— 标准库缺到这个程度，边界还没
+  移到"能当脚本引擎用"。
 - **技术前提**（当前均已就绪，只剩版本号同步）：
   - 内部依赖同时写 `path` 与 `version`（`[workspace.dependencies]` 单点维护，
     version 用宽版本 `"0.1"`，patch 升级只改 `workspace.package.version`）。

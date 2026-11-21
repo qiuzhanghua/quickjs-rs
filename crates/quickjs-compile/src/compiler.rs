@@ -370,8 +370,14 @@ impl FnState {
 
     /// The scope a declaration lands in: a script's top-level declarations are
     /// globals, everything else gets a slot.
-    fn declares_globally(&self) -> bool {
-        self.is_script && self.current_block == self.body_block
+    /// Whether a binding declared *now* becomes a property of the global object.
+    ///
+    /// For a script, a top-level `var` and the top-level `let`/`const` are globals.
+    /// The `var` case is decided by the keyword rather than by the cursor position:
+    /// `var` is function-scoped, so a `var i` in a `for` head is still the same
+    /// binding as a `var i` in the body, even though the head has its own block.
+    fn declares_globally(&self, def: &VarDef) -> bool {
+        self.is_script && (!def.is_lexical || self.current_block == self.body_block)
     }
 }
 
@@ -409,10 +415,21 @@ impl Compiler {
         state.line = program.span.start.line;
         state.column = program.span.start.column;
         // Locals are numbered in declaration order; `<ret>` is always slot 0.
+        //
+        // `var_block` has to grow in step with `vars`: it is indexed by slot, so a
+        // slot that only appears in one of the two arrays shifts every later
+        // binding's block and silently loses the temporal-dead-zone marking for
+        // the script's own blocks. A function frame has no `<ret>`, which is why
+        // the misalignment only showed up at the top level.
         state.vars.push(VarDef::var("<ret>"));
+        state.var_block.push(0);
         self.stack.push(state);
         // The body is its own scope, keyed by the position of the program.
-        let body_key = program.span.start.offset as u64;
+        // The script body needs a key no statement can produce. Statement keys are
+        // source offsets, and the program's own start offset is `0` — which is also
+        // the offset of the first statement, so a top-level `{ let x }` or
+        // `for (let i …)` used to share the body's block and lose its scope.
+        let body_key = u64::MAX;
         self.push_block(body_key, 0);
         self.state().body_block = body_key;
         self.hoist(&program.body, body_key)?;
@@ -470,10 +487,24 @@ impl Compiler {
         //
         // Only slots have a `set_` form: a global is stored with `put_var` and
         // read with `get_var`, and the reference does not fold those.
+        //
+        // A label between the two cancels the fold. `set_x v` leaves the value on
+        // the stack, which is only equivalent when the read immediately follows the
+        // store; when a jump target sits in between, the store must *consume* the
+        // value and the read must fetch it afresh. A loop head is exactly that
+        // case — `for (var i = 0; i < 3; i++)` stores the initialiser, then the
+        // condition re-reads it — and folding across the label would make the
+        // condition compare whatever the previous iteration left on the stack.
         if action == VarAction::Get {
             let is_slot = self.cur().vars.iter().any(|v| v.name == name)
                 || self.cur().args.iter().any(|a| a.name == name);
+            let at_label = {
+                let state = self.state();
+                let here = state.insns.len();
+                state.labels.contains(&Some(here))
+            };
             if is_slot
+                && !at_label
                 && let Some(Insn::Var {
                     action: previous,
                     name: previous_name,
@@ -615,7 +646,7 @@ impl Compiler {
     }
 
     fn declare(&mut self, name: &str, def: VarDef) -> u32 {
-        if self.cur().declares_globally() {
+        if self.cur().declares_globally(&def) {
             self.declare_global(name, &def);
             return 0;
         }
@@ -1100,7 +1131,7 @@ impl Compiler {
 
     /// Declare a `var`: it lives in the function's own scope, not the block's.
     fn declare_var(&mut self, name: &str, def: VarDef) {
-        if self.cur().declares_globally() {
+        if self.cur().declares_globally(&def) {
             self.declare_global(name, &def);
             return;
         }
@@ -1800,11 +1831,29 @@ impl Compiler {
                 op: UnaryOp::Minus,
                 argument,
             } if matches!(argument.unparen().kind, ExprKind::Number(_)) => {
-                // The reference folds `-1` into the `push_minus1` short form.
                 let ExprKind::Number(value) = argument.unparen().kind else {
                     unreachable!("matched above")
                 };
-                self.push_number(-value);
+                // The reference folds a negative literal only when the negation is
+                // exact in the integer range: `-1` becomes `push_minus1` and
+                // `-1.5e3` becomes `push_i16 -1500`, but `-0` and `-2.5` keep a
+                // runtime `neg`. Folding `-0` would lose the sign — `1/-0` is
+                // `-Infinity`, not `Infinity` — and folding a fraction would change
+                // which instruction the reference emits.
+                let negated = -value;
+                // `-2147483648` is deliberately excluded: its magnitude is one past
+                // `i32::MAX`, so the reference sends it through the constant pool and
+                // negates at run time instead.
+                if value > 0.0
+                    && negated == negated.trunc()
+                    && negated >= -(i32::MAX as f64)
+                    && negated < 0.0
+                {
+                    self.push_number(negated);
+                } else {
+                    self.push_number(value);
+                    self.emit(Opcode::Neg, &[]);
+                }
             }
             ExprKind::Unary { op, argument } => self.unary(*op, argument)?,
             ExprKind::Conditional { test, cons, alt } => {
@@ -1837,6 +1886,19 @@ impl Compiler {
             ExprKind::OptionalChain(inner) => self.optional_chain(inner)?,
             ExprKind::Array { elements } => self.array_literal(elements, expr.span)?,
             ExprKind::Object(properties) => self.object_literal(properties, expr.span)?,
+            ExprKind::New { callee, arguments } => {
+                // `new C(args)` compiles to `C; dup; args…; call_constructor n`.
+                // The `dup` is not redundant: `call_constructor` takes the
+                // constructor twice, once as the target and once as `new.target`,
+                // which is what makes `new.target === C` inside the body.
+                self.expr(callee)?;
+                self.emit(Opcode::Dup, &[]);
+                let args = arguments.as_deref().unwrap_or(&[]);
+                for argument in args {
+                    self.expr(argument)?;
+                }
+                self.emit(Opcode::CallConstructor, &[Op::Int(args.len() as i32)]);
+            }
             ExprKind::Arrow(func) => {
                 let function = self.compile_function(func)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
@@ -2576,14 +2638,45 @@ impl Compiler {
             };
             state.args.push(VarDef::var(name.name.clone()));
         }
+        let depth = self.stack.len();
         self.stack.push(state);
+        let result = self.compile_function_body(func);
+        if result.is_err() {
+            // A failed compile must not leave its `FnState` behind. Every caller
+            // reads `self.state()` as "the function being compiled", so a leftover
+            // frame silently retargets all later bookkeeping at a dead function.
+            self.stack.truncate(depth);
+        }
+        result
+    }
+
+    /// The body of a function, with its frame already pushed.
+    fn compile_function_body(
+        &mut self,
+        func: &ast::Function,
+    ) -> Result<CompiledFunction, SyntaxError> {
         let body_key = func.params_span.end.offset as u64;
         self.push_block(body_key, 0);
         self.state().body_block = body_key;
-        let body = func
-            .body
-            .statements()
-            .ok_or_else(|| SyntaxError::new("concision bodies are not supported yet", func.span))?;
+        // An arrow with an expression body has no statements; the expression is
+        // its `return`. Building the statement here keeps one code path below, and
+        // matters for correctness beyond convenience: returning early with the new
+        // `FnState` still on the stack would leave the compiler looking at the
+        // wrong function, which surfaces as an unrelated underflow later.
+        let concise = match &func.body {
+            js_parse::ast::FunctionBody::Expr(value) => Some(Stmt::new(
+                StmtKind::Return(Some(Box::new((**value).clone()))),
+                value.span,
+            )),
+            js_parse::ast::FunctionBody::Block(_) => None,
+        };
+        let body: &[Stmt] = match &concise {
+            Some(stmt) => std::slice::from_ref(stmt),
+            None => func
+                .body
+                .statements()
+                .ok_or_else(|| SyntaxError::new("unsupported function body", func.span))?,
+        };
         self.hoist(body, body_key)?;
         self.emit_scope_enter(body_key);
         for stmt in body {

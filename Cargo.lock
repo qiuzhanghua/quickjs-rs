@@ -37,5 +37,7 @@ dependencies = [
 name = "quickjs-pure"
 version = "0.1.1"
 dependencies = [
+ "quickjs-compile",
  "quickjs-gc",
+ "quickjs-parse",
 ]

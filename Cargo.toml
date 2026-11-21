@@ -28,7 +28,7 @@ categories = ["development-tools"]
 # 上面 `workspace.package.version` 一处；抬 minor 时这里必须同步。
 quickjs-gc = { path = "crates/quickjs-gc", version = "0.1" }
 quickjs-parse = { path = "crates/quickjs-parse", version = "0.1" }
-# quickjs-compile 目前没有下游依赖（门面尚未接入编译器），等接入后再在这里加一行。
+quickjs-compile = { path = "crates/quickjs-compile", version = "0.1" }
 quickjs-pure = { path = "crates/quickjs-pure", version = "0.1" }
 # 仅 dev 使用，不上传，因此不需要版本约束。
 quickjs-conformance = { path = "crates/quickjs-conformance" }

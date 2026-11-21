@@ -17,3 +17,5 @@ name = "quickjs"
 
 [dependencies]
 quickjs-gc.workspace = true
+quickjs-parse.workspace = true
+quickjs-compile.workspace = true

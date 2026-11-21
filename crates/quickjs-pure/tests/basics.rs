@@ -1,4 +1,4 @@
-//! Foundations of the public `quickjs` API, before any JavaScript exists.
+//! Foundations of the public `quickjs` API.
 
 #[test]
 fn runtime_defaults_are_sane() {
@@ -10,12 +10,30 @@ fn runtime_defaults_are_sane() {
 }
 
 #[test]
-fn context_eval_reports_not_implemented() {
+fn context_eval_runs_a_script() {
     let rt = quickjs::Runtime::new();
     let mut ctx = quickjs::Context::new(&rt);
-    match ctx.eval("1+1") {
-        Err(quickjs::Error::NotImplemented(what)) => assert!(what.contains("eval")),
-        other => panic!("expected NotImplemented, got {other:?}"),
+    let value = ctx.eval("1+1").expect("runs");
+    assert_eq!(value.to_js_string(), "2");
+}
+
+#[test]
+fn a_syntax_error_is_reported_before_running() {
+    let rt = quickjs::Runtime::new();
+    let mut ctx = quickjs::Context::new(&rt);
+    match ctx.eval("let = ;") {
+        Err(quickjs::Error::Syntax(_)) => {}
+        other => panic!("expected a syntax error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_thrown_value_comes_back_as_an_exception() {
+    let rt = quickjs::Runtime::new();
+    let mut ctx = quickjs::Context::new(&rt);
+    match ctx.eval("throw 'boom'") {
+        Err(quickjs::Error::Exception(text)) => assert!(text.contains("boom"), "{text}"),
+        other => panic!("expected an exception, got {other:?}"),
     }
 }
 
