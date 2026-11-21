@@ -163,6 +163,37 @@ fn legacy_octal_and_non_octal_decimal() {
     assert_eq!(kinds("08e1"), vec![float(80.0)]);
 }
 
+/// A literal made only of octal digits ends at the last digit: the `.` that
+/// follows is a property access, never a fraction. A digit outside 0-7 is what
+/// turns the whole literal into a NonOctalDecimalIntegerLiteral, and only then
+/// may a fraction follow. Both cases are checked against the C oracle.
+#[test]
+fn legacy_octal_does_not_swallow_a_fraction() {
+    assert_eq!(
+        kinds("077.a"),
+        vec![int(63), punct(Punct::Dot), ident("a")],
+        "`077.a` is `(077).a`, not a number"
+    );
+    assert_eq!(
+        kinds("077.5"),
+        vec![int(63), float(0.5)],
+        "`077.5` is two tokens; upstream rejects it at parse time"
+    );
+    assert_eq!(kinds("018.5"), vec![float(18.5)], "non-octal decimal takes it");
+    assert_eq!(kinds("019.e1"), vec![float(190.0)]);
+    assert_eq!(error_message("018.a"), "invalid number literal");
+}
+
+/// A `_` separator may not follow the leading zero of a decimal literal, and it
+/// does not make the literal decimal either.
+#[test]
+fn numeric_separator_needs_a_digit_first() {
+    assert_eq!(error_message("0_1"), "invalid number literal");
+    assert_eq!(error_message("077_1"), "invalid number literal");
+    assert_eq!(error_message("018_1"), "invalid number literal");
+    assert_eq!(kinds("1_0"), vec![int(10)], "ordinary separators still work");
+}
+
 #[test]
 fn bigint_literals() {
     assert_eq!(

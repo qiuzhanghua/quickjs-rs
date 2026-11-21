@@ -423,6 +423,11 @@ impl<'a> Lexer<'a> {
 
         // Integer part (may be empty for `.5`).
         if self.peek_char() != Some('.') {
+            // `0_1`: a separator may not follow the leading zero of a decimal
+            // literal — the `0` form admits no digits after it.
+            if self.peek_char() == Some('0') && self.bytes.get(self.pos + 1) == Some(&b'_') {
+                return Err(self.error("invalid number literal", start));
+            }
             let count = self.scan_digits(10, &mut digits, start)?;
             if count == 0 {
                 return Err(self.error("invalid number literal", start));
@@ -477,12 +482,12 @@ impl<'a> Lexer<'a> {
             text.push(c);
             self.bump();
         }
-        if matches!(
-            self.peek_char(),
-            Some('.') | Some('e') | Some('E') | Some('_')
-        ) {
-            // `08.5`, `08e1`, `0_1` are ordinary decimal literals / errors; hand
-            // back to the general scanner by re-reading the leading `0`.
+        if matches!(self.peek_char(), Some('.') | Some('e') | Some('E')) && !all_octal {
+            // `08.5`, `018e1`, `019.5` are ordinary decimal literals: a digit
+            // outside 0-7 makes the whole literal a NonOctalDecimalIntegerLiteral.
+            // A genuine legacy octal (`077`) ends at the last digit — the `.` in
+            // `077.a` is a property access, and `077.5` is two tokens (`077`, `.5`).
+            // Hand back to the general scanner by re-reading the leading `0`.
             self.reset_to(start);
             self.legacy_octal = true;
             self.bump();
