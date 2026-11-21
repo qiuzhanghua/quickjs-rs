@@ -120,6 +120,14 @@ pub enum Value {
     /// back. QuickJS reuses the integer tag for this (and notes it as a hardening
     /// gap); a distinct variant keeps it out of reach of arithmetic.
     ReturnAddress(u32),
+    /// An array hole: an index that was skipped rather than filled.
+    ///
+    /// `[1,,3]` and `[1,undefined,3]` are different arrays: `forEach` skips the hole,
+    /// `in` reports it absent, and the debug printer shows `<1 empty item>`. That
+    /// distinction has to live in the element vector, and this is the marker for it.
+    /// It is never observable from JavaScript: reading the index yields `undefined`
+    /// and no language operation can produce it.
+    Hole,
     /// The internal marker a `let`/`const` binding holds between its scope being
     /// entered and its initialiser running.
     ///
@@ -182,7 +190,10 @@ impl Value {
             }
             // The internal markers are never observable from JavaScript;
             // reporting `undefined` keeps the answer honest if a bug lets one leak.
-            Value::Uninitialized | Value::CatchOffset(_) | Value::ReturnAddress(_) => "undefined",
+            Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => "undefined",
         }
     }
 
@@ -197,7 +208,10 @@ impl Value {
             Value::String(s) => !s.as_str().is_empty(),
             // Every object is truthy, including `new Boolean(false)`.
             Value::Object(_) => true,
-            Value::Uninitialized | Value::CatchOffset(_) | Value::ReturnAddress(_) => false,
+            Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => false,
         }
     }
 
@@ -220,7 +234,10 @@ impl Value {
             // value-of/valueOf machinery; until that lands an object is `NaN`
             // rather than a panic.
             Value::Object(_) => f64::NAN,
-            Value::Uninitialized | Value::CatchOffset(_) | Value::ReturnAddress(_) => f64::NAN,
+            Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => f64::NAN,
         }
     }
 
@@ -250,9 +267,10 @@ impl Value {
             Value::Float(f) => number_to_string(*f),
             Value::String(s) => s.as_str().to_string(),
             Value::Object(_) => "[object Object]".to_string(),
-            Value::Uninitialized | Value::CatchOffset(_) | Value::ReturnAddress(_) => {
-                "undefined".to_string()
-            }
+            Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => "undefined".to_string(),
         }
     }
 
@@ -309,9 +327,10 @@ impl Value {
             Value::Float(f) => Primitive::Number(*f),
             Value::String(s) => Primitive::String(s.as_str().to_string()),
             Value::Object(_) => Primitive::String(self.to_js_string()),
-            Value::Uninitialized | Value::CatchOffset(_) | Value::ReturnAddress(_) => {
-                Primitive::Undefined
-            }
+            Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => Primitive::Undefined,
         }
     }
 }
@@ -536,6 +555,7 @@ impl fmt::Debug for Value {
             Value::String(s) => write!(f, "{:?}", s.as_str()),
             Value::Object(_) => f.write_str("[object]"),
             Value::Uninitialized => f.write_str("<uninitialised>"),
+            Value::Hole => f.write_str("<hole>"),
             Value::CatchOffset(offset) => write!(f, "<catch {offset}>"),
             Value::ReturnAddress(address) => write!(f, "<ret {address}>"),
         }

@@ -4,6 +4,56 @@
 
 ## 未发布
 
+### M4：标准库第一波
+
+`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、`Reflect`
+与八个错误类。参考实现的 `test_builtin.js` 中 M4 覆盖的 237 条语句通过 229 条。
+
+几处容易写错、都按参考行为实现的语义：
+
+- **`Object.prototype.toString`** 用标签判断（`[object Array]`），不是查类字段。
+- **`Object.is`** 与 `===` 只差两处：`NaN` 与 `-0`。
+- **`defineProperty`** 省略的属性描述符一律为 `false`，所以能造出不可见属性。
+- **`freeze`/`seal`/`preventExtensions`** 三者可区分（`isFrozen`/`isSealed`），
+  且失败写入在 sloppy 下静默、strict 下 `TypeError`；`sort`/`reverse` 这类写回方法
+  一律抛错，因为它们走 `[[Set]]`。
+- **数组的洞是真洞**：`[1,,3]` 与 `[1,undefined,3]` 不同，`forEach` 跳过前者，
+  打印器显示 `<1 empty item>`；`a.length = 5` 用洞填充，`a[3]=4` 在中间留洞。
+- **`Math.round`** 半数向 `+∞` 舍入（`-0.5` → `-0`），**`toFixed`/`toExponential`/
+  `toPrecision`** 半数远离零（Rust 的格式化是半数取偶，`(1.125).toFixed(2)` 会差一位）。
+- **`Math.sumPrecise`** 不是补偿求和：它要「精确求和后一次舍入」，三累加器才够。
+- **`sort` 默认按字符串序**，所以 `[10,9,1].sort()` 是 `[1,10,9]`。
+- **数组方法泛型**：`Array.prototype.join.call("abc")` 是 `a,b,c`，而 `sort.call("aa")`
+  抛 `TypeError`（字符串盒的索引只读）。
+- **数组迭代器惰性**：`keys.call({length: 2**32+1})` 只推进几步，不能物化。
+- **`arguments`** 由 `special_object` 在函数体开头初始化，是普通对象而非数组。
+- **sloppy 模式的 `this`** 会把原始类型装箱（`typeof this` 是 `object`），strict 不装箱。
+- **`bind`** 用独立的 `Callable::Bound` 变体承载 target/this/leading args，
+  而不是塞进属性（那些不可观测）。
+
+### 修：M4 过程中暴露的编译器与词法 bug
+
+1. **词法层不合并代理对**：`"\u{dbff}\u{dfff}"` 与 `"\u{10ffff}"` 曾是两个字符串。
+   Rust 的 `char` 存不了孤立代理项，但**成对**的两个转义必须合成一个码点；
+   状态改为词法器字段，跨转义保留高半。
+2. **`put`+`get` 折叠在标签之后仍然发生**：`for (i=0; …)` 的 init 多留一个值
+   （`dup` + `drop`），后置折叠把 `dup;put` 变 `set` 再吃掉 `drop`，于是循环条件
+   比的是上一次迭代的残留。现在标签用 `label_since_insn` 标志记录，init/update
+   的表达式改用已有的 discard 机制，与参考形状一致。
+3. **`get_length`** 补上：`.length` 读取有自己的 opcode，参考对任何对象都用它。
+4. **`Loc8` 窄槽编码**：`encode_operands` 对 `Loc8`/`Loc16` 静默不写操作数（同 M2
+   的 `AtomU8` 一类问题），`inc_loc` 因此编码出垃圾字节。
+5. **`compile_function` 早退留下 `FnState`**：后续 `stmt_depth -= 1` 作用到错的状态。
+
+### 已知缺口（记录，不隐藏）
+
+- `Error.stack` / 栈回溯：需要 `pc2line` 表，`assert_json_error` 因此仍失败。
+- `toString(radix)` 的**小数**部分精度不足：`(1.3).toString(7)` 少两位，
+  需要精确 bignum 转换。
+- `Object.freeze` 后的数组在参考里退化为稀疏形态、打印成 `[ 0: 1, … ]`；
+  这是其内部表示泄漏，未复刻。
+- `Date`、`RegExp`、`Symbol`、`Map`/`Set`、生成器/async、直接 `eval` 的作用域。
+
 ### M3：VM 核心
 
 `qjs` 现在真的执行 JavaScript：`qjs -e 'print(1+1)'` 打印 `2`，
@@ -105,7 +155,7 @@
 
 ### 测试
 
-203 个测试，28 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
+233 个测试，30 个测试套件，全部通过；`cargo clippy -D warnings` 干净。
 
 VM 侧新增 `tests/run.rs`：17 条行为断言，期望值全部取自参考实现（`qjs -e …`）而不是
 我们自己的输出。另有 36 条 `qjs -e` 端到端差分全对。

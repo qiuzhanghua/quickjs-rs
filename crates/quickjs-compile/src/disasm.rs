@@ -154,7 +154,7 @@ fn format_operands(out: &mut String, function: &Function, pc: usize, instruction
         | OpFormat::NoneArg
         | OpFormat::NoneVarRef
         | OpFormat::Npopx => {}
-        OpFormat::U8 | OpFormat::Loc8 => {
+        OpFormat::U8 => {
             if let Some(Operand::U32(value)) = first {
                 let _ = write!(out, " {value}");
             }
@@ -188,7 +188,8 @@ fn format_operands(out: &mut String, function: &Function, pc: usize, instruction
                 let _ = write!(out, " {a},{b}");
             }
         }
-        OpFormat::Loc => {
+        // `loc8` is the narrow form of `loc`: same operand, same name, one byte.
+        OpFormat::Loc | OpFormat::Loc8 => {
             if let Some(Operand::U32(index)) = first {
                 let _ = write!(out, " {index}: ");
                 print_var_name(out, function, Slot::Loc(*index));

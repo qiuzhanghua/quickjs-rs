@@ -69,6 +69,17 @@ pub struct Realm {
     /// Names of the globals that came from a *declaration*, which are
     /// non-configurable properties of the global object.
     pub declared: Vec<String>,
+    /// The error constructors by class name, so a runtime error can throw a real
+    /// `TypeError` instance rather than a look-alike object.
+    pub errors: BTreeMap<&'static str, Gc<JsObject>>,
+    /// `String.prototype`, used by `ToString` on primitives and by the boxing path.
+    pub string_proto: Option<Gc<JsObject>>,
+    /// `Number.prototype`.
+    pub number_proto: Option<Gc<JsObject>>,
+    /// `Boolean.prototype`.
+    pub boolean_proto: Option<Gc<JsObject>>,
+    /// `Error.prototype`, the prototype of every error instance.
+    pub error_proto: Gc<JsObject>,
 }
 
 /// One activation record.
@@ -79,8 +90,10 @@ struct Frame {
     env: Gc<ClosureEnv>,
     /// The `this` binding.
     this: Value,
-    /// Argument slots.
+    /// Argument slots, sized to the declared parameter count.
     args: Vec<Value>,
+    /// The values the caller actually passed, which is what `arguments` exposes.
+    passed: Vec<Value>,
     /// Local slots.
     locals: Vec<Value>,
     /// Reference cells for this frame's own captured bindings.
@@ -89,8 +102,7 @@ struct Frame {
     stack: Vec<Value>,
     /// Byte offset of the next instruction.
     pc: usize,
-    /// The callee, kept for the stack traces that arrive with the error objects.
-    #[allow(dead_code)]
+    /// The callee, so a native builtin can tell which constructor it is.
     callee: Value,
 }
 
@@ -120,8 +132,6 @@ impl<'a> Interp<'a> {
             heap,
             Some(object_proto.clone()),
             Callable::Native {
-                name: "",
-                length: 0,
                 func: |_, _, _| Ok(Value::Undefined),
             },
         );
@@ -136,6 +146,11 @@ impl<'a> Interp<'a> {
                 array_proto,
                 globals: BTreeMap::new(),
                 declared: Vec::new(),
+                errors: BTreeMap::new(),
+                string_proto: None,
+                number_proto: None,
+                boolean_proto: None,
+                error_proto: JsObject::ordinary(heap, None),
             },
             frames: Vec::new(),
             output: String::new(),
@@ -171,11 +186,33 @@ impl<'a> Interp<'a> {
     }
 
     /// A new native function object.
-    pub fn new_native(&self, name: &'static str, length: u32, func: NativeFn) -> Gc<JsObject> {
+    ///
+    /// The observable `name` and `length` are installed as properties here, which is
+    /// what `Function.prototype.name` and `.length` read; nothing else stores them,
+    /// so `f.name = "x"` behaves like the writable property it is.
+    pub fn new_native(&self, name: impl Into<String>, length: u32, func: NativeFn) -> Gc<JsObject> {
+        let function = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::Native { func },
+        );
+        function.define(
+            "name",
+            Property::with_attributes(self.string(name), false, false),
+        );
+        function.define(
+            "length",
+            Property::with_attributes(Value::Int(length as i32), false, false),
+        );
+        function
+    }
+
+    /// A new bound function.
+    pub fn new_bound(&self, target: Value, this: Value, args: Vec<Value>) -> Gc<JsObject> {
         JsObject::function(
             self.heap,
             Some(self.realm.function_proto.clone()),
-            Callable::Native { name, length, func },
+            Callable::Bound { target, this, args },
         )
     }
 
@@ -194,6 +231,29 @@ impl<'a> Interp<'a> {
         let this = Value::Object(self.realm.global.clone());
         let callee = Value::Undefined;
         self.execute(compiled, env, this, Vec::new(), callee)
+    }
+
+    /// Compile and run `source` in global scope, returning its completion value.
+    ///
+    /// This is what `eval` and `new Function` use. Running it as a script means it
+    /// sees the global object and nothing else, which is right for `eval("1+1")` and
+    /// for a `Function` body; a *direct* eval that reads a local variable would need
+    /// the compiler to hand its variable environment over, which is not implemented.
+    pub fn eval_in_global(&mut self, source: &str) -> JsResult<Value> {
+        let program = js_parse::parse_script(source).map_err(|error| {
+            Signal::Throw(self.make_error("SyntaxError", &format!("invalid source: {error}")))
+        })?;
+        let compiled = js_compile::compile_script(&program)
+            .map_err(|error| Signal::Throw(self.make_error("SyntaxError", &error.message)))?;
+        self.run_script(compiled)
+    }
+
+    /// Run a compiled script whose completion value is a function, returning it.
+    ///
+    /// `new Function(...)` compiles `(function(params) { body })` and this runs it to
+    /// get the closure out, which keeps the constant-pool plumbing in one place.
+    pub fn run_function_source(&mut self, code: CompiledFunction) -> JsResult<Value> {
+        self.run_script(code)
     }
 
     /// The environment of a script or of any function compiled at global scope:
@@ -301,8 +361,13 @@ impl<'a> Interp<'a> {
             ));
         }
         let arg_count = code.code.args.len();
-        // Missing arguments are `undefined`, which is different from not passing
-        // them only for `arguments`, which this milestone does not implement.
+        // How many were actually passed, which `arguments.length` reports and
+        // `assert(x)` depends on: a call with one argument must not look like a call
+        // with one argument and an explicit `undefined`.
+        let passed = args.len();
+        // Missing arguments are `undefined` in their slots; extra ones are dropped
+        // from the slots but still reachable through `arguments`.
+        let mut passed_values = args.clone();
         args.resize(arg_count, Value::Undefined);
         args.truncate(arg_count);
         let cell_count = code.code.var_ref_count as usize;
@@ -320,17 +385,27 @@ impl<'a> Interp<'a> {
                 cells[*cell as usize].set(value);
             }
         }
-        // A sloppy-mode function called without a receiver sees the global object.
-        let this = if this.is_nullish() && !code.code.strict {
-            Value::Object(self.realm.global.clone())
-        } else {
+        // Sloppy mode substitutes the global object for a missing receiver and boxes a
+        // primitive one, so `function f(){ return typeof this }` called as `f.call(1)`
+        // reports `object`. Strict mode passes the value through untouched.
+        let this = if code.code.strict {
             this
+        } else if this.is_nullish() {
+            Value::Object(self.realm.global.clone())
+        } else if matches!(this, Value::Object(_)) {
+            this
+        } else {
+            match crate::builtins::this_object(self, &this) {
+                Ok(boxed) => Value::Object(boxed),
+                Err(_) => this,
+            }
         };
         self.frames.push(Frame {
             code,
             env,
             this,
             args,
+            passed: passed_values.drain(..passed).collect(),
             locals,
             cells,
             stack: Vec::with_capacity(16),
@@ -477,13 +552,51 @@ impl<'a> Interp<'a> {
     /// The own array element `key` names, if this object has one.
     fn own_element(&self, object: &Gc<JsObject>, key: &str) -> Option<Value> {
         let index = array_index(key)?;
-        object.array_get(index as usize)
+        // A hole reads as `undefined` but is not a stored `undefined`; mapping it
+        // here keeps that distinction out of every read site.
+        object.array_get(index as usize).map(|value| match value {
+            Value::Hole => Value::Undefined,
+            other => other,
+        })
     }
 
     /// Store `object[key] = value`, honouring setters and inherited properties.
     pub fn set_property(&mut self, object: &Gc<JsObject>, key: &str, value: Value) -> JsResult<()> {
+        self.set_property_with(object, key, value, DeleteFailure::Throw)
+    }
+
+    /// Store a property, choosing what to do when the object refuses.
+    ///
+    /// A rejected store is a `TypeError` in strict mode and a silent no-op in sloppy
+    /// mode, which is the one place assignment differs by mode. Native code (the array
+    /// methods, `JSON`) always asks for the throw.
+    pub fn set_property_with(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &str,
+        value: Value,
+        on_failure: DeleteFailure,
+    ) -> JsResult<()> {
         if let Some(index) = array_index(key) {
             if object.is_array() {
+                // Adding an index past the end makes the array longer, which a
+                // non-extensible array refuses.
+                if index as usize >= object.array_length().unwrap_or(0) && !object.is_extensible() {
+                    return match on_failure {
+                        DeleteFailure::Throw => Err(self.type_error(format!(
+                            "cannot add property '{key}', object is not extensible"
+                        ))),
+                        DeleteFailure::Ignore => Ok(()),
+                    };
+                }
+                if object.element_is_locked(index) {
+                    return match on_failure {
+                        DeleteFailure::Throw => {
+                            Err(self.type_error(format!("'{key}' is read-only")))
+                        }
+                        DeleteFailure::Ignore => Ok(()),
+                    };
+                }
                 object.array_set(index as usize, value);
                 return Ok(());
             }
@@ -492,9 +605,36 @@ impl<'a> Interp<'a> {
             let length = value.to_number();
             if length.is_finite() && length >= 0.0 {
                 let length = length as usize;
+                // `a.length = n` with `n` below a non-configurable element cannot
+                // drop that element, so the whole assignment fails. The spec makes
+                // this a `TypeError` rather than a silent no-op, in any mode.
+                if let Some(blocked) = (length..object.array_length().unwrap_or(0))
+                    .find(|index| object.element_is_locked(*index as u32))
+                {
+                    // Sloppy mode stops the truncation at the blocking element
+                    // instead of failing; strict mode raises.
+                    // Both modes stop at the blocking element; they differ in
+                    // whether that is reported. The reference truncates *then*
+                    // throws, so the array is left in the shortened state.
+                    object.array_truncate(blocked + 1);
+                    return match on_failure {
+                        DeleteFailure::Throw => {
+                            Err(self.type_error(format!("cannot delete property '{blocked}'")))
+                        }
+                        DeleteFailure::Ignore => Ok(()),
+                    };
+                }
                 object.array_set_length(length);
                 return Ok(());
             }
+        }
+        if !object.is_extensible() && !object.has_own(key) && lookup(object, key).is_none() {
+            return match on_failure {
+                DeleteFailure::Throw => Err(self.type_error(format!(
+                    "cannot add property '{key}', object is not extensible"
+                ))),
+                DeleteFailure::Ignore => Ok(()),
+            };
         }
         if let Some((owner, property)) = lookup(object, key) {
             if property.is_accessor() {
@@ -543,7 +683,16 @@ impl<'a> Interp<'a> {
         };
         let callable = function.with(|data| match &data.kind {
             ObjectKind::Function(callable) => match callable {
-                Callable::Native { func, .. } => Some(NativeCall::Native(*func)),
+                Callable::Native { func } => Some(NativeCall::Native(*func)),
+                Callable::Bound { target, this, args } => {
+                    let mut all = args.clone();
+                    all.extend(args.iter().take(0).cloned());
+                    Some(NativeCall::Bound {
+                        target: target.clone(),
+                        this: this.clone(),
+                        leading: args.clone(),
+                    })
+                }
                 Callable::Bytecode { code, env } => {
                     Some(NativeCall::Bytecode(code.clone(), env.clone()))
                 }
@@ -552,6 +701,15 @@ impl<'a> Interp<'a> {
         });
         match callable {
             Some(NativeCall::Native(func)) => func(self, this, &args),
+            Some(NativeCall::Bound {
+                target,
+                this: bound_this,
+                leading,
+            }) => {
+                let mut all = leading;
+                all.extend(args);
+                self.call_value(target, bound_this, all)
+            }
             Some(NativeCall::Bytecode(code, env)) => self.execute(code, env, this, args, callee),
             None => Err(Signal::Throw(
                 self.make_error("TypeError", "not a function"),
@@ -573,6 +731,32 @@ impl<'a> Interp<'a> {
         );
         let value = Value::Object(prototype);
         function.define("prototype", Property::with_attributes(value, true, false));
+    }
+
+    /// The object `special_object` builds.
+    ///
+    /// Only `arguments` is implemented. It is an ordinary object with a `length` and
+    /// one property per passed argument, which is what `typeof`, `arguments[i]` and
+    /// `arguments.length` observe. Mapped arguments — sloppy mode's aliasing between
+    /// `arguments[i]` and the parameter it came from — is *not* implemented, so a
+    /// write through `arguments` does not reach the parameter.
+    fn special_object(&mut self, magic: u32) -> JsResult<Value> {
+        match magic {
+            0 | 1 => {
+                let args = self.frame().passed.clone();
+                let proto = self.realm.object_proto.clone();
+                let object = self.new_object(Some(proto));
+                object.define_data("length", Value::Int(args.len() as i32));
+                for (index, value) in args.into_iter().enumerate() {
+                    object.define_data(&index.to_string(), value);
+                }
+                Ok(Value::Object(object))
+            }
+            other => Err(Signal::Throw(self.make_error(
+                "InternalError",
+                &format!("special_object {other} is not implemented yet"),
+            ))),
+        }
     }
 
     /// Call `callee`, or push its frame and let the main loop run it.
@@ -648,10 +832,57 @@ impl<'a> Interp<'a> {
     /// matters here is that the thrown value stringifies the way a script printing
     /// the caught value expects.
     pub fn make_error(&self, name: &str, message: &str) -> Value {
-        let error = self.new_object(Some(self.realm.object_proto.clone()));
-        error.define_data("name", self.string(name));
-        error.define_data("message", self.string(message));
+        let proto = self
+            .realm
+            .errors
+            .get(name)
+            .map(|constructor| self.prototype_of(constructor))
+            .unwrap_or_else(|| self.realm.error_proto.clone());
+        let error = self.new_object(Some(proto));
+        // `name` and `message` are own properties of the instance, which is what
+        // makes `e.name` cheap and `Error.prototype.name` the fallback for a plain
+        // `Error`.
+        error.define(
+            "name",
+            Property::with_attributes(self.string(name), true, false),
+        );
+        error.define(
+            "message",
+            Property::with_attributes(self.string(message), true, false),
+        );
         Value::Object(error)
+    }
+
+    /// The function object currently being called, if any.
+    ///
+    /// A native function is a bare `fn` pointer, so it cannot capture which class
+    /// it belongs to; it reads that from the callee instead. This is also what a
+    /// stack trace would use.
+    pub fn current_callee(&self) -> Option<Gc<JsObject>> {
+        match &self.frames.last()?.callee {
+            Value::Object(object) => Some(object.clone()),
+            _ => None,
+        }
+    }
+
+    /// The `prototype` property of a constructor, falling back to
+    /// `Object.prototype` for anything that is not shaped like one.
+    pub fn prototype_of(&self, constructor: &Gc<JsObject>) -> Gc<JsObject> {
+        constructor
+            .own_property("prototype")
+            .and_then(|property| property.value)
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_else(|| self.realm.object_proto.clone())
+    }
+
+    /// Throw a `TypeError` carrying `message`.
+    pub fn type_error(&self, message: impl AsRef<str>) -> Signal {
+        Signal::Throw(self.make_error("TypeError", message.as_ref()))
+    }
+
+    /// Throw a `RangeError` carrying `message`.
+    pub fn range_error(&self, message: impl AsRef<str>) -> Signal {
+        Signal::Throw(self.make_error("RangeError", message.as_ref()))
     }
 
     /// The `ReferenceError` a read of an uninitialised binding raises.
@@ -1142,6 +1373,24 @@ impl<'a> Interp<'a> {
             }
 
             // -- objects ----------------------------------------------------
+            SpecialObject => {
+                let value = self.special_object(a)?;
+                self.push(value);
+            }
+            GetLength => {
+                // `get_length` is the `.length` read; an array and a string answer
+                // from their own length, anything else from the property.
+                let target = self.pop();
+                let value = match &target {
+                    Value::Object(object) => match object.array_length() {
+                        Some(length) => Value::Int(length as i32),
+                        None => self.read_field(&target, "length")?,
+                    },
+                    Value::String(text) => Value::Int(text.utf16_len() as i32),
+                    _ => self.read_field(&target, "length")?,
+                };
+                self.push(value);
+            }
             GetField | GetField2 => {
                 let object = self.pop();
                 let key = self.atom_text(a as usize);
@@ -1511,6 +1760,8 @@ impl<'a> Interp<'a> {
             };
             cells.push(cell);
         }
+        let name = function.name.clone();
+        let length = function.args.len() as u32;
         let code = Gc::new(self.heap, CompiledCode::new(*function));
         let env = Gc::new(self.heap, ClosureEnv { cells });
         let object = JsObject::function(
@@ -1518,6 +1769,16 @@ impl<'a> Interp<'a> {
             Some(self.realm.function_proto.clone()),
             Callable::Bytecode { code, env },
         );
+        object.define(
+            "length",
+            Property::with_attributes(Value::Int(length as i32), false, false),
+        );
+        if !name.is_empty() {
+            object.define(
+                "name",
+                Property::with_attributes(self.string(name), false, false),
+            );
+        }
         self.install_function_prototype(&object);
         Ok(Value::Object(object))
     }
@@ -1525,12 +1786,13 @@ impl<'a> Interp<'a> {
     // -- conversions used by the operators ----------------------------------
 
     fn numeric_of(&mut self, value: Value) -> JsResult<Value> {
-        if let Value::Object(_) = value {
-            // `+obj` runs `ToPrimitive` first; without it an object is `NaN`.
-            let number = value.to_number();
-            return Ok(Value::Float(number));
+        // `+x` is `ToNumber`, which for a string parses it and for an object runs
+        // `ToPrimitive` first. Returning a string unchanged would let `+"1"` stay a
+        // string, which then behaves differently in every later comparison.
+        match value {
+            Value::Int(_) | Value::Float(_) => Ok(value),
+            other => Ok(Value::Float(self.to_js_number(&other)?)),
         }
-        Ok(value)
     }
 
     fn numeric(&mut self, value: Value) -> JsResult<Value> {
@@ -1544,8 +1806,8 @@ impl<'a> Interp<'a> {
         let right = self.pop();
         let left = self.pop();
         // `+` concatenates when either operand is a string *after* `ToPrimitive`.
-        let left = self.primitive_of(left);
-        let right = self.primitive_of(right);
+        let left = self.primitive_of(left)?;
+        let right = self.primitive_of(right)?;
         if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
             let text = format!("{}{}", left.to_js_string(), right.to_js_string());
             self.push(self.string(text));
@@ -1557,16 +1819,65 @@ impl<'a> Interp<'a> {
         Ok(())
     }
 
-    fn primitive_of(&mut self, value: Value) -> Value {
-        match &value {
-            Value::Object(_) => Value::Float(value.to_number()),
-            _ => value,
+    fn primitive_of(&mut self, value: Value) -> JsResult<Value> {
+        self.to_primitive(value, Hint::Default)
+    }
+
+    /// `ToPrimitive`, which is what makes `"" + obj` produce `obj.toString()`.
+    ///
+    /// The order depends on the hint: the "number" order tries `valueOf` first and
+    /// `toString` second, the "string" order the other way round, and the default
+    /// hint uses the number order. A result that is still an object is a `TypeError`,
+    /// because no built-in `valueOf`/`toString` returns one.
+    pub fn to_primitive(&mut self, value: Value, hint: Hint) -> JsResult<Value> {
+        let Value::Object(object) = &value else {
+            return Ok(value);
+        };
+        let order: [&str; 2] = match hint {
+            Hint::String => ["toString", "valueOf"],
+            Hint::Number | Hint::Default => ["valueOf", "toString"],
+        };
+        let receiver = object.clone();
+        for method in order {
+            if let Some(function) = self.get_property(&receiver, method)?
+                && matches!(&function, Value::Object(object) if object.is_callable())
+            {
+                let result =
+                    self.call_value(function, Value::Object(receiver.clone()), Vec::new())?;
+                if !matches!(result, Value::Object(_)) {
+                    return Ok(result);
+                }
+            }
         }
+        Err(self.type_error("cannot convert object to primitive value"))
+    }
+
+    /// `ToString` with the object case going through `ToPrimitive`.
+    pub fn to_js_string(&mut self, value: &Value) -> JsResult<String> {
+        if matches!(value, Value::Object(_)) {
+            let primitive = self.to_primitive(value.clone(), Hint::String)?;
+            return Ok(primitive.to_js_string());
+        }
+        Ok(value.to_js_string())
+    }
+
+    /// `ToNumber` with the object case going through `ToPrimitive`.
+    pub fn to_js_number(&mut self, value: &Value) -> JsResult<f64> {
+        if matches!(value, Value::Object(_)) {
+            let primitive = self.to_primitive(value.clone(), Hint::Number)?;
+            return Ok(primitive.to_number());
+        }
+        Ok(value.to_number())
     }
 
     fn propkey_of(&mut self, value: &Value) -> String {
         match value {
             Value::Int(_) | Value::Float(_) => number_to_string(value.to_number()),
+            // An object key runs `ToPropertyKey`, which needs `ToPrimitive` first;
+            // falling back to its `ToString` would print `[object Object]`.
+            Value::Object(_) => self
+                .to_js_string(value)
+                .unwrap_or_else(|_| "[object Object]".to_string()),
             other => other.to_js_string(),
         }
     }
@@ -1598,6 +1909,19 @@ impl<'a> Interp<'a> {
                     });
                 }
             }
+            // A property of a primitive is looked up on its prototype: this is what
+            // makes `"a".toUpperCase()` reach `String.prototype` without boxing.
+            let prototype = match object {
+                Value::String(_) => self.realm.string_proto.clone(),
+                Value::Int(_) | Value::Float(_) => self.realm.number_proto.clone(),
+                Value::Bool(_) => self.realm.boolean_proto.clone(),
+                _ => None,
+            };
+            if let Some(prototype) = prototype
+                && let Some(value) = self.get_property(&prototype, key)?
+            {
+                return Ok(value);
+            }
             return Ok(Value::Undefined);
         };
         Ok(self.get_property(object, key)?.unwrap_or(Value::Undefined))
@@ -1610,7 +1934,13 @@ impl<'a> Interp<'a> {
                 &format!("cannot set property '{key}' of {}", object.to_js_string()),
             )));
         };
-        self.set_property(object, key, value)
+        // `put_field`/`put_array_el` are plain assignments, so the mode decides.
+        let on_failure = if self.frame().code.code.strict {
+            DeleteFailure::Throw
+        } else {
+            DeleteFailure::Ignore
+        };
+        self.set_property_with(object, key, value, on_failure)
     }
 
     fn has_property(&mut self, key: &Value, object: &Value) -> JsResult<bool> {
@@ -1749,9 +2079,22 @@ impl<'a> Interp<'a> {
     }
 
     /// The iterator for `for-of`: the object and its `next` method.
+    ///
+    /// An object that already carries a `next` method is used as it is — that is what
+    /// `arr.values()` returns — and only arrays and strings get the built-in
+    /// sequence iterator.
     fn get_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
-        // Arrays and strings are the two iterables this milestone reaches; the
-        // full `Symbol.iterator` protocol arrives with the builtins.
+        // An existing iterator: `for (x of arr.entries())`.
+        if let Value::Object(object) = value {
+            if let Some(next) = self.get_property(object, "next")?
+                && matches!(&next, Value::Object(function) if object.is_callable() || function.is_callable())
+            {
+                return Ok(Iterator {
+                    object: value.clone(),
+                    next,
+                });
+            }
+        }
         if let Value::Object(object) = value
             && object.is_array()
         {
@@ -1786,6 +2129,21 @@ impl<'a> Interp<'a> {
 
     /// One step of an internal iterator: the value and whether it is exhausted.
     fn iterator_step(&mut self, iterator: &Iterator) -> JsResult<(Value, bool)> {
+        // A real iterator (`next` is a function) answers with a result object.
+        if matches!(&iterator.next, Value::Object(object) if object.is_callable()) {
+            let result =
+                self.call_value(iterator.next.clone(), iterator.object.clone(), Vec::new())?;
+            let Some(result) = result.as_object().cloned() else {
+                return Err(self.type_error("iterator result is not an object"));
+            };
+            let done = self
+                .get_property(&result, "done")?
+                .is_some_and(|value| value.to_boolean());
+            let value = self
+                .get_property(&result, "value")?
+                .unwrap_or(Value::Undefined);
+            return Ok((value, done));
+        }
         let Value::Object(object) = &iterator.object else {
             return Ok((Value::Undefined, true));
         };
@@ -1886,6 +2244,31 @@ impl<'a> Interp<'a> {
 enum NativeCall {
     Native(NativeFn),
     Bytecode(Gc<CompiledCode>, Gc<ClosureEnv>),
+    Bound {
+        target: Value,
+        this: Value,
+        leading: Vec<Value>,
+    },
+}
+
+/// What a store does when the object refuses the write.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeleteFailure {
+    /// Raise a `TypeError`, which is what strict mode and every built-in does.
+    Throw,
+    /// Ignore the write, which is what a sloppy-mode assignment does.
+    Ignore,
+}
+
+/// Which type `ToPrimitive` prefers when it converts an object.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Hint {
+    /// The default hint, which behaves like [`Hint::Number`].
+    Default,
+    /// `Number(obj)` and the arithmetic operators.
+    Number,
+    /// `String(obj)` and `ToPropertyKey`.
+    String,
 }
 
 /// Which table a binding slot indexes, for the messages that name it.
@@ -2000,6 +2383,220 @@ fn decode(code: &[u8], pc: usize) -> Option<(Opcode, u32, u32, usize)> {
         }
     };
     Some((op, a, b, pc + info.size as usize))
+}
+
+/// How `print` renders a value: the reference's `JS_PrintValue`.
+///
+/// This is *not* `ToString`. `print({a:1})` shows `{ a: 1 }` and `print([1])` shows
+/// `[ 1 ]`, because the host printer dumps the structure rather than converting it.
+/// The format is reproduced closely because the test suite compares output text:
+///
+/// * an empty container has two spaces inside its brackets — `[  ]`, `{  }`;
+/// * nesting stops at depth 2 and prints `[Array]` / `[Object]`;
+/// * a cycle prints `[circular N]` with `N` the stack index of the object;
+/// * an array with an interior hole prints as `idx: value` pairs, while holes at the
+///   end print as `<N empty item(s)>`;
+/// * a string is quoted inside a container but raw at the top level, which is why
+///   `print("x")` and `print(["x"])` differ.
+pub fn debug_display(interp: &Interp<'_>, value: &Value) -> String {
+    // A string argument is printed raw: `js_print` converts it with `ToString`
+    // instead of dumping it, and the quoting only appears inside a container.
+    if let Value::String(text) = value {
+        return text.as_str().to_string();
+    }
+    let mut printer = Printer {
+        interp,
+        out: String::new(),
+        stack: Vec::new(),
+    };
+    printer.value(value, 0);
+    printer.out
+}
+
+/// The `JS_PrintValue` state: output, and the objects currently being printed.
+struct Printer<'a, 'rt> {
+    /// Kept for the class-name lookups that typed arrays and `Date` will need.
+    #[allow(dead_code)]
+    interp: &'a Interp<'rt>,
+    out: String,
+    stack: Vec<Gc<JsObject>>,
+}
+
+impl Printer<'_, '_> {
+    /// Depth past which a container is summarised by its class name.
+    const MAX_DEPTH: usize = 2;
+
+    fn value(&mut self, value: &Value, level: usize) {
+        match value {
+            Value::Undefined
+            | Value::Uninitialized
+            | Value::Hole
+            | Value::CatchOffset(_)
+            | Value::ReturnAddress(_) => self.out.push_str("undefined"),
+            Value::Null => self.out.push_str("null"),
+            Value::Bool(true) => self.out.push_str("true"),
+            Value::Bool(false) => self.out.push_str("false"),
+            Value::Int(number) => self.out.push_str(&number.to_string()),
+            Value::Float(number) => {
+                self.out
+                    .push_str(&crate::value::number_to_string_for_print(*number));
+            }
+            Value::String(text) => self.print_string(text.as_str()),
+            Value::Object(object) => self.object(object, level),
+        }
+    }
+
+    fn object(&mut self, object: &Gc<JsObject>, level: usize) {
+        // A cycle is reported rather than followed; the index is where the object
+        // already sits in the print stack, which is what the reference shows.
+        if let Some(index) = self.stack.iter().position(|seen| seen.ptr_eq(object)) {
+            self.out.push_str(&format!("[circular {index}]"));
+            return;
+        }
+        if object.is_callable() {
+            let name = object
+                .own_property("name")
+                .and_then(|property| property.value)
+                .map(|value| value.to_js_string())
+                .unwrap_or_default();
+            if name.is_empty() {
+                self.out.push_str("[Function (anonymous)]");
+            } else {
+                self.out.push_str(&format!("[Function {name}]"));
+            }
+            return;
+        }
+        if level >= Self::MAX_DEPTH {
+            let class = if object.is_array() { "Array" } else { "Object" };
+            self.out.push_str(&format!("[{class}]"));
+            return;
+        }
+        self.stack.push(object.clone());
+        if object.is_array() {
+            self.array(object, level);
+        } else {
+            self.plain_object(object, level);
+        }
+        self.stack.pop();
+    }
+
+    fn array(&mut self, object: &Gc<JsObject>, level: usize) {
+        let elements = object.array_elements().unwrap_or_default();
+        self.out.push_str("[ ");
+        // An interior hole means the array is "sparse": the reference prints those
+        // as `index: value` pairs and says nothing about the holes themselves, while
+        // a hole run at the end becomes a single `<N empty items>` note.
+        let last_present = elements
+            .iter()
+            .rposition(|value| !matches!(value, Value::Hole));
+        let has_interior_hole = match last_present {
+            Some(last) => elements[..last]
+                .iter()
+                .any(|value| matches!(value, Value::Hole)),
+            None => false,
+        };
+        let mut first = true;
+        if has_interior_hole {
+            let mut index = 0;
+            while index < elements.len() {
+                let value = &elements[index];
+                if matches!(value, Value::Hole) {
+                    index += 1;
+                    continue;
+                }
+                if !first {
+                    self.out.push_str(", ");
+                }
+                first = false;
+                self.out.push_str(&format!("{index}: "));
+                self.value(value, level + 1);
+                index += 1;
+            }
+        } else {
+            for (index, value) in elements.iter().enumerate() {
+                if matches!(value, Value::Hole) {
+                    continue;
+                }
+                if !first {
+                    self.out.push_str(", ");
+                }
+                first = false;
+                let _ = index;
+                self.value(value, level + 1);
+            }
+            if let Some(last) = last_present {
+                let trailing = elements.len() - last - 1;
+                if trailing > 0 {
+                    if !first {
+                        self.out.push_str(", ");
+                    }
+                    self.out.push_str(&format!(
+                        "<{trailing} empty item{}>",
+                        if trailing > 1 { "s" } else { "" }
+                    ));
+                }
+            } else if !elements.is_empty() {
+                let count = elements.len();
+                self.out.push_str(&format!(
+                    "<{count} empty item{}>",
+                    if count > 1 { "s" } else { "" }
+                ));
+            }
+        }
+        self.out.push_str(" ]");
+    }
+
+    fn plain_object(&mut self, object: &Gc<JsObject>, level: usize) {
+        self.out.push_str("{ ");
+        let mut first = true;
+        for key in object.own_keys() {
+            let Some(property) = object.own_property(&key) else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
+            }
+            if !first {
+                self.out.push_str(", ");
+            }
+            first = false;
+            self.out
+                .push_str(&js_compile::disasm::print_atom(&Atom::from_text(&key)));
+            self.out.push_str(": ");
+            // An accessor has no value to dump; the reference names the half that
+            // exists instead of calling it.
+            if property.is_accessor() {
+                let text = match (property.getter.is_some(), property.setter.is_some()) {
+                    (true, true) => "[Getter/Setter]",
+                    (false, true) => "[Setter]",
+                    _ => "[Getter]",
+                };
+                self.out.push_str(text);
+            } else {
+                self.value(&property.value.unwrap_or(Value::Undefined), level + 1);
+            }
+        }
+        self.out.push_str(" }");
+    }
+
+    /// A string inside a container, quoted with the escapes `js_print_string1` uses.
+    fn print_string(&mut self, text: &str) {
+        self.out.push('"');
+        for character in text.chars() {
+            match character {
+                '"' => self.out.push_str("\\\""),
+                '\\' => self.out.push_str("\\\\"),
+                '\n' => self.out.push_str("\\n"),
+                '\r' => self.out.push_str("\\r"),
+                '\t' => self.out.push_str("\\t"),
+                c if (c as u32) < 0x20 => {
+                    self.out.push_str(&format!("\\u{:04x}", c as u32));
+                }
+                c => self.out.push(c),
+            }
+        }
+        self.out.push('"');
+    }
 }
 
 /// How `print` renders a value.

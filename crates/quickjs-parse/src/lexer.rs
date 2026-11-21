@@ -32,6 +32,12 @@ pub struct Lexer<'a> {
     column: u32,
     strict: bool,
     legacy_octal: bool,
+    /// A high surrogate seen in an escape, waiting for its low half.
+    ///
+    /// `"\ud83d\ude00"` spells one code point as two escapes, and the pairing has to
+    /// survive between them, so the pending half lives here rather than being local to
+    /// one escape.
+    pending_high_surrogate: Option<u32>,
 }
 
 /// Every punctuator, longest first so that a prefix test picks the longest form.
@@ -107,6 +113,7 @@ impl<'a> Lexer<'a> {
             column: 1,
             strict: false,
             legacy_octal: false,
+            pending_high_surrogate: None,
         }
     }
 
@@ -354,7 +361,8 @@ impl<'a> Lexer<'a> {
                 }
                 self.bump();
                 self.bump();
-                let escaped = self.scan_unicode_escape_body(start)?;
+                let escaped =
+                    char::from_u32(self.scan_unicode_escape_body(start)?).unwrap_or('\u{fffd}');
                 let ok = if first {
                     is_id_start(escaped)
                 } else {
@@ -601,12 +609,14 @@ impl<'a> Lexer<'a> {
         let start = self.position();
         self.bump(); // opening quote
         let mut out = String::new();
+        self.pending_high_surrogate = None;
         loop {
             let Some(c) = self.peek_char() else {
                 return Err(self.error("unterminated string literal", start));
             };
             if c == quote {
                 self.bump();
+                self.flush_pending_surrogate(&mut out);
                 return Ok(TokenKind::String(out));
             }
             if is_line_terminator(c) {
@@ -616,14 +626,20 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 self.scan_escape(&mut out, start, EscapeContext::String)?;
             } else {
+                // A literal character after a pending high half means no low half
+                // followed, so the pair never completes.
+                self.flush_pending_surrogate(&mut out);
                 out.push(c);
                 self.bump();
             }
         }
     }
 
-    /// Scan the body of a `\u` escape (the `\u` has already been consumed).
-    fn scan_unicode_escape_body(&mut self, start: Position) -> Result<char> {
+    /// The code point of a `\u…` escape, surrogates included.
+    ///
+    /// Returning the raw value rather than a `char` is what lets the caller pair a
+    /// high half with the low half that follows it.
+    fn scan_unicode_escape_body(&mut self, start: Position) -> Result<u32> {
         if self.peek_char() == Some('{') {
             self.bump();
             let mut value: u32 = 0;
@@ -651,10 +667,10 @@ impl<'a> Lexer<'a> {
             if digits == 0 {
                 return Err(self.error("malformed Unicode escape", start));
             }
-            // A surrogate code point is a legal escape (`"\u{d800}"` has length 1
-            // in an engine). `char` cannot hold it, so substitute U+FFFD until
-            // strings learn to carry WTF-8 (see the crate docs).
-            return Ok(char::from_u32(value).unwrap_or('\u{fffd}'));
+            if value > 0x10ffff {
+                return Err(self.error("code point out of range", start));
+            }
+            return Ok(value);
         }
         let mut value: u32 = 0;
         for _ in 0..4 {
@@ -666,14 +682,63 @@ impl<'a> Lexer<'a> {
                 _ => return Err(self.error("malformed Unicode escape", start)),
             }
         }
-        // A lone surrogate is allowed in string literals (`"\ud800"` has length
-        // 1); `char` cannot represent it, so it is encoded as U+FFFD only when
-        // it actually needs to travel as a scalar. QuickJS keeps UTF-16 code
-        // units, so represent surrogates explicitly.
-        Ok(char::from_u32(value).unwrap_or('\u{fffd}'))
+        Ok(value)
     }
 
+    /// Decode one escape sequence and append it to `out`.
+    ///
+    /// A surrogate written as a pair of escapes — `"\ud83d\ude00"` — denotes one code
+    /// point, so the high half is held in `pending_high` until the next escape says
+    /// whether a low half follows. `char` cannot hold a surrogate, so a true lone
+    /// surrogate becomes U+FFFD; a *pair* combines into the character it spells,
+    /// which is what makes `"\u{dbff}\u{dfff}"` and `"\u{10ffff}"` the same string.
     fn scan_escape(
+        &mut self,
+        out: &mut String,
+        start: Position,
+        context: EscapeContext,
+    ) -> Result<()> {
+        self.scan_escape_inner(out, start, context)
+    }
+
+    /// Emit any half-finished surrogate as U+FFFD.
+    ///
+    /// Called when the string ends: a high half with no low half after it cannot be
+    /// represented, so it degrades to the replacement character, matching what an
+    /// engine sees when it converts the unpaired code unit to UTF-8.
+    fn flush_pending_surrogate(&mut self, out: &mut String) {
+        if self.pending_high_surrogate.take().is_some() {
+            out.push('\u{fffd}');
+        }
+    }
+
+    /// Append a decoded code unit, combining a surrogate pair written as two escapes.
+    fn push_code_unit(&mut self, out: &mut String, value: u32) {
+        const HIGH_START: u32 = 0xd800;
+        const HIGH_END: u32 = 0xdc00;
+        const LOW_END: u32 = 0xe000;
+        if let Some(high) = self.pending_high_surrogate.take() {
+            if (HIGH_START..HIGH_END).contains(&value) || !(HIGH_START..LOW_END).contains(&value) {
+                // A second high half, or a normal character: the first one stands
+                // alone. Nothing can rescue it, so it becomes the replacement.
+                out.push('\u{fffd}');
+            } else {
+                let combined = 0x10000 + ((high - HIGH_START) << 10) + (value - HIGH_START - 0x400);
+                out.push(char::from_u32(combined).unwrap_or('\u{fffd}'));
+                return;
+            }
+        }
+        if (HIGH_START..HIGH_END).contains(&value) {
+            self.pending_high_surrogate = Some(value);
+        } else if (HIGH_END..LOW_END).contains(&value) {
+            // A lone low half.
+            out.push('\u{fffd}');
+        } else {
+            out.push(char::from_u32(value).unwrap_or('\u{fffd}'));
+        }
+    }
+
+    fn scan_escape_inner(
         &mut self,
         out: &mut String,
         start: Position,
@@ -730,8 +795,8 @@ impl<'a> Lexer<'a> {
                 out.push(char::from_u32(value).expect("value <= 0xff"));
             }
             'u' => {
-                let ch = self.scan_unicode_escape_body(start)?;
-                out.push(ch);
+                let unit = self.scan_unicode_escape_body(start)?;
+                self.push_code_unit(out, unit);
             }
             c if is_line_terminator(c) => {
                 // Escaped line terminator: contributes nothing (line

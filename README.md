@@ -26,7 +26,8 @@
 | M1b | AST + 解析器 + early errors + 作用域分析 | ✅ |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 🚧 核心子集已通过差分（见下） |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ✅ `qjs` 能执行 JS |
-| M4–M11 | 内建库、ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
+| M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Reflect） | ✅ `test_builtin.js` 的 M4 部分 229/237 语句通过 |
+| M5–M11 | ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
 | M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
 
 ## 已交付的结构
@@ -44,10 +45,11 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**尚未发布到 crates.io**。M3 的门槛（`qjs` 能真正执行 JS）已经跨过，但内建库还是空的
-——`[1,2,3].map(…)`、`JSON.stringify`、`String`、`Object` 都还不存在，装一个叫
-`quickjs` 的 crate 却发现 `Object` 未定义，与"名字和行为相符"这条尺子仍然冲突。
-发布计划见 [`docs/requirements.md` 的发布策略](docs/requirements.md)。
+**尚未发布到 crates.io**。M3（能执行 JS）与 M4（标准库第一波）都已达成：
+`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、
+`Reflect` 与错误类均可用，`qjs` 能跑通参考实现的 `test_builtin.js` 中 M4 覆盖的部分。
+剩下的已知缺口（`Error.stack`、`Date`、`RegExp`、`Symbol`、`Map`/`Set`、生成器）
+记在 `docs/requirements.md`，发布计划见同处的「发布策略」。
 
 ## 开发
 

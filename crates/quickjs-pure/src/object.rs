@@ -101,12 +101,26 @@ pub enum Callable {
         /// The captured environment.
         env: Gc<ClosureEnv>,
     },
+    /// A function produced by `Function.prototype.bind`.
+    ///
+    /// This is a variant rather than a native function carrying the state in
+    /// properties because the state is not observable: `bind` has to remember its
+    /// target, `this` and leading arguments, and a native trampoline cannot capture
+    /// them.
+    Bound {
+        /// The function being called.
+        target: Value,
+        /// The `this` every call uses.
+        this: Value,
+        /// Arguments prepended to every call's own.
+        args: Vec<Value>,
+    },
     /// A built-in implemented in Rust.
+    ///
+    /// The `name` and `length` a script observes are ordinary properties on the
+    /// function object, not fields here: they are writable (`f.name = "x"` works)
+    /// and would otherwise be two sources of truth.
     Native {
-        /// The name reported by `Function.prototype.name`.
-        name: &'static str,
-        /// How many arguments the function declares.
-        length: u32,
         /// The implementation.
         func: NativeFn,
     },
@@ -118,6 +132,13 @@ impl Trace for Callable {
             Callable::Bytecode { code, env } => {
                 tracer.visit(code);
                 tracer.visit(env);
+            }
+            Callable::Bound { target, this, args } => {
+                target.trace(tracer);
+                this.trace(tracer);
+                for argument in args {
+                    argument.trace(tracer);
+                }
             }
             Callable::Native { .. } => {}
         }
@@ -227,6 +248,16 @@ pub struct ObjectData {
     pub props: Vec<(String, Property)>,
     /// What kind of object this is.
     pub kind: ObjectKind,
+    /// Whether new properties may be added. `Object.preventExtensions`, `seal` and
+    /// `freeze` clear it, and nothing clears it back.
+    pub extensible: bool,
+    /// Whether array elements may be replaced.
+    ///
+    /// Elements are not in the property table, so their attributes need somewhere to
+    /// live; `Object.freeze` clears this and `Object.isFrozen` reads it. A *single*
+    /// non-writable element is recorded in the property table instead, which is what
+    /// `Object.defineProperty(a, "3", {configurable: false})` does.
+    pub elements_writable: bool,
 }
 
 impl Trace for ObjectData {
@@ -256,6 +287,8 @@ impl JsObject {
                 proto,
                 props: Vec::new(),
                 kind,
+                extensible: true,
+                elements_writable: true,
             }),
         }
     }
@@ -297,7 +330,11 @@ impl JsObject {
         f(&mut self.data.borrow_mut())
     }
 
-    /// Whether this object is callable.
+    /// Whether this object can be called.
+    ///
+    /// Covers every [`Callable`] variant, `Bound` included: `typeof bound ===
+    /// "function"` and `bound()` works, so from a script's point of view a bound
+    /// function is a function.
     pub fn is_callable(&self) -> bool {
         matches!(self.data.borrow().kind, ObjectKind::Function(_))
     }
@@ -352,13 +389,16 @@ impl JsObject {
         }
     }
 
-    /// Store into an array, extending it with `undefined` if `index` is past the
-    /// end, and return whether the write happened.
+    /// Store into an array, and return whether the write happened.
+    ///
+    /// The gap an out-of-range store leaves behind is filled with [`Value::Hole`], not
+    /// `undefined`: `a = [1]; a[3] = 4` has holes at 1 and 2, which `forEach` skips
+    /// and the debug printer reports. A store *of* `undefined` is a real element.
     pub fn array_set(&self, index: usize, value: Value) -> bool {
         match &mut self.data.borrow_mut().kind {
             ObjectKind::Array { elements } => {
                 if index >= elements.len() {
-                    elements.resize(index + 1, Value::Undefined);
+                    elements.resize(index + 1, Value::Hole);
                 }
                 elements[index] = value;
                 true
@@ -367,11 +407,41 @@ impl JsObject {
         }
     }
 
-    /// Set the length of an array, truncating or extending with `undefined`.
+    /// Store an element, honouring its attributes, reporting whether it happened.
+    ///
+    /// Array methods that write back (`sort`, `reverse`, `splice`, …) use this rather
+    /// than [`Self::array_set`]: the spec has them go through `[[Set]]`, so a frozen
+    /// element makes them throw instead of being quietly overwritten.
+    pub fn array_store(&self, index: usize, value: Value) -> bool {
+        if self.elements_writable() {
+            return self.array_set(index, value);
+        }
+        if self.element_attributes(index as u32).is_some() {
+            // A recorded descriptor decides on its own.
+            return !self.element_is_locked(index as u32) && self.array_set(index, value);
+        }
+        false
+    }
+
+    /// Store `value` as a plain element without creating holes, used by `push`.
+    pub fn array_push_hole(&self) -> bool {
+        match &mut self.data.borrow_mut().kind {
+            ObjectKind::Array { elements } => {
+                elements.push(Value::Hole);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Set the length of an array, truncating or extending with holes.
+    ///
+    /// `a.length = 5` on a two-element array leaves three holes, so the fill value is
+    /// [`Value::Hole`] rather than `undefined`.
     pub fn array_set_length(&self, length: usize) -> bool {
         match &mut self.data.borrow_mut().kind {
             ObjectKind::Array { elements } => {
-                elements.resize(length, Value::Undefined);
+                elements.resize(length, Value::Hole);
                 true
             }
             _ => false,
@@ -439,6 +509,43 @@ impl JsObject {
             }
             None => true,
         }
+    }
+
+    /// Whether new properties may be added.
+    pub fn is_extensible(&self) -> bool {
+        self.data.borrow().extensible
+    }
+
+    /// Make the object non-extensible.
+    pub fn set_extensible(&self, extensible: bool) {
+        self.data.borrow_mut().extensible = extensible;
+    }
+
+    /// Whether array elements may be replaced.
+    pub fn elements_writable(&self) -> bool {
+        self.data.borrow().elements_writable
+    }
+
+    /// Make array elements read-only, as `Object.freeze` does.
+    pub fn set_elements_writable(&self, writable: bool) {
+        self.data.borrow_mut().elements_writable = writable;
+    }
+
+    /// The attributes recorded for an array index, if `defineProperty` set any.
+    pub fn element_attributes(&self, index: u32) -> Option<Property> {
+        self.own_property(&index.to_string())
+    }
+
+    /// Whether a store at `index` would be rejected.
+    ///
+    /// An element is locked either by `Object.freeze` on the whole object or by a
+    /// non-configurable, non-writable descriptor recorded for that one index.
+    pub fn element_is_locked(&self, index: u32) -> bool {
+        if !self.elements_writable() {
+            return true;
+        }
+        self.element_attributes(index)
+            .is_some_and(|property| !property.writable && !property.configurable)
     }
 
     /// The own property names, in definition order.

@@ -273,13 +273,14 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 
 ### 发布策略
 
-**结论：M4 让标准库可用之后再发布**（决策 5，由 M3 的完成修订）。
+**结论：发布门槛（M4）已跨过，可以发；具体时点待定**（决策 5，经 M3/M4 两次修订）。
 
-M3 交付后，`qjs -e 'print(1+1)'` 真的打印 `2`，深递归、闭包、`for-of`、`try/finally`
-都能跑，原先"装上来什么都跑不了"的理由消失了。但同一把尺子给出了新的边界：
-`Object is not defined`、`[1,2,3].map(…)` 不存在、没有 `JSON`、没有 `String`。
-**一个叫 `quickjs` 的 crate 连 `Object` 都没有，仍然属于名字与行为不符**，所以发布
-线移到 M4 内建库第一波之后。理由与硬约束：
+M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`、`JSON.stringify`、
+`Math.sumPrecise`、`Reflect.apply`、`Object.freeze` 的冻结语义都按参考实现的行为工作，
+参考实现的 `test_builtin.js` 中 M4 覆盖的 237 条语句里有 229 条通过。原先"连 `Object`
+都没有"的理由消失了，发布线可以往前移。**剩余的已知缺口**（`Error.stack`、`Date`、
+`RegExp`、`Symbol`、`Map`/`Set`、生成器/async、`eval` 的直接作用域）应当写进发布说明，
+而不是假装不存在。理由与硬约束：
 
 - **名字被占**：`quickjs`（danclive，2019，FFI 包装）、`qjs`（flier，2019，`qjs-sys`
   绑定）都在 crates.io 上；`quickjs-rs` 亦被占用（2026-04 三个版本全被 yank，

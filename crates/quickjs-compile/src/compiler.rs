@@ -292,6 +292,13 @@ struct FnState {
     /// an assignment whose result is unused emits nothing extra. The expression
     /// statement then has nothing to drop.
     no_value: bool,
+    /// Whether a label was placed since the last instruction was emitted.
+    ///
+    /// The `put`/`get` fold is only valid when the two are adjacent in the final
+    /// stream; a label in between means a jump can land on the read, so the store has
+    /// to keep consuming its value. A flag is enough and avoids having to reason about
+    /// which index a label recorded.
+    label_since_insn: bool,
     /// Whether the value of the expression being compiled is thrown away.
     ///
     /// Only an expression *statement* discards its value, and only the outermost
@@ -316,6 +323,8 @@ struct FnState {
     /// global properties rather than locals, which is why they show up as
     /// closure variables with `[global_decl]`.
     is_script: bool,
+    /// Whether the function is an arrow, which never gets its own `arguments`.
+    is_arrow: bool,
     /// Whether the code emitted so far leaves the program's result on the stack.
     /// The reference tracks this for the hidden `<ret>` local of an eval script.
     leaves_value: bool,
@@ -352,6 +361,7 @@ impl FnState {
             current_block: 0,
             var_block: Vec::new(),
             no_value: false,
+            label_since_insn: false,
             discard_value: false,
             body_block: 0,
             block_heads: Vec::new(),
@@ -362,6 +372,7 @@ impl FnState {
             line: 1,
             column: 1,
             is_script: false,
+            is_arrow: false,
             leaves_value: false,
             stmt_depth: 0,
             hoisted: Vec::new(),
@@ -459,6 +470,7 @@ impl Compiler {
     }
 
     fn emit(&mut self, op: Opcode, operands: &[Op]) {
+        self.state().label_since_insn = false;
         self.state().insns.push(Insn::Fixed {
             op,
             operands: operands.to_vec(),
@@ -479,6 +491,12 @@ impl Compiler {
         self.state().leaves_value = false;
     }
 
+    /// Whether `name` is a local or argument slot rather than a global.
+    fn is_slot(&self, name: &str) -> bool {
+        self.cur().vars.iter().any(|v| v.name == name)
+            || self.cur().args.iter().any(|a| a.name == name)
+    }
+
     fn emit_var(&mut self, action: VarAction, name: &str) {
         // Peephole: `put_x v` followed by `get_x v` becomes `set_x v`, which
         // stores and keeps the value in one instruction. The reference does this
@@ -496,14 +514,15 @@ impl Compiler {
         // condition re-reads it — and folding across the label would make the
         // condition compare whatever the previous iteration left on the stack.
         if action == VarAction::Get {
-            let is_slot = self.cur().vars.iter().any(|v| v.name == name)
-                || self.cur().args.iter().any(|a| a.name == name);
-            let at_label = {
-                let state = self.state();
-                let here = state.insns.len();
-                state.labels.contains(&Some(here))
-            };
+            let is_slot = self.is_slot(name);
+            let at_label = std::mem::take(&mut self.state().label_since_insn);
+            //
+            // `arguments` is excluded because the reference treats it as a special
+            // binding: it is initialised once and read many times, and folding its
+            // initialisation into a `set_` would leave the object on the stack where
+            // the reference leaves nothing.
             if is_slot
+                && name != "arguments"
                 && !at_label
                 && let Some(Insn::Var {
                     action: previous,
@@ -518,6 +537,7 @@ impl Compiler {
             }
         }
         let block = self.cur().current_block;
+        self.state().label_since_insn = false;
         self.state().insns.push(Insn::Var {
             action,
             name: name.to_string(),
@@ -533,6 +553,7 @@ impl Compiler {
 
     fn place_label(&mut self, label: Label) {
         let index = self.cur().insns.len();
+        self.state().label_since_insn = true;
         self.state().labels[label.0 as usize] = Some(index);
     }
 
@@ -788,8 +809,18 @@ impl Compiler {
                             self.var_decl(decl)?;
                         }
                         ForInit::Expr(expr) => {
-                            self.expr(expr)?;
-                            self.emit(Opcode::Drop, &[]);
+                            // The head's value is discarded. Saying so lets an
+                            // assignment store with `put` instead of `dup`+`put`, which
+                            // is what the reference emits — and the difference matters:
+                            // a `dup`/`drop` pair around the store gives the peephole a
+                            // chance to fold the store into the *condition's* read.
+                            self.state().discard_value = true;
+                            let result = self.expr(expr);
+                            self.state().discard_value = false;
+                            result?;
+                            if !std::mem::take(&mut self.state().no_value) {
+                                self.emit(Opcode::Drop, &[]);
+                            }
                         }
                     }
                 }
@@ -806,8 +837,13 @@ impl Compiler {
                 self.loop_body(body, labels, cont, end)?;
                 self.place_label(cont);
                 if let Some(update) = update {
-                    self.expr(update)?;
-                    self.emit(Opcode::Drop, &[]);
+                    self.state().discard_value = true;
+                    let result = self.expr(update);
+                    self.state().discard_value = false;
+                    result?;
+                    if !std::mem::take(&mut self.state().no_value) {
+                        self.emit(Opcode::Drop, &[]);
+                    }
                 }
                 self.emit_jump(Opcode::Goto, top, &[]);
                 self.place_label(end);
@@ -1142,6 +1178,62 @@ impl Compiler {
         // A `var` belongs to the function scope, never to the enclosing block.
         state.var_block.push(0);
         state.vars.push(def);
+    }
+
+    /// Give the function an `arguments` binding if its body mentions one.
+    ///
+    /// The check runs on the *instruction* stream rather than the AST: by this point
+    /// every reference has become an `Insn::Var`, so scanning is exact and needs no
+    /// AST walker. Declaring lazily matters for more than tidiness — always declaring
+    /// would renumber every later local slot and stop the bytecode matching the
+    /// reference, which only adds the binding when the body uses it.
+    ///
+    /// `arguments` is a local, initialised at the top of the body by
+    /// `special_object`; that is the reference's shape, so the disassembly agrees.
+    fn provide_arguments(&mut self) {
+        let current = self.stack.len() - 1;
+        if self.stack[current].is_script || self.stack[current].is_arrow {
+            return;
+        }
+        let mentions = self.stack[current]
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Var { name, .. } if name == "arguments"));
+        if !mentions
+            || self.stack[current]
+                .vars
+                .iter()
+                .any(|v| v.name == "arguments")
+        {
+            return;
+        }
+        let slot = self.stack[current].vars.len() as u32;
+        self.declare_var("arguments", VarDef::var("arguments"));
+        // The binding has to be initialised before anything reads it, so the two
+        // instructions go in front — which shifts every label that has been placed.
+        let init = [
+            Insn::Fixed {
+                op: Opcode::SpecialObject,
+                // 1 is `mapped arguments`, which is what sloppy mode uses; the
+                // mapping itself (writes reaching the parameters) is not implemented,
+                // so the object behaves like the strict one.
+                operands: vec![Op::Int(if self.stack[current].strict { 0 } else { 1 })],
+            },
+            Insn::Var {
+                action: VarAction::Put,
+                name: "arguments".to_string(),
+                block: 0,
+            },
+        ];
+        let inserted = init.len();
+        for (index, instruction) in init.into_iter().enumerate() {
+            self.stack[current].insns.insert(index, instruction);
+        }
+        for placed in self.stack[current].labels.iter_mut().flatten() {
+            *placed += inserted;
+        }
+        self.stack[current].label_since_insn = true;
+        let _ = slot;
     }
 
     /// Record a top-level script declaration as a global.
@@ -1886,6 +1978,7 @@ impl Compiler {
             ExprKind::OptionalChain(inner) => self.optional_chain(inner)?,
             ExprKind::Array { elements } => self.array_literal(elements, expr.span)?,
             ExprKind::Object(properties) => self.object_literal(properties, expr.span)?,
+            ExprKind::Template(template) => self.template_literal(template)?,
             ExprKind::New { callee, arguments } => {
                 // `new C(args)` compiles to `C; dup; args…; call_constructor n`.
                 // The `dup` is not redundant: `call_constructor` takes the
@@ -1914,6 +2007,46 @@ impl Compiler {
                     "this expression form is not supported by the compiler yet",
                     expr.span,
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile `a${x}b`.
+    ///
+    /// A template is a `+` chain built left to right: the leading chunk (or an empty
+    /// string when the template starts with a substitution), then for each
+    /// substitution its value, `to_propkey` and `add`, then the following chunk when
+    /// it is not empty. `to_propkey` is what makes a number or object substitute the
+    /// way `ToString` would while leaving the result a string for `add` to
+    /// concatenate.
+    ///
+    /// The chunk is an atom rather than a constant-pool string, because a non-empty
+    /// chunk always lands where a value is pushed and `push_atom_value` is the
+    /// instruction the reference uses for it; the empty first chunk has its own
+    /// zero-byte form.
+    fn template_literal(&mut self, template: &TemplateLiteral) -> Result<(), SyntaxError> {
+        let first = template.quasis.first();
+        match first.and_then(|quasi| quasi.cooked.clone()) {
+            Some(text) if !text.is_empty() => {
+                self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(&text))]);
+            }
+            // Either the template begins with a substitution, or the chunk is
+            // empty — in both cases the chain needs a string to start from.
+            _ => self.emit(Opcode::PushEmptyString, &[]),
+        }
+        for (index, expression) in template.expressions.iter().enumerate() {
+            self.expr(expression)?;
+            self.emit(Opcode::ToPropkey, &[]);
+            self.emit(Opcode::Add, &[]);
+            if let Some(text) = template
+                .quasis
+                .get(index + 1)
+                .and_then(|quasi| quasi.cooked.clone())
+                && !text.is_empty()
+            {
+                self.emit(Opcode::PushAtomValue, &[Op::Atom(Atom::from_text(&text))]);
+                self.emit(Opcode::Add, &[]);
             }
         }
         Ok(())
@@ -2088,6 +2221,12 @@ impl Compiler {
                     self.optional_guard(end);
                 }
                 match property {
+                    // `.length` has its own opcode. The reference emits it for every
+                    // object, not just arrays, so a name-based rule is right and
+                    // cheaper than the generic field read.
+                    MemberProp::Ident(name) if name.name == "length" => {
+                        self.emit(Opcode::GetLength, &[]);
+                    }
                     MemberProp::Ident(name) => {
                         self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text(&name.name))]);
                     }
@@ -2340,7 +2479,17 @@ impl Compiler {
                     AssignOp::Assign => {
                         self.expr(value)?;
                         self.set_name_if_anonymous(value, &name.name);
-                        self.emit(Opcode::Dup, &[]);
+                        // A discarded store to a *slot* consumes its value, so no copy
+                        // is needed. A global store goes through `put_var`, which the
+                        // reference always pairs with a `dup` — matching it keeps the
+                        // bytecode identical. Getting this wrong is not only an extra
+                        // instruction: a stray copy gives the peephole a chance to fold
+                        // the store into an unrelated later read.
+                        let slot = self.is_slot(&name.name);
+                        if keep || !slot {
+                            self.emit(Opcode::Dup, &[]);
+                        }
+                        self.state().no_value = !keep && slot;
                         self.emit_var(VarAction::Put, &name.name);
                     }
                     AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
@@ -2486,6 +2635,13 @@ impl Compiler {
                 argument.span,
             ));
         };
+        // A discarded `i++` keeps the plain `get`/`post_inc`/`put` shape. The
+        // reference's `inc_loc` folds those three into one, but it does so only in some
+        // positions (a `for` update and not a bare statement, and never for a lexical
+        // binding), so emitting it unconditionally would move *away* from its output.
+        // The instruction is equivalent either way; matching the reference matters more
+        // than saving two instructions.
+        let _ = !std::mem::take(&mut self.state().discard_value);
         self.emit_var(VarAction::Get, &name.name);
         let instruction = match (op, prefix) {
             (UpdateOp::Increment, true) => Opcode::Inc,
@@ -2625,6 +2781,7 @@ impl Compiler {
             kind,
         );
         state.strict = self.cur().strict;
+        state.is_arrow = func.is_arrow;
         state.line = func.span.start.line;
         state.column = func.span.start.column;
         // A function body has no hidden `<ret>` local; the value comes back on
@@ -2709,6 +2866,7 @@ impl Compiler {
     /// Resolve and assemble the function on top of the compiler stack, then pop
     /// it.
     fn finish_current(&mut self) -> CompiledFunction {
+        self.provide_arguments();
         let mut resolved = resolve(&mut self.stack);
         // Captured bindings need a reference cell; the count goes in the header so
         // the runtime knows how many cells to allocate on entry.
@@ -4194,9 +4352,23 @@ fn encode_operands(
     };
     match info.format {
         None | NoneInt | NoneLoc | NoneArg | NoneVarRef | Npopx => {}
-        U8 | Loc8 | Const8 => {
+        U8 | Const8 => {
             if let Some(value) = operands.first().and_then(operand_uint) {
                 code.push(value as u8);
+            }
+        }
+        // The narrow slot forms (`inc_loc8` and friends) take a slot operand just
+        // like their wide counterparts, only one byte wide.
+        Loc8 => {
+            if let Some(Op::Slot(slot)) = operands.first() {
+                let index = match slot {
+                    Slot::Arg(i)
+                    | Slot::Loc(i)
+                    | Slot::VarRef(i)
+                    | Slot::Global(i)
+                    | Slot::GlobalDecl(i) => *i,
+                };
+                code.push(index as u8);
             }
         }
         I8 => {
