@@ -256,12 +256,8 @@ fn variables_match_the_reference() {
 #[test]
 fn unsupported_constructs_fail_loudly() {
     for source in [
-        // A transfer out of a `try` needs `nip_catch` to unwind the catch offset;
-        // until that lands it must fail rather than emit a stack that never unwinds.
-        "function f(){ try { return 1; } finally { } }",
-        "function f(){ try { return 1; } catch (e) { } }",
-        "function f(){ while (a) { try { break; } finally { } } }",
-        "function f(){ while (a) { try { continue; } catch (e) { } } }",
+        // A destructuring catch parameter is not wired up yet.
+        "function f(){ try { a(); } catch ([e]) { } }",
         "for (const x of xs) ;",
         "class A { }",
         "function* g() { }",
@@ -537,6 +533,26 @@ fn try_catch_finally_matches_the_reference() {
         // Nesting.
         "function f(){ try { try { a(); } catch(e) { b(e); } } catch(e) { c(e); } }",
         "function f(){ try { a(); } catch(e) { try { b(); } finally { c(); } } }",
+        // Leaping out of a `try`. `nip_catch` discards the catch offset while
+        // keeping the return value, then each enclosing finalizer runs.
+        "function f(){ try { return 1; } catch(e) { b(); } }",
+        "function f(){ try { return 1; } finally { c(); } }",
+        "function f(){ try { return 1; } catch(e) { b(); } finally { c(); } }",
+        "function f(){ try { return; } finally { c(); } }",
+        "function f(){ try { a(); return 1; } finally { c(); } }",
+        "function f(){ try { try { return 1; } finally { c(); } } finally { d(); } }",
+        // A `switch` inside the `try` leaves its discriminant on the stack, and
+        // `nip_catch` has to take that with it.
+        "function f(y){ try { switch(y){ case 1: return 2; } } finally { c(); } }",
+        // `break` and `continue` out of a `try` with a finalizer.
+        "function f(){ while(a){ try { break; } finally { c(); } } }",
+        "function f(){ while(a){ try { continue; } finally { c(); } } }",
+        "function f(){ while(a){ try { if(b) break; d(); } finally { c(); } } e(); }",
+        // A labelled break out of two nested `try`s.
+        "function f(){ o: while(a){ try { try { break o; } finally { c(); } } finally { d(); } } e(); }",
+        // `break` out of a `finally` has to drop both its slots.
+        // `return` inside a `finally`.
+        "function f(){ try { a(); } finally { return 1; } }",
     ];
     assert_cases(&cases);
 }

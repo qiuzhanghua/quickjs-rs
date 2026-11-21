@@ -68,7 +68,7 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | TDZ/作用域 | 同上 + 14 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
 | break/continue/标签 | 同上 | 24 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
 | switch | 同上 | 20 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
-| try/catch/finally | 同上 | 13 条用例一致；catch 参数与三个作用域、异常链、空 finally 的 gosub 消除全对 |
+| try/catch/finally | 同上 | 25 条用例一致；异常链、三个作用域、空 finally 消除、跨 try 的 return/break/continue 全对 |
 
 ### M2 已知差距
 
@@ -78,7 +78,8 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 当前已覆盖 `break`/`continue` 与标签（含多层标签链、跨层 `break outer`）、`switch`
 （fallthrough、`default` 写在任意位置、空 `case` 链、`break`）、`try`/`catch`/`finally`
-（异常边、`gosub`/`ret` 共享 finally、catch 参数与三个独立作用域），以及 TDZ 与作用域链：`let`/`const` 在作用域入口被标记未初始化（`set_loc_uninitialized`），
+（异常边、`gosub`/`ret` 共享 finally、catch 参数与三个独立作用域、跨 try 边界的
+`return`/`break`/`continue` 逐层展开 finally），以及 TDZ 与作用域链：`let`/`const` 在作用域入口被标记未初始化（`set_loc_uninitialized`），
 读取走 `get_loc_check`、写入走 `put_loc_check`/`set_loc_check`，捕获的绑定分配引用格并在
 离开块时 `close_loc`，函数声明在作用域入口实例化，`global` 访问通过 `global_ref` 逐层转发，
 `return` 之后的死代码不编译。
@@ -87,12 +88,11 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 `for-in`/`for-of`、解构、类、生成器与 async（需要状态机）、
 `with`、模块、可选链、数组字面量与对象字面量、`??`。
 
-`try` 里跨越的 `return`/`break`/`continue` 也尚未支持（需要 `nip_catch` 展开 catch
-偏移，有 finally 时还要先跑它），目前返回明确的 `SyntaxError`。
+
 
 ### 已知优化差距
 
-有一个 `#[ignore]` 的差分测试列出了 16 个**语义正确但字节码不同**的用例，全部来自
+有一个 `#[ignore]` 的差分测试列出了 15 个**语义正确但字节码不同**的用例，全部来自
 参考实现的优化层，与本项目的功能无关：
 
 - `fold_constants`：常量条件（`while(1)`、`if(0)`）应删除测试指令

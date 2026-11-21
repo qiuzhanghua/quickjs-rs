@@ -673,3 +673,100 @@ fn an_empty_finally_leaves_no_subroutine() {
         disassemble(inner)
     );
 }
+
+#[test]
+fn a_return_through_a_try_unwinds_the_catch_offset() {
+    // The catch offset sits on the value stack for the whole `try`. A `return`
+    // inside one cannot just return: it has to discard the offset, keeping the
+    // value, and run any finalizer. `nip_catch` is what does the first part.
+    let compiled = compile("function f(){ try { return 1; } catch(e) { b(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let ops: Vec<Opcode> = instructions
+        .iter()
+        .map(|(_, i)| general_form(i.op))
+        .collect();
+    let nip = ops
+        .iter()
+        .position(|op| *op == Opcode::NipCatch)
+        .unwrap_or_else(|| panic!("no nip_catch\n{}", disassemble(inner)));
+    assert_eq!(
+        ops.get(nip + 1),
+        Some(&Opcode::Return),
+        "nip_catch must come immediately before the return\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn every_finalizer_on_the_way_out_runs() {
+    // Two nested `try`s with finalizers, and a `return` inside both: each layer
+    // needs its own `nip_catch` and its own `gosub`.
+    let compiled =
+        compile("function f(){ try { try { return 1; } finally { c(); } } finally { d(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let count = |op: Opcode| {
+        instructions
+            .iter()
+            .filter(|(_, i)| general_form(i.op) == op)
+            .count()
+    };
+    // Two finalizers, each entered from the normal path, the propagating path and
+    // the return path.
+    assert_eq!(
+        count(Opcode::NipCatch),
+        2,
+        "one per enclosing finalizer\n{}",
+        disassemble(inner)
+    );
+    assert_eq!(
+        count(Opcode::Ret),
+        2,
+        "one copy each\n{}",
+        disassemble(inner)
+    );
+    // Two paths each: the return unwinding out of the inner `try` reaches the inner
+    // finalizer directly and the outer one after it, and an exception propagating
+    // from either the `try` or the finalizer reaches it through the rethrow path.
+    assert_eq!(
+        count(Opcode::Gosub),
+        4,
+        "two finalizers, each reached by a return and by a propagation\n{}",
+        disassemble(inner)
+    );
+}
+
+#[test]
+fn leaving_a_switch_inside_a_try_discards_the_discriminant() {
+    // The discriminant stays on the stack under the catch offset, so the exit path
+    // has to discard both. `nip_catch` rewinds to just above the innermost catch
+    // offset, which takes the discriminant with it.
+    let compiled =
+        compile("function f(y){ try { switch(y){ case 1: return 2; } } finally { c(); } }");
+    let inner = functions(&compiled)
+        .into_iter()
+        .find(|f| f.name == "f")
+        .unwrap();
+    let instructions = inner.instructions();
+    let nip = instructions
+        .iter()
+        .position(|(_, i)| general_form(i.op) == Opcode::NipCatch)
+        .unwrap_or_else(|| panic!("no nip_catch\n{}", disassemble(inner)));
+    let ops: Vec<Opcode> = instructions
+        .iter()
+        .map(|(_, i)| general_form(i.op))
+        .collect();
+    assert_eq!(
+        ops.get(nip + 1),
+        Some(&Opcode::Gosub),
+        "the finalizer runs after the unwind\n{}",
+        disassemble(inner)
+    );
+}

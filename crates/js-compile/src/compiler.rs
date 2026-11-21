@@ -112,11 +112,26 @@ struct JumpTarget {
     /// loop gives none; `a: b: for(;;)` gives two, because both labels name the
     /// same statement and `break a` must reach the same place as `break b`.
     names: Vec<String>,
-    /// Where `break` lands.
-    break_label: Label,
-    /// Where `continue` lands. `None` for a labelled non-loop statement, which
-    /// `break` may leave but `continue` may not target.
+    /// Where `break` lands. `None` for a construct `break` may only leave, not
+    /// target — a `try`, whose entry exists purely to unwind.
+    break_label: Option<Label>,
+    /// Where `continue` lands. `None` for anything that is not a loop.
     continue_label: Option<Label>,
+    /// Stack slots to discard when control leaves this construct by a jump.
+    ///
+    /// Both `switch` and `try` leave something on the value stack for the duration
+    /// of the construct — the discriminant, or the `catch` offset — and a jump out
+    /// has to take it with it. A loop leaves nothing.
+    drop_count: u32,
+    /// The finalizer to run when control leaves this construct.
+    ///
+    /// Set on a `try` even when it has no `finally`: the label is always emitted and
+    /// the empty-subroutine removal cleans up afterwards, so the code that unwinds
+    /// does not have to know whether a finalizer exists.
+    finally_label: Option<Label>,
+    /// Whether this is a labelled non-loop statement, which an unlabelled `break`
+    /// does not reach.
+    is_regular_stmt: bool,
 }
 
 /// Which part of a `try` statement a block key refers to.
@@ -638,15 +653,7 @@ impl Compiler {
                 self.emit_scope_leave(for_key);
                 self.state().current_block = for_parent;
             }
-            StmtKind::Return(value) => match value {
-                Some(expr) => {
-                    self.expr(expr)?;
-                    self.emit(Opcode::Return, &[]);
-                }
-                None => {
-                    self.emit(Opcode::ReturnUndef, &[]);
-                }
-            },
+            StmtKind::Return(value) => self.return_stmt(value.as_deref())?,
             StmtKind::Throw(expr) => {
                 self.expr(expr)?;
                 self.emit(Opcode::Throw, &[]);
@@ -704,6 +711,39 @@ impl Compiler {
                     stmt.span,
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Compile `return`, running every enclosing finalizer on the way out.
+    ///
+    /// `nip_catch` is what makes this possible: it discards everything on the stack
+    /// down to and including the `catch` offset while keeping the return value on
+    /// top, so the frame the finalizer sees has the same shape as on the normal
+    /// path.
+    fn return_stmt(&mut self, value: Option<&Expr>) -> Result<(), SyntaxError> {
+        let mut has_value = value.is_some();
+        if let Some(expr) = value {
+            self.expr(expr)?;
+        }
+        let targets = self.cur().jump_targets.clone();
+        for target in targets.iter().rev() {
+            let Some(finally) = target.finally_label else {
+                continue;
+            };
+            if !has_value {
+                // The finalizer expects a value to pass through; with nothing to
+                // return, `undefined` stands in.
+                self.emit(Opcode::Undefined, &[]);
+                has_value = true;
+            }
+            self.emit(Opcode::NipCatch, &[]);
+            self.emit_jump(Opcode::Gosub, finally, &[]);
+        }
+        if has_value {
+            self.emit(Opcode::Return, &[]);
+        } else {
+            self.emit(Opcode::ReturnUndef, &[]);
         }
         Ok(())
     }
@@ -957,8 +997,12 @@ impl Compiler {
     ) -> Result<(), SyntaxError> {
         self.push_jump_target(JumpTarget {
             names: labels.to_vec(),
-            break_label,
+            break_label: Some(break_label),
             continue_label: Some(continue_label),
+            // A loop leaves nothing of its own on the value stack.
+            drop_count: 0,
+            finally_label: None,
+            is_regular_stmt: false,
         });
         let result = self.stmt(body);
         self.pop_jump_target();
@@ -973,45 +1017,59 @@ impl Compiler {
         self.state().jump_targets.pop();
     }
 
-    /// The target a `break`/`continue` refers to: the innermost one, or the
-    /// nearest enclosing one with that label.
-    fn jump_target(&self, label: Option<&Ident>) -> Option<&JumpTarget> {
-        let targets = &self.cur().jump_targets;
-        match label {
-            None => targets.last(),
-            Some(label) => targets
-                .iter()
-                .rev()
-                .find(|target| target.names.contains(&label.name)),
-        }
-    }
-
     fn control_transfer(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
         let (label, is_break) = match &stmt.kind {
             StmtKind::Break(label) => (label.as_ref(), true),
             StmtKind::Continue(label) => (label.as_ref(), false),
             _ => unreachable!("control_transfer is only called for break and continue"),
         };
-        let Some(target) = self.jump_target(label) else {
-            // The parser rejects a break/continue with no target, so reaching
-            // here means the compiler's own bookkeeping is wrong.
-            return Err(SyntaxError::new(
-                "break/continue has no enclosing loop",
-                stmt.span,
-            ));
-        };
-        let destination = if is_break {
-            target.break_label
-        } else {
-            match target.continue_label {
-                Some(label) => label,
-                None => {
-                    return Err(SyntaxError::new("continue must target a loop", stmt.span));
-                }
+
+        // Walk outward from the innermost construct. Everything considered before
+        // the match is a construct control is leaving, and leaving it has a cost:
+        // its stack slots go, and its finalizer runs.
+        let targets = self.cur().jump_targets.clone();
+        for target in targets.iter().rev() {
+            let destination = match (label, is_break) {
+                // An unlabelled `break` skips a labelled non-loop statement: `break`
+                // may name one, but the bare form only means "leave the loop".
+                (None, true) => target.break_label.filter(|_| !target.is_regular_stmt),
+                (None, false) => target.continue_label,
+                (Some(name), true) => target
+                    .break_label
+                    .filter(|_| target.names.contains(&name.name)),
+                (Some(name), false) => target
+                    .continue_label
+                    .filter(|_| target.names.contains(&name.name)),
+            };
+
+            if let Some(destination) = destination {
+                self.emit_jump(Opcode::Goto, destination, &[]);
+                return Ok(());
             }
-        };
-        self.emit_jump(Opcode::Goto, destination, &[]);
-        Ok(())
+
+            for _ in 0..target.drop_count {
+                self.emit(Opcode::Drop, &[]);
+            }
+            if let Some(finally) = target.finally_label {
+                // The finalizer runs as a subroutine and is handed a dummy return
+                // value, which is dropped afterwards to keep the stack the depth it
+                // had before.
+                self.emit(Opcode::Undefined, &[]);
+                self.emit_jump(Opcode::Gosub, finally, &[]);
+                self.emit(Opcode::Drop, &[]);
+            }
+        }
+
+        // The parser rejects a break/continue with no target, so reaching here
+        // means the compiler's own bookkeeping is wrong.
+        Err(SyntaxError::new(
+            if is_break {
+                "break has no enclosing loop or switch"
+            } else {
+                "continue has no enclosing loop"
+            },
+            stmt.span,
+        ))
     }
 
     /// Compile a labelled statement.
@@ -1037,8 +1095,11 @@ impl Compiler {
         let end = self.new_label();
         self.push_jump_target(JumpTarget {
             names,
-            break_label: end,
+            break_label: Some(end),
             continue_label: None,
+            drop_count: 0,
+            finally_label: None,
+            is_regular_stmt: true,
         });
         let result = self.stmt(inner);
         self.pop_jump_target();
@@ -1091,9 +1152,14 @@ impl Compiler {
         let break_label = self.new_label();
         self.push_jump_target(JumpTarget {
             names: Vec::new(),
-            break_label,
+            break_label: Some(break_label),
             // `switch` is a valid `break` target but not a `continue` target.
             continue_label: None,
+            // The discriminant stays on the value stack for the whole statement, so
+            // a `break` aimed further out has to discard it.
+            drop_count: 1,
+            finally_label: None,
+            is_regular_stmt: false,
         });
 
         // Runs of tests. `case 1: case 2: body` is one run: the empty clause hands
@@ -1237,25 +1303,24 @@ impl Compiler {
     ) -> Result<(), SyntaxError> {
         self.reset_value();
 
-        // Crossing a `try` needs `nip_catch` to unwind the catch offset, and one
-        // that also has a `finally` has to run it first. Until that is implemented,
-        // refuse rather than emit code whose stack does not unwind.
-        if let Some(transfer) = Self::transfer_out_of_try(block, handler, finalizer) {
-            return Err(SyntaxError::new(
-                format!(
-                    "{} inside a try block is not supported by the compiler yet",
-                    transfer
-                ),
-                stmt.span,
-            ));
-        }
-
         let catch_label = self.new_label();
         let catch2_label = self.new_label();
         let finally_label = self.new_label();
         let end_label = self.new_label();
 
         self.emit_jump(Opcode::Catch, catch_label, &[]);
+
+        // The guarded block. `break` may not target it, so its entry exists purely
+        // to unwind: a jump out has to discard the catch offset and run the
+        // finalizer.
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label: None,
+            continue_label: None,
+            drop_count: 1,
+            finally_label: Some(finally_label),
+            is_regular_stmt: false,
+        });
 
         let block_key = Self::try_block_key(stmt, TryPart::Block);
         let block_parent = self.cur().current_block;
@@ -1266,6 +1331,7 @@ impl Compiler {
         self.state().current_block = block_parent;
         // A guarded block that ends in a `return`/`throw` never reaches the
         // epilogue, so the reference does not emit one.
+        self.pop_jump_target();
         let block_live = !block.last().is_some_and(Self::terminates);
 
         if block_live {
@@ -1304,6 +1370,14 @@ impl Compiler {
             }
             self.emit_jump(Opcode::Catch, catch2_label, &[]);
 
+            self.push_jump_target(JumpTarget {
+                names: Vec::new(),
+                break_label: None,
+                continue_label: None,
+                drop_count: 1,
+                finally_label: Some(finally_label),
+                is_regular_stmt: false,
+            });
             let catch_key = Self::try_block_key(stmt, TryPart::Catch);
             let catch_parent = self.cur().current_block;
             self.push_block(catch_key, catch_parent);
@@ -1311,6 +1385,7 @@ impl Compiler {
             self.stmts(&handler.body)?;
             self.emit_scope_leave(catch_key);
             self.state().current_block = catch_parent;
+            self.pop_jump_target();
             let handler_live = !handler.body.last().is_some_and(Self::terminates);
 
             if handler_live {
@@ -1334,6 +1409,17 @@ impl Compiler {
         }
 
         self.place_label(finally_label);
+        // Inside the finalizer, leaving has a different cost: the return value and
+        // the `gosub` return address are both on the stack, and neither finalizer nor
+        // any outer one may run before the block has finished.
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label: None,
+            continue_label: None,
+            drop_count: 2,
+            finally_label: None,
+            is_regular_stmt: false,
+        });
         if let Some(finalizer) = finalizer {
             let finally_key = Self::try_block_key(stmt, TryPart::Finally);
             let finally_parent = self.cur().current_block;
@@ -1343,52 +1429,10 @@ impl Compiler {
             self.emit_scope_leave(finally_key);
             self.state().current_block = finally_parent;
         }
+        self.pop_jump_target();
         self.emit(Opcode::Ret, &[]);
         self.place_label(end_label);
         Ok(())
-    }
-
-    /// Find a `return`/`break`/`continue` that would have to unwind a `try`.
-    ///
-    /// Only the guarded block and the handler need this: a transfer written in the
-    /// finalizer has already had the finalizer run for it.
-    fn transfer_out_of_try(
-        block: &[Stmt],
-        handler: &Option<CatchClause>,
-        finalizer: Option<&[Stmt]>,
-    ) -> Option<&'static str> {
-        let _ = finalizer;
-        fn find(body: &[Stmt]) -> Option<&'static str> {
-            for stmt in body {
-                let found = match &stmt.kind {
-                    StmtKind::Return(_) => Some("return"),
-                    StmtKind::Break(_) => Some("break"),
-                    StmtKind::Continue(_) => Some("continue"),
-                    // A transfer nested inside these still leaves the `try` unless a
-                    // loop or switch of its own catches it.
-                    StmtKind::Block(inner) => find(inner),
-                    StmtKind::If { cons, alt, .. } => find(std::slice::from_ref(cons))
-                        .or_else(|| alt.as_ref().and_then(|alt| find(std::slice::from_ref(alt)))),
-                    StmtKind::Labeled { body, .. } => find(std::slice::from_ref(body)),
-                    StmtKind::Try {
-                        block,
-                        handler,
-                        finalizer,
-                    } => find(block).or_else(|| {
-                        handler
-                            .as_ref()
-                            .and_then(|handler| find(&handler.body))
-                            .or_else(|| finalizer.as_deref().and_then(find))
-                    }),
-                    _ => None,
-                };
-                if found.is_some() {
-                    return found;
-                }
-            }
-            None
-        }
-        find(block).or_else(|| handler.as_ref().and_then(|handler| find(&handler.body)))
     }
 
     fn for_in_of(
@@ -2856,6 +2900,44 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         };
     }
 
+    // Code after an unconditional transfer is unreachable, and the reference drops it
+    // as it walks past the transfer — the `skip_dead_code` in its first pass. It
+    // scans forward until it finds a label something still jumps to, so a run of
+    // dead instructions between a `throw` and the next live target disappears.
+    //
+    // The scan repeats because dropping a jump lowers the reference count of the
+    // label it pointed at, which can strand what follows. Only a real label keeps an
+    // instruction alive here; the per-instruction labels allocated above belong to
+    // this pass, not to the program.
+    loop {
+        let mut references = vec![false; kept.len() + 1];
+        for (_, operands) in &kept {
+            if let Some(target) = target_kept_index(operands, &label_kept)
+                && target < references.len()
+            {
+                references[target] = true;
+            }
+        }
+        let mut doomed = vec![false; kept.len()];
+        let mut any = false;
+        for (index, (op, _)) in kept.iter().enumerate() {
+            if !is_transfer(*op) {
+                continue;
+            }
+            for next in index + 1..kept.len() {
+                if references[next] {
+                    break;
+                }
+                doomed[next] = true;
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+        kept = drop_instructions(kept, &mut label_kept, &doomed);
+    }
+
     // A label that lands on an unconditional jump stands for wherever that jump
     // goes, so retarget it once and every jump to the label follows for free.
     // This is what makes `continue` in a `for` head reach the loop top instead of
@@ -2931,14 +3013,11 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
         kept = next;
     }
 
-    // Code after an unconditional transfer is unreachable, and the reference drops
-    // it when it walks past that transfer. Stage-wise the removals above happen
-    // later than the walk would, so a trailing run can survive: `try`/`catch`'s
-    // `goto end` becomes a jump to the next instruction and is deleted, leaving the
-    // label at the end of the function with nothing pointing at it.
-    //
-    // Only a real label keeps an instruction alive here. The per-instruction labels
-    // allocated above belong to this pass, not to the program.
+    // The same walk at the end of the function: `try`/`catch`'s `goto end` becomes a
+    // jump to the next instruction and is deleted, leaving the label at the end with
+    // nothing pointing at it. If that also strands the last instruction, it goes
+    // too — which is how a `try` whose body always returns ends on its `ret` rather
+    // than an implicit `return_undef`.
     // Which instructions something still jumps to. Reading the surviving jumps is
     // what the reference's reference counts amount to: once a jump has been folded
     // away the label it named is unreferenced, even though the program still has a
@@ -2997,6 +3076,51 @@ fn assemble(insns: &mut [Option<(Opcode, Vec<Op>)>], state: &mut FnState) -> (Ve
     }
     let stack_size = compute_stack_size(&code);
     (code, stack_size)
+}
+
+/// Whether an instruction always transfers control away, so anything after it in the
+/// same stream is unreachable.
+fn is_transfer(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Goto
+            | Opcode::Goto8
+            | Opcode::Goto16
+            | Opcode::Return
+            | Opcode::ReturnUndef
+            | Opcode::Throw
+            | Opcode::ThrowError
+            | Opcode::Ret
+    )
+}
+
+/// Remove the marked instructions and renumber the label table so it keeps pointing
+/// at the same instructions. A label whose instruction went away moves to whatever
+/// follows it, since a jump is never left with nowhere to land.
+fn drop_instructions(
+    kept: Vec<(Opcode, Vec<Op>)>,
+    label_kept: &mut [Option<usize>],
+    doomed: &[bool],
+) -> Vec<(Opcode, Vec<Op>)> {
+    let mut result: Vec<(Opcode, Vec<Op>)> = Vec::with_capacity(kept.len());
+    let mut moved: Vec<Option<usize>> = vec![None; kept.len()];
+    for (old, entry) in kept.into_iter().enumerate() {
+        if doomed.get(old).copied().unwrap_or(false) {
+            continue;
+        }
+        moved[old] = Some(result.len());
+        result.push(entry);
+    }
+    for slot in label_kept.iter_mut() {
+        let Some(old) = *slot else { continue };
+        *slot = match moved.get(old).copied().flatten() {
+            Some(new) => Some(new),
+            None => (old..moved.len())
+                .find_map(|i| moved[i])
+                .or(Some(result.len())),
+        };
+    }
+    result
 }
 
 fn is_goto(op: Opcode) -> bool {
@@ -3067,10 +3191,13 @@ fn retarget_labels(operands: &[Op], label_kept: &[Option<usize>], kept_len: usiz
 /// encode that count in their operand, which is added to the static `n_pop`.
 fn compute_stack_size(code: &[u8]) -> u32 {
     let mut depth_at = vec![u16::MAX; code.len()];
-    let mut worklist: Vec<(usize, u32)> = vec![(0, 0)];
+    // Each entry carries the enclosing `catch` levels, innermost last, because
+    // `nip_catch` needs them: it rewinds the stack to just above the innermost catch
+    // offset and forgets that level.
+    let mut worklist: Vec<(usize, u32, Vec<u32>)> = vec![(0, 0, Vec::new())];
     let mut max_depth = 0u32;
 
-    while let Some((pc, depth)) = worklist.pop() {
+    while let Some((pc, depth, catch_levels)) = worklist.pop() {
         if pc >= code.len() {
             continue;
         }
@@ -3104,7 +3231,19 @@ fn compute_stack_size(code: &[u8]) -> u32 {
         // adjust here.
         let _ = &mut n_push;
 
-        let depth = depth.saturating_sub(n_pop) + n_push;
+        // The depth before this instruction's own push, which is what a `catch`
+        // records as its level.
+        let depth_before = depth;
+        let mut depth = depth.saturating_sub(n_pop) + n_push;
+        let mut catch_levels = catch_levels;
+        if op == Opcode::NipCatch {
+            // Discard everything above the innermost catch offset, keeping the value
+            // on top: the frame the code after this sees is the same shape it would
+            // have had if the `try` were not there.
+            if let Some(base) = catch_levels.pop() {
+                depth = base + 1;
+            }
+        }
         max_depth = max_depth.max(depth);
 
         // Successors.
@@ -3112,14 +3251,14 @@ fn compute_stack_size(code: &[u8]) -> u32 {
         match op {
             Opcode::Goto | Opcode::Goto8 | Opcode::Goto16 => {
                 if let Some(target) = target {
-                    worklist.push((target, depth));
+                    worklist.push((target, depth, catch_levels));
                 }
             }
             Opcode::IfFalse | Opcode::IfFalse8 | Opcode::IfTrue | Opcode::IfTrue8 => {
                 if let Some(target) = target {
-                    worklist.push((target, depth));
+                    worklist.push((target, depth, catch_levels.clone()));
                 }
-                worklist.push((next, depth));
+                worklist.push((next, depth, catch_levels));
             }
             // A `catch` records an exception edge to the handler. The handler is
             // entered with the thrown value on top of the stack, in the slot the
@@ -3128,9 +3267,13 @@ fn compute_stack_size(code: &[u8]) -> u32 {
             // is the same on both paths.
             Opcode::Catch => {
                 if let Some(target) = target {
-                    worklist.push((target, depth));
+                    // The handler is protected by the *enclosing* catch, not by this
+                    // one: an error raised inside it is what the handler's own
+                    // `catch` catches.
+                    worklist.push((target, depth, catch_levels.clone()));
                 }
-                worklist.push((next, depth));
+                catch_levels.push(depth_before);
+                worklist.push((next, depth, catch_levels));
             }
             // `gosub` calls a subroutine with the return address on top. The opcode
             // table records no push for it — `ret` is what pops the slot — so the
@@ -3138,9 +3281,9 @@ fn compute_stack_size(code: &[u8]) -> u32 {
             // instruction is being computed.
             Opcode::Gosub => {
                 if let Some(target) = target {
-                    worklist.push((target, depth + 1));
+                    worklist.push((target, depth + 1, catch_levels.clone()));
                 }
-                worklist.push((next, depth));
+                worklist.push((next, depth, catch_levels));
             }
             // `ret` goes back to a `gosub`; nothing here follows it.
             Opcode::Ret
@@ -3148,7 +3291,7 @@ fn compute_stack_size(code: &[u8]) -> u32 {
             | Opcode::ReturnUndef
             | Opcode::Throw
             | Opcode::ThrowError => {}
-            _ => worklist.push((next, depth)),
+            _ => worklist.push((next, depth, catch_levels)),
         }
     }
     max_depth
