@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/js-gc",
+    "crates/js-parse",
     "crates/quickjs",
     "crates/qjs",
     "crates/quickjs-conformance",

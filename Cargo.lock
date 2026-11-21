@@ -7,6 +7,13 @@ name = "js-gc"
 version = "0.0.0"
 
 [[package]]
+name = "js-parse"
+version = "0.0.0"
+dependencies = [
+ "quickjs-conformance",
+]
+
+[[package]]
 name = "qjs"
 version = "0.0.0"
 dependencies = [

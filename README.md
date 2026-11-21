@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.2，关键决策已确认）
-- 🚧 当前进度：**M0 完成**（工作区骨架 + `js-gc` + 差分测试框架）
+- 🚧 当前进度：**M1a 完成**（词法分析器），M0（骨架 + `js-gc` + 差分框架）已完成
 
 ## 已确认决策
 
@@ -20,7 +20,8 @@
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | M0 | 工作区骨架、`js-gc`（Gc/WeakGc/循环回收）、差分测试框架、`qjs` 选项面 | ✅ |
-| M1 | 词法 + 解析器 + AST（ES2025 全量）+ early errors | ⬜ |
+| M1a | 词法分析器（ES2025 全量词法） | ✅ |
+| M1b | AST + 解析器 + early errors | ⬜ |
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | ⬜ |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ⬜ |
 | M4–M11 | 内建库、ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
@@ -29,7 +30,8 @@
 ## M0 已交付
 
 ```
-crates/js-gc/                引用计数 + 循环回收（11 + 5 个测试）
+crates/js-gc/                引用计数 + 循环回收（16 个测试）
+crates/js-parse/             词法分析器（33 个单元测试 + 5 个差分测试）
 crates/quickjs/              公共 API 骨架：Runtime / Context / Error / COMPAT_VERSION
 crates/qjs/                  CLI：选项面与上游逐字节一致（--help、用法错误、-q）
 crates/quickjs-conformance/  差分测试 harness（候选 vs C 参考实现）

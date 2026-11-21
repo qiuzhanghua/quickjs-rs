@@ -1,0 +1,12 @@
+[package]
+name = "js-parse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "ECMAScript 2025 lexer, AST and parser for the pure-Rust QuickJS port"
+
+[dependencies]
+
+[dev-dependencies]
+quickjs-conformance.workspace = true
