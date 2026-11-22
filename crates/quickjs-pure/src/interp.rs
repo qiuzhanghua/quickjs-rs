@@ -23,7 +23,7 @@ use js_gc::{Gc, Heap};
 
 use crate::object::{
     Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, LocalVars, NativeFn, ObjectKind,
-    Property, PropertyKey, array_index, lookup_key,
+    Property, PropertyKey, array_index, lookup_key, same_proto,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -552,6 +552,119 @@ impl<'a> Interp<'a> {
     /// A new ordinary object with the given prototype.
     pub fn new_object(&self, proto: Option<Gc<JsObject>>) -> Gc<JsObject> {
         JsObject::ordinary(self.heap, proto)
+    }
+
+    /// `[[OwnPropertyKeys]]`, with the `ownKeys` trap when there is one.
+    ///
+    /// A trap's list is used **as returned**: unlike an ordinary object, whose integer
+    /// keys the engine sorts, a proxy is specified to hand back exactly what the handler
+    /// produced. That is why the two branches are not merged.
+    pub fn object_own_property_keys(
+        &mut self,
+        object: &Gc<JsObject>,
+    ) -> JsResult<Vec<PropertyKey>> {
+        if let Some(keys) = self.proxy_own_keys(object)? {
+            return Ok(keys);
+        }
+        // Integer-like keys ascending, then the string keys in insertion order, then the
+        // symbols — the order every schema that walks an object expects.
+        let entries = object.property_entries();
+        let mut numeric: Vec<u32> = Vec::new();
+        let mut strings: Vec<PropertyKey> = Vec::new();
+        let mut symbols: Vec<PropertyKey> = Vec::new();
+        for (key, _) in entries {
+            match &key {
+                PropertyKey::Symbol(_) => symbols.push(key),
+                PropertyKey::String(_) => match key.as_str().and_then(array_index) {
+                    Some(index) => {
+                        if !numeric.contains(&index) {
+                            numeric.push(index);
+                        }
+                    }
+                    None => strings.push(key),
+                },
+            }
+        }
+        numeric.sort_unstable();
+        let mut keys: Vec<PropertyKey> = numeric
+            .into_iter()
+            .map(|index| PropertyKey::from(index.to_string()))
+            .collect();
+        keys.extend(strings);
+        keys.extend(symbols);
+        Ok(keys)
+    }
+
+    /// `[[GetOwnProperty]]` on an ordinary object: the property table, then the two
+    /// things an engine keeps outside it — array elements and an array's `length`.
+    fn ordinary_own_property(object: &Gc<JsObject>, key: &PropertyKey) -> Option<Property> {
+        if let Some(property) = object.own_property_key(key) {
+            return Some(property);
+        }
+        // An array's elements live in their own vector rather than the property table, so
+        // a descriptor for one has to be synthesized — with the attributes an element has.
+        if let Some(index) = key.as_str().and_then(array_index)
+            && let Some(value) = object.array_get(index as usize)
+            && !matches!(value, Value::Hole)
+        {
+            return Some(Property::data(value));
+        }
+        // `length` is an own property of an array that is not in its property table
+        // either: `[].hasOwnProperty("length")` is true, and its descriptor is writable
+        // and non-enumerable.
+        if key.as_str() == Some("length")
+            && let Some(length) = object.array_length()
+        {
+            return Some(Property {
+                value: Some(Value::Int(length as i32)),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+                getter: None,
+                setter: None,
+            });
+        }
+        None
+    }
+
+    /// `[[GetOwnProperty]]`, with the `getOwnPropertyDescriptor` trap when there is one.
+    pub fn object_get_own_property(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Property>> {
+        if let Some(answer) = self.proxy_get_own_property(object, key)? {
+            return Ok(answer);
+        }
+        Ok(Self::ordinary_own_property(object, key))
+    }
+
+    /// `[[DefineOwnProperty]]`, with the `defineProperty` trap when there is one.
+    pub fn object_define_own_property(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+        property: Property,
+    ) -> JsResult<bool> {
+        if let Some(accepted) = self.proxy_define_property(object, key, property.clone())? {
+            return Ok(accepted);
+        }
+        object.define_key(key, property);
+        Ok(true)
+    }
+
+    /// Build a proxy object over `target`, with its traps read from `handler`.
+    pub fn new_proxy(&self, target: Gc<JsObject>, handler: Value) -> Gc<JsObject> {
+        JsObject::proxy(self.heap, target, handler)
+    }
+
+    /// The `revoke` function for a proxy's slots.
+    pub fn new_revoker(&self, slots: crate::object::ProxyRef) -> Gc<JsObject> {
+        JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::Revoker(slots),
+        )
     }
 
     /// A new array.
@@ -1798,6 +1911,15 @@ impl<'a> Interp<'a> {
         receiver: Option<&Value>,
         key: &PropertyKey,
     ) -> JsResult<Option<Value>> {
+        // A proxy answers for itself, before any of the shortcuts below: `new
+        // Proxy([], {get: …})` must not read `length` out of an element vector it does not
+        // have.
+        if object.proxy_state().is_some() {
+            let receiver = receiver
+                .cloned()
+                .unwrap_or_else(|| Value::Object(object.clone()));
+            return self.proxy_get(object, &receiver, key);
+        }
         // The element-vector and `length` shortcuts are string-only: an array index
         // has no symbol spelling.
         if let Some(text) = key.as_str() {
@@ -2035,6 +2157,19 @@ impl<'a> Interp<'a> {
         value: Value,
         on_failure: DeleteFailure,
     ) -> JsResult<()> {
+        // A proxy's `set` trap decides, and its `false` means the same thing an
+        // ordinary refusal means: a `TypeError` in strict code, nothing in sloppy code.
+        if object.proxy_state().is_some() {
+            let receiver = Value::Object(object.clone());
+            if let Some(accepted) = self.proxy_set(object, key, value.clone(), &receiver)? {
+                return match (accepted, on_failure) {
+                    (true, _) | (false, DeleteFailure::Ignore) => Ok(()),
+                    (false, DeleteFailure::Throw) => {
+                        Err(self.type_error(format!("proxy 'set' refused to write '{key}'")))
+                    }
+                };
+            }
+        }
         // The element and `length` shortcuts only exist for string keys: an array
         // index has no symbol spelling, and a symbol named `length` is an ordinary
         // property.
@@ -2144,12 +2279,21 @@ impl<'a> Interp<'a> {
     }
 
     /// Delete `object[key]`.
-    pub fn delete_property(&mut self, object: &Gc<JsObject>, key: &str) -> bool {
+    pub fn delete_property(&mut self, object: &Gc<JsObject>, key: &str) -> JsResult<bool> {
         self.delete_property_key(object, &PropertyKey::from(key))
     }
 
     /// [`Interp::delete_property`] with a key that may be a symbol.
-    pub fn delete_property_key(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> bool {
+    pub fn delete_property_key(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+    ) -> JsResult<bool> {
+        // A proxy decides for itself, and may even throw; the invariant checks live in
+        // `proxy_delete`.
+        if let Some(answer) = self.proxy_delete(object, key)? {
+            return Ok(answer);
+        }
         if let Some(index) = key.as_str().and_then(array_index) {
             if let Some(elements) = object.array_elements()
                 && (index as usize) < elements.len()
@@ -2157,13 +2301,687 @@ impl<'a> Interp<'a> {
                 // A hole rather than a shift: `delete a[0]` leaves `length` alone and
                 // the index stops answering `in`.
                 if object.element_is_locked(index) {
-                    return false;
+                    return Ok(false);
                 }
                 object.array_set(index as usize, Value::Hole);
-                return true;
+                return Ok(true);
             }
         }
-        object.delete_key(key)
+        Ok(object.delete_key(key))
+    }
+
+    // -- proxy traps --------------------------------------------------------
+    //
+    // A proxy's internal methods all look the same: ask the handler for the trap, call it
+    // with the target and the operation's own arguments, then check the answer against
+    // the target. The checks are not decoration — they are what stops a proxy from
+    // reporting a `non-configurable` property as missing, which would let a frozen object
+    // be rewritten by standing in front of it.
+
+    /// The target and handler of `object`, or `None` when it is not a proxy.
+    ///
+    /// A *revoked* proxy is a `TypeError` rather than `None`, because every operation on
+    /// one has to fail: the slots the traps would have been read from are gone.
+    fn proxy_parts(&mut self, object: &Gc<JsObject>) -> JsResult<Option<(Gc<JsObject>, Value)>> {
+        let Some(state) = object.proxy_state() else {
+            return Ok(None);
+        };
+        let state = state.borrow();
+        match (&state.target, &state.handler) {
+            (Some(target), Some(handler)) => Ok(Some((target.clone(), handler.clone()))),
+            _ => Err(self.type_error("cannot use a proxy that has been revoked")),
+        }
+    }
+
+    /// Call `handler[name]`, or answer `None` when the trap is absent.
+    ///
+    /// A trap that is present but not callable is a `TypeError` rather than "no trap":
+    /// the spec checks `IsCallable` and refuses, so `{ get: 1 }` must not quietly fall
+    /// back to the target.
+    fn proxy_trap(
+        &mut self,
+        handler: &Value,
+        name: &str,
+        args: Vec<Value>,
+    ) -> JsResult<Option<Value>> {
+        let Value::Object(table) = handler else {
+            return Err(self.type_error("proxy handler is not an object"));
+        };
+        let trap = self.get_property(table, name)?.unwrap_or(Value::Undefined);
+        match trap {
+            Value::Undefined => Ok(None),
+            Value::Object(function) if function.is_callable() => {
+                let answer = self.call_value(Value::Object(function), handler.clone(), args)?;
+                Ok(Some(answer))
+            }
+            _ => Err(self.type_error(format!("proxy trap '{name}' is not a function"))),
+        }
+    }
+
+    /// Whether `object`'s own property `key` is one the target refuses to lose.
+    ///
+    /// A non-configurable property is fixed: no trap may hide it, delete it, or change
+    /// its value behind the target's back. This goes through
+    /// [`Self::ordinary_own_property`] rather than the property table so that an array's
+    /// elements and its `length` — both fixed, both outside the table — are covered.
+    fn is_fixed_property(target: &Gc<JsObject>, key: &PropertyKey) -> Option<Property> {
+        Self::ordinary_own_property(target, key).filter(|property| !property.configurable)
+    }
+
+    /// `[[Get]]` on a proxy. `Some` means the proxy answered, `None` means "not a proxy".
+    fn proxy_get(
+        &mut self,
+        object: &Gc<JsObject>,
+        receiver: &Value,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Value>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "get",
+            vec![Value::Object(target.clone()), key_value, receiver.clone()],
+        )?
+        else {
+            // No trap: forward to the target's own `[[Get]]`, keeping the receiver so an
+            // inherited getter still sees the proxy.
+            return Ok(Some(
+                self.get_property_key_for(&target, Some(receiver), key)?
+                    .unwrap_or(Value::Undefined),
+            ));
+        };
+        if let Some(fixed) = Self::is_fixed_property(&target, key) {
+            if fixed.is_accessor() {
+                // A fixed accessor with no getter must read as `undefined`.
+                let has_getter = fixed
+                    .getter
+                    .as_ref()
+                    .is_some_and(|getter| !matches!(getter, Value::Undefined));
+                if !has_getter && !matches!(result, Value::Undefined) {
+                    return Err(self.type_error(format!(
+                        "proxy 'get' must report undefined for the non-configurable property '{key}'"
+                    )));
+                }
+            } else if !fixed.writable {
+                let fixed_value = fixed.value.unwrap_or(Value::Undefined);
+                if !fixed_value.same_value(&result) {
+                    return Err(self.type_error(format!(
+                        "proxy 'get' disagrees with the non-configurable property '{key}'"
+                    )));
+                }
+            }
+        }
+        Ok(Some(result))
+    }
+
+    /// `[[Set]]` on a proxy.
+    ///
+    /// The boolean is the trap's answer: the caller turns `false` into a `TypeError` in
+    /// strict mode and a silent no-op in sloppy mode, which is the same split an ordinary
+    /// read-only store has.
+    fn proxy_set(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+        value: Value,
+        receiver: &Value,
+    ) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "set",
+            vec![
+                Value::Object(target.clone()),
+                key_value,
+                value.clone(),
+                receiver.clone(),
+            ],
+        )?
+        else {
+            // No trap: store on the target, which is where an ordinary proxy write lands.
+            self.set_property_with_key(&target, key, value, DeleteFailure::Ignore)?;
+            return Ok(Some(true));
+        };
+        if !result.to_boolean() {
+            return Ok(Some(false));
+        }
+        if let Some(fixed) = Self::is_fixed_property(&target, key) {
+            if fixed.is_accessor() {
+                let has_setter = fixed
+                    .setter
+                    .as_ref()
+                    .is_some_and(|setter| !matches!(setter, Value::Undefined));
+                if !has_setter {
+                    return Err(self.type_error(format!(
+                        "proxy 'set' succeeded on the non-configurable accessor '{key}', which has no setter"
+                    )));
+                }
+            } else if !fixed.writable {
+                let fixed_value = fixed.value.unwrap_or(Value::Undefined);
+                if !fixed_value.same_value(&value) {
+                    return Err(self.type_error(format!(
+                        "proxy 'set' changed the non-configurable property '{key}'"
+                    )));
+                }
+            }
+        }
+        // A new property cannot appear on a target that refuses new properties.
+        if Self::ordinary_own_property(&target, key).is_none() && !target.is_extensible() {
+            return Err(self.type_error(format!(
+                "proxy 'set' added '{key}' to a non-extensible target"
+            )));
+        }
+        Ok(Some(true))
+    }
+
+    /// `[[HasProperty]]` on a proxy, which is the `in` operator.
+    fn proxy_has(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "has",
+            vec![Value::Object(target.clone()), key_value],
+        )?
+        else {
+            return Ok(Some(self.has_own_or_inherited(&target, key)?));
+        };
+        if !result.to_boolean() && Self::is_fixed_property(&target, key).is_some() {
+            return Err(self.type_error(format!(
+                "proxy 'has' denied the non-configurable property '{key}'"
+            )));
+        }
+        // A non-extensible target cannot grow, so every own property it *has* is fixed.
+        if !result.to_boolean()
+            && !target.is_extensible()
+            && Self::ordinary_own_property(&target, key).is_some()
+        {
+            return Err(self.type_error(format!(
+                "proxy 'has' denied the own property '{key}' of a non-extensible target"
+            )));
+        }
+        Ok(Some(result.to_boolean()))
+    }
+
+    /// `[[Delete]]` on a proxy.
+    fn proxy_delete(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "deleteProperty",
+            vec![Value::Object(target.clone()), key_value],
+        )?
+        else {
+            return Ok(Some(self.delete_property_key(&target, key)?));
+        };
+        if result.to_boolean() && Self::is_fixed_property(&target, key).is_some() {
+            return Err(self.type_error(format!(
+                "proxy 'deleteProperty' removed the non-configurable property '{key}'"
+            )));
+        }
+        if result.to_boolean()
+            && !target.is_extensible()
+            && Self::ordinary_own_property(&target, key).is_some()
+        {
+            return Err(self.type_error(format!(
+                "proxy 'deleteProperty' removed '{key}' from a non-extensible target"
+            )));
+        }
+        Ok(Some(result.to_boolean()))
+    }
+
+    /// The own keys a proxy reports, after the `ownKeys` trap and its invariants.
+    fn proxy_own_keys(&mut self, object: &Gc<JsObject>) -> JsResult<Option<Vec<PropertyKey>>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let Some(result) =
+            self.proxy_trap(&handler, "ownKeys", vec![Value::Object(target.clone())])?
+        else {
+            // No trap: the target's own keys, already in the order an object reports.
+            return Ok(Some(self.object_own_property_keys(&target)?));
+        };
+        // `CreateListFromArrayLike` with the string-or-symbol restriction.
+        let list = self.list_from_array_like(&result, true)?;
+        let mut keys: Vec<PropertyKey> = Vec::with_capacity(list.len());
+        for value in list {
+            let key = self.propkey(&value);
+            if keys.contains(&key) {
+                return Err(self.type_error(format!(
+                    "proxy 'ownKeys' returned the duplicate key '{key}'"
+                )));
+            }
+            keys.push(key);
+        }
+        for (key, property) in target.property_entries() {
+            if !property.configurable && !keys.contains(&key) {
+                return Err(self.type_error(format!(
+                    "proxy 'ownKeys' dropped the non-configurable key '{key}'"
+                )));
+            }
+            if !target.is_extensible() && !keys.contains(&key) {
+                return Err(self.type_error(format!(
+                    "proxy 'ownKeys' dropped '{key}', which a non-extensible target owns"
+                )));
+            }
+        }
+        if !target.is_extensible() {
+            let own = target.property_entries().len();
+            if keys.len() != own {
+                return Err(
+                    self.type_error("proxy 'ownKeys' does not match its non-extensible target")
+                );
+            }
+        }
+        Ok(Some(keys))
+    }
+
+    /// `[[GetOwnProperty]]` on a proxy.
+    fn proxy_get_own_property(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Option<Property>>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "getOwnPropertyDescriptor",
+            vec![Value::Object(target.clone()), key_value],
+        )?
+        else {
+            // No trap: the target's own descriptor is the answer. This has to go through
+            // the same synthesis an ordinary object gets, because a proxy's own property
+            // table is empty by design — reading it directly reported `undefined` for
+            // every key, including an array's indices and `length`.
+            return Ok(Some(Self::ordinary_own_property(&target, key)));
+        };
+        let answer = if matches!(result, Value::Undefined) {
+            None
+        } else {
+            Some(self.property_from_descriptor(&result)?)
+        };
+        let fixed = Self::is_fixed_property(&target, key);
+        match (&answer, &fixed) {
+            // A non-configurable property cannot be reported as absent.
+            (None, Some(_)) => {
+                return Err(self.type_error(format!(
+                    "proxy 'getOwnPropertyDescriptor' hid the non-configurable property '{key}'"
+                )));
+            }
+            (Some(descriptor), Some(fixed)) => {
+                if descriptor.configurable {
+                    return Err(self.type_error(format!(
+                        "proxy 'getOwnPropertyDescriptor' made '{key}' configurable"
+                    )));
+                }
+                if fixed.is_accessor() != descriptor.is_accessor() {
+                    return Err(self.type_error(format!(
+                        "proxy 'getOwnPropertyDescriptor' changed the kind of '{key}'"
+                    )));
+                }
+                if !fixed.is_accessor() && !fixed.writable {
+                    let fixed_value = fixed.value.clone().unwrap_or(Value::Undefined);
+                    let reported = descriptor.value.clone().unwrap_or(Value::Undefined);
+                    if !fixed_value.same_value(&reported) {
+                        return Err(self.type_error(format!(
+                            "proxy 'getOwnPropertyDescriptor' changed the value of '{key}'"
+                        )));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(Some(answer))
+    }
+
+    /// `[[DefineOwnProperty]]` on a proxy.
+    fn proxy_define_property(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+        property: Property,
+    ) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let key_value = self.key_value(key);
+        let descriptor = self.descriptor_from_property(&property);
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "defineProperty",
+            vec![Value::Object(target.clone()), key_value, descriptor],
+        )?
+        else {
+            return Ok(None);
+        };
+        if !result.to_boolean() {
+            return Ok(Some(false));
+        }
+        let fixed = Self::is_fixed_property(&target, key);
+        let creating = Self::ordinary_own_property(&target, key).is_none();
+        if creating && !target.is_extensible() {
+            return Err(self.type_error(format!(
+                "proxy 'defineProperty' added '{key}' to a non-extensible target"
+            )));
+        }
+        if let Some(fixed) = fixed {
+            if property.configurable {
+                return Err(self.type_error(format!(
+                    "proxy 'defineProperty' made the non-configurable '{key}' configurable"
+                )));
+            }
+            if !fixed.writable && property.writable && !fixed.is_accessor() {
+                return Err(self.type_error(format!(
+                    "proxy 'defineProperty' made the read-only '{key}' writable"
+                )));
+            }
+        }
+        Ok(Some(true))
+    }
+
+    /// `[[GetPrototypeOf]]` on a proxy.
+    fn proxy_get_prototype_of(
+        &mut self,
+        object: &Gc<JsObject>,
+    ) -> JsResult<Option<Option<Gc<JsObject>>>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "getPrototypeOf",
+            vec![Value::Object(target.clone())],
+        )?
+        else {
+            return Ok(Some(target.proto()));
+        };
+        let proto = match &result {
+            Value::Null => None,
+            Value::Object(proto) => Some(proto.clone()),
+            _ => {
+                return Err(self.type_error("proxy 'getPrototypeOf' must return an object or null"));
+            }
+        };
+        if !target.is_extensible() && !same_proto(proto.as_ref(), target.proto().as_ref()) {
+            return Err(self.type_error(
+                "proxy 'getPrototypeOf' changed the prototype of a non-extensible target",
+            ));
+        }
+        Ok(Some(proto))
+    }
+
+    /// `[[SetPrototypeOf]]` on a proxy.
+    fn proxy_set_prototype_of(
+        &mut self,
+        object: &Gc<JsObject>,
+        proto: Option<Gc<JsObject>>,
+    ) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let proto_value = match &proto {
+            Some(proto) => Value::Object(proto.clone()),
+            None => Value::Null,
+        };
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "setPrototypeOf",
+            vec![Value::Object(target.clone()), proto_value],
+        )?
+        else {
+            target.set_proto(proto);
+            return Ok(Some(true));
+        };
+        if result.to_boolean()
+            && !target.is_extensible()
+            && !same_proto(proto.as_ref(), target.proto().as_ref())
+        {
+            return Err(self.type_error(
+                "proxy 'setPrototypeOf' changed the prototype of a non-extensible target",
+            ));
+        }
+        Ok(Some(result.to_boolean()))
+    }
+
+    /// `[[IsExtensible]]` on a proxy.
+    fn proxy_is_extensible(&mut self, object: &Gc<JsObject>) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "isExtensible",
+            vec![Value::Object(target.clone())],
+        )?
+        else {
+            return Ok(Some(target.is_extensible()));
+        };
+        // The answer is not the proxy's to invent: it must agree with the target, or a
+        // script could learn `false` while the target keeps accepting new properties.
+        if result.to_boolean() != target.is_extensible() {
+            return Err(self.type_error("proxy 'isExtensible' disagrees with its target"));
+        }
+        Ok(Some(result.to_boolean()))
+    }
+
+    /// `[[PreventExtensions]]` on a proxy.
+    fn proxy_prevent_extensions(&mut self, object: &Gc<JsObject>) -> JsResult<Option<bool>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "preventExtensions",
+            vec![Value::Object(target.clone())],
+        )?
+        else {
+            target.set_extensible(false);
+            return Ok(Some(true));
+        };
+        if result.to_boolean() && target.is_extensible() {
+            return Err(self.type_error(
+                "proxy 'preventExtensions' reported success but the target is still extensible",
+            ));
+        }
+        Ok(Some(result.to_boolean()))
+    }
+
+    /// `[[Call]]` on a proxy, through the `apply` trap.
+    fn proxy_apply(
+        &mut self,
+        object: &Gc<JsObject>,
+        this: Value,
+        args: Vec<Value>,
+    ) -> JsResult<Option<Value>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        // The trap gets the arguments as one array, which is the shape the spec passes
+        // and the shape `apply` traps are written against (`args[0]` is the first one).
+        let arguments = self.new_array(args.clone());
+        let this_for_trap = this.clone();
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "apply",
+            vec![
+                Value::Object(target.clone()),
+                this_for_trap,
+                Value::Object(arguments),
+            ],
+        )?
+        else {
+            return Ok(Some(self.call_value(Value::Object(target), this, args)?));
+        };
+        Ok(Some(result))
+    }
+
+    /// `[[Construct]]` on a proxy, through the `construct` trap.
+    fn proxy_construct(
+        &mut self,
+        object: &Gc<JsObject>,
+        args: Vec<Value>,
+        new_target: &Value,
+    ) -> JsResult<Option<Value>> {
+        let Some((target, handler)) = self.proxy_parts(object)? else {
+            return Ok(None);
+        };
+        if !target.is_callable() {
+            return Err(self.type_error("proxy target is not a constructor"));
+        }
+        let arguments = self.new_array(args.clone());
+        let Some(result) = self.proxy_trap(
+            &handler,
+            "construct",
+            vec![
+                Value::Object(target.clone()),
+                Value::Object(arguments),
+                new_target.clone(),
+            ],
+        )?
+        else {
+            return Ok(Some(self.construct(
+                Value::Object(target),
+                new_target.clone(),
+                args,
+            )?));
+        };
+        if !matches!(result, Value::Object(_)) {
+            return Err(self.type_error("proxy 'construct' must return an object"));
+        }
+        Ok(Some(result))
+    }
+
+    /// `[[HasProperty]]` on an ordinary object, which the proxy fallback needs.
+    fn has_own_or_inherited(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> JsResult<bool> {
+        // The object itself first: it may be a proxy, and then the answer is its trap's.
+        if let Some(answer) = self.proxy_has(object, key)? {
+            return Ok(answer);
+        }
+        if object.own_property_key(key).is_some() {
+            return Ok(true);
+        }
+        if let Some(index) = key.as_str().and_then(array_index)
+            && object
+                .array_get(index as usize)
+                .is_some_and(|value| !matches!(value, Value::Hole))
+        {
+            return Ok(true);
+        }
+        // A proxy further up the chain answers for itself.
+        for ancestor in object.chain() {
+            if let Some(answer) = self.proxy_has(&ancestor, key)? {
+                return Ok(answer);
+            }
+            if ancestor.own_property_key(key).is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `CreateListFromArrayLike`, optionally restricted to property keys.
+    ///
+    /// The `ownKeys` trap is the one place a script's array reaches the engine this way,
+    /// and refusing a non-key element there is what makes `ownKeys: () => [1.5]` a
+    /// `TypeError` instead of a property named `"1.5"`.
+    fn list_from_array_like(&mut self, value: &Value, keys_only: bool) -> JsResult<Vec<Value>> {
+        let object = self.object_from(value)?;
+        let length = self
+            .get_property(&object, "length")?
+            .map(|value| value.to_number())
+            .unwrap_or(0.0);
+        if !length.is_finite() || length < 0.0 {
+            return Err(self.type_error("invalid array-like length"));
+        }
+        let length = length as usize;
+        let mut items = Vec::with_capacity(length.min(1024));
+        for index in 0..length {
+            let item = self
+                .get_property(&object, &index.to_string())?
+                .unwrap_or(Value::Undefined);
+            if keys_only && matches!(&item, Value::Symbol(_)) {
+                items.push(item);
+                continue;
+            }
+            if keys_only && !matches!(&item, Value::String(_)) {
+                return Err(self.type_error("proxy 'ownKeys' must return strings and symbols"));
+            }
+            items.push(item);
+        }
+        Ok(items)
+    }
+
+    /// A `Property` from the descriptor object a trap returned.
+    fn property_from_descriptor(&mut self, value: &Value) -> JsResult<Property> {
+        let object = self.object_from(value)?;
+        let field = |interp: &mut Self, name: &str| -> JsResult<Option<Value>> {
+            interp.get_property(&object, name)
+        };
+        let getter = field(self, "get")?;
+        let setter = field(self, "set")?;
+        let accessor = getter.is_some() || setter.is_some();
+        let boolean = |interp: &mut Self, name: &str| -> JsResult<bool> {
+            Ok(interp
+                .get_property(&object, name)?
+                .is_some_and(|value| value.to_boolean()))
+        };
+        let enumerable = boolean(self, "enumerable")?;
+        let configurable = boolean(self, "configurable")?;
+        if accessor {
+            if field(self, "value")?.is_some() || field(self, "writable")?.is_some() {
+                return Err(
+                    self.type_error("a descriptor cannot be both a data property and an accessor")
+                );
+            }
+            Ok(Property {
+                getter: getter.or(Some(Value::Undefined)),
+                setter: setter.or(Some(Value::Undefined)),
+                enumerable,
+                configurable,
+                writable: false,
+                value: None,
+            })
+        } else {
+            Ok(Property {
+                value: Some(field(self, "value")?.unwrap_or(Value::Undefined)),
+                writable: boolean(self, "writable")?,
+                enumerable,
+                configurable,
+                getter: None,
+                setter: None,
+            })
+        }
+    }
+
+    /// The descriptor object for a `Property`, which the `defineProperty` trap receives.
+    fn descriptor_from_property(&mut self, property: &Property) -> Value {
+        let object = self.new_object(None);
+        if property.is_accessor() {
+            let getter = property.getter.clone().unwrap_or(Value::Undefined);
+            let setter = property.setter.clone().unwrap_or(Value::Undefined);
+            object.define_data("get", getter);
+            object.define_data("set", setter);
+        } else {
+            let value = property.value.clone().unwrap_or(Value::Undefined);
+            object.define_data("value", value);
+            object.define_data("writable", Value::Bool(property.writable));
+        }
+        object.define_data("enumerable", Value::Bool(property.enumerable));
+        object.define_data("configurable", Value::Bool(property.configurable));
+        Value::Object(object)
     }
 
     // -- calling ------------------------------------------------------------
@@ -2177,6 +2995,17 @@ impl<'a> Interp<'a> {
             let what = format!("{} is not a function", callee.to_js_string());
             return Err(Signal::Throw(self.make_error("TypeError", &what)));
         };
+        // A proxy of a function is called through its `apply` trap. It has no
+        // `ObjectKind::Function` of its own, so this has to come before the dispatch
+        // below, and a proxy of a non-function has nothing to forward to.
+        if function.proxy_state().is_some() {
+            return match self.proxy_apply(function, this, args)? {
+                Some(result) => Ok(result),
+                None => Err(Signal::Throw(
+                    self.make_error("TypeError", "proxy target is not callable"),
+                )),
+            };
+        }
         let callable = function.with(|data| match &data.kind {
             ObjectKind::Function(callable) => match callable {
                 Callable::Native { func } => Some(NativeCall::Native(*func)),
@@ -2192,6 +3021,7 @@ impl<'a> Interp<'a> {
                 Callable::Bytecode { code, env } => {
                     Some(NativeCall::Bytecode(code.clone(), env.clone()))
                 }
+                Callable::Revoker(slots) => Some(NativeCall::Revoker(slots.clone())),
             },
             _ => None,
         });
@@ -2216,6 +3046,15 @@ impl<'a> Interp<'a> {
                     self.native_frames.pop();
                 }
                 result
+            }
+            Some(NativeCall::Revoker(slots)) => {
+                // Idempotent: revoking twice answers `undefined` again rather than
+                // complaining, which is what the spec says and what a `finally` block
+                // relies on.
+                let mut state = slots.borrow_mut();
+                state.target = None;
+                state.handler = None;
+                Ok(Value::Undefined)
             }
             Some(NativeCall::Bound {
                 target,
@@ -2745,6 +3584,16 @@ impl<'a> Interp<'a> {
                     self.make_error("TypeError", "not a constructor"),
                 ));
             };
+            // A proxy of a function constructs through its `construct` trap, and the
+            // trap's answer is the result directly — no fresh object is made here.
+            if object.proxy_state().is_some() {
+                return match self.proxy_construct(&object, args, &new_target)? {
+                    Some(result) => Ok(result),
+                    None => Err(Signal::Throw(
+                        self.make_error("TypeError", "proxy target is not a constructor"),
+                    )),
+                };
+            }
             // A function can opt out of `[[Construct]]` outright. `Symbol` does: there is
             // no wrapper object to build, and `new Symbol()` is a `TypeError` naming it.
             if object
@@ -3407,7 +4256,7 @@ impl<'a> Interp<'a> {
                 let deleted = if self.realm.globals.contains_key(&name) {
                     false
                 } else if global.own_property(&name).is_some() {
-                    self.delete_property(&global, &name)
+                    self.delete_property(&global, &name)?
                 } else {
                     true
                 };
@@ -4024,10 +4873,8 @@ impl<'a> Interp<'a> {
 
             // -- iteration --------------------------------------------------
             ForInStart => {
-                let object = self.realm.global.clone();
-                let _ = &object;
                 let value = self.pop();
-                let record = self.for_in_record(&value);
+                let record = self.for_in_record(&value)?;
                 self.push(Value::Object(record));
             }
             ForInNext => {
@@ -4035,7 +4882,7 @@ impl<'a> Interp<'a> {
                 // the compiler tests it with `if_false` to jump back into the body,
                 // so reporting `true` while keys remain would end the loop at once.
                 let record = self.peek(0);
-                match self.for_in_advance(&record) {
+                match self.for_in_advance(&record)? {
                     Some(key) => {
                         let text = self.string(key);
                         self.push(text);
@@ -4148,7 +4995,7 @@ impl<'a> Interp<'a> {
                 let deleted = match &target {
                     Value::Object(object) => {
                         let object = object.clone();
-                        self.delete_property_key(&object, &key)
+                        self.delete_property_key(&object, &key)?
                     }
                     // A string's `length` and its index properties are
                     // non-configurable, so deleting one answers `false`.
@@ -4992,6 +5839,11 @@ impl<'a> Interp<'a> {
             ));
         };
         let key = self.propkey(key);
+        // `in` on a proxy is the `has` trap; the invariant that keeps a fixed property
+        // from being denied lives in `proxy_has`.
+        if object.proxy_state().is_some() {
+            return self.has_own_or_inherited(object, &key);
+        }
         if object.own_property_key(&key).is_some() {
             return Ok(true);
         }
@@ -5021,10 +5873,54 @@ impl<'a> Interp<'a> {
         let Some(Value::Object(prototype)) = prototype else {
             return Ok(false);
         };
-        Ok(target
-            .chain()
-            .iter()
-            .any(|ancestor| ancestor.ptr_eq(&prototype)))
+        // `instanceof` walks `[[GetPrototypeOf]]`, so a proxy answers through its trap —
+        // which is also what makes `proxyOfInstance instanceof C` work.
+        let mut current = Some(target.clone());
+        while let Some(object) = current {
+            if object.ptr_eq(&prototype) {
+                return Ok(true);
+            }
+            current = self.object_prototype_of(&object)?;
+        }
+        Ok(false)
+    }
+
+    /// `[[GetPrototypeOf]]`, with the proxy trap when there is one.
+    pub fn object_prototype_of(&mut self, object: &Gc<JsObject>) -> JsResult<Option<Gc<JsObject>>> {
+        if let Some(proto) = self.proxy_get_prototype_of(object)? {
+            return Ok(proto);
+        }
+        Ok(object.proto())
+    }
+
+    /// `[[SetPrototypeOf]]`, with the proxy trap when there is one.
+    pub fn object_set_prototype_of(
+        &mut self,
+        object: &Gc<JsObject>,
+        proto: Option<Gc<JsObject>>,
+    ) -> JsResult<bool> {
+        if let Some(answer) = self.proxy_set_prototype_of(object, proto.clone())? {
+            return Ok(answer);
+        }
+        object.set_proto(proto);
+        Ok(true)
+    }
+
+    /// `[[IsExtensible]]`, with the proxy trap when there is one.
+    pub fn object_is_extensible(&mut self, object: &Gc<JsObject>) -> JsResult<bool> {
+        if let Some(answer) = self.proxy_is_extensible(object)? {
+            return Ok(answer);
+        }
+        Ok(object.is_extensible())
+    }
+
+    /// `[[PreventExtensions]]`, with the proxy trap when there is one.
+    pub fn object_prevent_extensions(&mut self, object: &Gc<JsObject>) -> JsResult<bool> {
+        if let Some(answer) = self.proxy_prevent_extensions(object)? {
+            return Ok(answer);
+        }
+        object.set_extensible(false);
+        Ok(true)
     }
 
     fn copy_properties(
@@ -5069,25 +5965,29 @@ impl<'a> Interp<'a> {
             }
         }
         let source = &source_object;
-        let mut keys = source.own_enumerable_keys();
-        if let Some(length) = source.array_length() {
-            keys.retain(|key| key.as_str() != Some("length"));
-            for index in 0..length {
-                if let Some(value) = source.array_get(index) {
-                    target.define_data(&index.to_string(), value);
-                }
-            }
-        }
-        for key in keys {
-            if excluded.contains(&key) {
+        // Through `[[OwnPropertyKeys]]` and `[[Get]]`, so `{...proxy}` asks the handler.
+        // Reading the property table directly made every spread of a proxy empty.
+        let keys = self.object_own_property_keys(source)?;
+        for as_key in keys {
+            if as_key.is_symbol() {
+                // A spread copies string-keyed properties only.
                 continue;
             }
-            let as_key = PropertyKey::from(key);
-            if let Some(property) = source.own_property_key(&as_key)
-                && let Some(value) = property.value
-            {
-                target.define_data_key(&as_key, value);
+            if excluded.contains(&crate::value::Wtf8::new(
+                as_key.as_str().unwrap_or_default(),
+            )) {
+                continue;
             }
+            let enumerable = self
+                .object_get_own_property(source, &as_key)?
+                .is_some_and(|property| property.enumerable);
+            if !enumerable {
+                continue;
+            }
+            let value = self
+                .get_property_key(source, &as_key)?
+                .unwrap_or(Value::Undefined);
+            target.define_data_key(&as_key, value);
         }
         Ok(())
     }
@@ -5128,9 +6028,43 @@ impl<'a> Interp<'a> {
     /// within one object the integer-like keys in ascending numeric order ahead of the
     /// string keys in insertion order. A shadowed key only appears once, and a key that
     /// is a non-enumerable own property anywhere nearer is skipped entirely.
-    fn for_in_record(&mut self, value: &Value) -> Gc<JsObject> {
+    fn for_in_record(&mut self, value: &Value) -> JsResult<Gc<JsObject>> {
         let record = self.new_object(None);
         let mut keys: Vec<crate::value::Wtf8> = Vec::new();
+        // A proxy supplies its own key list, and — the reason this is not just another
+        // branch of the ordinary walk — *re-decides* whether each key is enumerable as
+        // the loop goes. `record.__proxy` marks that, and `for_in_advance` re-reads the
+        // descriptor there.
+        if let Value::Object(object) = value
+            && object.proxy_state().is_some()
+        {
+            let own = self
+                .proxy_own_keys(object)?
+                .unwrap_or_else(|| object.own_property_keys());
+            let mut ordered: Vec<PropertyKey> = Vec::with_capacity(own.len());
+            let mut numeric: Vec<u32> = Vec::new();
+            let mut rest: Vec<PropertyKey> = Vec::new();
+            for key in own {
+                match key.as_str().and_then(array_index) {
+                    Some(index) => numeric.push(index),
+                    None => rest.push(key),
+                }
+            }
+            numeric.sort_unstable();
+            ordered.extend(
+                numeric
+                    .into_iter()
+                    .map(|index| PropertyKey::from(index.to_string())),
+            );
+            ordered.extend(rest);
+            for (index, key) in ordered.into_iter().enumerate() {
+                record.define_data(&index.to_string(), self.key_value(&key));
+            }
+            record.define_data("__index", Value::Int(0));
+            // The mark that makes `for_in_advance` re-ask the proxy per key.
+            record.define_data("__proxy", Value::Object(object.clone()));
+            return Ok(record);
+        }
         if let Value::Object(object) = value {
             let mut chain = vec![object.clone()];
             chain.extend(object.chain());
@@ -5180,24 +6114,53 @@ impl<'a> Interp<'a> {
             record.define_data(&index.to_string(), self.string_wtf8(key));
         }
         record.define_data("__index", Value::Int(0));
-        record
+        Ok(record)
     }
 
-    fn for_in_advance(&mut self, record: &Value) -> Option<String> {
+    /// The next key of a `for…in` record, `None` when the loop is done.
+    ///
+    /// For a proxy the descriptor is re-read on *every* step rather than filtered once up
+    /// front: the spec's `EnumerateObjectProperties` asks `[[GetOwnProperty]]` per key as
+    /// the loop reaches it, so a handler that stops reporting a key partway through drops
+    /// it from the rest of the iteration. Snapshotting the list instead kept yielding a
+    /// key the handler had already withdrawn.
+    fn for_in_advance(&mut self, record: &Value) -> JsResult<Option<String>> {
         let Value::Object(record) = record else {
-            return None;
+            return Ok(None);
         };
-        let index = record
-            .own_property("__index")
-            .and_then(|property| property.value)
-            .map(|value| value.to_int32())
-            .unwrap_or(0);
-        match record.own_property(&index.to_string()) {
-            Some(property) => {
-                record.define_data("__index", Value::Int(index + 1));
-                property.value.map(|value| value.to_js_string())
+        let proxy = record
+            .own_property("__proxy")
+            .and_then(|property| property.value);
+        loop {
+            let index = record
+                .own_property("__index")
+                .and_then(|property| property.value)
+                .map(|value| value.to_int32())
+                .unwrap_or(0);
+            let Some(candidate) = record
+                .own_property(&index.to_string())
+                .and_then(|property| property.value)
+            else {
+                return Ok(None);
+            };
+            record.define_data("__index", Value::Int(index + 1));
+            let text = candidate.to_js_string();
+            let Some(Value::Object(proxy)) = &proxy else {
+                return Ok(Some(text));
+            };
+            // The candidate is already a key string here, so the lookup does not need a
+            // second `ToPropertyKey` conversion.
+            let key = PropertyKey::from(text.as_str());
+            let live = match self.proxy_get_own_property(proxy, &key)? {
+                Some(descriptor) => descriptor,
+                // Not a proxy after all, or it lost its state: fall back to the target.
+                None => proxy.own_property_key(&key),
+            };
+            if live.is_some_and(|property| property.enumerable) {
+                return Ok(Some(text));
             }
-            None => None,
+            // Withdrawn or non-enumerable: this key is skipped, and the loop looks at the
+            // next one.
         }
     }
 
@@ -5479,6 +6442,8 @@ enum NativeCall {
         this: Value,
         leading: Vec<Value>,
     },
+    /// `Proxy.revocable`'s `revoke`: clear the proxy's slots and answer `undefined`.
+    Revoker(crate::object::ProxyRef),
 }
 
 /// What a store does when the object refuses the write.

@@ -793,6 +793,24 @@ impl Value {
         }
     }
 
+    /// `SameValue`, the equality `Object.is` uses and a proxy invariant needs.
+    ///
+    /// It is [`Value::same_value_zero`] plus the one extra distinction: `+0` and `-0`
+    /// are different values here, which is what makes `Object.is(0, -0)` false.
+    pub fn same_value(&self, other: &Value) -> bool {
+        if let (Value::Int(_) | Value::Float(_), Value::Int(_) | Value::Float(_)) = (self, other) {
+            let (a, b) = (self.to_number(), other.to_number());
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == 0.0 && b == 0.0 {
+                return a.is_sign_negative() == b.is_sign_negative();
+            }
+            return a == b;
+        }
+        self.strict_equals(other)
+    }
+
     /// `SameValueZero`, the equality a `Map` key and a `Set` element use.
     ///
     /// It differs from `===` in exactly one place: `NaN` equals itself. That is what makes

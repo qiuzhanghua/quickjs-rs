@@ -54,12 +54,10 @@ FILES = {
         "skip": {},
     },
     "test_loop.js": {
-        "skip": {
-            "test_for_in_proxy": "no Proxy object in the realm yet",
-            # Not a gap: the reference hangs on this one too (exit 124). It only
-            # checks that `l: break l` inside `for(;;)` compiles.
-            "test_cyclic_labels": "the reference hangs on it as well",
-        },
+        # Every test the reference passes, passes here. `test_cyclic_labels` shows up in
+        # the runner's "the reference itself fails" bucket: it loops forever on both
+        # sides, because it only checks that `l: break l` inside `for(;;)` *compiles*.
+        "skip": {},
     },
     "test_bigint.js": {
         "skip": {},

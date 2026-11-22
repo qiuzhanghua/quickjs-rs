@@ -128,6 +128,17 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             }
             ObjectKind::TypedArray { .. } => "Object",
             ObjectKind::Ordinary => "Object",
+            // A proxy reports the tag of what it stands in for, which is what makes
+            // `Object.prototype.toString.call(new Proxy([], {}))` say `[object Array]`.
+            ObjectKind::Proxy(_) => {
+                if object.is_array() {
+                    "Array"
+                } else if object.is_callable() {
+                    "Function"
+                } else {
+                    "Object"
+                }
+            }
         }) {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),
@@ -195,22 +206,13 @@ fn value_of(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
 
 fn has_own_property(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let object = this_object(interp, &this)?;
-    let key = arg(args, 0).to_js_string();
-    Ok(Value::Bool(own_has(&object, &key)))
-}
-
-/// Whether `object` has `key` as an own property, elements included.
-fn own_has(object: &Gc<JsObject>, key: &str) -> bool {
-    if object.own_property(key).is_some() {
-        return true;
-    }
-    match array_index(key) {
-        Some(index) => object.array_get(index as usize).is_some(),
-        None => {
-            // `length` is own on an array even though it is not in the property table.
-            key == "length" && object.is_array()
-        }
-    }
+    let key = interp.property_key(&arg(args, 0));
+    // `[[GetOwnProperty]]`, not a peek at the property table: a proxy answers this with
+    // its `getOwnPropertyDescriptor` trap, and it may still be holding a `TypeError` for
+    // a handler that lied about a fixed property.
+    Ok(Value::Bool(
+        interp.object_get_own_property(&object, &key)?.is_some(),
+    ))
 }
 
 fn is_prototype_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -236,29 +238,6 @@ fn property_is_enumerable(interp: &mut Interp<'_>, this: Value, args: &[Value]) 
             .is_some(),
     };
     Ok(Value::Bool(enumerable))
-}
-
-/// Every own key of `value`, symbols included, in the spec's order: integer-like keys
-/// ascending, then the string keys in insertion order, then the symbols.
-///
-/// `Reflect.ownKeys` and `Object.getOwnPropertyDescriptors` use this; everything that is
-/// specified to skip symbols (`Object.keys`, `for…in`, `JSON.stringify`) uses
-/// [`own_keys`]. The result is a list of [`PropertyKey`]s rather than `Value`s because
-/// turning one into a `Value` needs the heap, which the caller has and this does not.
-pub fn own_property_keys(value: &Value) -> Vec<PropertyKey> {
-    let Some(object) = value.as_object() else {
-        if let Value::String(text) = value {
-            return (0..text.utf16_len())
-                .map(|i| PropertyKey::from(i.to_string()))
-                .collect();
-        }
-        return Vec::new();
-    };
-    let mut out: Vec<PropertyKey> = own_keys(value).into_iter().map(PropertyKey::from).collect();
-    for symbol in object.own_symbol_keys() {
-        out.push(PropertyKey::Symbol(symbol));
-    }
-    out
 }
 
 /// The own keys of `value`, in the order the spec requires: integer-like keys
@@ -303,7 +282,7 @@ pub fn own_keys(value: &Value) -> Vec<crate::value::Wtf8> {
 
 fn keys(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let value = arg(args, 0);
-    let Some(object) = value.as_object() else {
+    let Some(_object) = value.as_object() else {
         // `Object.keys("ab")` is `["0", "1"]`; `Object.keys(1)` is `[]`.
         return match value {
             Value::String(text) => {
@@ -319,34 +298,47 @@ fn keys(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
             }
         };
     };
-    let keys: Vec<Value> = own_keys(&value)
-        .into_iter()
-        .filter(|key| {
-            object
-                .own_property_key(&PropertyKey::from(key.clone()))
-                .map(|property| property.enumerable)
-                .unwrap_or(true)
-        })
-        .map(|key| interp.string_wtf8(key))
+    // A proxy reports its own key list, and asks about each key's enumerability one at
+    // a time — `Object.keys(proxyOfFrozen)` must not see a key the handler hides.
+    let keys: Vec<Value> = own_enumerable_keys(interp, &value)?
+        .iter()
+        .map(|key| interp.key_value(key))
         .collect();
     let array = interp.new_array(keys);
     Ok(Value::Object(array))
+}
+
+/// The own enumerable **string** keys of `value`, in the order `[[OwnPropertyKeys]]`
+/// reports them.
+///
+/// This goes through the interpreter rather than reading the object directly, which is
+/// what makes `Object.keys(proxy)` ask the handler: a proxy's own property table is empty
+/// by design, so reading it would answer "no keys" for every proxy.
+fn own_enumerable_keys(interp: &mut Interp<'_>, value: &Value) -> JsResult<Vec<PropertyKey>> {
+    let Some(object) = value.as_object().cloned() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for key in interp.object_own_property_keys(&object)? {
+        if key.is_symbol() {
+            continue;
+        }
+        let enumerable = interp
+            .object_get_own_property(&object, &key)?
+            .is_some_and(|property| property.enumerable);
+        if enumerable {
+            out.push(key);
+        }
+    }
+    Ok(out)
 }
 
 fn values(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let value = arg(args, 0);
     let mut out = Vec::new();
     if let Value::Object(object) = &value {
-        for key in own_keys(&value) {
-            let as_key = PropertyKey::from(key.clone());
-            let enumerable = object
-                .own_property_key(&as_key)
-                .map(|property| property.enumerable)
-                .unwrap_or(true);
-            if !enumerable {
-                continue;
-            }
-            if let Some(found) = interp.get_property_key(object, &as_key)? {
+        for key in own_enumerable_keys(interp, &value)? {
+            if let Some(found) = interp.get_property_key(object, &key)? {
                 out.push(found);
             }
         }
@@ -360,17 +352,10 @@ fn entries(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
     let value = arg(args, 0);
     let mut out = Vec::new();
     if let Value::Object(object) = &value {
-        for key in own_keys(&value) {
-            let as_key = PropertyKey::from(key.clone());
-            let enumerable = object
-                .own_property_key(&as_key)
-                .map(|property| property.enumerable)
-                .unwrap_or(true);
-            if !enumerable {
-                continue;
-            }
-            if let Some(found) = interp.get_property_key(object, &as_key)? {
-                let pair = interp.new_array(vec![interp.string_wtf8(key), found]);
+        for key in own_enumerable_keys(interp, &value)? {
+            if let Some(found) = interp.get_property_key(object, &key)? {
+                let name = interp.key_value(&key);
+                let pair = interp.new_array(vec![name, found]);
                 out.push(Value::Object(pair));
             }
         }
@@ -385,19 +370,16 @@ fn assign(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Val
         return Err(interp.type_error("Object.assign target is not an object"));
     };
     for source in args.iter().skip(1) {
-        let Value::Object(source_object) = source else {
+        let Value::Object(_) = source else {
             continue;
         };
-        for key in own_keys(source) {
-            let as_key = PropertyKey::from(key);
-            let enumerable = source_object
-                .own_property_key(&as_key)
-                .map(|property| property.enumerable)
-                .unwrap_or(true);
-            if !enumerable {
-                continue;
-            }
-            if let Some(found) = interp.get_property_key(source_object, &as_key)? {
+        // `Object.assign` copies exactly the own enumerable keys, so it goes through
+        // `[[OwnPropertyKeys]]` and `[[Get]]` — which is what makes it see a proxy's
+        // handler rather than the empty property table behind it.
+        for as_key in own_enumerable_keys(interp, source)? {
+            if let Some(found) =
+                interp.get_property_key(source.as_object().expect("checked above"), &as_key)?
+            {
                 interp.set_property_with_key(
                     target_object,
                     &as_key,
@@ -427,7 +409,9 @@ fn create(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Val
 
 fn get_prototype_of(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     match arg(args, 0) {
-        Value::Object(object) => Ok(object.proto().map_or(Value::Null, Value::Object)),
+        Value::Object(object) => Ok(interp
+            .object_prototype_of(&object)?
+            .map_or(Value::Null, Value::Object)),
         Value::Undefined | Value::Null => {
             Err(interp.type_error("cannot convert undefined or null to object"))
         }
@@ -496,7 +480,11 @@ fn set_prototype_of(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> Js
         _ => return Err(interp.type_error("prototype must be an object or null")),
     };
     if let Some(object) = target.as_object() {
-        object.set_proto(proto);
+        // A proxy answers through `setPrototypeOf` and may refuse; the `Object.` entry
+        // point turns a refusal into a `TypeError` rather than reporting `false`.
+        if !interp.object_set_prototype_of(object, proto)? {
+            return Err(interp.type_error("proxy refused to change its prototype"));
+        }
     }
     Ok(target)
 }
@@ -563,10 +551,13 @@ pub fn define_property_on(
             setter: None,
         }
     };
-    object.define_key(&key, property);
+    // A proxy decides through `defineProperty`, and a refusal is a `TypeError` here
+    // because `Object.defineProperty` reports failure that way.
+    if !interp.object_define_own_property(object, &key, property)? {
+        return Err(interp.type_error("proxy 'defineProperty' refused"));
+    }
     Ok(())
 }
-
 /// One boolean field of a property descriptor, or `None` when it is absent.
 fn descriptor_bool(
     interp: &mut Interp<'_>,
@@ -585,18 +576,30 @@ fn get_own_property_names(
     args: &[Value],
 ) -> JsResult<Value> {
     let value = arg(args, 0);
-    let mut names = own_keys(&value);
-    // `length` is an own property of an array and of a string, even though it is
-    // not enumerated by `Object.keys`.
-    if matches!(&value, Value::Object(object) if object.is_array())
-        || matches!(&value, Value::String(_))
-    {
-        names.push(crate::value::Wtf8::new("length"));
-    }
-    let names: Vec<Value> = names
-        .into_iter()
-        .map(|name| interp.string_wtf8(name))
+    let Some(object) = value.as_object() else {
+        // A string's index properties are own and enumerable but non-writable; a
+        // primitive has no other own keys.
+        let mut names: Vec<Value> = crate::builtins::object::own_keys(&value)
+            .into_iter()
+            .map(|name| interp.string_wtf8(name))
+            .collect();
+        if matches!(&value, Value::String(_)) {
+            names.push(interp.string("length"));
+        }
+        let array = interp.new_array(names);
+        return Ok(Value::Object(array));
+    };
+    let mut names: Vec<Value> = interp
+        .object_own_property_keys(object)?
+        .iter()
+        .filter(|key| !key.is_symbol())
+        .map(|key| interp.key_value(key))
         .collect();
+    // `length` is an own property of an array that is not in its property table, and it
+    // is not enumerable, so only this entry point reports it.
+    if object.is_array() && !names.iter().any(|name| name.to_js_string() == "length") {
+        names.push(interp.string("length"));
+    }
     let array = interp.new_array(names);
     Ok(Value::Object(array))
 }
@@ -614,10 +617,11 @@ fn get_own_property_symbols(
     let Some(object) = value.as_object() else {
         return Err(interp.type_error("not an object"));
     };
-    let symbols: Vec<Value> = object
-        .own_symbol_keys()
+    let symbols: Vec<Value> = interp
+        .object_own_property_keys(object)?
         .into_iter()
-        .map(Value::Symbol)
+        .filter(|key| key.is_symbol())
+        .map(|key| interp.key_value(&key))
         .collect();
     let array = interp.new_array(symbols);
     Ok(Value::Object(array))
@@ -633,7 +637,7 @@ fn get_own_property_descriptor(
         return Err(interp.type_error("target is not an object"));
     };
     let key = interp.property_key(&arg(args, 1));
-    let Some(property) = object.own_property_key(&key) else {
+    let Some(property) = interp.object_get_own_property(object, &key)? else {
         return Ok(Value::Undefined);
     };
     let proto = interp.realm.object_proto.clone();
@@ -727,18 +731,20 @@ fn is_sealed(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult
     ))
 }
 
-fn prevent_extensions(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+fn prevent_extensions(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let target = arg(args, 0);
     if let Some(object) = target.as_object() {
-        object.set_extensible(false);
+        if !interp.object_prevent_extensions(object)? {
+            return Err(interp.type_error("proxy refused to become non-extensible"));
+        }
     }
     Ok(target)
 }
 
-fn is_extensible(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+fn is_extensible(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let target = arg(args, 0);
     Ok(Value::Bool(match target.as_object() {
-        Some(object) => object.is_extensible(),
+        Some(object) => interp.object_is_extensible(object)?,
         None => false,
     }))
 }

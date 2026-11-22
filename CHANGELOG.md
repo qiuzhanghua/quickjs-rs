@@ -4,6 +4,40 @@
 
 ## 未发布
 
+### 加：`Proxy`
+
+`Proxy` 和 `Proxy.revocable` 落地，十一个 trap 全部接线：`get`、`set`、`has`、
+`deleteProperty`、`ownKeys`、`getOwnPropertyDescriptor`、`defineProperty`、
+`getPrototypeOf`、`setPrototypeOf`、`isExtensible`、`preventExtensions`，外加
+`apply`/`construct`（所以 `typeof proxyOfFunction === "function"`、
+`new proxyOfConstructor()` 都对）。为此在 `ObjectKind` 上加了一个 `Proxy` 变体，
+持有 target 与 handler 两个槽位；`revoke` 共享同一份槽位，清空即撤销，撤销之后
+任何操作都是 `TypeError`。
+
+不变量全部实现，这不是装饰 —— 没有它们，`new Proxy(frozen, {…})` 就能绕过
+`Object.freeze`：非配置属性不许被藏、被删、被改名；非可扩展的 target 不许让
+`isExtensible` 撒谎、不许让 `ownKeys` 多报或漏报、不许换原型；trap 存在但不可调用
+是 `TypeError` 而不是"当作没有 trap"。
+
+这一版还顺手补了三处**既有**的漏洞，都是"对象之外还藏着属性"这一类的：
+
+1. **`Reflect.ownKeys([1,2])` 少了 `length`**。`length` 是数组的自有、非枚举、
+   非配置属性，却存在元素数组里而不在属性表里，于是所有"取自有键"的视图都漏了它。
+   这同时让 proxy 不变量覆盖不到 `length` —— handler 可以把 `length` 报成可配置的
+   而没人拦。现在 `property_entries` 统一合成它。
+2. **`Array.prototype.map.call(proxyOfArray, f)` 静默返回 `[]`**。一个数组的代理
+   没有自己的元素数组，而所有高阶数组方法都从一个 `elements()` 读元素。现在
+   `elements()` 走 `[[Get]]`，一次修好 `map`/`filter`/`reduce`/`join`/`slice`/
+   `concat`/`flat` 等二十来个方法。同样地 `{...proxy}`、`Object.assign({}, proxy)`、
+   `hasOwnProperty`、`JSON.stringify` 也都改走内部方法。
+3. **`goto` 超过 127 字节被截断**。`choose_short_form` 无条件把 `Goto` 选成
+   `Goto8`、`IfFalse` 选成 `IfFalse8`，不检查偏移是否装得下 i8。溢出后跳转落进
+   字节码中间甚至函数之外，而 VM 把"跑出末尾"当作返回 —— 于是脚本**静默停止**，
+   没有报错，也没有异常，看起来就像整个文件只有前半段。触发它需要恰到好处的形状：
+   一个嵌套循环、循环体里四个含 `eval` 的闭包。现在短形式的选择是一个不动点：
+   从最宽形式开始，只把**确实装得下**的跳转收窄，并且 `goto` 在装不下 i8 时退到
+   `goto16` —— 与参考实现的指令选择一致（反汇编差分测试对着 oracle 通过）。
+
 ### 修：六个错答案，两个一直没被量到的测试文件
 
 `test_loop.js` 和 `test_bigint.js` 是纯语言测试、不需要任何宿主注入，却从来没跑过。
@@ -41,15 +75,17 @@
 参考实现没编译时**明确打印 SKIPPED**而不是静默跳过，CI 可用 `--require-oracle`
 把它变成硬要求。
 
-当前账（参考能跑的 79 个测试里过 78 个）：
+当前账（参考能跑的 79 个测试全过）：
 
 | 文件 | 结果 |
 |---|---|
 | `test_language.js` | 29/29 |
 | `test_closure.js` | 7/7 |
-| `test_loop.js` | 17/18（差 `test_for_in_proxy`：还没有 `Proxy`） |
+| `test_loop.js` | 18/18 |
 | `test_bigint.js` | 5/5 |
 | `test_builtin.js` | 20/20 |
+
+已知缺口清单现在是**空的**。
 
 ## v0.2.0 — 2026-11-21
 

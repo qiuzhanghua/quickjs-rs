@@ -169,21 +169,28 @@ fn write_object(
 ) -> JsResult<()> {
     // Enumerable own keys in the spec's order, skipping keys whose values do not
     // serialise (a function-valued property is omitted, not `null`).
-    let keys: Vec<crate::value::Wtf8> =
-        crate::builtins::object::own_keys(&Value::Object(object.clone()))
-            .into_iter()
-            .filter(|key| {
-                object
-                    .own_property_key(&crate::object::PropertyKey::from(key.clone()))
-                    .map(|property| property.enumerable)
-                    .unwrap_or(true)
-            })
-            .collect();
+    //
+    // Through `[[OwnPropertyKeys]]` and `[[GetOwnProperty]]`, so a proxy serialises as
+    // its handler describes it: reading the property table directly made
+    // `JSON.stringify(proxy)` emit `{}` for every proxy.
+    let mut keys: Vec<crate::object::PropertyKey> = Vec::new();
+    for key in interp.object_own_property_keys(object)? {
+        if key.is_symbol() {
+            // A symbol-keyed property is invisible to `JSON.stringify`.
+            continue;
+        }
+        let enumerable = interp
+            .object_get_own_property(object, &key)?
+            .is_some_and(|property| property.enumerable);
+        if enumerable {
+            keys.push(key);
+        }
+    }
     let mut written = 0usize;
     let mut body = String::new();
     for key in keys {
-        let key_text = key.to_string_lossy().into_owned();
-        let Some(value) = interp.get_property(object, &key_text)? else {
+        let key_text = key.as_str().unwrap_or_default().to_string();
+        let Some(value) = interp.get_property_key(object, &key)? else {
             continue;
         };
         let mut piece = String::new();

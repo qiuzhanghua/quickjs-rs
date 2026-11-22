@@ -24,6 +24,7 @@ pub mod map;
 mod math;
 mod number;
 mod object;
+pub mod proxy;
 mod reflect;
 pub mod regexp;
 mod string;
@@ -70,6 +71,7 @@ pub fn install(interp: &mut Interp<'_>) {
     math::install(interp);
     json::install(interp);
     reflect::install(interp);
+    proxy::install(interp);
     date::install(interp);
     // `RegExp` after `String` (its methods dispatch to `Symbol.replace` and friends) and
     // after `Symbol`, whose well-known keys it defines its methods under.

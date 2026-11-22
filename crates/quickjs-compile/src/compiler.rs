@@ -7165,16 +7165,9 @@ fn assemble(
 
     // Choose an opcode for each instruction and its size, so label offsets can be
     // computed.
-    let mut chosen = Vec::with_capacity(kept.len());
-    let mut offsets = Vec::with_capacity(kept.len() + 1);
-    let mut offset = 0usize;
-    for (op, operands) in &kept {
-        let op = choose_short_form(*op, operands);
-        offsets.push(offset);
-        chosen.push(op);
-        offset += op.size() as usize;
-    }
-    offsets.push(offset);
+    let chosen = choose_opcodes(&kept, &label_kept);
+    let offsets = instruction_offsets(&chosen);
+    let offset = *offsets.last().unwrap_or(&0);
 
     let mut code = Vec::with_capacity(offset);
     for (position, (_, operands)) in kept.iter().enumerate() {
@@ -7496,10 +7489,84 @@ fn choose_short_form(op: Opcode, operands: &[Op]) -> Opcode {
         (Call, Some(Op::Int(count))) if (0..=3).contains(count) => {
             op.short_form(*count as u32).unwrap_or(op)
         }
-        (IfFalse, _) => IfFalse8,
-        (IfTrue, _) => IfTrue8,
-        (Goto, _) => Goto8,
         _ => op,
+    }
+}
+
+/// The byte offset each instruction will start at, plus the total code size.
+fn instruction_offsets(chosen: &[Opcode]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(chosen.len() + 1);
+    let mut offset = 0usize;
+    for op in chosen {
+        offsets.push(offset);
+        offset += op.size() as usize;
+    }
+    offsets.push(offset);
+    offsets
+}
+
+/// Pick an encoding for every instruction, shrinking a jump to its 8-bit form only when
+/// the offset actually fits.
+///
+/// The choice is circular: an instruction's size decides the offsets of everything after
+/// it, and the offsets decide whether a jump may be short. So this starts with every jump
+/// in its widest form and shrinks what fits, repeating until a pass changes nothing.
+/// Shrinking only ever *shortens* distances, so the loop converges.
+///
+/// Doing it in one pass instead — which is what this used to do — silently truncated any
+/// jump further than 127 bytes: `goto8` with a mangled offset lands in the middle of the
+/// bytecode, and the VM treats running off the end as a return. That is how a nested loop
+/// with four closures in its body simply stopped, with no error and no output past the
+/// first iteration.
+fn choose_opcodes(kept: &[(Opcode, Vec<Op>)], label_kept: &[Option<usize>]) -> Vec<Opcode> {
+    let mut chosen: Vec<Opcode> = kept
+        .iter()
+        .map(|(op, operands)| choose_short_form(*op, operands))
+        .collect();
+    // A jump the compiler emitted in its widest form, and the forms it may shrink to.
+    let candidates = |op: Opcode| match op {
+        Opcode::Goto => Some((Opcode::Goto8, Opcode::Goto16, true)),
+        Opcode::IfFalse => Some((Opcode::IfFalse8, Opcode::IfFalse, false)),
+        Opcode::IfTrue => Some((Opcode::IfTrue8, Opcode::IfTrue, false)),
+        _ => None,
+    };
+    loop {
+        let offsets = instruction_offsets(&chosen);
+        let mut changed = false;
+        for index in 0..kept.len() {
+            let (op, operands) = &kept[index];
+            let Some((short, medium, has_medium)) = candidates(*op) else {
+                continue;
+            };
+            if chosen[index] == short {
+                continue;
+            }
+            let Some(target) = target_kept_index(operands, label_kept) else {
+                continue;
+            };
+            let Some(&target_offset) = offsets.get(target) else {
+                continue;
+            };
+            // A jump is relative to the byte after its opcode, which is the convention
+            // `jump_target_of` decodes with.
+            let relative = target_offset as i64 - (offsets[index] as i64 + 1);
+            if (-128..=127).contains(&relative) {
+                chosen[index] = short;
+                changed = true;
+            } else if has_medium
+                && chosen[index] == Opcode::Goto
+                && (-32_768..=32_767).contains(&relative)
+            {
+                // Too far for 8 bits and close enough for 16. Only `goto` has a medium
+                // form: `if_false`/`if_true` jump straight from 8 to 32 bits, exactly as
+                // the reference encodes them.
+                chosen[index] = medium;
+                changed = true;
+            }
+        }
+        if !changed {
+            return chosen;
+        }
     }
 }
 

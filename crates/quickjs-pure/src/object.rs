@@ -273,6 +273,13 @@ pub enum Callable {
         /// The implementation.
         func: NativeFn,
     },
+    /// The `revoke` function `Proxy.revocable` hands back.
+    ///
+    /// It is a variant rather than a `Native` with the slots in a property because a
+    /// `NativeFn` is a plain function pointer: it cannot capture, and the slots are
+    /// precisely what this function exists to hold. Keeping them here also means the
+    /// collector sees them, so a proxy stays alive while only its `revoke` is reachable.
+    Revoker(crate::object::ProxyRef),
 }
 
 impl Trace for Callable {
@@ -290,6 +297,7 @@ impl Trace for Callable {
                 }
             }
             Callable::Native { .. } => {}
+            Callable::Revoker(slots) => slots.borrow().trace(tracer),
         }
     }
 }
@@ -527,6 +535,41 @@ pub enum ObjectKind {
     /// the generator object — and the collector has to see them, which it only does for
     /// things hanging off a `Gc`.
     Generator(Box<crate::interp::GeneratorState>),
+    /// A `Proxy`: a stand-in that forwards every internal method to a target through a
+    /// handler's traps.
+    ///
+    /// The state sits behind an `Rc` because `Proxy.revocable` hands the script a
+    /// `revoke` function that has to reach *this* proxy's two slots later, from a call
+    /// site that has no pointer to the object. Revoking clears them, which also drops
+    /// the collector's references to the target and the handler.
+    Proxy(ProxyRef),
+}
+
+/// The two slots of a proxy, shared with its `revoke` function.
+///
+/// `None` in both slots means revoked: every operation then throws a `TypeError`, and
+/// the target and handler are no longer reachable — which is the whole point of
+/// `Proxy.revocable`.
+#[derive(Default)]
+pub struct ProxyState {
+    /// The object the traps receive, or `None` once revoked.
+    pub target: Option<Gc<JsObject>>,
+    /// The trap table, or `None` once revoked.
+    pub handler: Option<Value>,
+}
+
+/// A proxy's mutable state, shared between the proxy object and its `revoke`.
+pub type ProxyRef = std::rc::Rc<std::cell::RefCell<ProxyState>>;
+
+impl Trace for ProxyState {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let Some(target) = &self.target {
+            tracer.visit(target);
+        }
+        if let Some(handler) = &self.handler {
+            handler.trace(tracer);
+        }
+    }
 }
 
 impl Trace for ObjectKind {
@@ -554,6 +597,7 @@ impl Trace for ObjectKind {
             }
             ObjectKind::Function(callable) => callable.trace(tracer),
             ObjectKind::Generator(state) => state.trace(tracer),
+            ObjectKind::Proxy(state) => state.borrow().trace(tracer),
         }
     }
 }
@@ -762,7 +806,57 @@ impl JsObject {
     /// "function"` and `bound()` works, so from a script's point of view a bound
     /// function is a function.
     pub fn is_callable(&self) -> bool {
-        matches!(self.data.borrow().kind, ObjectKind::Function(_))
+        match &self.data.borrow().kind {
+            ObjectKind::Function(_) => true,
+            // A proxy is callable exactly when its target is: the `apply` trap is what a
+            // call to it runs, and a target that cannot be called has nothing to forward
+            // to. This is what makes `typeof proxyOfFunction === "function"`.
+            ObjectKind::Proxy(state) => state
+                .borrow()
+                .target
+                .as_ref()
+                .is_some_and(|target| target.is_callable()),
+            _ => false,
+        }
+    }
+
+    /// Whether the target of this proxy can be constructed.
+    pub fn is_constructor(&self) -> bool {
+        match &self.data.borrow().kind {
+            ObjectKind::Function(_) => true,
+            ObjectKind::Proxy(state) => state
+                .borrow()
+                .target
+                .as_ref()
+                .is_some_and(|target| target.is_callable()),
+            _ => false,
+        }
+    }
+
+    /// This object's proxy slots, when it is one (revoked or not).
+    pub fn proxy_state(&self) -> Option<ProxyRef> {
+        match &self.data.borrow().kind {
+            ObjectKind::Proxy(state) => Some(state.clone()),
+            _ => None,
+        }
+    }
+
+    /// A proxy over `target` reading its traps from `handler`.
+    ///
+    /// The prototype stays empty on purpose: `[[GetPrototypeOf]]` on a proxy forwards to
+    /// the target through the `getPrototypeOf` trap, so copying the target's prototype
+    /// here would be a second, disagreeing source of truth.
+    pub fn proxy(heap: &js_gc::Heap, target: Gc<JsObject>, handler: Value) -> Gc<JsObject> {
+        Gc::new(
+            heap,
+            JsObject::new(
+                ObjectKind::Proxy(std::rc::Rc::new(std::cell::RefCell::new(ProxyState {
+                    target: Some(target),
+                    handler: Some(handler),
+                }))),
+                None,
+            ),
+        )
     }
 
     /// The prototype.
@@ -803,9 +897,65 @@ impl JsObject {
         }
     }
 
+    /// Every own key with its descriptor, array indices included.
+    ///
+    /// [`JsObject::own_property_keys`] answers the same question without the
+    /// descriptors; a proxy invariant needs both at once, because it has to check the
+    /// *value* of a key it is told about and the presence of a key it is not.
+    pub fn property_entries(&self) -> Vec<(PropertyKey, Property)> {
+        let data = self.data.borrow();
+        let mut out: Vec<(PropertyKey, Property)> = data.props.to_vec();
+        // An array's elements live in their own vector rather than the property table, so
+        // they have to be synthesized — with the attributes an ordinary element has.
+        if let ObjectKind::Array { elements } = &data.kind {
+            for (index, element) in elements.iter().enumerate() {
+                if matches!(element, Value::Hole) {
+                    continue;
+                }
+                let key = PropertyKey::from(index.to_string());
+                if !out.iter().any(|(existing, _)| *existing == key) {
+                    out.push((key, Property::data(element.clone())));
+                }
+            }
+        }
+        // `length` is own on an array without being in the property table either. It is
+        // writable, non-enumerable and — the part proxy invariants care about —
+        // non-configurable, so leaving it out let a handler hide or redefine it.
+        if matches!(data.kind, ObjectKind::Array { .. })
+            && let Some(length) = self.array_length()
+        {
+            let key = PropertyKey::from("length");
+            if !out.iter().any(|(existing, _)| *existing == key) {
+                out.push((
+                    key,
+                    Property {
+                        value: Some(Value::Int(length as i32)),
+                        writable: true,
+                        enumerable: false,
+                        configurable: false,
+                        getter: None,
+                        setter: None,
+                    },
+                ));
+            }
+        }
+        out
+    }
+
     /// Whether this object has array elements at all.
     pub fn is_array(&self) -> bool {
-        matches!(self.data.borrow().kind, ObjectKind::Array { .. })
+        match &self.data.borrow().kind {
+            ObjectKind::Array { .. } => true,
+            // `Array.isArray` is specified to see *through* a proxy: it forwards
+            // `[[Get]]`/prototype checks to the target, and the answer for a proxy of an
+            // array is yes.
+            ObjectKind::Proxy(state) => state
+                .borrow()
+                .target
+                .as_ref()
+                .is_some_and(|target| target.is_array()),
+            _ => false,
+        }
     }
 
     /// `length` for an array, reading it out of the element vector.
@@ -1141,6 +1291,18 @@ impl JsObject {
             out.push(object);
         }
         out
+    }
+}
+
+/// Whether two prototypes are the same one, `None` included.
+///
+/// A proxy's prototype invariants have to compare "no prototype" against "no
+/// prototype" without unwrapping either side first.
+pub(crate) fn same_proto(a: Option<&Gc<JsObject>>, b: Option<&Gc<JsObject>>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.ptr_eq(b),
+        _ => false,
     }
 }
 

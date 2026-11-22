@@ -12,7 +12,7 @@
 
 use crate::builtins::{arg, arg_int_or, define_method, this_object};
 use crate::interp::{Interp, JsResult};
-use crate::object::{JsObject, Property};
+use crate::object::{JsObject, Property, PropertyKey};
 use crate::value::Value;
 use js_gc::Gc;
 
@@ -218,8 +218,27 @@ fn receiver(interp: &mut Interp<'_>, this: &Value) -> JsResult<Gc<JsObject>> {
     Ok(copy)
 }
 
-fn elements(object: &Gc<JsObject>) -> Vec<Value> {
-    object.array_elements().unwrap_or_default()
+/// The elements of an array, reading through a proxy's `get` trap when it is one.
+///
+/// This is the single entry point every array method uses, which is why the proxy case
+/// belongs here rather than in each method: a proxy of an array has no element vector of
+/// its own, so reading one directly answered "empty array" for every higher-order method
+/// — `Array.prototype.map.call(proxyOfArray, f)` silently produced `[]`.
+fn elements(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Value>> {
+    if object.proxy_state().is_some() {
+        let length = length_of(interp, &Value::Object(object.clone()))?;
+        let mut out = Vec::with_capacity(length);
+        for index in 0..length {
+            let key = PropertyKey::from(index.to_string());
+            out.push(
+                interp
+                    .get_property_key(object, &key)?
+                    .unwrap_or(Value::Undefined),
+            );
+        }
+        return Ok(out);
+    }
+    Ok(object.array_elements().unwrap_or_default())
 }
 
 /// Normalise a possibly negative index the way every array method does.
@@ -256,7 +275,7 @@ fn push(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 
 fn pop(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut current = elements(&array);
+    let mut current = elements(interp, &array)?;
     let value = current.pop().unwrap_or(Value::Undefined);
     array.array_set_length(current.len());
     Ok(value)
@@ -264,7 +283,7 @@ fn pop(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value>
 
 fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut current = elements(&array);
+    let mut current = elements(interp, &array)?;
     if current.is_empty() {
         return Ok(Value::Undefined);
     }
@@ -278,7 +297,7 @@ fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Valu
 
 fn unshift(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(&array);
+    let current = elements(interp, &array)?;
     let mut combined: Vec<Value> = args.to_vec();
     combined.extend(current);
     let length = combined.len();
@@ -294,7 +313,7 @@ fn unshift(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Val
 
 fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(&array);
+    let current = elements(interp, &array)?;
     let start = normalise(arg_int_or(args, 0, 0) as f64, current.len());
     let end = normalise(
         match args.get(1) {
@@ -314,11 +333,11 @@ fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
 
 fn concat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut out = elements(&array);
+    let mut out = elements(interp, &array)?;
     for value in args {
         // An array argument is flattened one level; anything else is appended.
         match value.as_object() {
-            Some(object) if object.is_array() => out.extend(elements(object)),
+            Some(object) if object.is_array() => out.extend(elements(interp, object)?),
             _ => out.push(value.clone()),
         }
     }
@@ -335,8 +354,8 @@ fn join(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     // A hole joins as an empty field, exactly as `undefined` does; the difference is
     // only visible to `forEach` and the debug printer. An element that is an object
     // goes through `ToString`, so a boxed number joins as `"1"`.
-    let mut parts = Vec::with_capacity(elements(&array).len());
-    for value in elements(&array) {
+    let mut parts = Vec::with_capacity(elements(interp, &array)?.len());
+    for value in elements(interp, &array)? {
         let part = match value {
             Value::Undefined | Value::Null | Value::Hole => String::new(),
             other => interp.to_js_string(&other)?,
@@ -352,7 +371,7 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
 
 fn index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(&array);
+    let current = elements(interp, &array)?;
     let needle = arg(args, 0);
     let start = normalise(arg_int_or(args, 1, 0) as f64, current.len());
     let found = current
@@ -366,7 +385,7 @@ fn index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
 
 fn last_index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(&array);
+    let current = elements(interp, &array)?;
     let needle = arg(args, 0);
     let found = current
         .iter()
@@ -380,9 +399,12 @@ fn last_index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResu
 fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let needle = arg(args, 0);
-    let start = normalise(arg_int_or(args, 1, 0) as f64, elements(&array).len());
+    let start = normalise(
+        arg_int_or(args, 1, 0) as f64,
+        elements(interp, &array)?.len(),
+    );
     // `includes` uses SameValueZero, so it finds `NaN` where `indexOf` cannot.
-    let found = elements(&array).iter().skip(start).any(|value| {
+    let found = elements(interp, &array)?.iter().skip(start).any(|value| {
         value.strict_equals(&needle)
             || (matches!(value, Value::Float(f) if f.is_nan())
                 && matches!(needle, Value::Float(f) if f.is_nan()))
@@ -392,7 +414,7 @@ fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
 
 fn at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(&array);
+    let current = elements(interp, &array)?;
     let length = current.len() as f64;
     let raw = arg_int_or(args, 0, 0) as f64;
     let index = if raw < 0.0 { length + raw } else { raw };
@@ -510,8 +532,12 @@ fn array_iterator_next(interp: &mut Interp<'_>, this: Value, _args: &[Value]) ->
 
 /// The clamped length of an array-like, read lazily.
 fn length_of(interp: &mut Interp<'_>, source: &Value) -> JsResult<usize> {
+    // The fast path reads the element vector, which a proxy of an array does not have —
+    // `is_array` answers true for one (that is what `Array.isArray` must say), so the
+    // proxy check has to come too or the length would come back as zero.
     if let Some(array) = source.as_object().cloned()
         && array.is_array()
+        && array.proxy_state().is_none()
     {
         return Ok(array.array_length().unwrap_or(0));
     }
@@ -561,7 +587,7 @@ fn iterate(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Vec
         return Err(interp.type_error("callback is not a function"));
     }
     let mut out = Vec::new();
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         // A hole is not an element: the iteration methods skip it entirely, so
         // `[1,,3].forEach(f)` calls `f` twice and the index passed is the real one.
         if matches!(value, Value::Hole) {
@@ -593,7 +619,7 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
         return Err(interp.type_error("callback is not a function"));
     }
     let mut out = Vec::new();
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -618,7 +644,7 @@ fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
         return Err(interp.type_error("callback is not a function"));
     }
     let mut out = Vec::new();
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -658,7 +684,7 @@ fn reduce_with(
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
-    let current: Vec<(usize, Value)> = elements(&array)
+    let current: Vec<(usize, Value)> = elements(interp, &array)?
         .into_iter()
         .enumerate()
         .filter(|(_, value)| !matches!(value, Value::Hole))
@@ -696,7 +722,7 @@ fn reduce_with(
 fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -719,7 +745,7 @@ fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -742,7 +768,7 @@ fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
 fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -765,7 +791,7 @@ fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(&array).into_iter().enumerate() {
+    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
         if matches!(value, Value::Hole) {
             continue;
         }
@@ -787,7 +813,7 @@ fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<
 
 fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current_len = elements(&array).len();
+    let current_len = elements(interp, &array)?.len();
     let value = arg(args, 0);
     let start = normalise(arg_int_or(args, 1, 0) as f64, current_len);
     let end = normalise(
@@ -809,7 +835,7 @@ fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 
 fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut current = elements(&array);
+    let mut current = elements(interp, &array)?;
     let length = current.len();
     let start = normalise(arg_int_or(args, 0, 0) as f64, length);
     let remove = if args.len() > 1 {
@@ -833,7 +859,7 @@ fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
 
 fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut current = elements(&array);
+    let mut current = elements(interp, &array)?;
     current.reverse();
     for (index, value) in current.into_iter().enumerate() {
         store_or_throw(interp, &array, index, value)?;
@@ -847,7 +873,7 @@ fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
 /// because `"10" < "9"`. Kept as-is because the reference does the same.
 fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut current = elements(&array);
+    let mut current = elements(interp, &array)?;
     let comparator = args
         .first()
         .cloned()
@@ -952,20 +978,28 @@ fn flat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         Some(value) => value.to_number() as i64,
     };
     let mut out = Vec::new();
-    flatten(&elements(&array), depth, &mut out);
+    let items = elements(interp, &array)?;
+    flatten(interp, &items, depth, &mut out)?;
     let result = interp.new_array(out);
     Ok(Value::Object(result))
 }
 
-fn flatten(source: &[Value], depth: i64, out: &mut Vec<Value>) {
+fn flatten(
+    interp: &mut Interp<'_>,
+    source: &[Value],
+    depth: i64,
+    out: &mut Vec<Value>,
+) -> JsResult<()> {
     for value in source {
         match value.as_object() {
             Some(object) if depth > 0 && object.is_array() => {
-                flatten(&elements(object), depth - 1, out);
+                let nested = elements(interp, object)?;
+                flatten(interp, &nested, depth - 1, out)?;
             }
             _ => out.push(value.clone()),
         }
     }
+    Ok(())
 }
 
 fn flat_map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -974,7 +1008,8 @@ fn flat_map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
         return Ok(mapped);
     };
     let mut out = Vec::new();
-    flatten(&elements(array), 1, &mut out);
+    let items = elements(interp, array)?;
+    flatten(interp, &items, 1, &mut out)?;
     let result = interp.new_array(out);
     Ok(Value::Object(result))
 }
