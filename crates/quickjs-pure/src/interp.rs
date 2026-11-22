@@ -133,6 +133,10 @@ pub struct Realm {
     pub suppressed_error_proto: Option<Gc<JsObject>>,
     /// The `DisposableStack` prototype, for `move`'s intrinsic construction.
     pub disposable_stack_proto: Option<Gc<JsObject>>,
+    /// `ArrayBuffer.prototype`.
+    pub array_buffer_proto: Option<Gc<JsObject>>,
+    /// `%TypedArray%.prototype`, the prototype every view type inherits from.
+    pub typed_array_proto: Option<Gc<JsObject>>,
     /// The `AsyncDisposableStack` prototype.
     pub async_disposable_stack_proto: Option<Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
@@ -495,6 +499,8 @@ impl<'a> Interp<'a> {
                 regexp_ctor: None,
                 suppressed_error_proto: None,
                 disposable_stack_proto: None,
+                array_buffer_proto: None,
+                typed_array_proto: None,
                 async_disposable_stack_proto: None,
                 well_known_symbols: WellKnownSymbols::default(),
             },
@@ -1966,6 +1972,12 @@ impl<'a> Interp<'a> {
     /// The own array element `key` names, if this object has one.
     fn own_element(&self, object: &Gc<JsObject>, key: &str) -> Option<Value> {
         let index = array_index(key)?;
+        // A typed array's elements live in its buffer, not in a property list: reading one
+        // goes through the view's element type so a bounds check and a detached buffer are
+        // both handled there.
+        if object.typed_array_parts().is_some() {
+            return object.typed_array_element(index as usize);
+        }
         // A hole reads as `undefined` but is not a stored `undefined`; mapping it
         // here keeps that distinction out of every read site.
         object.array_get(index as usize).map(|value| match value {
@@ -2006,6 +2018,16 @@ impl<'a> Interp<'a> {
         // index has no symbol spelling, and a symbol named `length` is an ordinary
         // property.
         let text = key.as_str();
+        // A typed array's elements are a window onto its buffer: the store has to go
+        // through the view's element type so the value is wrapped (or clamped) and so an
+        // out-of-range or detached write is a silent no-op, as the spec says.
+        if let Some(text) = text
+            && let Some(index) = array_index(text)
+            && object.typed_array_parts().is_some()
+        {
+            object.typed_array_set(index as usize, value);
+            return Ok(());
+        }
         if let Some(text) = text
             && let Some(index) = array_index(text)
             && object.is_array()
@@ -2388,7 +2410,7 @@ impl<'a> Interp<'a> {
     ///
     /// `apply` accepts any array-like, not only a real array: the reference reads
     /// `length` and then each index, so `{length: 2, 0: "a", 1: "b"}` works too.
-    fn array_like_to_args(&mut self, value: &Value) -> JsResult<Vec<Value>> {
+    pub fn array_like_to_args(&mut self, value: &Value) -> JsResult<Vec<Value>> {
         let Some(object) = value.as_object().cloned() else {
             if value.is_nullish() {
                 // `f.apply(this, null)` passes no arguments at all.

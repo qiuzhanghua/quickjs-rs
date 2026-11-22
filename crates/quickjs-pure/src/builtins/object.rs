@@ -118,6 +118,8 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::Generator(_) => "Generator",
             ObjectKind::RegExp(_) => "RegExp",
             ObjectKind::DisposableStack(_) => "Object",
+            ObjectKind::ArrayBuffer(_) => "ArrayBuffer",
+            ObjectKind::TypedArray { .. } => "Object",
             ObjectKind::Ordinary => "Object",
         }) {
             "Array" => "Array".to_string(),

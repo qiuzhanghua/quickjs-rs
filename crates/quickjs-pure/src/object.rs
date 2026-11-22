@@ -16,8 +16,117 @@ use js_compile::bytecode::Function as CompiledFunction;
 use js_gc::{Gc, Trace, Tracer};
 
 use std::fmt;
+use std::rc::Rc;
 
 use crate::value::{Cell, JsSymbol, Value};
+
+/// The bytes an `ArrayBuffer` owns, plus whether they have been detached.
+///
+/// `transfer()` moves the bytes to a new buffer and leaves this one empty and detached; a
+/// view of a detached buffer reads `undefined` from every index.
+pub struct BufferStorage {
+    /// The bytes, in memory order.
+    pub bytes: Vec<u8>,
+    /// Whether `transfer()` has taken the bytes away.
+    pub detached: bool,
+}
+
+impl JsObject {
+    /// The storage of this object, when it is an `ArrayBuffer`.
+    pub fn array_buffer_storage(&self) -> Option<Rc<RefCell<BufferStorage>>> {
+        match &self.data.borrow().kind {
+            ObjectKind::ArrayBuffer(storage) => Some(storage.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make this object an `ArrayBuffer` owning `storage`.
+    pub fn set_array_buffer(&self, storage: Rc<RefCell<BufferStorage>>) {
+        self.data.borrow_mut().kind = ObjectKind::ArrayBuffer(storage);
+    }
+
+    /// `(buffer, element, offset, length)`, when this object is a typed-array view.
+    pub fn typed_array_parts(
+        &self,
+    ) -> Option<(
+        Gc<JsObject>,
+        crate::builtins::typedarray::ElementType,
+        usize,
+        usize,
+    )> {
+        match &self.data.borrow().kind {
+            ObjectKind::TypedArray {
+                buffer,
+                element,
+                offset,
+                length,
+            } => Some((buffer.clone(), *element, *offset, *length)),
+            _ => None,
+        }
+    }
+
+    /// Make this object a typed-array view.
+    pub fn set_typed_array(
+        &self,
+        buffer: Gc<JsObject>,
+        element: crate::builtins::typedarray::ElementType,
+        offset: usize,
+        length: usize,
+    ) {
+        self.data.borrow_mut().kind = ObjectKind::TypedArray {
+            buffer,
+            element,
+            offset,
+            length,
+        };
+    }
+
+    /// The element type, when this object is a typed-array view.
+    pub fn typed_array_element_type(&self) -> Option<crate::builtins::typedarray::ElementType> {
+        self.typed_array_parts().map(|(_, element, _, _)| element)
+    }
+
+    /// How many elements the view exposes, or `None` when this is not a view.
+    ///
+    /// A detached buffer reports `0`: the storage is gone, so there is nothing to index.
+    pub fn typed_array_length(&self) -> Option<usize> {
+        let (buffer, _, _, length) = self.typed_array_parts()?;
+        let storage = buffer.array_buffer_storage()?;
+        if storage.borrow().detached {
+            return Some(0);
+        }
+        Some(length)
+    }
+
+    /// Read one view element.
+    ///
+    /// Out-of-range and detached reads are `undefined` rather than an error, which is what
+    /// makes `a[999]` and a detached `a[0]` behave the way the language says.
+    pub fn typed_array_element(&self, index: usize) -> Option<Value> {
+        let (buffer, element, offset, length) = self.typed_array_parts()?;
+        let storage = buffer.array_buffer_storage()?;
+        let storage = storage.borrow();
+        if storage.detached || index >= length {
+            return Some(Value::Undefined);
+        }
+        Some(element.read(&storage.bytes, offset + index * element.size()))
+    }
+
+    /// Store one view element, applying the type's wrap or clamp.
+    pub fn typed_array_set(&self, index: usize, value: Value) -> Option<()> {
+        let (buffer, element, offset, length) = self.typed_array_parts()?;
+        if index >= length {
+            return Some(());
+        }
+        let storage = buffer.array_buffer_storage()?;
+        let mut storage = storage.borrow_mut();
+        if storage.detached {
+            return Some(());
+        }
+        element.write(&mut storage.bytes, offset + index * element.size(), value);
+        Some(())
+    }
+}
 
 /// A property of an object.
 #[derive(Clone, Default)]
@@ -363,6 +472,23 @@ pub enum ObjectKind {
     RegExp(crate::builtins::regexp::RegExpData),
     /// A `DisposableStack` or `AsyncDisposableStack`: the resources it holds.
     DisposableStack(crate::builtins::disposable::StackState),
+    /// An `ArrayBuffer`: a byte range that typed-array views share.
+    ///
+    /// The bytes sit behind an `Rc<RefCell<…>>` rather than in the object so that every view
+    /// of the buffer sees the same storage; the *views* hold the `Gc<JsObject>` of this
+    /// buffer, which is what keeps it alive and what the collector traces.
+    ArrayBuffer(std::rc::Rc<std::cell::RefCell<BufferStorage>>),
+    /// A typed-array view: a window onto an `ArrayBuffer`.
+    TypedArray {
+        /// The buffer whose bytes this view reads.
+        buffer: Gc<JsObject>,
+        /// What one element is.
+        element: crate::builtins::typedarray::ElementType,
+        /// Byte offset of element zero.
+        offset: usize,
+        /// How many elements the view exposes.
+        length: usize,
+    },
     /// A generator object: a detached frame plus how far it got.
     ///
     /// The frame lives here rather than in the interpreter because a suspended generator
@@ -379,6 +505,10 @@ impl Trace for ObjectKind {
             // integers only.
             ObjectKind::RegExp(_) => {}
             ObjectKind::DisposableStack(state) => state.trace(tracer),
+            // A buffer's bytes are plain bytes and hold no GC values; a view keeps its
+            // buffer alive through the `Gc` it carries.
+            ObjectKind::ArrayBuffer(_) => {}
+            ObjectKind::TypedArray { buffer, .. } => tracer.visit(buffer),
             ObjectKind::Ordinary => {}
             ObjectKind::Array { elements } => {
                 for element in elements {

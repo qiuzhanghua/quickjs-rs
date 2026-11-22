@@ -2046,3 +2046,94 @@ fn regexp_unicode_mode_and_case_folding() {
         "false true\n"
     );
 }
+
+#[test]
+fn typed_arrays_are_views_onto_a_buffer() {
+    // The whole point of the type: two views of one buffer see each other's writes.
+    assert_eq!(
+        eval(
+            "var b = new ArrayBuffer(8); var u = new Uint8Array(b); var i = new Int32Array(b);\n\
+              i[0] = -1; print(u.join(','))"
+        ),
+        "255,255,255,255,0,0,0,0\n"
+    );
+    // `subarray` shares storage; `slice` copies.
+    assert_eq!(
+        eval(
+            "var a = new Uint8Array([1, 2, 3, 4]);\n\
+              var s = a.subarray(1, 3); s[0] = 9;\n\
+              var c = a.slice(1, 3); c[0] = 7;\n\
+              print(a.join(','), s.join(','), c.join(','))"
+        ),
+        "1,9,3,4 9,3 7,3\n"
+    );
+    // `.set` reads its source before writing, so `a.set(a)` is a no-op rather than a smear.
+    assert_eq!(
+        eval(
+            "var a = new Uint8Array([1, 2, 3, 4]); a.set([10, 11], 2); a.set(a.subarray(0, 2), 2);\n\
+              print(a.join(','))"
+        ),
+        "1,2,1,2\n"
+    );
+}
+
+#[test]
+fn typed_array_stores_wrap_and_clamp() {
+    // An integer element type wraps at its own width; `Int8Array` of `255` is `-1`, and
+    // `Int32Array` of `2^32 - 1` is `-1` as well.
+    assert_eq!(
+        eval(
+            "var a = new Int8Array(1); a[0] = 255; var b = new Int32Array(1);\n\
+              b[0] = Math.pow(2, 32) - 1; print(a[0], b[0])"
+        ),
+        "-1 -1\n"
+    );
+    // `Uint8ClampedArray` clamps instead, and rounds half to *even*: `0.5` is `0`, `2.5` is
+    // `2`, `1.5` is `2`.
+    assert_eq!(
+        eval(
+            "var a = new Uint8ClampedArray(5);\n\
+              a[0] = -100; a[1] = 1.5; a[2] = 0.5; a[3] = 1233.5; a[4] = NaN;\n\
+              print(a.join(','))"
+        ),
+        "0,2,0,255,0\n"
+    );
+    // …and a float view round-trips through half precision.
+    assert_eq!(
+        eval("print(new Float16Array([1, 0.5, -2]).join(','))"),
+        "1,0.5,-2\n"
+    );
+}
+
+#[test]
+fn typed_array_reads_and_detachment() {
+    // Out-of-range reads and writes are silently `undefined`/ignored, not errors.
+    assert_eq!(
+        eval("var a = new Uint8Array(2); a[5] = 1; print(String(a[5]), a.length)"),
+        "undefined 2\n"
+    );
+    // `transfer()` detaches: the byte count drops to 0 and every index reads `undefined`,
+    // which all the views of that buffer see at once.
+    assert_eq!(
+        eval(
+            "var b = new ArrayBuffer(16); var a = new Uint8Array(b); a.fill(42);\n\
+              var before = a[0]; b.transfer();\n\
+              print(before, String(a[0]), a.length, b.byteLength)"
+        ),
+        "42 undefined 0 0\n"
+    );
+    // A misaligned or oversized window is a `RangeError`.
+    assert_eq!(
+        throws("new Uint32Array(new ArrayBuffer(16), 2, 1)"),
+        "RangeError: byte offset is not aligned"
+    );
+    assert_eq!(
+        throws("new Uint32Array(new ArrayBuffer(4), 0, 2)"),
+        "RangeError: invalid length"
+    );
+    // One argument means "the rest of the buffer", so a missing length is not a `NaN` error.
+    assert_eq!(
+        eval("var b = new ArrayBuffer(16); print(new Uint8Array(b).length)"),
+        "16\n"
+    );
+}

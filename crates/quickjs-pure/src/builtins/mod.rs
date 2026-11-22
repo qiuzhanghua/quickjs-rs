@@ -26,6 +26,7 @@ mod reflect;
 pub mod regexp;
 mod string;
 mod symbol;
+pub mod typedarray;
 
 use crate::interp::Interp;
 use crate::object::{JsObject, NativeFn, Property};
@@ -77,6 +78,9 @@ pub fn install(interp: &mut Interp<'_>) {
     // The stacks need `Symbol.dispose` (installed by `symbol`) and the error prototypes,
     // and nothing else depends on them.
     disposable::install(interp, &object_proto);
+    // The typed arrays need `Array.prototype`-style helpers (`join`) and `Symbol.toStringTag`,
+    // both of which are installed by now.
+    typedarray::install(interp, &object_proto);
     generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
 }
