@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v1.0 —— M0–M5 已完成（`qjs` 能执行 JS，ES6+ 语言特性齐备：class/解构/generator/`Proxy`/`Promise`/async）；本轮版本 v0.3.0
+> 状态：v1.0 —— M0–M5 已完成（`qjs` 能执行 JS，ES6+ 语言特性齐备：class/解构/generator/`Proxy`/`Promise`/async）；已发布 v0.3.0
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -273,13 +273,16 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 
 ### 发布策略
 
-**结论：v0.2.0 已发布；v0.3.0 为本轮版本**（决策 5，经 M3/M4 两次修订，M5 完成后按同一策略再发一版）。
+**结论：v0.2.0、v0.3.0 均已发布**（决策 5，经 M3/M4 两次修订，M5 完成后按同一策略再发一版）。
 v0.3.0 的边界是 M5 完成：语言特性齐了，但模块系统（M6）与 `std`/`os`（M9）仍缺，
 因此**尚不能跑真实脚本**——README 与 CHANGELOG 都把这条写在显眼处，而不是只说"已完成 M5"。
 
-2026-11-21 按 `scripts/publish.sh` 的顺序发布到 crates.io：`quickjs-gc` → `quickjs-parse`
-→ `quickjs-compile` → `quickjs-pure`，四个都是 `0.2.0`。发布后用独立项目依赖
-`quickjs = { package = "quickjs-pure", version = "0.2" }` 验证过能拉取、编译并执行 JS。
+2026-11-21 发布 `0.2.0`（M4 边界），11-22 发布 `0.3.0`（M5 边界），都按
+`scripts/publish.sh` 的顺序：`quickjs-gc` → `quickjs-parse` → `quickjs-compile`
+→ `quickjs-pure`。两次发布后都用独立项目
+`quickjs = { package = "quickjs-pure", version = "0.x" }` 验证过能拉取、编译并执行 JS；
+`0.3.0` 那次的验证用例专门覆盖了新能力（`Proxy` 的 `get` trap、`await`、async generator
+配 `for await`），输出 `proxy:2 await:42 gen:1+2`。
 
 M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`、`JSON.stringify`、
 `Math.sumPrecise`、`Reflect.apply`、`Object.freeze` 的冻结语义都按参考实现的行为工作。

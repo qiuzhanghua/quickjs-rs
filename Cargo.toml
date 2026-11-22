@@ -15,7 +15,7 @@ edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/qiuzhanghua/quickjs-rs"
-readme = "README.md"
+# 每个 crate 自己声明 readme：相对 crate 目录，指向它自己的 README.md。
 keywords = ["javascript", "quickjs", "ecmascript", "interpreter"]
 categories = ["development-tools"]
 # 路径相对仓库根解析，因此每个 crate 的包里都带同一份 README。

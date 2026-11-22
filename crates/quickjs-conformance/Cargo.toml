@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme.workspace = true
+# 相对本 crate 目录；继承 workspace 的 "README.md" 会被解析成
+# ../../README.md（包外路径），cargo 因此警告 readme 指向包外。
+readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 description = "Differential test harness: pure-Rust qjs vs the C reference implementation"
