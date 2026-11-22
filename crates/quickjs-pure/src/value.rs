@@ -52,6 +52,75 @@ impl fmt::Debug for JsString {
     }
 }
 
+/// A JavaScript symbol, stored on the GC heap.
+///
+/// A symbol is a *unique* property key that is not a string. Its identity is the
+/// allocation, not the description: `Symbol("a") !== Symbol("a")`, and two symbols with
+/// the same description still key two different properties. Only `Symbol.for` produces
+/// the same symbol twice, and it does so by looking the key up in the realm's registry
+/// rather than by comparing descriptions.
+pub struct JsSymbol {
+    /// The description shown by `Symbol.prototype.toString` and `description`.
+    ///
+    /// `Symbol()` and the well-known symbols have none, which is why this is an
+    /// `Option` and not an empty string — `Symbol().description` is `undefined`.
+    description: Option<String>,
+    /// The registry key, when the symbol came from `Symbol.for`.
+    ///
+    /// `Symbol.keyFor` answers `undefined` for every symbol without one, including the
+    /// well-known symbols, so the presence of this field is exactly what it tests.
+    registry_key: Option<String>,
+}
+
+impl JsSymbol {
+    /// A unique symbol with `description`.
+    pub fn new(description: Option<String>) -> JsSymbol {
+        JsSymbol {
+            description,
+            registry_key: None,
+        }
+    }
+
+    /// The registry entry for `key`, as `Symbol.for` returns it.
+    pub fn registered(key: String) -> JsSymbol {
+        JsSymbol {
+            description: Some(key.clone()),
+            registry_key: Some(key),
+        }
+    }
+
+    /// The description, if there is one.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// The registry key, if this symbol came from `Symbol.for`.
+    pub fn registry_key(&self) -> Option<&str> {
+        self.registry_key.as_deref()
+    }
+
+    /// `Symbol.prototype.toString`: `Symbol(description)`.
+    ///
+    /// A description is inserted verbatim, so `Symbol("a)b").toString()` is
+    /// `Symbol(a)b)` — the spec does not escape it.
+    pub fn to_display_string(&self) -> String {
+        match &self.description {
+            Some(text) => format!("Symbol({text})"),
+            None => "Symbol()".to_string(),
+        }
+    }
+}
+
+impl Trace for JsSymbol {
+    fn trace(&self, _tracer: &mut Tracer) {}
+}
+
+impl fmt::Debug for JsSymbol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_display_string())
+    }
+}
+
 /// A mutable binding cell, shared between closures.
 ///
 /// A variable that a closure captures cannot live in a stack slot, because the
@@ -105,6 +174,8 @@ pub enum Value {
     String(Gc<JsString>),
     /// An object, function, or array.
     Object(Gc<JsObject>),
+    /// A symbol: a unique property key that is not a string.
+    Symbol(Gc<JsSymbol>),
     /// A try-handler target, pushed by `catch` and scanned for when an exception
     /// is raised.
     ///
@@ -160,6 +231,14 @@ impl Value {
         }
     }
 
+    /// The symbol, if this is one.
+    pub fn as_symbol(&self) -> Option<&Gc<JsSymbol>> {
+        match self {
+            Value::Symbol(symbol) => Some(symbol),
+            _ => None,
+        }
+    }
+
     /// The object, if this is one.
     pub fn as_object(&self) -> Option<&Gc<JsObject>> {
         match self {
@@ -181,6 +260,7 @@ impl Value {
             Value::Bool(_) => "boolean",
             Value::Int(_) | Value::Float(_) => "number",
             Value::String(_) => "string",
+            Value::Symbol(_) => "symbol",
             Value::Object(object) => {
                 if object.is_callable() {
                     "function"
@@ -206,6 +286,8 @@ impl Value {
             // `NaN` is falsy, and so is `-0`.
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
             Value::String(s) => !s.as_str().is_empty(),
+            // Every symbol is truthy, even the one with no description.
+            Value::Symbol(_) => true,
             // Every object is truthy, including `new Boolean(false)`.
             Value::Object(_) => true,
             Value::Uninitialized
@@ -230,6 +312,9 @@ impl Value {
             Value::Int(i) => *i as f64,
             Value::Float(f) => *f,
             Value::String(s) => string_to_number(s.as_str()),
+            // `ToNumber` of a symbol is a `TypeError`; `NaN` keeps this infallible
+            // helper total, and the arithmetic operators reject symbols first.
+            Value::Symbol(_) => f64::NAN,
             // `ToNumber` of an object runs `ToPrimitive` first, which needs the
             // value-of/valueOf machinery; until that lands an object is `NaN`
             // rather than a panic.
@@ -266,6 +351,10 @@ impl Value {
             Value::Int(i) => i.to_string(),
             Value::Float(f) => number_to_string(*f),
             Value::String(s) => s.as_str().to_string(),
+            // `ToString` of a symbol is a `TypeError`; this descriptive form is what
+            // `String(sym)` and the error messages use. Callers that must throw go
+            // through `Interp::checked_to_string`.
+            Value::Symbol(s) => s.to_display_string(),
             Value::Object(_) => "[object Object]".to_string(),
             Value::Uninitialized
             | Value::Hole
@@ -285,6 +374,8 @@ impl Value {
                 a == b
             }
             (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
+            // A symbol is equal only to itself: the same description means nothing.
+            (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             // Objects compare by identity, never structurally.
             (Value::Object(a), Value::Object(b)) => a.ptr_eq(b),
             _ => false,
@@ -307,6 +398,7 @@ impl Value {
             (Value::Undefined | Value::Null, Value::Undefined | Value::Null) => true,
             (Value::Undefined | Value::Null, _) | (_, Value::Undefined | Value::Null) => false,
             (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
+            (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             (Value::Bool(a), Value::Bool(b)) => a == b,
             // Everything else compares numerically, which covers `"1" == 1`,
             // `true == 1` and `Int` against `Float`.
@@ -326,6 +418,9 @@ impl Value {
             Value::Int(i) => Primitive::Number(*i as f64),
             Value::Float(f) => Primitive::Number(*f),
             Value::String(s) => Primitive::String(s.as_str().to_string()),
+            // A symbol stays distinct from a string here so `==` does not treat it as
+            // one; only an object's `ToPrimitive` can produce a symbol from an object.
+            Value::Symbol(s) => Primitive::Symbol(s.clone()),
             Value::Object(_) => Primitive::String(self.to_js_string()),
             Value::Uninitialized
             | Value::Hole
@@ -342,6 +437,8 @@ enum Primitive {
     Bool(bool),
     Number(f64),
     String(String),
+    /// A symbol, which is a primitive but compares by identity.
+    Symbol(Gc<JsSymbol>),
 }
 
 /// `==` once both sides are primitives.
@@ -350,6 +447,11 @@ fn primitive_loose_equals(left: &Primitive, right: &Primitive) -> bool {
     match (left, right) {
         (Undefined | Null, Undefined | Null) => true,
         (Undefined | Null, _) | (_, Undefined | Null) => false,
+        // A symbol is a primitive, so `==` on two symbols is identity. Against
+        // anything else it is `false` — the only coercion that could apply is boxing,
+        // and `Object(Symbol())` is an object, not a `Primitive`.
+        (Symbol(a), Symbol(b)) => a.ptr_eq(b),
+        (Symbol(_), _) | (_, Symbol(_)) => false,
         (String(a), String(b)) => a == b,
         (Bool(a), Bool(b)) => a == b,
         (Number(a), Number(b)) => a == b,
@@ -539,6 +641,7 @@ impl Trace for Value {
         match self {
             Value::String(s) => tracer.visit(s),
             Value::Object(o) => tracer.visit(o),
+            Value::Symbol(s) => tracer.visit(s),
             _ => {}
         }
     }
@@ -554,6 +657,7 @@ impl fmt::Debug for Value {
             Value::Float(x) => write!(f, "{}", number_to_string(*x)),
             Value::String(s) => write!(f, "{:?}", s.as_str()),
             Value::Object(_) => f.write_str("[object]"),
+            Value::Symbol(s) => f.write_str(&s.to_display_string()),
             Value::Uninitialized => f.write_str("<uninitialised>"),
             Value::Hole => f.write_str("<hole>"),
             Value::CatchOffset(offset) => write!(f, "<catch {offset}>"),

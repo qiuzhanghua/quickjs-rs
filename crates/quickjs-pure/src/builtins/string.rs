@@ -45,6 +45,21 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
         define_method(string_proto, name, length, func, interp);
     }
 
+    // `String.prototype[Symbol.iterator]` walks the UTF-16 code units. `array::values`
+    // already does exactly that when handed a string primitive — see `element_at` — so
+    // the function is shared rather than reimplemented.
+    if let Some(values_fn) = interp
+        .realm
+        .array_proto
+        .own_property("values")
+        .and_then(|property| property.value)
+    {
+        let key = interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::Iterator);
+        string_proto.define_key(&key, Property::data(values_fn));
+    }
+
     let constructor = interp.new_native("String", 1, constructor);
     constructor.define(
         "prototype",

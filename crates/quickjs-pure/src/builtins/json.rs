@@ -72,7 +72,10 @@ fn write_value(
     // serialises to its ISO string.
     let value = &call_to_json(interp, value, key)?;
     match value {
+        // A symbol serialises to nothing, exactly like `undefined`: `JSON.stringify`
+        // drops it from an object and answers `undefined` for it at the top level.
         Value::Undefined
+        | Value::Symbol(_)
         | Value::Uninitialized
         | Value::Hole
         | Value::CatchOffset(_)

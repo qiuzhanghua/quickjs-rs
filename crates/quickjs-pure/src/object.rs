@@ -15,7 +15,9 @@ use std::cell::RefCell;
 use js_compile::bytecode::Function as CompiledFunction;
 use js_gc::{Gc, Trace, Tracer};
 
-use crate::value::{Cell, Value};
+use std::fmt;
+
+use crate::value::{Cell, JsSymbol, Value};
 
 /// A property of an object.
 #[derive(Clone, Default)]
@@ -61,6 +63,23 @@ impl Property {
     }
 
     /// An accessor property.
+    /// An accessor property with explicit `enumerable`/`configurable` flags, which is
+    /// what `Symbol.prototype.description` needs: it is enumerable: false in the spec.
+    pub fn accessor_with(
+        getter: Option<Value>,
+        setter: Option<Value>,
+        enumerable: bool,
+    ) -> Property {
+        Property {
+            getter,
+            setter,
+            enumerable,
+            configurable: true,
+            ..Property::default()
+        }
+    }
+
+    /// An accessor property with the default `enumerable`/`configurable` flags.
     pub fn accessor(getter: Option<Value>, setter: Option<Value>) -> Property {
         Property {
             getter,
@@ -248,12 +267,83 @@ impl Trace for ObjectKind {
 }
 
 /// The mutable half of an object.
+/// What a property is keyed by.
+///
+/// A string and a symbol are separate key spaces even when they look alike: `o["a"]`
+/// and `o[Symbol("a")]` are two properties, and `o[Symbol("a")]` is not reachable by
+/// any string. Symbols are also invisible to `for`/`Object.keys`/`JSON.stringify`,
+/// which is the whole point of them, so the distinction has to survive into the
+/// property table rather than being flattened into a name.
+#[derive(Clone)]
+pub enum PropertyKey {
+    /// An ordinary string key.
+    String(String),
+    /// A symbol key.
+    Symbol(Gc<JsSymbol>),
+}
+
+impl PropertyKey {
+    /// The key as a string, for the operations that only accept one.
+    ///
+    /// A symbol has no string form that would address it, so this answers `None` —
+    /// which is what makes `get_field` on a symbol key fall through to the general
+    /// path instead of silently reading a same-named string property.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyKey::String(text) => Some(text),
+            PropertyKey::Symbol(_) => None,
+        }
+    }
+
+    /// Whether this is an ordinary string key.
+    pub fn is_symbol(&self) -> bool {
+        matches!(self, PropertyKey::Symbol(_))
+    }
+}
+
+impl fmt::Display for PropertyKey {
+    /// How a key reads inside an error message: strings bare, symbols in their
+    /// `Symbol(description)` form.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropertyKey::String(text) => write!(f, "{text}"),
+            PropertyKey::Symbol(symbol) => write!(f, "{}", symbol.to_display_string()),
+        }
+    }
+}
+
+impl PartialEq for PropertyKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (PropertyKey::String(a), PropertyKey::String(b)) => a == b,
+            // Symbols compare by identity, never by description.
+            (PropertyKey::Symbol(a), PropertyKey::Symbol(b)) => a.ptr_eq(b),
+            _ => false,
+        }
+    }
+}
+
+impl From<&str> for PropertyKey {
+    fn from(text: &str) -> PropertyKey {
+        PropertyKey::String(text.to_string())
+    }
+}
+
+impl Trace for PropertyKey {
+    fn trace(&self, tracer: &mut Tracer) {
+        if let PropertyKey::Symbol(symbol) = self {
+            tracer.visit(symbol);
+        }
+    }
+}
+
+/// An object's mutable state: its prototype, property table and internal slots.
 pub struct ObjectData {
     /// The prototype, or `None` for `Object.prototype` and for a null-prototype
     /// object created with `Object.create(null)`.
     pub proto: Option<Gc<JsObject>>,
-    /// Properties in definition order.
-    pub props: Vec<(String, Property)>,
+    /// Properties in definition order, string and symbol keys interleaved.
+    pub props: Vec<(PropertyKey, Property)>,
     /// What kind of object this is.
     pub kind: ObjectKind,
     /// Whether new properties may be added. `Object.preventExtensions`, `seal` and
@@ -285,7 +375,8 @@ impl Trace for ObjectData {
         if let Some(home) = &self.home_object {
             tracer.visit(home);
         }
-        for (_, property) in &self.props {
+        for (key, property) in &self.props {
+            key.trace(tracer);
             property.trace(tracer);
         }
         self.kind.trace(tracer);
@@ -508,28 +599,44 @@ impl JsObject {
         }
     }
 
-    /// The own data property `name`, if there is one.
-    pub fn own_property(&self, name: &str) -> Option<Property> {
+    /// The own data property `key`, if there is one.
+    pub fn own_property_key(&self, key: &PropertyKey) -> Option<Property> {
         let data = self.data.borrow();
         data.props
             .iter()
-            .find(|(key, _)| key == name)
+            .find(|(existing, _)| existing == key)
             .map(|(_, property)| property.clone())
+    }
+
+    /// The own data property `name`, if there is one.
+    pub fn own_property(&self, name: &str) -> Option<Property> {
+        self.own_property_key(&PropertyKey::from(name))
+    }
+
+    /// Whether the object has an own property `key`.
+    pub fn has_own_key(&self, key: &PropertyKey) -> bool {
+        let data = self.data.borrow();
+        data.props.iter().any(|(existing, _)| existing == key)
     }
 
     /// Whether the object has an own property `name`.
     pub fn has_own(&self, name: &str) -> bool {
-        self.data.borrow().props.iter().any(|(key, _)| key == name)
+        self.has_own_key(&PropertyKey::from(name))
     }
 
     /// Define or replace an own property, keeping the original position when the
-    /// name already exists.
-    pub fn define(&self, name: &str, property: Property) {
+    /// key already exists.
+    pub fn define_key(&self, key: &PropertyKey, property: Property) {
         let mut data = self.data.borrow_mut();
-        match data.props.iter_mut().find(|(key, _)| key == name) {
+        match data.props.iter_mut().find(|(existing, _)| existing == key) {
             Some((_, slot)) => *slot = property,
-            None => data.props.push((name.to_string(), property)),
+            None => data.props.push((key.clone(), property)),
         }
+    }
+
+    /// Define or replace an own property under a string key.
+    pub fn define(&self, name: &str, property: Property) {
+        self.define_key(&PropertyKey::from(name), property);
     }
 
     /// Define an own data property, with the default attributes.
@@ -540,6 +647,11 @@ impl JsObject {
         self.define(name, Property::data(value));
     }
 
+    /// Define an own data property under `key`.
+    pub fn define_data_key(&self, key: &PropertyKey, value: Value) {
+        self.define_key(key, Property::data(value));
+    }
+
     /// Store a value into an existing own data property, keeping its attributes.
     ///
     /// Returns `false` when the property is absent, is an accessor, or is not
@@ -547,8 +659,14 @@ impl JsObject {
     /// [`Self::define_data`], because redefining is how a non-configurable global
     /// silently became configurable again and started answering `delete` with `true`.
     pub fn write_value(&self, name: &str, value: Value) -> bool {
+        self.write_value_key(&PropertyKey::from(name), value)
+    }
+
+    /// Store a value into an existing own data property under `key`.
+    pub fn write_value_key(&self, key: &PropertyKey, value: Value) -> bool {
         let mut data = self.data.borrow_mut();
-        let Some((_, property)) = data.props.iter_mut().find(|(key, _)| key == name) else {
+        let Some((_, property)) = data.props.iter_mut().find(|(existing, _)| existing == key)
+        else {
             return false;
         };
         if property.is_accessor() || !property.writable {
@@ -560,8 +678,13 @@ impl JsObject {
 
     /// Delete an own property, reporting whether it was there and removable.
     pub fn delete(&self, name: &str) -> bool {
+        self.delete_key(&PropertyKey::from(name))
+    }
+
+    /// Delete an own property under `key`.
+    pub fn delete_key(&self, key: &PropertyKey) -> bool {
         let mut data = self.data.borrow_mut();
-        match data.props.iter().position(|(key, _)| key == name) {
+        match data.props.iter().position(|(existing, _)| existing == key) {
             Some(index) => {
                 if data.props[index].1.configurable {
                     data.props.remove(index);
@@ -611,13 +734,14 @@ impl JsObject {
             .is_some_and(|property| !property.writable && !property.configurable)
     }
 
-    /// The own property names, in definition order.
+    /// The own property *names*, in definition order. Symbol keys are excluded:
+    /// `Object.keys` and `for…in` cannot see them.
     pub fn own_keys(&self) -> Vec<String> {
         self.data
             .borrow()
             .props
             .iter()
-            .map(|(key, _)| key.clone())
+            .filter_map(|(key, _)| key.as_str().map(str::to_string))
             .collect()
     }
 
@@ -628,8 +752,39 @@ impl JsObject {
             .props
             .iter()
             .filter(|(_, property)| property.enumerable)
-            .map(|(key, _)| key.clone())
+            .filter_map(|(key, _)| key.as_str().map(str::to_string))
             .collect()
+    }
+
+    /// The own symbol keys, in definition order, for `Object.getOwnPropertySymbols`.
+    pub fn own_symbol_keys(&self) -> Vec<Gc<JsSymbol>> {
+        self.data
+            .borrow()
+            .props
+            .iter()
+            .filter_map(|(key, _)| match key {
+                PropertyKey::Symbol(symbol) => Some(symbol.clone()),
+                PropertyKey::String(_) => None,
+            })
+            .collect()
+    }
+
+    /// Every own key, strings first then symbols — the order `Reflect.ownKeys` and
+    /// `Object.getOwnPropertyDescriptors` report, and the order `JSON.stringify`
+    /// walks before it skips the symbols.
+    pub fn own_property_keys(&self) -> Vec<PropertyKey> {
+        let data = self.data.borrow();
+        let mut strings: Vec<PropertyKey> = Vec::new();
+        let mut symbols: Vec<PropertyKey> = Vec::new();
+        for (key, _) in &data.props {
+            if key.is_symbol() {
+                symbols.push(key.clone());
+            } else {
+                strings.push(key.clone());
+            }
+        }
+        strings.extend(symbols);
+        strings
     }
 
     /// The prototype chain, starting with the prototypes of this object.
@@ -649,16 +804,21 @@ impl JsObject {
 /// Returns the object that owns the property along with the property itself. The
 /// owner matters for a store: an inherited accessor is invoked on the receiver,
 /// while an inherited *data* property is shadowed by a new own property.
-pub fn lookup(object: &Gc<JsObject>, name: &str) -> Option<(Gc<JsObject>, Property)> {
-    if let Some(property) = object.own_property(name) {
+pub fn lookup_key(object: &Gc<JsObject>, key: &PropertyKey) -> Option<(Gc<JsObject>, Property)> {
+    if let Some(property) = object.own_property_key(key) {
         return Some((object.clone(), property));
     }
     for ancestor in object.chain() {
-        if let Some(property) = ancestor.own_property(name) {
+        if let Some(property) = ancestor.own_property_key(key) {
             return Some((ancestor, property));
         }
     }
     None
+}
+
+/// [`lookup_key`] for a string key.
+pub fn lookup(object: &Gc<JsObject>, name: &str) -> Option<(Gc<JsObject>, Property)> {
+    lookup_key(object, &PropertyKey::from(name))
 }
 
 /// The array index a property key names, if it names one.

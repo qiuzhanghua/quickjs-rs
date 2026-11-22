@@ -53,6 +53,19 @@ pub fn install(interp: &mut Interp<'_>, array_proto: &Gc<JsObject>) {
         define_method(array_proto, name, length, func, interp);
     }
 
+    // `Array.prototype[Symbol.iterator]` is `values`: the spec defines iteration over an
+    // array as iteration over its values, and sharing the function means a script
+    // calling `a[Symbol.iterator]()` and a `for…of` get the same kind of object.
+    if let Some(values_fn) = array_proto
+        .own_property("values")
+        .and_then(|property| property.value)
+    {
+        let key = interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::Iterator);
+        array_proto.define_key(&key, Property::data(values_fn));
+    }
+
     let constructor = interp.new_native("Array", 1, constructor);
     constructor.define(
         "prototype",
@@ -436,7 +449,19 @@ fn iterator(interp: &mut Interp<'_>, this: Value, kind: IteratorKind) -> JsResul
     );
     let next = crate::builtins::method(interp, "next", 0, array_iterator_next)?;
     object.define_data("next", next);
+    // An iterator is itself iterable — `for (var k of a.keys())` needs it — and the way
+    // it says so is a `Symbol.iterator` method answering `this`.
+    let key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::Iterator);
+    let identity = crate::builtins::method(interp, "[Symbol.iterator]", 0, self_iterator)?;
+    object.define_key(&key, Property::data(identity));
     Ok(Value::Object(object))
+}
+
+/// `%ArrayIteratorPrototype%[Symbol.iterator]`, which answers the iterator itself.
+fn self_iterator(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(this)
 }
 
 /// The shared `next` of the three array iterators.

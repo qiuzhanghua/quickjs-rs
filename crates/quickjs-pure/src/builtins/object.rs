@@ -13,7 +13,7 @@
 
 use crate::builtins::{arg, define_method, this_object};
 use crate::interp::{Interp, JsResult};
-use crate::object::{JsObject, ObjectKind, Property, array_index};
+use crate::object::{JsObject, ObjectKind, Property, PropertyKey, array_index};
 use crate::value::Value;
 use js_gc::Gc;
 
@@ -51,6 +51,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         ("setPrototypeOf", 2, set_prototype_of),
         ("defineProperty", 3, define_property),
         ("getOwnPropertyNames", 1, get_own_property_names),
+        ("getOwnPropertySymbols", 1, get_own_property_symbols),
         ("getOwnPropertyDescriptor", 2, get_own_property_descriptor),
         ("freeze", 1, freeze),
         ("isFrozen", 1, is_frozen),
@@ -94,6 +95,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
         Value::Bool(_) => "Boolean".to_string(),
         Value::Int(_) | Value::Float(_) => "Number".to_string(),
         Value::String(_) => "String".to_string(),
+        Value::Symbol(_) => "Symbol".to_string(),
         Value::Object(object) => match object.with(|data| match &data.kind {
             ObjectKind::Array { .. } => "Array",
             ObjectKind::Function(_) => "Function",
@@ -120,6 +122,18 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
 }
 
 fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    // `Symbol.toStringTag` overrides the built-in tag: `{[Symbol.toStringTag]: "Mine"}`
+    // stringifies as `[object Mine]`. It applies to objects only, and only when the
+    // property is a string.
+    if let Value::Object(object) = &this {
+        let key = interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::ToStringTag);
+        if let Some(Value::String(tag)) = interp.get_property_key(object, &key)? {
+            let tag = tag.as_str().to_string();
+            return Ok(interp.string(format!("[object {tag}]")));
+        }
+    }
     let tag = tag_of(interp, &this);
     Ok(interp.string(format!("[object {tag}]")))
 }
@@ -178,6 +192,32 @@ fn property_is_enumerable(interp: &mut Interp<'_>, this: Value, args: &[Value]) 
             .is_some(),
     };
     Ok(Value::Bool(enumerable))
+}
+
+/// Every own key of `value`, symbols included, in the spec's order: integer-like keys
+/// ascending, then the string keys in insertion order, then the symbols.
+///
+/// `Reflect.ownKeys` and `Object.getOwnPropertyDescriptors` use this; everything that is
+/// specified to skip symbols (`Object.keys`, `for…in`, `JSON.stringify`) uses
+/// [`own_keys`]. The result is a list of [`PropertyKey`]s rather than `Value`s because
+/// turning one into a `Value` needs the heap, which the caller has and this does not.
+pub fn own_property_keys(value: &Value) -> Vec<PropertyKey> {
+    let Some(object) = value.as_object() else {
+        if let Value::String(text) = value {
+            return (0..text.utf16_len())
+                .map(|i| PropertyKey::String(i.to_string()))
+                .collect();
+        }
+        return Vec::new();
+    };
+    let mut out: Vec<PropertyKey> = own_keys(value)
+        .into_iter()
+        .map(PropertyKey::String)
+        .collect();
+    for symbol in object.own_symbol_keys() {
+        out.push(PropertyKey::Symbol(symbol));
+    }
+    out
 }
 
 /// The own keys of `value`, in the order the spec requires: integer-like keys
@@ -370,11 +410,11 @@ pub fn define_property_on(
     object: &Gc<JsObject>,
     args: &[Value],
 ) -> JsResult<()> {
-    let key = arg(args, 1).to_js_string();
+    let key = interp.property_key(&arg(args, 1));
     let Value::Object(descriptor) = arg(args, 2) else {
         return Err(interp.type_error("property descriptor must be an object"));
     };
-    let previous = object.own_property(&key);
+    let previous = object.own_property_key(&key);
     let writable = descriptor_bool(interp, &descriptor, "writable")?.unwrap_or(false);
     let enumerable = descriptor_bool(interp, &descriptor, "enumerable")?.unwrap_or(false);
     let configurable = descriptor_bool(interp, &descriptor, "configurable")?.unwrap_or(false);
@@ -414,7 +454,7 @@ pub fn define_property_on(
             setter: None,
         }
     };
-    object.define(&key, property);
+    object.define_key(&key, property);
     Ok(())
 }
 
@@ -449,6 +489,28 @@ fn get_own_property_names(
     Ok(Value::Object(array))
 }
 
+/// `Object.getOwnPropertySymbols(obj)`.
+///
+/// The only way to enumerate symbol keys, and the reason a symbol-keyed property is
+/// effectively private: nothing else reports it.
+fn get_own_property_symbols(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+) -> JsResult<Value> {
+    let value = arg(args, 0);
+    let Some(object) = value.as_object() else {
+        return Err(interp.type_error("not an object"));
+    };
+    let symbols: Vec<Value> = object
+        .own_symbol_keys()
+        .into_iter()
+        .map(Value::Symbol)
+        .collect();
+    let array = interp.new_array(symbols);
+    Ok(Value::Object(array))
+}
+
 fn get_own_property_descriptor(
     interp: &mut Interp<'_>,
     _this: Value,
@@ -458,8 +520,8 @@ fn get_own_property_descriptor(
     let Value::Object(object) = &target else {
         return Err(interp.type_error("target is not an object"));
     };
-    let key = arg(args, 1).to_js_string();
-    let Some(property) = object.own_property(&key) else {
+    let key = interp.property_key(&arg(args, 1));
+    let Some(property) = object.own_property_key(&key) else {
         return Ok(Value::Undefined);
     };
     let proto = interp.realm.object_proto.clone();

@@ -22,8 +22,8 @@ use js_compile::opcode::{OpFormat, Opcode};
 use js_gc::{Gc, Heap};
 
 use crate::object::{
-    Callable, ClosureEnv, CompiledCode, JsObject, NativeFn, ObjectKind, Property, array_index,
-    lookup,
+    Callable, ClosureEnv, CompiledCode, JsObject, NativeFn, ObjectKind, Property, PropertyKey,
+    array_index, lookup, lookup_key,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -114,6 +114,19 @@ pub struct Realm {
     pub date_proto: Gc<JsObject>,
     /// `%GeneratorPrototype%`, the prototype of every generator object.
     pub generator_proto: Gc<JsObject>,
+    /// `Symbol.prototype`.
+    pub symbol_proto: Option<Gc<JsObject>>,
+    /// The `Symbol.for` registry: `key -> symbol`.
+    ///
+    /// Scoped to the realm, which is what makes `Symbol.for("k")` answer the same
+    /// symbol every time within one script while a fresh realm starts empty.
+    pub symbol_registry: BTreeMap<String, Value>,
+    /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
+    ///
+    /// Held as plain `Value`s rather than looked up on `Symbol` each time: the runtime
+    /// asks for them on every `for…of` and every `ToPrimitive`, and a realm field is
+    /// both faster and impossible to break from a script.
+    well_known_symbols: WellKnownSymbols,
 }
 
 /// One binding of the frame that called `eval`, so the eval'd code can read and
@@ -254,6 +267,102 @@ impl js_gc::Trace for GeneratorState {
     }
 }
 
+/// The realm's well-known symbols, indexed by the order [`builtins::symbol`] creates
+/// them in.
+///
+/// Each is a field rather than a map entry because the runtime reads them on hot paths
+/// (`for…of`, `ToPrimitive`) and because a missing one would be a bug, not a lookup
+/// failure — reaching a default here means the builtin did not install, and every
+/// accessor panics rather than silently answering `undefined`.
+///
+/// [`builtins::symbol`]: crate::builtins::symbol
+#[derive(Default)]
+pub struct WellKnownSymbols {
+    /// The symbol values, positionally. Empty until `Symbol` installs.
+    symbols: Vec<Value>,
+}
+
+/// Which well-known symbol a caller wants.
+///
+/// A typed accessor beats passing a name around: a typo is a compile error rather than
+/// an `undefined` key that quietly matches nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WellKnown {
+    /// `Symbol.toPrimitive`.
+    ToPrimitive,
+    /// `Symbol.iterator`.
+    Iterator,
+    /// `Symbol.match`.
+    Match,
+    /// `Symbol.matchAll`.
+    MatchAll,
+    /// `Symbol.replace`.
+    Replace,
+    /// `Symbol.search`.
+    Search,
+    /// `Symbol.split`.
+    Split,
+    /// `Symbol.toStringTag`.
+    ToStringTag,
+    /// `Symbol.isConcatSpreadable`.
+    IsConcatSpreadable,
+    /// `Symbol.hasInstance`.
+    HasInstance,
+    /// `Symbol.species`.
+    Species,
+    /// `Symbol.unscopables`.
+    Unscopables,
+    /// `Symbol.asyncIterator`.
+    AsyncIterator,
+}
+
+impl WellKnown {
+    /// The index `Symbol`'s installer creates this symbol at.
+    fn index(self) -> usize {
+        match self {
+            WellKnown::ToPrimitive => 0,
+            WellKnown::Iterator => 1,
+            WellKnown::Match => 2,
+            WellKnown::MatchAll => 3,
+            WellKnown::Replace => 4,
+            WellKnown::Search => 5,
+            WellKnown::Split => 6,
+            WellKnown::ToStringTag => 7,
+            WellKnown::IsConcatSpreadable => 8,
+            WellKnown::HasInstance => 9,
+            WellKnown::Species => 10,
+            WellKnown::Unscopables => 11,
+            WellKnown::AsyncIterator => 12,
+        }
+    }
+}
+
+impl Realm {
+    /// Record the well-known symbols, in the order `Symbol`'s installer made them.
+    pub fn set_well_known_symbols(&mut self, symbols: Vec<Value>) {
+        self.well_known_symbols.symbols = symbols;
+    }
+
+    /// A well-known symbol.
+    pub fn well_known(&self, which: WellKnown) -> Value {
+        self.well_known_symbols
+            .symbols
+            .get(which.index())
+            .cloned()
+            .unwrap_or(Value::Undefined)
+    }
+
+    /// The well-known symbol as a property key.
+    pub fn well_known_key(&self, which: WellKnown) -> PropertyKey {
+        match self.well_known(which) {
+            Value::Symbol(symbol) => PropertyKey::Symbol(symbol),
+            // Unreachable once `Symbol` has installed; an empty string key matches
+            // nothing, which degrades to "the object has no such method".
+            _ => PropertyKey::String(String::new()),
+        }
+    }
+}
+
 /// The interpreter: a realm plus a frame stack.
 pub struct Interp<'a> {
     /// The heap everything is allocated on.
@@ -341,6 +450,9 @@ impl<'a> Interp<'a> {
                 error_proto: JsObject::ordinary(heap, None),
                 date_proto: JsObject::ordinary(heap, None),
                 generator_proto: JsObject::ordinary(heap, None),
+                symbol_proto: None,
+                symbol_registry: BTreeMap::new(),
+                well_known_symbols: WellKnownSymbols::default(),
             },
             frames: Vec::new(),
             eval_scope: None,
@@ -1244,23 +1356,54 @@ impl<'a> Interp<'a> {
     /// An inherited accessor runs with the *receiver* as `this`, which is why the
     /// lookup returns the owner rather than just the value.
     pub fn get_property(&mut self, object: &Gc<JsObject>, key: &str) -> JsResult<Option<Value>> {
-        if let Some(value) = self.own_element(object, key) {
-            return Ok(Some(value));
+        self.get_property_key(object, &PropertyKey::from(key))
+    }
+
+    /// [`Interp::get_property`] with a key that may be a symbol.
+    pub fn get_property_key(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Value>> {
+        self.get_property_key_for(object, None, key)
+    }
+
+    /// [`Interp::get_property_key`], with an explicit `this` for an inherited accessor.
+    ///
+    /// The receiver matters when the property is found on a *prototype*: a getter has to
+    /// see the object the read started from. For a primitive that is the primitive
+    /// itself — `Symbol("x").description` runs the getter with the symbol as `this`,
+    /// not with `Symbol.prototype` — which is why the receiver cannot be inferred from
+    /// the owner.
+    pub fn get_property_key_for(
+        &mut self,
+        object: &Gc<JsObject>,
+        receiver: Option<&Value>,
+        key: &PropertyKey,
+    ) -> JsResult<Option<Value>> {
+        // The element-vector and `length` shortcuts are string-only: an array index
+        // has no symbol spelling.
+        if let Some(text) = key.as_str() {
+            if let Some(value) = self.own_element(object, text) {
+                return Ok(Some(value));
+            }
+            // `length` is not stored as a property: an array's length is its element
+            // count, and keeping one copy of it is what makes `push`/`pop` and
+            // `a.length = n` agree.
+            if let Some(length) = object.array_length()
+                && text == "length"
+            {
+                return Ok(Some(Value::Int(length as i32)));
+            }
         }
-        // `length` is not stored as a property: an array's length is its element
-        // count, and keeping one copy of it is what makes `push`/`pop` and
-        // `a.length = n` agree.
-        if key == "length"
-            && let Some(length) = object.array_length()
-        {
-            return Ok(Some(Value::Int(length as i32)));
-        }
-        match lookup(object, key) {
+        match lookup_key(object, key) {
             Some((_, property)) => {
                 if property.is_accessor() {
                     match &property.getter {
                         Some(getter) if !matches!(getter, Value::Undefined) => {
-                            let receiver = Value::Object(object.clone());
+                            let receiver = receiver
+                                .cloned()
+                                .unwrap_or_else(|| Value::Object(object.clone()));
                             self.call_value(getter.clone(), receiver, Vec::new())
                                 .map(Some)
                         }
@@ -1458,8 +1601,26 @@ impl<'a> Interp<'a> {
         value: Value,
         on_failure: DeleteFailure,
     ) -> JsResult<()> {
-        if let Some(index) = array_index(key) {
-            if object.is_array() {
+        self.set_property_with_key(object, &PropertyKey::from(key), value, on_failure)
+    }
+
+    /// [`Interp::set_property_with`] with a key that may be a symbol.
+    pub fn set_property_with_key(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+        value: Value,
+        on_failure: DeleteFailure,
+    ) -> JsResult<()> {
+        // The element and `length` shortcuts only exist for string keys: an array
+        // index has no symbol spelling, and a symbol named `length` is an ordinary
+        // property.
+        let text = key.as_str();
+        if let Some(text) = text
+            && let Some(index) = array_index(text)
+            && object.is_array()
+        {
+            {
                 // Adding an index past the end makes the array longer, which a
                 // non-extensible array refuses.
                 if index as usize >= object.array_length().unwrap_or(0) && !object.is_extensible() {
@@ -1482,7 +1643,7 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
-        if key == "length" && object.is_array() {
+        if text == Some("length") && object.is_array() {
             let length = value.to_number();
             if length.is_finite() && length >= 0.0 {
                 let length = length as usize;
@@ -1509,15 +1670,17 @@ impl<'a> Interp<'a> {
                 return Ok(());
             }
         }
-        if !object.is_extensible() && !object.has_own(key) && lookup(object, key).is_none() {
+        if !object.is_extensible() && !object.has_own_key(key) && lookup_key(object, key).is_none()
+        {
             return match on_failure {
                 DeleteFailure::Throw => Err(self.type_error(format!(
-                    "cannot add property '{key}', object is not extensible"
+                    "cannot add property {}, object is not extensible",
+                    key
                 ))),
                 DeleteFailure::Ignore => Ok(()),
             };
         }
-        if let Some((owner, property)) = lookup(object, key) {
+        if let Some((owner, property)) = lookup_key(object, key) {
             if property.is_accessor() {
                 if let Some(setter) = &property.setter
                     && !matches!(setter, Value::Undefined)
@@ -1538,18 +1701,23 @@ impl<'a> Interp<'a> {
             // An existing writable own property keeps its attributes: only the value
             // moves. Redefining instead would reset them, which is how a
             // non-configurable global `var` used to become deletable.
-            if owner.ptr_eq(object) && object.write_value(key, value.clone()) {
+            if owner.ptr_eq(object) && object.write_value_key(key, value.clone()) {
                 return Ok(());
             }
         }
         // No own data property: create one, shadowing whatever the prototype holds.
-        object.define_data(key, value);
+        object.define_data_key(key, value);
         Ok(())
     }
 
     /// Delete `object[key]`.
     pub fn delete_property(&mut self, object: &Gc<JsObject>, key: &str) -> bool {
-        if let Some(index) = array_index(key) {
+        self.delete_property_key(object, &PropertyKey::from(key))
+    }
+
+    /// [`Interp::delete_property`] with a key that may be a symbol.
+    pub fn delete_property_key(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> bool {
+        if let Some(index) = key.as_str().and_then(array_index) {
             if let Some(elements) = object.array_elements()
                 && (index as usize) < elements.len()
             {
@@ -1562,7 +1730,7 @@ impl<'a> Interp<'a> {
                 return true;
             }
         }
-        object.delete(key)
+        object.delete_key(key)
     }
 
     // -- calling ------------------------------------------------------------
@@ -1990,6 +2158,22 @@ impl<'a> Interp<'a> {
                     self.make_error("TypeError", "not a constructor"),
                 ));
             };
+            // A function can opt out of `[[Construct]]` outright. `Symbol` does: there is
+            // no wrapper object to build, and `new Symbol()` is a `TypeError` naming it.
+            if object
+                .own_property("_not_a_constructor")
+                .and_then(|property| property.value)
+                .is_some_and(|value| value.to_boolean())
+            {
+                let name = object
+                    .own_property("name")
+                    .and_then(|property| property.value)
+                    .map(|value| value.to_js_string())
+                    .unwrap_or_default();
+                return Err(Signal::Throw(
+                    self.make_error("TypeError", &format!("{name} is not a constructor")),
+                ));
+            }
             // A generator function has no `[[Construct]]`, and the reference names it in
             // the message: `new (function* G(){})()` reports "G is not a constructor".
             if object.with(|data| match &data.kind {
@@ -2946,13 +3130,18 @@ impl<'a> Interp<'a> {
             GetArrayEl | GetArrayEl2 | GetArrayEl3 => {
                 let key = self.pop();
                 let object = self.pop();
-                let text = self.propkey_of(&key);
-                let value = self.read_field(&object, &text)?;
+                let key = self.propkey(&key);
+                let value = self.read_field_key(&object, &key)?;
                 if matches!(op, GetArrayEl2 | GetArrayEl3) {
                     self.push(object);
                 }
                 if op == GetArrayEl3 {
-                    self.push(key);
+                    // The key goes back in its *value* form, which the compiler stores
+                    // into the target of a destructuring assignment.
+                    self.push(match &key {
+                        PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
+                        PropertyKey::String(text) => self.string(text.clone()),
+                    });
                 }
                 self.push(value);
             }
@@ -2966,8 +3155,8 @@ impl<'a> Interp<'a> {
                 let value = self.pop();
                 let key = self.pop();
                 let object = self.pop();
-                let text = self.propkey_of(&key);
-                self.write_field(&object, &text, value)?;
+                let key = self.propkey(&key);
+                self.write_field_key(&object, &key, value)?;
             }
             DefineField => {
                 let value = self.pop();
@@ -2991,13 +3180,15 @@ impl<'a> Interp<'a> {
                 self.push(object);
             }
             DefineArrayEl => {
-                // `obj key value -> obj key`
+                // `obj key value -> obj key`. The *value* form of the key is what goes
+                // back on the stack — the compiler stores it into the pattern's binding —
+                // so the symbol is not stringified on the way through.
                 let value = self.pop();
-                let key = self.pop();
+                let key_value = self.pop();
                 let object = self.peek(0);
-                let text = self.propkey_of(&key);
-                self.write_field(&object, &text, value)?;
-                self.push(key);
+                let key = self.propkey(&key_value);
+                self.write_field_key(&object, &key, value)?;
+                self.push(key_value);
             }
             SetHomeObject => {
                 // `obj func -> obj func`: records the object a method was defined on so
@@ -3064,7 +3255,7 @@ impl<'a> Interp<'a> {
                 }
                 self.set_function_name(&function, &key_with_accessor_prefix(&key, b));
                 if let Some(array) = object.as_object() {
-                    define_function_property(array, &key, function, b);
+                    define_function_property(array, &PropertyKey::from(key.as_str()), function, b);
                 }
                 self.push(object);
             }
@@ -3072,10 +3263,10 @@ impl<'a> Interp<'a> {
                 let function = self.pop();
                 let key = self.pop();
                 let object = self.pop();
-                let text = self.propkey_of(&key);
-                self.set_function_name(&function, &key_with_accessor_prefix(&text, a));
+                let key = self.propkey(&key);
+                self.set_function_name(&function, &key_with_accessor_prefix(&key.to_string(), a));
                 if let Some(array) = object.as_object() {
-                    define_function_property(array, &text, function, a);
+                    define_function_property(array, &key, function, a);
                 }
                 self.push(object);
             }
@@ -3096,9 +3287,15 @@ impl<'a> Interp<'a> {
                 self.push(exclusion);
             }
             ToPropkey => {
+                // A symbol survives unchanged: this is `ToPropertyKey`, not `ToString`,
+                // and stringifying here would turn `{[Symbol("b")]: 2}` into an
+                // ordinary `"Symbol(b)"` property.
                 let value = self.pop();
-                let key = self.propkey_of(&value);
-                self.push(self.string(key));
+                let key = match self.propkey(&value) {
+                    PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
+                    PropertyKey::String(text) => self.string(text),
+                };
+                self.push(key);
             }
             SetName => {
                 let function = self.peek(0);
@@ -3249,17 +3446,18 @@ impl<'a> Interp<'a> {
                 // non-configurable property answers `false` and stays.
                 let key = self.pop();
                 let target = self.pop();
-                let key = self.propkey_of(&key);
+                let key = self.propkey(&key);
+                let text_label = key.as_str().unwrap_or("").to_string();
                 let deleted = match &target {
                     Value::Object(object) => {
                         let object = object.clone();
-                        self.delete_property(&object, &key)
+                        self.delete_property_key(&object, &key)
                     }
                     // A string's `length` and its index properties are
                     // non-configurable, so deleting one answers `false`.
                     Value::String(text) => {
-                        !(key == "length"
-                            || array_index(&key)
+                        !(text_label == "length"
+                            || array_index(&text_label)
                                 .is_some_and(|index| (index as usize) < text.utf16_len()))
                     }
                     // "delete null.a" is a TypeError, not a no-op: the operator needs an
@@ -3549,7 +3747,11 @@ impl<'a> Interp<'a> {
         let left = self.primitive_of(left)?;
         let right = self.primitive_of(right)?;
         if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
-            let text = format!("{}{}", left.to_js_string(), right.to_js_string());
+            // `ToString` on both sides, which rejects a symbol: `"" + Symbol()` is a
+            // `TypeError`, the one place a symbol and a string do not mix.
+            let left = self.checked_to_string(&left)?;
+            let right = self.checked_to_string(&right)?;
+            let text = format!("{left}{right}");
             self.push(self.string(text));
             return Ok(());
         }
@@ -3581,6 +3783,30 @@ impl<'a> Interp<'a> {
         } else {
             hint
         };
+        // `Symbol.toPrimitive` wins over `valueOf`/`toString` when it exists, and it is
+        // handed the hint as a string. This is the hook a Date uses for its default hint
+        // and a script uses to take over conversion entirely.
+        let key = self.realm.well_known_key(WellKnown::ToPrimitive);
+        if let Some(Value::Object(function)) = self.get_property_key(object, &key)? {
+            if !function.is_callable() {
+                return Err(self.type_error("Symbol.toPrimitive is not a function"));
+            }
+            let hint = match hint {
+                Hint::String => "string",
+                Hint::Number => "number",
+                Hint::Default => "default",
+            };
+            let hint = self.string(hint);
+            let result = self.call_value(
+                Value::Object(function),
+                Value::Object(object.clone()),
+                vec![hint],
+            )?;
+            if matches!(result, Value::Object(_)) {
+                return Err(self.type_error("cannot convert object to primitive value"));
+            }
+            return Ok(result);
+        }
         let order: [&str; 2] = match hint {
             Hint::String => ["toString", "valueOf"],
             Hint::Number | Hint::Default => ["valueOf", "toString"],
@@ -3618,6 +3844,18 @@ impl<'a> Interp<'a> {
         Ok(value.to_number())
     }
 
+    /// `ToPropertyKey`: what a computed member access uses as its key.
+    ///
+    /// A symbol is returned as itself, never stringified — that is what keeps
+    /// `o[sym]` and `o["Symbol(a)"]` apart. Everything else becomes its string form.
+    fn propkey(&mut self, value: &Value) -> PropertyKey {
+        match value {
+            Value::Symbol(symbol) => PropertyKey::Symbol(symbol.clone()),
+            _ => PropertyKey::String(self.propkey_of(value)),
+        }
+    }
+
+    /// `ToPropertyKey` for the callers that can only use a string key.
     fn propkey_of(&mut self, value: &Value) -> String {
         match value {
             Value::Int(_) | Value::Float(_) => number_to_string(value.to_number()),
@@ -3639,6 +3877,16 @@ impl<'a> Interp<'a> {
     /// `get_field`/`get_array_el` need and what a builtin reading a property off an
     /// argument needs too.
     pub fn read_field(&mut self, object: &Value, key: &str) -> JsResult<Value> {
+        self.read_field_key(object, &PropertyKey::from(key))
+    }
+
+    /// [`Interp::read_field`] with a key that may be a symbol.
+    ///
+    /// A symbol key never reaches the string shortcuts: a string's `length` and its
+    /// indices are string properties, and a symbol named `length` is a different
+    /// property that a string primitive cannot have.
+    pub fn read_field_key(&mut self, object: &Value, key: &PropertyKey) -> JsResult<Value> {
+        let text = key.as_str().unwrap_or("");
         let Value::Object(object) = object else {
             // Reading a property of `undefined`/`null` is the classic TypeError.
             if object.is_nullish() {
@@ -3648,12 +3896,12 @@ impl<'a> Interp<'a> {
                 )));
             }
             // A string has `length` and index access without being boxed.
-            if let Value::String(text) = object {
-                if key == "length" {
-                    return Ok(Value::Int(text.utf16_len() as i32));
+            if let Value::String(value) = object {
+                if text == "length" {
+                    return Ok(Value::Int(value.utf16_len() as i32));
                 }
-                if let Some(index) = array_index(key) {
-                    let units: Vec<u16> = text.as_str().encode_utf16().collect();
+                if let Some(index) = array_index(text) {
+                    let units: Vec<u16> = value.as_str().encode_utf16().collect();
                     return Ok(match units.get(index as usize) {
                         Some(unit) => {
                             let character = String::from_utf16_lossy(&[*unit]);
@@ -3669,19 +3917,28 @@ impl<'a> Interp<'a> {
                 Value::String(_) => self.realm.string_proto.clone(),
                 Value::Int(_) | Value::Float(_) => self.realm.number_proto.clone(),
                 Value::Bool(_) => self.realm.boolean_proto.clone(),
+                // A symbol's methods live on `Symbol.prototype`, reached the same way —
+                // `sym.description` reads through the prototype, not off the symbol.
+                Value::Symbol(_) => self.realm.symbol_proto.clone(),
                 _ => None,
             };
             if let Some(prototype) = prototype
-                && let Some(value) = self.get_property(&prototype, key)?
+                && let Some(value) = self.get_property_key_for(&prototype, Some(object), key)?
             {
                 return Ok(value);
             }
             return Ok(Value::Undefined);
         };
-        Ok(self.get_property(object, key)?.unwrap_or(Value::Undefined))
+        Ok(self
+            .get_property_key(object, key)?
+            .unwrap_or(Value::Undefined))
     }
 
     fn write_field(&mut self, object: &Value, key: &str, value: Value) -> JsResult<()> {
+        self.write_field_key(object, &PropertyKey::from(key), value)
+    }
+
+    fn write_field_key(&mut self, object: &Value, key: &PropertyKey, value: Value) -> JsResult<()> {
         let Value::Object(object) = object else {
             return Err(Signal::Throw(self.make_error(
                 "TypeError",
@@ -3694,7 +3951,47 @@ impl<'a> Interp<'a> {
         } else {
             DeleteFailure::Ignore
         };
-        self.set_property_with(object, key, value, on_failure)
+        self.set_property_with_key(object, key, value, on_failure)
+    }
+
+    /// `ToString`, as the spec defines it: a symbol is a `TypeError`.
+    ///
+    /// [`Value::to_js_string`] cannot fail, so it answers the descriptive form for a
+    /// symbol. That is right for `String(sym)` and for error messages, and wrong for
+    /// everything the spec routes through `ToString` — `"" + sym`, `${sym}`,
+    /// `Number.parseInt(sym)` — so those callers use this instead.
+    pub fn checked_to_string(&mut self, value: &Value) -> JsResult<String> {
+        if matches!(value, Value::Symbol(_)) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "cannot convert symbol to string"),
+            ));
+        }
+        // An object runs `ToPrimitive` first, which may itself produce a symbol —
+        // `({[Symbol.toPrimitive]: () => sym}) + ""` has to throw too.
+        let value = self.to_primitive(value.clone(), Hint::String)?;
+        if matches!(value, Value::Symbol(_)) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "cannot convert symbol to string"),
+            ));
+        }
+        Ok(value.to_js_string())
+    }
+
+    /// `ToPropertyKey` for a builtin that takes a key argument.
+    ///
+    /// Distinct from [`Interp::propkey`], which is `fn`-private to the instruction
+    /// loop; the builtins reach this one.
+    pub fn property_key(&mut self, value: &Value) -> PropertyKey {
+        self.propkey(value)
+    }
+
+    /// A [`PropertyKey`] as the `Value` a script sees — what `Reflect.ownKeys` and
+    /// `Object.getOwnPropertySymbols` put in their result array.
+    pub fn key_value(&self, key: &PropertyKey) -> Value {
+        match key {
+            PropertyKey::String(text) => self.string(text.clone()),
+            PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
+        }
     }
 
     /// `ToObject`: box a primitive, refuse `undefined` and `null`.
@@ -3780,20 +4077,20 @@ impl<'a> Interp<'a> {
                 self.make_error("TypeError", "cannot use 'in' on a non-object"),
             ));
         };
-        let text = self.propkey_of(key);
-        if object.own_property(&text).is_some() {
+        let key = self.propkey(key);
+        if object.own_property_key(&key).is_some() {
             return Ok(true);
         }
         // An array hole is an index that exists as a slot but not as a property, so
         // `1 in [1,,3]` is `false` even though reading `a[1]` yields `undefined`.
-        if let Some(index) = array_index(&text)
+        if let Some(index) = key.as_str().and_then(array_index)
             && object
                 .array_get(index as usize)
                 .is_some_and(|value| !matches!(value, Value::Hole))
         {
             return Ok(true);
         }
-        Ok(lookup(object, &text).is_some())
+        Ok(lookup_key(object, &key).is_some())
     }
 
     fn instance_of(&mut self, object: &Value, constructor: &Value) -> JsResult<bool> {
@@ -3948,38 +4245,46 @@ impl<'a> Interp<'a> {
     /// An object that already carries a `next` method is used as it is — that is what
     /// `arr.values()` returns — and only arrays and strings get the built-in
     /// sequence iterator.
+    /// `GetIterator(value)`: the real `Symbol.iterator` protocol.
+    ///
+    /// The method is looked up on the value (through its prototype), called with no
+    /// arguments, and its result becomes the iterator. A generator gets here through
+    /// `%GeneratorPrototype%[Symbol.iterator]`, which answers `this`; an array through
+    /// `Array.prototype[Symbol.iterator]`, which builds a one-shot index iterator.
+    ///
+    /// This used to be a shortcut — "has a callable `next`, or is an array" — because
+    /// there were no symbols to key the protocol on. Now that there are, the shortcut is
+    /// gone: a `for…of` over `null`, over a plain object, or over an object whose
+    /// `Symbol.iterator` is not callable all report the same `TypeError` the reference
+    /// does, and a user-defined iterable works without a special case.
     fn get_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
-        // An existing iterator: `for (x of arr.entries())`.
-        if let Value::Object(object) = value {
-            if let Some(next) = self.get_property(object, "next")?
-                && matches!(&next, Value::Object(function) if object.is_callable() || function.is_callable())
-            {
-                return Ok(Iterator {
-                    object: value.clone(),
-                    next,
-                });
-            }
+        let key = self.realm.well_known_key(WellKnown::Iterator);
+        let method = self.read_field_key(value, &key)?;
+        let Value::Object(function) = &method else {
+            return Err(Signal::Throw(self.make_error(
+                "TypeError",
+                &format!("{} is not iterable", value.to_js_string()),
+            )));
+        };
+        if !function.is_callable() {
+            return Err(Signal::Throw(self.make_error(
+                "TypeError",
+                &format!("{} is not iterable", value.to_js_string()),
+            )));
         }
-        // An array or a string iterates through this crate's own `next`, not through a
-        // method on `Array.prototype` — the `Symbol` builtin that would carry the real one
-        // is a later milestone. It is still a real callable so that everything built on
-        // the iterator protocol (`yield*`, `IteratorNext`, `IteratorCall`) sees an
-        // ordinary iterator rather than a special case.
-        if let Value::Object(object) = value
-            && object.is_array()
-        {
-            return Ok(self.internal_iterator(value.clone()));
+        let iterator = self.call_value(method, value.clone(), Vec::new())?;
+        // The spec requires an object here; a primitive iterator has no `next` to call
+        // and would fail one step later with a confusing message.
+        if !matches!(iterator, Value::Object(_)) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "iterator is not an object"),
+            ));
         }
-        if let Value::String(text) = value {
-            let chars: Vec<Value> = (0..text.utf16_len())
-                .map(|index| self.string(text.as_str().get(index..index + 1).unwrap_or("")))
-                .collect();
-            let array = self.new_array(chars);
-            return Ok(self.internal_iterator(Value::Object(array)));
-        }
-        Err(Signal::Throw(
-            self.make_error("TypeError", "value is not iterable"),
-        ))
+        let next = self.read_field(&iterator, "next")?;
+        Ok(Iterator {
+            object: iterator,
+            next,
+        })
     }
 
     /// One step of an internal iterator: the value and whether it is exhausted.
@@ -4005,28 +4310,6 @@ impl<'a> Interp<'a> {
         Ok((Value::Undefined, true))
     }
 
-    /// A one-shot iterator over an array, backed by the crate's own `next`.
-    fn internal_iterator(&mut self, target: Value) -> Iterator {
-        let length = match &target {
-            Value::Object(object) => object.array_length().unwrap_or(0),
-            _ => 0,
-        };
-        let iterator = self.new_object(None);
-        iterator.define_data("target", target.clone());
-        iterator.define_data("__length", Value::Int(length as i32));
-        iterator.define_data("__index", Value::Int(0));
-        let next = self.new_native("next", 0, internal_iterator_next);
-        iterator.define(
-            "next",
-            Property::with_attributes(Value::Object(next.clone()), true, false),
-        );
-        Iterator {
-            object: Value::Object(iterator),
-            next: Value::Object(next),
-        }
-    }
-
-    /// Append every element of `iterable` to `array`, returning how many.
     /// `[...iterable]`: append everything the iterator yields, and answer the next
     /// index.
     ///
@@ -4208,43 +4491,6 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// `next` of the internal array/string iterator built by [`Interp::internal_iterator`].
-///
-/// It reads and advances `__index` on its own receiver, so the state is per-iterator and
-/// two `for` loops over one array do not interfere.
-fn internal_iterator_next(
-    interp: &mut Interp<'_>,
-    this: Value,
-    _args: &[Value],
-) -> JsResult<Value> {
-    let Some(object) = this.as_object().cloned() else {
-        return Err(Signal::Throw(
-            interp.make_error("TypeError", "not an iterator"),
-        ));
-    };
-    let index = object
-        .own_property("__index")
-        .and_then(|property| property.value)
-        .map(|value| value.to_int32())
-        .unwrap_or(0);
-    let target = object.own_property("target").and_then(|p| p.value);
-    let Value::Object(sequence) = target.unwrap_or(Value::Undefined) else {
-        return interp.iterator_result(Value::Undefined, true);
-    };
-    if index as usize >= sequence.array_length().unwrap_or(0) {
-        return interp.iterator_result(Value::Undefined, true);
-    }
-    object.define_data("__index", Value::Int(index + 1));
-    // Iteration yields `undefined` for a hole — `[...[1,,3]]` is `[1, undefined, 3]`
-    // with a real element in the middle, because the spread stores whatever the
-    // iterator produced.
-    let value = match sequence.array_get(index as usize) {
-        Some(Value::Hole) | None => Value::Undefined,
-        Some(value) => value,
-    };
-    interp.iterator_result(value, false)
-}
-
 /// The bytecode and environment of a function object, if it is a bytecode function.
 ///
 /// Extracted before a call so no borrow of the object is held across it.
@@ -4334,10 +4580,10 @@ fn key_with_accessor_prefix(key: &str, flags: u32) -> String {
 /// `z` twice, and replacing the property wholesale dropped the getter, so `a.z` read
 /// `undefined`. The reference passes `JS_PROP_HAS_GET`/`JS_PROP_HAS_SET` to
 /// `JS_DefineProperty`, which leaves the other half alone.
-fn define_function_property(object: &Gc<JsObject>, key: &str, function: Value, flags: u32) {
+fn define_function_property(object: &Gc<JsObject>, key: &PropertyKey, function: Value, flags: u32) {
     let enumerable = flags & 4 != 0;
     let kind = flags & 3;
-    let existing = object.own_property(key);
+    let existing = object.own_property_key(key);
     let property = match kind {
         1 => Property {
             getter: Some(function),
@@ -4366,7 +4612,7 @@ fn define_function_property(object: &Gc<JsObject>, key: &str, function: Value, f
             ..Property::default()
         },
     };
-    object.define(key, property);
+    object.define_key(key, property);
 }
 
 // ---------------------------------------------------------------------------
@@ -4512,6 +4758,7 @@ impl Printer<'_, '_> {
             | Value::Hole
             | Value::CatchOffset(_)
             | Value::ReturnAddress(_) => self.out.push_str("undefined"),
+            Value::Symbol(symbol) => self.out.push_str(&symbol.to_display_string()),
             Value::Null => self.out.push_str("null"),
             Value::Bool(true) => self.out.push_str("true"),
             Value::Bool(false) => self.out.push_str("false"),

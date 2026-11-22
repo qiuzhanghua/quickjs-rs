@@ -4,13 +4,11 @@
 //! `ObjectKind::Generator` payload — so all three methods do the same thing: ask the
 //! interpreter to advance the frame with a different "which method was this" tag.
 //!
-//! `%GeneratorPrototype%[Symbol.iterator]`, which is what makes a generator usable as an
-//! iterable in `for (… of …)` and `[...g]`, arrives with the `Symbol` builtin. Until then
-//! `Interp::get_iterator` recognises an object with a callable `next` directly, which is
-//! the same answer by a shorter route.
+//! `%GeneratorPrototype%[Symbol.iterator]` is installed here too: it answers `this`, which
+//! is what makes a generator usable directly in `for (… of …)` and `[...g]`.
 
 use crate::interp::{Interp, JsResult, ResumeKind, Signal};
-use crate::object::{JsObject, ObjectKind};
+use crate::object::{JsObject, ObjectKind, Property};
 use crate::value::Value;
 use js_gc::Gc;
 
@@ -63,4 +61,16 @@ pub fn install(interp: &mut Interp<'_>, proto: &Gc<JsObject>) {
     ] {
         super::define_method(proto, name, length, func, interp);
     }
+    // `%GeneratorPrototype%[Symbol.iterator]` answers `this`: a generator is its own
+    // iterator, which is what makes `for (… of gen())` work.
+    let key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::Iterator);
+    let identity = interp.new_native("[Symbol.iterator]", 0, iterator);
+    proto.define_key(&key, Property::data(Value::Object(identity)));
+}
+
+/// `%GeneratorPrototype%[Symbol.iterator]`.
+fn iterator(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(this)
 }

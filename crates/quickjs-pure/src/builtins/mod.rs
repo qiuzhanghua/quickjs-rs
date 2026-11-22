@@ -23,6 +23,7 @@ mod number;
 mod object;
 mod reflect;
 mod string;
+mod symbol;
 
 use crate::interp::Interp;
 use crate::object::{JsObject, NativeFn, Property};
@@ -50,6 +51,10 @@ pub fn install(interp: &mut Interp<'_>) {
     interp.realm.generator_proto = generator_proto.clone();
 
     error::install(interp);
+    // `Symbol` installs first among the rest because the well-known symbols are property
+    // keys the other builtins store their methods under — `Array.prototype[Symbol.iterator]`
+    // is defined during `array::install` below.
+    symbol::install(interp);
     object::install(interp, &object_proto);
     function::install(interp, &function_proto);
     array::install(interp, &array_proto);

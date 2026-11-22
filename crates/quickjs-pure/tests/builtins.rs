@@ -1370,3 +1370,86 @@ fn a_generator_is_iterable_and_not_a_constructor() {
         "TypeError G is not a constructor\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Symbols
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_symbol_is_a_unique_key_that_is_not_a_string() {
+    // Identity, not description: two symbols with the same text are two different keys.
+    assert_eq!(
+        eval("print(Symbol()===Symbol(), Symbol.for('k')===Symbol.for('k'))"),
+        "false true\n"
+    );
+    // A symbol key and a string key coexist on one object and are invisible to each
+    // other. `Object.keys` and `JSON.stringify` skip the symbol; only
+    // `getOwnPropertySymbols` and `Reflect.ownKeys` report it.
+    assert_eq!(
+        eval(
+            "var o={}; var s=Symbol('a'); o[s]=1; o.a=2; print(o[s], o.a, Object.keys(o).length, Object.getOwnPropertySymbols(o).length, JSON.stringify(o), s in o)"
+        ),
+        "1 2 1 1 {\"a\":2} true\n"
+    );
+    assert_eq!(
+        eval("print(Reflect.ownKeys({a:1,[Symbol('s')]:2}).map(String).join())"),
+        "a,Symbol(s)\n"
+    );
+}
+
+#[test]
+fn symbol_converts_to_a_string_only_on_request() {
+    assert_eq!(
+        eval(
+            "print(typeof Symbol(), String(Symbol('x')), Symbol().description, Object.prototype.toString.call(Symbol()))"
+        ),
+        "symbol Symbol(x) undefined [object Symbol]\n"
+    );
+    // `ToString` of a symbol is a TypeError, in concatenation and in a template alike.
+    assert_eq!(
+        eval("try{''+Symbol()}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+    assert_eq!(
+        eval("try{print(`${Symbol()}`)}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+    // `new Symbol()` has no `[[Construct]]`.
+    assert_eq!(
+        eval("try{new Symbol()}catch(e){print(e.name, e.message)}"),
+        "TypeError Symbol is not a constructor\n"
+    );
+}
+
+#[test]
+fn well_known_symbols_drive_the_protocols() {
+    // `Symbol.toStringTag` overrides the class name in `Object.prototype.toString`.
+    assert_eq!(
+        eval("var o={[Symbol.toStringTag]:'M'}; print(Object.prototype.toString.call(o))"),
+        "[object M]\n"
+    );
+    // `Symbol.toPrimitive` takes over conversion, and is handed the hint.
+    assert_eq!(
+        eval("var o={[Symbol.toPrimitive](h){return h}}; print(`${o}`)"),
+        "string\n"
+    );
+    // `Symbol.iterator` makes any object iterable — no special case in the engine.
+    assert_eq!(
+        eval(
+            "var o={[Symbol.iterator](){var i=0;return{next:()=>({value:i++,done:i>2})}}}; print([...o].join())"
+        ),
+        "0,1\n"
+    );
+    // The built-in types advertise iteration through the same symbol, so a script can
+    // drive them by hand.
+    assert_eq!(
+        eval(
+            "var it=[1,2][Symbol.iterator](); print(JSON.stringify(it.next()), JSON.stringify(it.next()), JSON.stringify(it.next()))"
+        ),
+        "{\"value\":1,\"done\":false} {\"value\":2,\"done\":false} {\"done\":true}\n"
+    );
+    assert_eq!(
+        eval("print([...'ab'].join(), typeof Symbol.iterator)"),
+        "a,b symbol\n"
+    );
+}

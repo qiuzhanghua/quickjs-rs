@@ -156,9 +156,9 @@ fn own_keys(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<V
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.ownKeys target is not an object"));
     };
-    let keys: Vec<Value> = crate::builtins::object::own_keys(&Value::Object(object.clone()))
-        .into_iter()
-        .map(|key| interp.string(key))
+    let keys: Vec<Value> = crate::builtins::object::own_property_keys(&Value::Object(object))
+        .iter()
+        .map(|key| interp.key_value(key))
         .collect();
     let array = interp.new_array(keys);
     Ok(Value::Object(array))
