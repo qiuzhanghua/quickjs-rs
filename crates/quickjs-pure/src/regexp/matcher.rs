@@ -7,7 +7,7 @@
 //! passed by shared reference and copied when a group is entered, rather than mutated in
 //! place: a branch that fails must not leave its captures behind.
 
-use super::{Flags, Node};
+use super::{ClassSet, Flags, Node, PropertyKind};
 
 /// Capture register: `caps[0]` is the whole match, `caps[n]` is group `n`.
 pub type Captures = Vec<Option<(usize, usize)>>;
@@ -98,6 +98,131 @@ impl Matcher<'_> {
         }
     }
 
+    /// How many characters a set can consume here, longest first.
+    ///
+    /// A set of single characters answers `0` or `1`; `\q{BC|A}` answers `2` or `1`. Returning
+    /// the lengths rather than the strings is what makes intersection and subtraction
+    /// expressible: two sets agree on a string exactly when they agree on a length at the
+    /// same position, because the string is the input either way.
+    fn set_lengths(&self, set: &ClassSet, position: usize) -> Vec<usize> {
+        let mut lengths = self.set_lengths_unsorted(set, position);
+        lengths.sort_unstable_by(|a, b| b.cmp(a));
+        lengths.dedup();
+        lengths
+    }
+
+    fn set_lengths_unsorted(&self, set: &ClassSet, position: usize) -> Vec<usize> {
+        match set {
+            ClassSet::Char(expected) => match self.at(position) {
+                Some(actual) if self.chars_equal(actual, *expected) => vec![1],
+                _ => Vec::new(),
+            },
+            ClassSet::Range(lo, hi) => match self.at(position) {
+                Some(c) if self.in_range(c, *lo, *hi) => vec![1],
+                _ => Vec::new(),
+            },
+            ClassSet::Property { kind, negated } => match self.at(position) {
+                Some(c) if self.property_holds(*kind, *negated, c) => vec![1],
+                _ => Vec::new(),
+            },
+            ClassSet::Predefined { negated, ranges } => match self.at(position) {
+                Some(c) => {
+                    let inside = ranges.iter().any(|(lo, hi)| self.in_range(c, *lo, *hi));
+                    if inside != *negated {
+                        vec![1]
+                    } else {
+                        Vec::new()
+                    }
+                }
+                None => Vec::new(),
+            },
+            ClassSet::Strings(members) => members
+                .iter()
+                .filter(|member| self.matches_sequence(member, position))
+                .map(|member| member.len())
+                .collect(),
+            ClassSet::Union(operands) => operands
+                .iter()
+                .flat_map(|operand| self.set_lengths_unsorted(operand, position))
+                .collect(),
+            ClassSet::Intersection(operands) => {
+                let mut iter = operands.iter();
+                let Some(first) = iter.next() else {
+                    return Vec::new();
+                };
+                let mut lengths = self.set_lengths(first, position);
+                for operand in iter {
+                    let other = self.set_lengths(operand, position);
+                    lengths.retain(|length| other.contains(length));
+                }
+                lengths
+            }
+            ClassSet::Difference(left, right) => {
+                let mut lengths = self.set_lengths(left, position);
+                let excluded = self.set_lengths(right, position);
+                lengths.retain(|length| !excluded.contains(length));
+                lengths
+            }
+            // A negated set is a complement of *characters*: it consumes exactly one, and
+            // only when the inner set does not accept that one character.
+            ClassSet::Negated(inner) => match self.at(position) {
+                Some(c) if !self.set_lengths(inner, position).contains(&1) => {
+                    let _ = c;
+                    vec![1]
+                }
+                _ => Vec::new(),
+            },
+        }
+    }
+
+    /// Whether `member` matches the input starting at `position`.
+    fn matches_sequence(&self, member: &[char], position: usize) -> bool {
+        member
+            .iter()
+            .enumerate()
+            .all(|(index, expected)| match self.at(position + index) {
+                Some(actual) => self.chars_equal(actual, *expected),
+                None => false,
+            })
+    }
+
+    /// Whether `c` lies in a range, honouring case-insensitivity.
+    fn in_range(&self, c: char, lo: char, hi: char) -> bool {
+        self.in_class(c, &[(lo, hi)])
+    }
+
+    /// Whether `c` has a property, honouring `\P` and case-insensitivity.
+    ///
+    /// `u` and `v` disagree about *where* the negation goes under `i`, and the difference is
+    /// observable: `\P{Lower}/ui` matches `a` (the negation is applied per case variant, and
+    /// `a` canonicalises to the non-lowercase `A`), while `\P{Lower}/vi` does not (the set is
+    /// case-closed first and only then complemented, so `a` stays inside). The test suite
+    /// pins both, so the dialect decides.
+    fn property_holds(&self, kind: PropertyKind, negated: bool, c: char) -> bool {
+        let mut candidates = vec![c];
+        if self.flags.ignore_case {
+            candidates.push(self.fold(c));
+            if let Some(upper) = c.to_uppercase().next() {
+                candidates.push(upper);
+            }
+            if let Some(lower) = c.to_lowercase().next() {
+                candidates.push(lower);
+            }
+        }
+        if self.flags.unicode_sets {
+            // `v`: close over case, then negate.
+            let holds = candidates
+                .into_iter()
+                .any(|candidate| kind.holds(candidate));
+            holds != negated
+        } else {
+            // `u`: negate each variant, then ask whether any answers yes.
+            candidates
+                .into_iter()
+                .any(|candidate| kind.holds(candidate) != negated)
+        }
+    }
+
     /// Whether `c` is in a character class's ranges.
     ///
     /// Case-insensitive matching has to fold *both* sides of the comparison, which
@@ -154,32 +279,24 @@ impl Matcher<'_> {
                 Some(c) if self.in_class(c, ranges) != *negated => k(position + 1, caps),
                 _ => false,
             },
+            // A property escape outside a class. `property_holds` decides where the negation
+            // goes for the dialect in force, which is the one place `u` and `v` disagree.
             Node::Property { kind, negated } => match self.at(position) {
-                // Case-insensitive matching canonicalises the character before the property
-                // is consulted, and negation applies to the *set*, not to the result: `\P
-                // {Lower}` is "everything that is not a lowercase letter", which contains
-                // `A` — so `/[\P{Lower}]/ui` matches `a`, because `a` canonicalises to `A`.
-                // That is why the negated flag sits inside the "any variant" test instead of
-                // outside it. Both fold directions are tried, because simple case folding
-                // does not pair every character symmetrically.
-                Some(c) => {
-                    let mut candidates = vec![c];
-                    if self.flags.ignore_case {
-                        candidates.push(self.fold(c));
-                        if let Some(upper) = c.to_uppercase().next() {
-                            candidates.push(upper);
-                        }
-                        if let Some(lower) = c.to_lowercase().next() {
-                            candidates.push(lower);
-                        }
-                    }
-                    let holds = candidates
-                        .into_iter()
-                        .any(|candidate| kind.holds(candidate) != *negated);
-                    if holds { k(position + 1, caps) } else { false }
-                }
-                None => false,
+                Some(c) if self.property_holds(*kind, *negated, c) => k(position + 1, caps),
+                _ => false,
             },
+            // A `v`-mode set may consume one character or several (`\q{BC}`), so matching it
+            // yields a *set of lengths* rather than a single one. The continuation is tried
+            // longest-first, which is the greedy reading every engine gives an alternation
+            // of literals.
+            Node::Set(set) => {
+                for length in self.set_lengths(set, position) {
+                    if k(position + length, caps) {
+                        return true;
+                    }
+                }
+                false
+            }
             Node::Start => {
                 let at_start =
                     position == 0 || (self.flags.multiline && self.after_newline(position));

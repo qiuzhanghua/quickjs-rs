@@ -159,14 +159,29 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
         0
     };
     let input: Vec<char> = text.chars().collect();
-    // `lastIndex` counts UTF-16 units in the spec; this engine indexes characters, which
-    // agree for everything outside the astral planes.
-    if start > input.len() {
+    // `lastIndex`, `index` and the `d` flag's pairs all count **UTF-16 code units**, while the
+    // matcher works in characters. `unit_start[i]` is the code-unit offset of character `i`,
+    // with one extra entry for the end, so the two unit systems convert both ways.
+    let mut unit_start = Vec::with_capacity(input.len() + 1);
+    let mut units = 0;
+    for character in &input {
+        unit_start.push(units);
+        units += character.len_utf16();
+    }
+    unit_start.push(units);
+    // A `lastIndex` inside a surrogate pair has no character of its own; it belongs to the
+    // character that contains it, which is the same as rounding down to a code point
+    // boundary — what the reference does, and what makes `/(?:)/gu` with `lastIndex = 1` on
+    // `"🐱"` report `index === 0`.
+    if start > units {
         if sticky_or_global {
             interp.set_property(object, "lastIndex", Value::Int(0))?;
         }
         return Ok(Value::Null);
     }
+    start = unit_start
+        .partition_point(|offset| *offset <= start)
+        .saturating_sub(1);
     let found = data.regex.exec_at(&input, start);
     let Some(found) = found else {
         if sticky_or_global {
@@ -174,9 +189,11 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
         }
         return Ok(Value::Null);
     };
-    start = found.end;
+    // `lastIndex` moves to the end of the match, in code units — not characters, which is
+    // why an astral match advances by two.
     if sticky_or_global {
-        interp.set_property(object, "lastIndex", Value::Int(start as i32))?;
+        let units = unit_start[found.end.min(unit_start.len() - 1)];
+        interp.set_property(object, "lastIndex", Value::Int(units as i32))?;
     }
     // The result array: the whole match, then one element per group. A group that did not
     // participate is `undefined`, not a hole.
@@ -188,7 +205,7 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
         });
     }
     let array = interp.new_array(elements);
-    let index = found.start;
+    let index = unit_start[found.start.min(unit_start.len() - 1)];
     let input_value = interp.string(text);
     interp.set_property(&array, "index", Value::Int(index as i32))?;
     interp.set_property(&array, "input", input_value.clone())?;
@@ -207,8 +224,12 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
         for capture in &found.captures {
             pairs.push(match capture {
                 Some((start, end)) => {
+                    let (start, end) = (
+                        unit_start[(*start).min(unit_start.len() - 1)],
+                        unit_start[(*end).min(unit_start.len() - 1)],
+                    );
                     let pair =
-                        interp.new_array(vec![Value::Int(*start as i32), Value::Int(*end as i32)]);
+                        interp.new_array(vec![Value::Int(start as i32), Value::Int(end as i32)]);
                     Value::Object(pair)
                 }
                 None => Value::Undefined,

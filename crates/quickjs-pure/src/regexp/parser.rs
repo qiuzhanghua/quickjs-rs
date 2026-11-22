@@ -11,7 +11,7 @@
 //! `char`s, which is already code-point granular. That matches the common cases and is
 //! documented as a limitation rather than pretended away.
 
-use super::Node;
+use super::{ClassSet, Node, PropertyKind};
 
 /// Why a pattern could not be parsed.
 #[derive(Debug, Clone)]
@@ -37,9 +37,12 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     groups: usize,
-    /// Whether the `u` flag is set, which turns several Annex B liberties into syntax
-    /// errors. See [`Parser::annex_b_char`].
+    /// Whether the `u` or `v` flag is set, which turns several Annex B liberties into
+    /// syntax errors. See [`Parser::annex_b_char`].
     unicode: bool,
+    /// Whether the `v` flag is set, which additionally enables the character-class set
+    /// algebra. Implies `unicode`.
+    sets: bool,
 }
 
 /// Parse `source` with `flags`.
@@ -50,7 +53,8 @@ pub fn parse(source: &str, flags: crate::regexp::Flags) -> Result<Parsed, Patter
         chars: source.chars().collect(),
         pos: 0,
         groups: 0,
-        unicode: flags.unicode,
+        unicode: flags.unicode || flags.unicode_sets,
+        sets: flags.unicode_sets,
     };
     let node = parser.disjunction(0)?;
     if parser.pos < parser.chars.len() {
@@ -130,6 +134,8 @@ impl Parser {
                 self.pos += 1;
                 Ok(Node::Any)
             }
+            // `v` swaps in the set algebra; every other dialect keeps the flat form.
+            '[' if self.sets => self.set_class(),
             '[' => self.character_class(),
             '(' => self.group(depth),
             '*' | '+' | '?' => Err(self.error("nothing to repeat")),
@@ -399,8 +405,46 @@ impl Parser {
             'f' => '\u{c}',
             'v' => '\u{b}',
             '0' => '\0',
-            'x' => self.hex(2)?,
-            'u' => self.hex(4)?,
+            // Annex B: an incomplete `\x`/`\u` is an *identity* escape for the letter, so
+            // `/\u{2}/` is `u` repeated twice while `/\u{2}/u` is the code point 2. The
+            // strict grammars keep the error.
+            'x' => match self.try_hex(2) {
+                Some(value) => value,
+                None if !self.unicode => 'x',
+                None => return Err(self.error("invalid escape")),
+            },
+            // `\u{…}` spells a whole code point; `\uXXXX` spells one code unit. The brace
+            // form exists only in the strict grammars, which is why plain `/\u{2}/` is the
+            // letter `u` repeated — the Annex B reading, and what the flag decides.
+            'u' if self.unicode && self.peek() == Some('{') => {
+                self.pos += 1; // the '{'
+                let start = self.pos;
+                while matches!(self.peek(), Some(c) if c != '}') {
+                    self.pos += 1;
+                }
+                let digits: String = self.chars[start..self.pos].iter().collect();
+                if !self.eat('}') {
+                    return Err(self.error("expecting '}' after \\u{"));
+                }
+                if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Err(self.error("invalid code point escape"));
+                }
+                let code = u32::from_str_radix(&digits, 16)
+                    .map_err(|_| self.error("invalid code point escape"))?;
+                if code > 0x10FFFF {
+                    return Err(self.error("code point out of range"));
+                }
+                // A surrogate is not a code point, so the strict grammar refuses it outright.
+                if (0xD800..0xE000).contains(&code) {
+                    return Err(self.error("code point escape names a surrogate"));
+                }
+                char::from_u32(code).ok_or_else(|| self.error("invalid code point escape"))?
+            }
+            'u' => match self.try_hex(4) {
+                Some(value) => value,
+                None if !self.unicode => 'u',
+                None => return Err(self.error("invalid escape")),
+            },
             'c' => {
                 // Inside a class the same Annex B rule applies: a non-letter after `\c`
                 // is a literal backslash, and the caller reads the letter itself.
@@ -417,25 +461,258 @@ impl Parser {
         })
     }
 
-    fn hex(&mut self, digits: usize) -> Result<char, PatternError> {
+    /// Exactly `digits` hex digits, or `None` with the position restored.
+    ///
+    /// Restoring matters: on a failure the caller falls back to reading the letter as an
+    /// identity escape, and a half-consumed `\u12` would then leave the `12` behind.
+    fn try_hex(&mut self, digits: usize) -> Option<char> {
         let start = self.pos;
         let mut value = 0u32;
         for _ in 0..digits {
-            let c = self.peek().ok_or_else(|| self.error("incomplete escape"))?;
-            let digit = c.to_digit(16).ok_or_else(|| self.error("invalid escape"))?;
-            value = value * 16 + digit;
-            self.pos += 1;
+            match self.peek().and_then(|c| c.to_digit(16)) {
+                Some(digit) => {
+                    value = value * 16 + digit;
+                    self.pos += 1;
+                }
+                None => {
+                    self.pos = start;
+                    return None;
+                }
+            }
         }
-        char::from_u32(value).ok_or_else(|| {
-            self.pos = start;
-            self.error("invalid escape")
-        })
+        match char::from_u32(value) {
+            Some(character) => Some(character),
+            None => {
+                self.pos = start;
+                None
+            }
+        }
+    }
+
+    /// A `v`-mode character class: `[...]` with the set algebra.
+    ///
+    /// The grammar is a list of operands joined either by juxtaposition (union) or by `&&`
+    /// / `--`. Mixing the two operators at one level is a `SyntaxError`, which is why the
+    /// operator is remembered and checked rather than folded left to right.
+    fn set_class(&mut self) -> Result<Node, PatternError> {
+        self.pos += 1; // '['
+        let negated = self.eat('^');
+        let mut operands: Vec<ClassSet> = Vec::new();
+        let mut operator: Option<u8> = None;
+        loop {
+            let Some(c) = self.peek() else {
+                return Err(self.error("unterminated character class"));
+            };
+            if c == ']' {
+                self.pos += 1;
+                break;
+            }
+            operands.push(self.set_operand()?);
+            // `&&` and `--` are the only operators; anything else continues the union.
+            let next_op = if self.starts_with("&&") {
+                self.pos += 2;
+                Some(b'&')
+            } else if self.starts_with("--") {
+                self.pos += 2;
+                Some(b'-')
+            } else {
+                None
+            };
+            if let (Some(seen), Some(found)) = (operator, next_op)
+                && seen != found
+            {
+                return Err(self.error("cannot mix '&&' and '--' in one character class"));
+            }
+            if next_op.is_some() {
+                operator = next_op;
+                // An operator needs a right-hand operand.
+                if matches!(self.peek(), Some(']') | None) {
+                    return Err(self.error("missing operand after set operator"));
+                }
+            }
+        }
+        let set = match operator {
+            None => ClassSet::Union(operands),
+            Some(b'&') => ClassSet::Intersection(operands),
+            Some(_) => {
+                // Subtraction is left-associative: `a -- b -- c` is `(a -- b) -- c`.
+                let mut iter = operands.into_iter();
+                let Some(first) = iter.next() else {
+                    return Err(self.error("empty character class"));
+                };
+                iter.fold(first, |left, right| {
+                    ClassSet::Difference(Box::new(left), Box::new(right))
+                })
+            }
+        };
+        let set = if negated {
+            // A negated set is a complement of characters, so a string member has no
+            // meaning in it; refusing beats silently matching one character of a pair.
+            if set_has_strings(&set) {
+                return Err(self.error(
+                    "negated character class may not contain strings longer than one character",
+                ));
+            }
+            ClassSet::Negated(Box::new(set))
+        } else {
+            set
+        };
+        Ok(Node::Set(Box::new(set)))
+    }
+
+    /// One operand of a `v`-mode class: a nested class, an escape, a `\q{…}` set, or a
+    /// character (possibly the start of a range).
+    fn set_operand(&mut self) -> Result<ClassSet, PatternError> {
+        let c = self
+            .peek()
+            .ok_or_else(|| self.error("unterminated character class"))?;
+        if c == '[' {
+            // A nested class unions into its parent unless it is negated, in which case it
+            // is a complement of its own.
+            return self.set_class().map(|node| match node {
+                Node::Set(set) => *set,
+                // `set_class` only ever builds a `Set`, so the alternative is unreachable;
+                // treating it as an empty union keeps the function total.
+                _ => ClassSet::Union(Vec::new()),
+            });
+        }
+        if c == '\\' {
+            return self.set_escape();
+        }
+        // A single character may open a range. `-` itself has to be escaped in `v` mode,
+        // which is what makes `--` unambiguous.
+        self.pos += 1;
+        if c == '-' {
+            return Err(self.error("a literal '-' must be escaped inside a character class"));
+        }
+        self.set_range_from(c)
+    }
+
+    /// Continue a `v`-mode operand after its first character, turning it into a range when
+    /// a single `-` follows.
+    fn set_range_from(&mut self, lo: char) -> Result<ClassSet, PatternError> {
+        // `-` starts a range only when it is a single dash: `--` is the subtraction
+        // operator and belongs to the caller.
+        if self.peek() == Some('-') && !self.starts_with("--") {
+            self.pos += 1;
+            let hi = match self.peek() {
+                Some(']') | None => return Err(self.error("unterminated range")),
+                Some('\\') => {
+                    self.pos += 1;
+                    let escape = self
+                        .peek()
+                        .ok_or_else(|| self.error("\\ at end of pattern"))?;
+                    self.pos += 1;
+                    self.escape_char(escape)?
+                }
+                Some(character) => {
+                    self.pos += 1;
+                    character
+                }
+            };
+            if hi < lo {
+                return Err(self.error("range out of order in character class"));
+            }
+            return Ok(ClassSet::Range(lo, hi));
+        }
+        Ok(ClassSet::Char(lo))
+    }
+
+    /// An escape inside a `v`-mode class.
+    fn set_escape(&mut self) -> Result<ClassSet, PatternError> {
+        self.pos += 1; // '\\'
+        let c = self
+            .peek()
+            .ok_or_else(|| self.error("\\ at end of pattern"))?;
+        match c {
+            'p' | 'P' => {
+                self.pos += 1;
+                let node = self.property_escape(c == 'P')?;
+                Ok(match node {
+                    Node::Property { kind, negated } => ClassSet::Property { kind, negated },
+                    Node::Char(character) => ClassSet::Char(character),
+                    _ => return Err(self.error("invalid property escape")),
+                })
+            }
+            'q' => {
+                self.pos += 1;
+                self.string_disjunction()
+            }
+            'd' | 'D' | 'w' | 'W' | 's' | 'S' => {
+                self.pos += 1;
+                let (negated, ranges) = class_for(c);
+                Ok(ClassSet::Predefined { negated, ranges })
+            }
+            _ => {
+                self.pos += 1;
+                let character = self.escape_char(c)?;
+                // An escaped character may still open a range: `[\--0]` is a range from
+                // `-` to `0`.
+                self.set_range_from(character)
+            }
+        }
+    }
+
+    /// `\q{a|bc}`: a set of strings, each of which may be several characters long.
+    fn string_disjunction(&mut self) -> Result<ClassSet, PatternError> {
+        if !self.eat('{') {
+            return Err(self.error("expecting '{' after \\q"));
+        }
+        let mut members: Vec<Vec<char>> = Vec::new();
+        loop {
+            let mut member: Vec<char> = Vec::new();
+            loop {
+                match self.peek() {
+                    None => return Err(self.error("unterminated \\q{…}")),
+                    Some('|') | Some('}') => break,
+                    Some('\\') => {
+                        self.pos += 1;
+                        let escape = self
+                            .peek()
+                            .ok_or_else(|| self.error("\\ at end of pattern"))?;
+                        self.pos += 1;
+                        member.push(self.escape_char(escape)?);
+                    }
+                    Some(character) => {
+                        self.pos += 1;
+                        member.push(character);
+                    }
+                }
+            }
+            if member.is_empty() {
+                return Err(self.error("empty string in \\q{…}"));
+            }
+            members.push(member);
+            if self.eat('|') {
+                continue;
+            }
+            if self.eat('}') {
+                break;
+            }
+            return Err(self.error("expecting '}' in \\q{…}"));
+        }
+        Ok(ClassSet::Strings(members))
+    }
+
+    fn starts_with(&self, text: &str) -> bool {
+        let mut at = self.pos;
+        for expected in text.chars() {
+            match self.chars.get(at) {
+                Some(actual) if *actual == expected => at += 1,
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn character_class(&mut self) -> Result<Node, PatternError> {
         self.pos += 1; // '['
         let negated = self.eat('^');
         let mut ranges: Vec<(char, char)> = Vec::new();
+        // A property escape cannot be written as a range list, so its presence switches the
+        // whole class over to the set representation. Everything else stays in `ranges`,
+        // which is the cheaper form.
+        let mut properties: Vec<ClassSet> = Vec::new();
         let mut first = true;
         loop {
             let Some(c) = self.peek() else {
@@ -476,9 +753,32 @@ impl Parser {
                     }
                 }
             }
-            atom.push_into(&mut ranges);
+            if let ClassAtom::Property { .. } = atom {
+                properties.push(atom.as_set());
+            } else {
+                atom.push_into(&mut ranges);
+            }
         }
-        Ok(Node::Class(negated, ranges))
+        if properties.is_empty() {
+            return Ok(Node::Class(negated, ranges));
+        }
+        let mut members: Vec<ClassSet> = ranges
+            .into_iter()
+            .map(|(lo, hi)| {
+                if lo == hi {
+                    ClassSet::Char(lo)
+                } else {
+                    ClassSet::Range(lo, hi)
+                }
+            })
+            .collect();
+        members.extend(properties);
+        let set = ClassSet::Union(members);
+        Ok(Node::Set(Box::new(if negated {
+            ClassSet::Negated(Box::new(set))
+        } else {
+            set
+        })))
     }
 
     /// One class atom: a single character, a range, or a whole built-in class.
@@ -505,11 +805,18 @@ impl Parser {
                 }
                 Ok(ClassAtom::Set(ranges))
             }
-            // A property escape is a set, not a range, and a class atom can only be one or
-            // the other. Refusing beats reading `\p` as the letter `p`, which is what the
-            // Annex B fallback below would otherwise do — silently, and with the wrong
-            // meaning.
-            'p' | 'P' => Err(self.error("property escapes inside [...] are not supported")),
+            // A property escape is a set, not a range; the caller collects these separately
+            // and builds a `ClassSet`. Outside the strict grammars `\p` is the letter `p`,
+            // which the Annex B fallback below gives.
+            'p' | 'P' if self.unicode => {
+                self.pos += 1;
+                let node = self.property_escape(e == 'P')?;
+                match node {
+                    Node::Property { kind, negated } => Ok(ClassAtom::Property { kind, negated }),
+                    Node::Char(character) => Ok(ClassAtom::Range(character, character)),
+                    _ => Err(self.error("invalid property escape")),
+                }
+            }
             _ => {
                 self.pos += 1;
                 let ch = self.escape_char(e)?;
@@ -525,6 +832,13 @@ enum ClassAtom {
     Range(char, char),
     /// Several ranges, from a `\d`-style escape.
     Set(Vec<(char, char)>),
+    /// A Unicode property escape, which only the strict grammars allow inside a class.
+    Property {
+        /// Which property.
+        kind: PropertyKind,
+        /// `\P{…}` rather than `\p{…}`.
+        negated: bool,
+    },
 }
 
 impl ClassAtom {
@@ -540,11 +854,49 @@ impl ClassAtom {
         match self {
             ClassAtom::Range(lo, hi) => out.push((*lo, *hi)),
             ClassAtom::Set(ranges) => out.extend_from_slice(ranges),
+            // A property is not a range, so it never lands in the range list; the caller
+            // notices it separately and builds a [`ClassSet`] instead.
+            ClassAtom::Property { .. } => {}
+        }
+    }
+
+    /// This atom as a set member.
+    fn as_set(&self) -> ClassSet {
+        match self {
+            ClassAtom::Range(lo, hi) if lo == hi => ClassSet::Char(*lo),
+            ClassAtom::Range(lo, hi) => ClassSet::Range(*lo, *hi),
+            ClassAtom::Set(ranges) => ClassSet::Union(
+                ranges
+                    .iter()
+                    .map(|(lo, hi)| ClassSet::Range(*lo, *hi))
+                    .collect(),
+            ),
+            ClassAtom::Property { kind, negated } => ClassSet::Property {
+                kind: *kind,
+                negated: *negated,
+            },
         }
     }
 }
 
 /// The built-in character class a `\d`-style escape stands for.
+/// Whether a set contains a member longer than one character.
+///
+/// A negated set is a complement of characters, so such a member cannot be expressed and the
+/// grammar rejects the pattern instead of matching one character of a longer string.
+fn set_has_strings(set: &ClassSet) -> bool {
+    match set {
+        ClassSet::Strings(members) => members.iter().any(|member| member.len() > 1),
+        ClassSet::Union(operands) | ClassSet::Intersection(operands) => {
+            operands.iter().any(set_has_strings)
+        }
+        ClassSet::Difference(left, right) => set_has_strings(left) || set_has_strings(right),
+        ClassSet::Negated(inner) => set_has_strings(inner),
+        ClassSet::Char(_) | ClassSet::Range(..) | ClassSet::Property { .. } => false,
+        ClassSet::Predefined { .. } => false,
+    }
+}
+
 fn class_for(c: char) -> (bool, Vec<(char, char)>) {
     match c {
         'd' => (false, vec![('0', '9')]),

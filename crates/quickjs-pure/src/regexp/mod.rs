@@ -40,6 +40,11 @@ pub struct Flags {
     /// `d`: `exec` also reports index pairs. Accepted; the array's `.indices` is built
     /// by the RegExp builtin.
     pub has_indices: bool,
+    /// `v`: Unicode-aware matching with the full character-class set grammar.
+    ///
+    /// Mutually exclusive with `u`, and strict about the same things — plus it accepts
+    /// nested classes, `&&`/`--` and `\q{…}` string sets, which `u` does not.
+    pub unicode_sets: bool,
 }
 
 impl Flags {
@@ -48,7 +53,7 @@ impl Flags {
     /// Returns the flags and the canonical order the spec fixes for `.flags`.
     pub fn parse(text: &str) -> Option<Flags> {
         let mut flags = Flags::default();
-        let mut seen = [false; 7];
+        let mut seen = [false; 8];
         for c in text.chars() {
             let (slot, target) = match c {
                 'g' => (0, &mut flags.global),
@@ -58,6 +63,7 @@ impl Flags {
                 'y' => (4, &mut flags.sticky),
                 'u' => (5, &mut flags.unicode),
                 'd' => (6, &mut flags.has_indices),
+                'v' => (7, &mut flags.unicode_sets),
                 _ => return None,
             };
             if seen[slot] {
@@ -65,6 +71,11 @@ impl Flags {
             }
             seen[slot] = true;
             *target = true;
+        }
+        // `u` and `v` are two dialects of the same strict grammar, so a pattern cannot ask
+        // for both.
+        if flags.unicode && flags.unicode_sets {
+            return None;
         }
         Some(flags)
     }
@@ -79,6 +90,7 @@ impl Flags {
             (self.multiline, 'm'),
             (self.dot_all, 's'),
             (self.unicode, 'u'),
+            (self.unicode_sets, 'v'),
             (self.sticky, 'y'),
         ] {
             if present {
@@ -137,6 +149,8 @@ pub enum Node {
     Any,
     /// `[...]`, or a bare `\d`-style escape. The flag says whether the set is inverted.
     Class(bool, Vec<(char, char)>),
+    /// A `v`-mode character class: sets, nesting, `&&`, `--` and `\q{…}` strings.
+    Set(Box<ClassSet>),
     /// `\p{Name}` / `\P{Name}`: a Unicode property escape.
     ///
     /// A separate node rather than a [`Node::Class`] because a property like `Lower` covers
@@ -204,6 +218,7 @@ impl Node {
             | Node::Any
             | Node::Class(..)
             | Node::Property { .. }
+            | Node::Set(_)
             | Node::Backref(_) => false,
             Node::Group { node, .. } => node.nullable(),
             Node::Concat(nodes) => nodes.iter().all(Node::nullable),
@@ -211,6 +226,45 @@ impl Node {
             Node::Repeat { min, node, .. } => *min == 0 || node.nullable(),
         }
     }
+}
+
+/// A character class as the `v` flag defines it.
+///
+/// `v` replaces the flat "list of ranges" of the older grammar with a real set algebra, so
+/// `[[a-c]&&B]` is the intersection of a nested class with a letter and `[\q{BC|A}]` is a set
+/// of *strings* rather than characters. That last part is why this cannot collapse into
+/// [`Node::Class`]: a member of a set may be two characters long, so matching it consumes a
+/// variable number of them.
+#[derive(Debug, Clone)]
+pub enum ClassSet {
+    /// One character.
+    Char(char),
+    /// An inclusive range.
+    Range(char, char),
+    /// A Unicode property escape.
+    Property {
+        /// Which property.
+        kind: PropertyKind,
+        /// `\P{…}` rather than `\p{…}`.
+        negated: bool,
+    },
+    /// A `\d`-style predefined set, with its own inversion.
+    Predefined {
+        /// Whether the set is inverted (`\D`).
+        negated: bool,
+        /// The ranges the plain form stands for.
+        ranges: Vec<(char, char)>,
+    },
+    /// One of several strings, from `\q{…}`. A member may be longer than one character.
+    Strings(Vec<Vec<char>>),
+    /// Any member of any operand.
+    Union(Vec<ClassSet>),
+    /// Members present in every operand.
+    Intersection(Vec<ClassSet>),
+    /// Members of the first operand that the second does not have.
+    Difference(Box<ClassSet>, Box<ClassSet>),
+    /// `[^…]`.
+    Negated(Box<ClassSet>),
 }
 
 /// A compiled pattern.

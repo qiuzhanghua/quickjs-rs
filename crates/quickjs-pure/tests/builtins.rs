@@ -2357,3 +2357,87 @@ fn map_and_set_surface() {
         "true\n"
     );
 }
+
+#[test]
+fn regexp_character_class_set_algebra() {
+    // `v` mode replaces the flat range list with a real set algebra: nested classes,
+    // intersection and subtraction.
+    assert_eq!(
+        eval("print('aAbBcC'.replace(/[[a-c]&&B]/gvi, 'X'))"),
+        "aAXXcC\n"
+    );
+    assert_eq!(
+        eval("print('aAbBcC'.replace(/[[a-c]--B]/gvi, 'X'))"),
+        "XXbBXX\n"
+    );
+    // `\q{…}` makes a set of *strings*: a member may be two characters long, so matching it
+    // consumes two and the alternation is tried longest-first.
+    assert_eq!(
+        eval("print('abcAbC'.replace(/[\\q{BC|A}]/gvi, 'X'))"),
+        "XXXX\n"
+    );
+    assert_eq!(
+        eval("print('abcAbC'.replace(/[\\q{BC|A}--a]/gvi, 'X'))"),
+        "aXAX\n"
+    );
+    // `&&` and `--` cannot be mixed at one level, and `-` must be escaped.
+    assert!(throws("new RegExp('[[a-c]&&B--a]', 'v')").starts_with("SyntaxError"));
+    // A range is still a range, but a lone `-` has to be escaped — that is what makes `--`
+    // unambiguous as the subtraction operator.
+    assert_eq!(eval("print(/[a-z]/v.test('m'))"), "true\n");
+    assert!(throws("new RegExp('[-]', 'v')").starts_with("SyntaxError"));
+    assert!(throws("new RegExp('[a-]', 'v')").starts_with("SyntaxError"));
+}
+
+#[test]
+fn regexp_u_and_v_disagree_about_negated_properties() {
+    // Under `i`, `u` negates per case variant — `a` canonicalises to the non-lowercase `A` —
+    // while `v` case-closes the set first and only then complements it.
+    assert_eq!(
+        eval("print(/\\P{Lower}/ui.test('a'), /\\P{Lower}/vi.test('a'))"),
+        "true false\n"
+    );
+    assert_eq!(
+        eval(
+            "print('aAbBcC#4'.replace(/\\P{Lower}/gui, 'X'), 'aAbBcC#4'.replace(/\\P{Lower}/gvi, 'X'))"
+        ),
+        "XXXXXXXX aAbBcCXX\n"
+    );
+    // …so the double negation `[^\P{Lower}]` means "lowercase letters" in `v`.
+    assert_eq!(
+        eval("print('aAbBcC#4'.replace(/[^\\P{Lower}]/gvi, 'X'))"),
+        "XXXXXX#4\n"
+    );
+    // A property escape inside a class works in `u` as well.
+    assert_eq!(
+        eval("print(/[\\p{Lower}]/u.test('a'), /[\\p{Lower}]/u.test('A'))"),
+        "true false\n"
+    );
+}
+
+#[test]
+fn regexp_code_point_escapes_and_code_unit_offsets() {
+    // `\u{…}` is the strict-grammar spelling of a code point; without `u` it is the letter
+    // `u` followed by a quantifier, which is the Annex B reading.
+    assert_eq!(
+        eval("print(/\\u{10000}/u.test('\\u{10000}'), /\\u{2}/.test('uu'))"),
+        "true true\n"
+    );
+    assert_eq!(eval("print(/\\u{2}/.source)"), "\\u{2}\n");
+    // `index`, `lastIndex` and the `d` flag's pairs all count UTF-16 code *units*, so an
+    // astral match spans two.
+    assert_eq!(
+        eval("var m = /\\u{10000}/u.exec('a\\u{10000}'); print(m.index, m[0].length)"),
+        "1 2\n"
+    );
+    assert_eq!(
+        eval("var m = /\\u{10000}/vgd.exec('\\u{10000}_'); print(m.indices[0].join(','))"),
+        "0,2\n"
+    );
+    // A `lastIndex` inside a surrogate pair belongs to the character containing it, which is
+    // the same as rounding down to a code point boundary.
+    assert_eq!(
+        eval("var a = /(?:)/gu; a.lastIndex = 1; a.exec('\\u{1F600}'); print(a.lastIndex)"),
+        "0\n"
+    );
+}
