@@ -2,6 +2,9 @@
 
 测量时间：2026-02（提交 `4a30079`，v0.4.0 之后）
 
+**已修**：4.1（`name`/`length`/`prototype` 属性）与 4.7（匿名类表达式）已修复，
+可运行通过率 **42.7% → 45.8%**，净修好 561 例、新引入失败 0 例。见第 7 节。
+
 复现：
 
 ```sh
@@ -27,9 +30,9 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 17665 |
 | **可运行中通过** | **7536（42.7%）** |
-| 可运行中失败 | 10129 |
+| 可运行中失败 | 9568 |
 | ↳ 其中挂起（引擎不终止） | 44 |
-| ↳ 其中答错 | 10085 |
+| ↳ 其中答错 | 9524 |
 | 跳过（引擎完全没这功能） | 6220 |
 
 跳过不是"通过"，所以它单列。按原因：
@@ -81,13 +84,43 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 
 ## 4. 已确认的引擎缺陷（有最小复现）
 
-### 4.1 函数的 `name`/`length` 不可配置（约 520 条）
+### 4.1 函数的 `name`/`length` 不可配置（约 520 条）— ✅ 已修
 
 ```js
 Object.getOwnPropertyDescriptor(function f(a){}, "name").configurable  // 应为 true，实为 false
 ```
 
 两个属性都按 ES 规范应为 `configurable: true`。影响 `Object.assign`、`Function`、每个内建方法的 `length.js`／`name.js` 用例——这类用例每个部件都有几个，所以它是**唯一一条横跨所有部件的缺陷**，修一次收益最广。
+
+根因不是漏写某个属性，而是 `Property::with_attributes(value, writable, enumerable)` 把
+`configurable` 绑死在 `writable` 上。这个推导对"内建方法"（`writable:true, configurable:true`）
+成立，而对函数上另外两种形态都不成立：
+
+| 属性 | 规范 | 旧推导 |
+|---|---|---|
+| 内建方法 | `writable:true, enumerable:false, configurable:true` | 对 |
+| `name` / `length` | `writable:false, enumerable:false, configurable:true` | 错（两个方向里的第一个） |
+| 函数 `prototype` | `writable:{用户函数 true, 内建 false}, enumerable:false, configurable:false` | 错（第二个） |
+
+已新增 `Property::name_or_length` 与 `Property::prototype_of` 把这两个例外收进一处，
+并在 `with_attributes` 的文档里写明它只对第一种成立。
+
+连带修掉的三处（同一类错误的其它出口）：
+- 匿名函数／箭头函数的 `name` 属性**根本不存在**，应为存在且为 `""`；
+- 类构造器的 `length` 被写成 `enumerable: true`（应为 `false`）；
+- 用户函数的 `prototype` 被写成 `configurable: true`（应为 `false`）。
+
+### 4.7 匿名类表达式求值为 `undefined` — ✅ 已修
+
+```js
+var x = class {}; print(x)          // 实为 undefined
+print(typeof (class {}))            // 实为 TypeError: undefined is not a function
+```
+
+编译器在类作用域里用 `name.unwrap_or_default()` 去 `SetInit` 一个绑定，匿名类没有这个绑定，
+于是对空字符串名字发出一条全局存储指令。修法是只在确实有类名时才初始化该绑定。
+
+修好后 NamedEvaluation 也随之正确：`var x = class {}` 的 `x.name === "x"`，而 `(class {}).name === ""`。
 
 ### 4.2 原始值接收者未装箱（ToObject）（约 192 + Array 一批）
 
@@ -135,10 +168,28 @@ Array.prototype.map.call(new Proxy([], {get: (_, k) => k === 'length' ? 2**32 : 
 
 优先级按"修一条能清掉多少条失败"排，而不是按里程碑顺序：
 
-1. `name`/`length` 可配置（4.1）——一条修复，横跨全部部件，约 520 条。
+1. ~~`name`/`length` 可配置（4.1）~~——已修，实测 +561 例。
 2. `ToObject` 装箱（4.2）——Array/Object 一批，约 300+ 条。
 3. `Promise`（真做）——251 条 Promise 加上 `flag:async` 632 条跳过的前置条件。
 4. TypedArray 补全（4.3）——约 1900 条，但工作量大，建议在 1–3 之后。
 5. 正则文法（4.5）——受 Unicode 表依赖，和 FR-8 一起做。
 
 前两项是小改动大杠杆，也正好是"静默错答案"而非"报错"的那一类，风险高于数字所示。
+
+## 7. 修复记录
+
+### 4.1 + 4.7：函数属性与匿名类表达式
+
+| | 修前 | 修后 |
+|---|---|---|
+| 可运行通过 | 7536（42.7%） | **8097（45.8%）** |
+| 可运行失败 | 10129 | 9568 |
+| 新引入失败 | — | **0** |
+
+逐用例对比（前后各跑一次全集，按用例名求差集）：修好 561 例，回归 0 例。改进分布：
+`Date/prototype` 85、`Array/prototype` 62、`String/prototype` 55、`RegExp/prototype` 23、
+`Map/prototype` 20、`Set/prototype` 16、`Function/prototype` 15、`Object/prototype` 14。
+
+回归保护：`crates/quickjs-pure/tests/builtins.rs` 的
+`function_name_length_and_prototype_have_the_spec_attributes`。已验证该测试在修复前
+会失败（`left: "false,false,false"`），不是装饰。

@@ -182,12 +182,55 @@ impl Property {
     }
 
     /// A data property with explicit attributes.
+    ///
+    /// `configurable` is derived from `writable`, because that derivation is right for the
+    /// case this is overwhelmingly used for: a built-in method or constructor, which the
+    /// spec gives `{writable: true, enumerable: false, configurable: true}`.
+    ///
+    /// It is *not* right for the two other shapes the spec uses on functions, and both were
+    /// wrong here for a long time — `name`/`length` are `{writable: false, enumerable:
+    /// false, configurable: true}`, and a function's `prototype` is `{writable: true,
+    /// enumerable: false, configurable: false}`. Use [`Property::name_or_length`] and
+    /// [`Property::prototype_of`] for those rather than spelling them out, so that the two
+    /// exceptions to the rule stay in one place.
     pub fn with_attributes(value: Value, writable: bool, enumerable: bool) -> Property {
         Property {
             value: Some(value),
             writable,
             enumerable,
             configurable: writable,
+            ..Property::default()
+        }
+    }
+
+    /// A `name` or `length` property: writable and enumerable are false, configurable true.
+    ///
+    /// Every function has both, and the spec makes them configurable so that a definition
+    /// can replace them (`Object.defineProperty(f, "length", {value: 0})`, and
+    /// `Function.prototype.bind` renaming its result). With them non-configurable, those
+    /// definitions throw and about five hundred conformance tests fail.
+    pub fn name_or_length(value: Value) -> Property {
+        Property {
+            value: Some(value),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        }
+    }
+
+    /// A function's `prototype`: not configurable, and writable only for user functions.
+    ///
+    /// A built-in constructor's `prototype` is read-only — assigning to `Object.prototype`
+    /// must not stick — while a user function's is writable, since that is how
+    /// `Ctor.prototype.method = f` sets up inheritance. Neither is configurable, so
+    /// `delete Ctor.prototype` fails in both cases.
+    pub fn prototype_of(value: Value, writable: bool) -> Property {
+        Property {
+            value: Some(value),
+            writable,
+            enumerable: false,
+            configurable: false,
             ..Property::default()
         }
     }

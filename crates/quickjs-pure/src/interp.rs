@@ -1501,13 +1501,10 @@ impl<'a> Interp<'a> {
             Some(self.realm.function_proto.clone()),
             Callable::Native { func },
         );
-        function.define(
-            "name",
-            Property::with_attributes(self.string(name), false, false),
-        );
+        function.define("name", Property::name_or_length(self.string(name)));
         function.define(
             "length",
-            Property::with_attributes(Value::Int(length as i32), false, false),
+            Property::name_or_length(Value::Int(length as i32)),
         );
         function
     }
@@ -2915,13 +2912,13 @@ impl<'a> Interp<'a> {
         );
         function.define(
             "prototype",
-            Property::with_attributes(Value::Object(proto.clone()), false, false),
+            Property::prototype_of(Value::Object(proto.clone()), false),
         );
         if let Some((code, _)) = bytecode_of(function) {
             let length = code.code.defined_args;
             function.define(
                 "length",
-                Property::with_attributes(Value::Int(length as i32), false, true),
+                Property::name_or_length(Value::Int(length as i32)),
             );
         }
         Ok(())
@@ -4098,7 +4095,7 @@ impl<'a> Interp<'a> {
             Property::with_attributes(constructor, true, false),
         );
         let value = Value::Object(prototype);
-        function.define("prototype", Property::with_attributes(value, true, false));
+        function.define("prototype", Property::prototype_of(value, true));
     }
 
     /// The object `special_object` builds.
@@ -6624,14 +6621,11 @@ impl<'a> Interp<'a> {
         );
         object.define(
             "length",
-            Property::with_attributes(Value::Int(length as i32), false, false),
+            Property::name_or_length(Value::Int(length as i32)),
         );
-        if !name.is_empty() {
-            object.define(
-                "name",
-                Property::with_attributes(self.string(name), false, false),
-            );
-        }
+        // Defined even when empty: `(function(){}).name` is `""`, not absent, and a test
+        // that checks the own-property descriptor fails if the property is missing.
+        object.define("name", Property::name_or_length(self.string(name)));
         self.install_function_prototype(&object);
         Ok(Value::Object(object))
     }
@@ -7755,7 +7749,7 @@ impl<'a> Interp<'a> {
             return;
         }
         let text = self.string(name);
-        object.define("name", Property::with_attributes(text, false, false));
+        object.define("name", Property::name_or_length(text));
     }
 
     // -- global declarations -----------------------------------------------

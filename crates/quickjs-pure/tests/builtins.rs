@@ -2528,3 +2528,59 @@ print(JSON.stringify(Array.from(new Set([1,2]), v => v * 10)));
         "[1,2]\n[[1,2]]\n[\"a\",\"b\"]\n[1,2]\n[\"x\",\"y\"]\n[10,20]\n"
     );
 }
+
+#[test]
+fn function_name_length_and_prototype_have_the_spec_attributes() {
+    // Every one of these was `configurable: false` — derived from `writable`, a
+    // derivation that is right for a built-in method and wrong for these three shapes.
+    // Roughly five hundred conformance tests depended on it, spread over every built-in,
+    // because `Object.assign`, `bind` and every `defineProperty(f, "length", …)` need to
+    // be able to redefine them.
+    let descriptor = |expr: &str| {
+        value(&format!(
+            r#"var d = Object.getOwnPropertyDescriptor({expr});
+               d === undefined ? "absent" : [d.writable, d.enumerable, d.configurable].join(",")"#
+        ))
+    };
+    // `{writable: false, enumerable: false, configurable: true}` for name and length.
+    let pairs = [
+        ("(function f(a){})", "name"),
+        ("(function f(a){})", "length"),
+        ("(function(){})", "name"),
+        ("(()=>{})", "name"),
+        ("(()=>{})", "length"),
+        ("(class C{})", "name"),
+        ("Object", "name"),
+        ("Object", "length"),
+        ("Array.prototype.map", "name"),
+        ("Array.prototype.map", "length"),
+        ("(function f(a){}).bind(null)", "name"),
+        ("(function f(a){a}).bind(null)", "length"),
+        (
+            "Object.getOwnPropertyDescriptor({get x(){}}, 'x').get",
+            "name",
+        ),
+    ];
+    for (object, key) in pairs {
+        assert_eq!(
+            descriptor(&format!("{object}, \"{key}\"")),
+            "false,false,true",
+            "{object}.{key}"
+        );
+    }
+    // An anonymous function's name is present and empty, not absent.
+    assert_eq!(value("(function(){}).name"), "");
+    assert_eq!(value("(()=>{}).name"), "");
+    assert_eq!(value("(class {}).name"), "");
+    // A user function's `prototype` is writable but *not* configurable, and a built-in
+    // constructor's is neither.
+    assert_eq!(
+        descriptor("(function f(){}), \"prototype\""),
+        "true,false,false"
+    );
+    assert_eq!(descriptor("Object, \"prototype\""), "false,false,false");
+    assert_eq!(value("delete (function f(){}).prototype"), "false");
+    // NamedEvaluation still names an anonymous class after its binding.
+    assert_eq!(value("var x = class {}; x.name"), "x");
+    assert_eq!(value("var x = class {}; typeof x"), "function");
+}

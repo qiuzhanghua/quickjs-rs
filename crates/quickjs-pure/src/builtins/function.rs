@@ -139,16 +139,13 @@ fn bind(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     let remaining = (length - leading.len() as f64).max(0.0);
     bound.define(
         "length",
-        Property::with_attributes(Value::Int(remaining as i32), false, false),
+        Property::name_or_length(Value::Int(remaining as i32)),
     );
     if let Some(object) = this.as_object()
         && let Some(Value::String(name)) = object.own_property("name").and_then(|p| p.value)
     {
         let text = format!("bound {}", name.to_string_lossy());
-        bound.define(
-            "name",
-            Property::with_attributes(interp.string(text), false, false),
-        );
+        bound.define("name", Property::name_or_length(interp.string(text)));
     }
     Ok(Value::Object(bound))
 }

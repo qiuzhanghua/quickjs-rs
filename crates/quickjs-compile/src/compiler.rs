@@ -4958,7 +4958,14 @@ impl Compiler {
         // can refer to the class by name (`static y = S.x`).
         // `set_loc` leaves the constructor on the stack, which is what the static field
         // call and the outer store both consume.
-        self.emit_var(VarAction::SetInit, &name.clone().unwrap_or_default());
+        //
+        // Only when there *is* such a binding: an anonymous class expression declares no
+        // class-scope name, and asking for one by the empty string resolved to nothing —
+        // which made `var x = class {}` assign `undefined` and put a bogus global store in
+        // the instruction stream.
+        if let Some(name) = &name {
+            self.emit_var(VarAction::SetInit, name);
+        }
         if !static_fields.is_empty() {
             let initialiser = self.compile_field_initialiser(&static_fields, class.span)?;
             let index = self.push_constant(Constant::Function(Box::new(initialiser)));
