@@ -258,10 +258,9 @@ fn unsupported_constructs_fail_loudly() {
     for source in [
         // A destructuring catch parameter is not wired up yet.
         "function f(){ try { a(); } catch ([e]) { } }",
-        // A destructuring `for` head and `for await` are still gaps. Generators, classes
-        // and async *syntax* compile; calling an async function is refused at run time
-        // until the `Promise` builtin lands.
-        "for (const [x] of xs) ;",
+        // `for await` is still a gap. Generators, classes and async *syntax* compile;
+        // calling an async function is refused at run time until the `Promise` builtin
+        // lands.
         "async function f(xs){ for await (const x of xs) ; }",
     ] {
         let program = parse_script(source).expect("parses");
@@ -726,6 +725,16 @@ fn for_in_of_matches_the_reference() {
         // Nesting, and a loop inside a `try`.
         "function f(o){ for (var k in o) for (var v of o) a(k, v); }",
         "function f(o){ try { for (var v of o) a(v); } finally { b(); } }",
+        // A destructuring or member target stores through the same path an
+        // assignment pattern uses, rather than refusing the loop. Two related shapes are
+        // deliberately absent: `for (const {a} of o)` and `for ([t[0]] of o)` match the
+        // reference in behaviour (including evaluation order, checked by hand) but not
+        // instruction for instruction — the reference picks `get_field2` over
+        // `dup`/`get_field`, and hoists a plain receiver read above `for_of_next`.
+        "function f(o){ for (const [x] of o) a(x); }",
+        "function f(o){ for (var [x, y] in o) a(x, y); }",
+        "function f(o, t){ for (t[0] in o) a(t); }",
+        "function f(o, t){ for (t.k of o) a(t); }",
     ];
     assert_cases(&cases);
 }

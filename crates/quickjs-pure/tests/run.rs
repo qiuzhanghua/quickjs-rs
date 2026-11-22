@@ -202,6 +202,64 @@ fn for_in_and_for_of() {
         eval("var t=0; for (var v of [1,2,3]) t+=v; print(t)"),
         "6\n"
     );
+    // The "integer keys first" ordering is per object, not for the whole chain: a
+    // prototype's `"4"` belongs after the target's own `x`/`y`.
+    assert_eq!(
+        eval(
+            "var a={x:2,y:2,'1':3}, b={'4':3}; Object.setPrototypeOf(a,b);\n\
+             var t=[]; for (var k in a) t.push(k); print(t.toString())"
+        ),
+        "1,x,y,4\n"
+    );
+    // A non-enumerable own property hides an enumerable one further up the chain.
+    assert_eq!(
+        eval(
+            "var a={y:2,'1':3}; Object.defineProperty(a,'x',{value:1});\n\
+             var b={x:3}; Object.setPrototypeOf(a,b);\n\
+             var t=[]; for (var k in a) t.push(k); print(t.toString())"
+        ),
+        "1,y\n"
+    );
+    // A destructuring or member target stores each element instead of a binding.
+    assert_eq!(
+        eval(
+            "var a=[], t=[];\n\
+             for (a[0] in {p:1,q:2}) t.push(a[0]);\n\
+             for (var [m] of [[1],[2]]) t.push(m);\n\
+             for ([a[1]] of [[9]]) t.push(a[1]);\n\
+             print(t.toString())"
+        ),
+        "p,q,1,2,9\n"
+    );
+}
+
+#[test]
+fn a_function_sees_a_var_declared_later_in_its_scope() {
+    // Function bodies used to be compiled at their declaration, so a `var` written
+    // further down the same scope was not declared yet and the read resolved to a
+    // *global* instead of the enclosing slot.
+    assert_eq!(
+        eval("function f(){ function g(){ return t } var t; return g() } print(f())"),
+        "undefined\n"
+    );
+    assert_eq!(
+        eval("function f(){ function g(){ return t } var t='v'; return g() } print(f())"),
+        "v\n"
+    );
+    assert_eq!(
+        eval("function f(){ function g(){ t += 'x' } var t='a'; g(); return t } print(f())"),
+        "ax\n"
+    );
+    // The same for a `let` in the body, which is a different binding again.
+    assert_eq!(
+        eval("function f(){ function g(){ return u } let u='L'; return g() } print(f())"),
+        "L\n"
+    );
+    // Hoisting still works in the other direction: a call before the declaration.
+    assert_eq!(
+        eval("function f(){ return g() } function g(){ return 7 } print(f())"),
+        "7\n"
+    );
 }
 
 #[test]

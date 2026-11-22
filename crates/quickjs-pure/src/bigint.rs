@@ -162,6 +162,12 @@ impl BigInt {
     /// Parse a JS `BigInt` string: optional sign, optional `0x`/`0o`/`0b`, no fraction.
     pub fn from_string(text: &str) -> Option<BigInt> {
         let text = text.trim();
+        // `StringToBigInt` is a `StringNumericLiteral` without a fraction, and an empty
+        // literal is zero — but only when it is empty outright: `"+"` and `"-"` carry a
+        // sign and no digits, which stays a `SyntaxError`.
+        if text.is_empty() {
+            return Some(BigInt::zero());
+        }
         let (negative, body) = match text.strip_prefix('-') {
             Some(rest) => (true, rest.trim_start()),
             None => (false, text.strip_prefix('+').unwrap_or(text).trim_start()),

@@ -3458,18 +3458,24 @@ impl<'a> Interp<'a> {
             }
             Plus => {
                 let value = self.pop();
+                // `+x` is `ToNumber`, and `ToNumber` refuses a bigint: unlike `++`,
+                // unary plus is defined to produce a *number*, which a bigint cannot
+                // become without loss. It used to fall through to `NaN`.
+                if matches!(value, Value::BigInt(_)) {
+                    return Err(self.type_error("cannot convert a BigInt to a number"));
+                }
                 let numeric = self.numeric_of(value)?;
                 self.push(numeric);
             }
             Inc => {
                 let raw = self.pop();
-                let value = self.numeric(raw)?;
-                self.push(increment(value));
+                let (_, updated) = self.advance_numeric(raw, true)?;
+                self.push(updated);
             }
             Dec => {
                 let raw = self.pop();
-                let value = self.numeric(raw)?;
-                self.push(decrement(value));
+                let (_, updated) = self.advance_numeric(raw, false)?;
+                self.push(updated);
             }
             PostInc | PostDec => {
                 // `x -> x x+1`: the *new* value ends up on top, so the store the
@@ -3478,13 +3484,8 @@ impl<'a> Interp<'a> {
                 // own result. Getting this backwards makes `i++` a no-op, which
                 // turns `while (i < 3)` into an infinite loop.
                 let raw = self.pop();
-                let value = self.numeric(raw)?;
-                let updated = if op == PostInc {
-                    increment(value.clone())
-                } else {
-                    decrement(value.clone())
-                };
-                self.push(value);
+                let (old, updated) = self.advance_numeric(raw, op == PostInc)?;
+                self.push(old);
                 self.push(updated);
             }
             Not => {
@@ -4456,6 +4457,32 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `++`/`--`, which step a bigint by `1n` and everything else by `1`.
+    ///
+    /// Returns the *converted* old value and the new one, because the two callers need
+    /// different halves: `++x` yields the new value, while `x++` yields the old one and
+    /// still stores the new. The old value is `ToNumeric(x)`, not `x` — `a.x++` where
+    /// `a.x` is `true` evaluates to `1`, so returning the raw operand handed back a
+    /// boolean.
+    ///
+    /// A bigint stays a bigint here: `ToNumeric` keeps the type, so routing `i++` through
+    /// the number path turned it into `NaN`, and every `for (i = 0n; i < n; i++)` loop in
+    /// a bigint algorithm then ran exactly once.
+    fn advance_numeric(&mut self, value: Value, up: bool) -> JsResult<(Value, Value)> {
+        if let Value::BigInt(big) = &value {
+            let one = crate::bigint::BigInt::from_i64(1);
+            let next = if up { big.add(&one) } else { big.sub(&one) };
+            return Ok((value, self.bigint(next)));
+        }
+        let old = self.numeric(value)?;
+        let new = if up {
+            increment(old.clone())
+        } else {
+            decrement(old.clone())
+        };
+        Ok((old, new))
+    }
+
     fn numeric(&mut self, value: Value) -> JsResult<Value> {
         // `ToNumber` on an object runs `ToPrimitive` first, which is how
         // `2 * {valueOf(){return 3}}` sees the 3 — and how a `valueOf` that throws is
@@ -4589,16 +4616,11 @@ impl<'a> Interp<'a> {
     fn binary_add(&mut self) -> JsResult<()> {
         let right = self.pop();
         let left = self.pop();
-        // `+` concatenates when either operand is a string *after* `ToPrimitive`.
         let left = self.primitive_of(left)?;
         let right = self.primitive_of(right)?;
-        // The two numeric types never mix, and `+` is no exception: `1n + 1` is an error,
-        // not a conversion.
-        if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) {
-            let value = self.bigint_arithmetic(Opcode::Add, left, right)?;
-            self.push(value);
-            return Ok(());
-        }
+        // `+` concatenates when either operand is a string *after* `ToPrimitive`, and
+        // that check comes before the bigint one: `"" + 1n` is a string, not a
+        // mixed-type error.
         if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
             // `ToString` on both sides, which rejects a symbol: `"" + Symbol()` is a
             // `TypeError`, the one place a symbol and a string do not mix.
@@ -4608,6 +4630,13 @@ impl<'a> Interp<'a> {
             // join canonical, so `"\uD800" + "\uDC00"` equals `"\u{10000}"`.
             let text = left.concat(&right);
             self.push(self.string_wtf8(text));
+            return Ok(());
+        }
+        // The two numeric types never mix, and `+` is no exception: `1n + 1` is an error,
+        // not a conversion.
+        if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) {
+            let value = self.bigint_arithmetic(Opcode::Add, left, right)?;
+            self.push(value);
             return Ok(());
         }
         let left = self.numeric(left)?;
@@ -5065,54 +5094,89 @@ impl<'a> Interp<'a> {
 
     // -- iteration ---------------------------------------------------------
 
+    /// One object's own keys in enumeration order: array indices ascending, then the
+    /// rest in insertion order.
+    ///
+    /// An index is ASCII, so a key with no `&str` form is never one. The flag says
+    /// whether the key is enumerable, which the caller resolves per key because an
+    /// array's elements are not in the same store as its named properties.
+    fn order_own_keys(own: Vec<(crate::value::Wtf8, bool)>) -> Vec<(crate::value::Wtf8, bool)> {
+        // An index can arrive twice, once from the array's element store and once from
+        // its property map, so the numeric keys go through a map that keeps the
+        // enumerable answer if either source gave one.
+        let mut numeric: std::collections::BTreeMap<u32, bool> = std::collections::BTreeMap::new();
+        for (key, enumerable) in &own {
+            if let Some(index) = key.as_str().and_then(array_index) {
+                let entry = numeric.entry(index).or_insert(false);
+                *entry = *entry || *enumerable;
+            }
+        }
+        let mut ordered: Vec<(crate::value::Wtf8, bool)> = numeric
+            .into_iter()
+            .map(|(index, enumerable)| (crate::value::Wtf8::new(index.to_string()), enumerable))
+            .collect();
+        ordered.extend(
+            own.into_iter()
+                .filter(|(key, _)| key.as_str().and_then(array_index).is_none()),
+        );
+        ordered
+    }
+
     /// Build the key list a `for-in` loop walks.
     ///
-    /// The order is the specification's: integer-like keys in ascending numeric
-    /// order, then the string keys in insertion order, own properties before
-    /// inherited ones, and a shadowed key only appears once.
+    /// The order is the specification's: own properties before inherited ones, and
+    /// within one object the integer-like keys in ascending numeric order ahead of the
+    /// string keys in insertion order. A shadowed key only appears once, and a key that
+    /// is a non-enumerable own property anywhere nearer is skipped entirely.
     fn for_in_record(&mut self, value: &Value) -> Gc<JsObject> {
         let record = self.new_object(None);
         let mut keys: Vec<crate::value::Wtf8> = Vec::new();
         if let Value::Object(object) = value {
             let mut chain = vec![object.clone()];
             chain.extend(object.chain());
+            // Every own string key the walk has seen, enumerable or not. A
+            // non-enumerable own property still hides a same-named enumerable one
+            // further up the chain, so `Object.defineProperty(a, "x", {value: 1})`
+            // keeps `x` out of the loop even when the prototype has one.
+            let mut visited: Vec<crate::value::Wtf8> = Vec::new();
             for object in chain {
-                let mut own = object.own_enumerable_keys();
+                let mut own: Vec<(crate::value::Wtf8, bool)> = object
+                    .own_property_keys()
+                    .iter()
+                    .filter_map(|key| key.as_wtf8().cloned())
+                    .map(|key| {
+                        let enumerable = object
+                            .own_property(&key.to_string_lossy())
+                            .map(|property| property.enumerable)
+                            .unwrap_or(false);
+                        (key, enumerable)
+                    })
+                    .collect();
                 if let Some(length) = object.array_length() {
-                    own.retain(|key| key.as_str() != Some("length"));
+                    own.retain(|(key, _)| key.as_str() != Some("length"));
                     for index in 0..length {
                         if object.array_get(index).is_some() {
-                            own.push(crate::value::Wtf8::new(index.to_string()));
+                            own.push((crate::value::Wtf8::new(index.to_string()), true));
                         }
                     }
                 }
-                for key in own {
-                    if !keys.contains(&key) {
+                // Integer-like keys come first in ascending order, then the rest in
+                // insertion order — and the ordering is *per object*, not for the chain
+                // as a whole: one pass over every collected key lifted a prototype's
+                // `"4"` above the target's own `x`/`y`, which is not the order
+                // `for…in` reports.
+                for (key, enumerable) in Self::order_own_keys(own) {
+                    if visited.contains(&key) {
+                        continue;
+                    }
+                    visited.push(key.clone());
+                    if enumerable {
                         keys.push(key);
                     }
                 }
             }
         }
-        // Integer-like keys come first in ascending order, then the rest in insertion
-        // order; an index is ASCII, so a key without a `&str` form is never one.
-        let indices: Vec<crate::value::Wtf8> = {
-            let mut numeric: Vec<u32> = keys
-                .iter()
-                .filter_map(|k| k.as_str().and_then(array_index))
-                .collect();
-            numeric.sort_unstable();
-            numeric
-                .into_iter()
-                .map(|n| crate::value::Wtf8::new(n.to_string()))
-                .collect()
-        };
-        let strings: Vec<crate::value::Wtf8> = keys
-            .into_iter()
-            .filter(|key| key.as_str().and_then(array_index).is_none())
-            .collect();
-        let mut ordered = indices;
-        ordered.extend(strings);
-        for (index, key) in ordered.into_iter().enumerate() {
+        for (index, key) in keys.into_iter().enumerate() {
             record.define_data(&index.to_string(), self.string_wtf8(key));
         }
         record.define_data("__index", Value::Int(0));

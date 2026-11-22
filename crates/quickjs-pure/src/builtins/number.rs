@@ -59,6 +59,9 @@ pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
 fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let number = match args.first() {
         None => Value::Int(0),
+        // A bigint converts to the nearest double, so a bigint wider than 53 bits loses
+        // precision exactly as `ToNumber` says it should.
+        Some(Value::BigInt(big)) => Value::Float(big.to_f64()),
         Some(value) => Value::Float(value.to_number()),
     };
     // `new Number(1)` is a wrapper object, so the number has to be stored on the

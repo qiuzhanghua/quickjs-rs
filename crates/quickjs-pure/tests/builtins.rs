@@ -2277,6 +2277,18 @@ fn bigint_conversion_is_exact_or_refuses() {
         eval("print(BigInt(5), BigInt('123'), BigInt(true), BigInt('0x1f'))"),
         "5n 123n 1n 31n\n"
     );
+    // `StringToBigInt` reads an empty literal as zero, while a lone sign stays a
+    // `SyntaxError` — that pair is why the empty case cannot simply be "no digits".
+    assert_eq!(
+        eval("print(BigInt(''), BigInt('   '), BigInt('  123  '))"),
+        "0n 0n 123n\n"
+    );
+    for source in ["BigInt('+')", "BigInt('-')", "BigInt('\\x00a')"] {
+        assert!(
+            throws(source).starts_with("SyntaxError"),
+            "{source} should be a SyntaxError"
+        );
+    }
     // A fraction has no exact bigint form, so it is a `RangeError` rather than a truncation.
     assert!(throws("BigInt(1.5)").starts_with("RangeError"));
     // A bigint is a primitive, so there is no wrapper to construct.
@@ -2288,6 +2300,44 @@ fn bigint_conversion_is_exact_or_refuses() {
         eval("print((255n).toString(16), BigInt.asIntN(8, 128n))"),
         "ff -128n\n"
     );
+    // `Number()` of a bigint rounds to the nearest double, losing width past 53 bits.
+    assert_eq!(
+        eval("print(Number(1n), Number(0xffffffffffffffffn))"),
+        "1 18446744073709552000\n"
+    );
+}
+
+#[test]
+fn bigint_obeys_the_number_rules_for_truth_and_equality() {
+    // `0n` is falsy. Treating every bigint as truthy made `if (b & 1n)` branch
+    // unconditionally, which silently corrupted bigint algorithms that test a bit —
+    // `compute_pi` drifted from the 29th digit onwards.
+    assert_eq!(
+        eval("print(0n ? 'T' : 'F', 1n ? 'T' : 'F', !0n, Boolean(-1n))"),
+        "F T true true\n"
+    );
+    // `++`/`--` keep a bigint a bigint. Routing them through `ToNumber` produced `NaN`,
+    // so `for (i = 0n; i < n; i++)` ran exactly once.
+    assert_eq!(
+        eval("var i = 0n; print(i++, i, ++i, typeof i); var j = 3n; print(j--, j)"),
+        "0n 1n 2n bigint\n3n 2n\n"
+    );
+    // Unary `+` asks for a *number*, which a bigint cannot become, so it is a `TypeError`
+    // rather than the `NaN` it used to be.
+    assert!(throws("+1n").starts_with("TypeError"));
+    // Loose equality compares the exact integers, not two rounded doubles:
+    // `100000000000000000001n` and `1e20` round to the same double but are not equal.
+    // A boolean is `ToNumber`ed first, so `true == 1n` holds.
+    assert_eq!(
+        eval(
+            "print(2 == 3n, 2 == 2n, '' == 0n, 2.5 == 2n, true == 1n, false == 0n,\n\
+             100000000000000000000n == 1e20, 100000000000000000001n == 1e20, null == 0n)"
+        ),
+        "false true true false true true true false false\n"
+    );
+    // `+` concatenates before it ever considers the numeric types.
+    assert_eq!(eval("print('a' + 1n, 1n + 'b')"), "a1 1b\n");
+    assert!(throws("1n + 1").starts_with("TypeError"));
 }
 
 #[test]

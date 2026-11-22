@@ -688,8 +688,10 @@ impl Value {
             Value::String(s) => !s.wtf8().is_empty(),
             // Every symbol is truthy, even the one with no description.
             Value::Symbol(_) => true,
-            // …and so is every bigint, including `0n`.
-            Value::BigInt(_) => true,
+            // A bigint follows the numbers: `0n` is falsy and every other width is truthy.
+            // Saying "every bigint is truthy" turned `if (b & 1n)` into an unconditional
+            // branch, which quietly corrupted every bigint algorithm that tests a bit.
+            Value::BigInt(big) => !big.is_zero(),
             // Every object is truthy, including `new Boolean(false)`.
             Value::Object(_) => true,
             Value::Uninitialized
@@ -832,17 +834,14 @@ impl Value {
                 crate::bigint::BigInt::from_string(&b.to_string_lossy()).as_ref() == Some(&**a)
             }
             (Value::BigInt(a), other) => match other {
-                Value::Int(_) | Value::Float(_) => {
-                    let number = other.to_number();
-                    number.is_finite() && number == a.to_f64() && number.fract() == 0.0
-                }
+                Value::Int(_) | Value::Float(_) => bigint_equals_number(a, other.to_number()),
+                // A boolean is `ToNumber`ed first, so `true == 1n` is true.
+                Value::Bool(flag) => bigint_equals_number(a, if *flag { 1.0 } else { 0.0 }),
                 _ => false,
             },
-            (other, Value::BigInt(_)) => match other {
-                Value::Int(_) | Value::Float(_) => {
-                    let number = other.to_number();
-                    number.is_finite() && number.fract() == 0.0 && number == self.to_number()
-                }
+            (other, Value::BigInt(b)) => match other {
+                Value::Int(_) | Value::Float(_) => bigint_equals_number(b, other.to_number()),
+                Value::Bool(flag) => bigint_equals_number(b, if *flag { 1.0 } else { 0.0 }),
                 _ => false,
             },
             // Everything else compares numerically, which covers `"1" == 1`,
@@ -911,6 +910,17 @@ fn primitive_loose_equals(left: &Primitive, right: &Primitive) -> bool {
             string_to_number(s) == (if *b { 1.0 } else { 0.0 })
         }
     }
+}
+
+/// `bigint == number`, compared as whole numbers rather than through the double.
+///
+/// Going through `to_f64` made `100000000000000000001n == 1e20` true, because the double
+/// rounds both sides onto the same value; the spec compares the exact integers, and a
+/// double that is already an integer converts to one exactly.
+fn bigint_equals_number(big: &crate::bigint::BigInt, number: f64) -> bool {
+    number.is_finite()
+        && number.fract() == 0.0
+        && crate::bigint::BigInt::from_f64_truncated(number) == *big
 }
 
 /// `ToInt32`.

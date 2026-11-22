@@ -514,6 +514,14 @@ struct FnState {
     /// `instantiate_hoisted_definitions` rather than at the statement, because a
     /// declaration is visible before it is reached.
     hoisted: Vec<(u64, HoistTarget, u32)>,
+    /// Function declarations whose bodies are compiled only once the enclosing scope
+    /// has finished hoisting, as (owning block, declaration).
+    ///
+    /// Compiling a body at the declaration makes the result depend on source order: in
+    /// `function f(){ return t } var t`, `t` is not declared yet when `f` is compiled,
+    /// so the read resolved to a *global* instead of the enclosing `var`. Hoisting the
+    /// names first and the bodies second is what removes that dependence.
+    deferred_funcs: Vec<(u64, Box<ast::Function>)>,
     /// The source position of the node being compiled. Every instruction emitted
     /// takes it, which is how the position table that feeds stack traces is built.
     cur_pos: Option<Position>,
@@ -589,6 +597,7 @@ impl FnState {
             leaves_value: false,
             stmt_depth: 0,
             hoisted: Vec::new(),
+            deferred_funcs: Vec::new(),
             cur_pos: None,
             insn_pos: Vec::new(),
         }
@@ -1553,6 +1562,25 @@ impl Compiler {
         let saved = self.cur().current_block;
         self.state().current_block = block;
         let result = self.hoist_list(body);
+        // Only now is every binding of this scope known, so the deferred function
+        // bodies can be compiled against the finished list. Compiled at its own
+        // declaration instead, a body that names a `var` written further down would
+        // have resolved that name as a global.
+        if result.is_ok() {
+            let deferred = std::mem::take(&mut self.state().deferred_funcs);
+            let mut outcome = Ok(());
+            for (owner, func) in deferred {
+                let previous = self.cur().current_block;
+                self.state().current_block = owner;
+                outcome = self.func_decl(&func);
+                self.state().current_block = previous;
+                if outcome.is_err() {
+                    break;
+                }
+            }
+            self.state().current_block = saved;
+            return outcome;
+        }
         // `current_block` is restored by the caller for a block statement, since
         // it needs it set while compiling; only clean up on the hoist path.
         self.state().current_block = saved;
@@ -1615,8 +1643,11 @@ impl Compiler {
                     self.declare_var(&name.name.clone(), def);
                 }
                 // The function object is created when the scope is entered, so it
-                // exists before the declaration is reached.
-                self.func_decl(func)?;
+                // exists before the declaration is reached. Its body is compiled
+                // *after* this scope's hoisting finishes, so a name it uses resolves
+                // even when the `var` that declares it comes later in the source.
+                let owner = self.cur().current_block;
+                self.state().deferred_funcs.push((owner, func.clone()));
             }
             StmtKind::ClassDecl(class) => {
                 if let Some(name) = &class.name {
@@ -2628,10 +2659,16 @@ impl Compiler {
                 self.emit_var(action, &name.name);
                 Ok(())
             }
-            _ => Err(SyntaxError::new(
-                "destructuring loop targets are not supported by the compiler yet",
-                pattern.span,
-            )),
+            // Every other target stores through the same path an assignment pattern
+            // uses, which is what makes `for (a[0] in obj)` write each key into the
+            // property instead of refusing the loop outright.
+            _ => self.destructure(
+                pattern,
+                match left {
+                    ForHead::VarDecl(decl) => Some(decl.kind),
+                    ForHead::Assign(_) => None,
+                },
+            ),
         }
     }
 
