@@ -97,10 +97,12 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
         Value::Object(object) => match object.with(|data| match &data.kind {
             ObjectKind::Array { .. } => "Array",
             ObjectKind::Function(_) => "Function",
+            ObjectKind::Generator(_) => "Generator",
             ObjectKind::Ordinary => "Object",
         }) {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),
+            "Generator" => "Generator".to_string(),
             other => {
                 // An arguments object, a RegExp and so on are distinguished by an
                 // internal tag; `_class` carries it for the classes that have one

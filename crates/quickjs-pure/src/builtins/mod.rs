@@ -15,6 +15,7 @@ mod array;
 pub(crate) mod date;
 mod error;
 mod function;
+mod generator;
 mod global;
 mod json;
 mod math;
@@ -43,6 +44,11 @@ pub fn install(interp: &mut Interp<'_>) {
     interp.realm.number_proto = Some(number_proto.clone());
     interp.realm.boolean_proto = Some(boolean_proto.clone());
 
+    // `%GeneratorPrototype%` has no constructor of its own, so it is created here and
+    // kept on the realm for `new_generator` to use as the prototype of every generator.
+    let generator_proto = interp.new_object(Some(object_proto.clone()));
+    interp.realm.generator_proto = generator_proto.clone();
+
     error::install(interp);
     object::install(interp, &object_proto);
     function::install(interp, &function_proto);
@@ -53,6 +59,7 @@ pub fn install(interp: &mut Interp<'_>) {
     json::install(interp);
     reflect::install(interp);
     date::install(interp);
+    generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
 }
 

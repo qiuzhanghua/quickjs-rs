@@ -471,6 +471,14 @@ enum HoistTarget {
 }
 
 impl FnState {
+    /// Whether this function suspends: a generator or an async function.
+    ///
+    /// A suspending function's `return` is a `return_async` and its body starts with an
+    /// `initial_yield`, so almost every statement that touches control flow asks this.
+    fn is_suspending(&self) -> bool {
+        self.kind.is_generator() || self.kind.is_async()
+    }
+
     fn new(name: impl Into<String>, kind: FunctionKind) -> FnState {
         FnState {
             name: name.into(),
@@ -1245,6 +1253,17 @@ impl Compiler {
             } else if let Some(finally) = target.finally_label {
                 self.emit_jump(Opcode::Gosub, finally, &[]);
             }
+        }
+        // A generator or async function does not return to its caller: it either
+        // finishes, and the value becomes `{value, done: true}`, or it suspends.
+        // `return_async` is the "finished" half, and it reads the value off the stack
+        // rather than carrying it, which is what the resume machinery expects.
+        if self.cur().is_suspending() {
+            if !has_value {
+                self.emit(Opcode::Undefined, &[]);
+            }
+            self.emit(Opcode::ReturnAsync, &[]);
+            return Ok(());
         }
         if has_value {
             self.emit(Opcode::Return, &[]);
@@ -2661,6 +2680,10 @@ impl Compiler {
             }
             ExprKind::Class(class) => self.class_definition(class, true)?,
             ExprKind::SuperCall(arguments) => self.super_call(arguments)?,
+            ExprKind::Yield { argument, delegate } => {
+                self.yield_expression(argument.as_deref(), *delegate)?
+            }
+            ExprKind::Await(argument) => self.await_expression(argument)?,
             ExprKind::Arrow(func) => {
                 let function = self.compile_function(func)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
@@ -3362,6 +3385,143 @@ impl Compiler {
                 self.emit(Opcode::Return, &[]);
             }
         }
+    }
+
+    /// `yield expr` / `yield* expr`.
+    ///
+    /// The suspension itself is one instruction: the value is on the stack, `yield` hands
+    /// it to the caller and parks the frame. On resume the stack holds the value the
+    /// caller passed *and* a "magic" number saying which method resumed it — `next`
+    /// passes `0`, `return` passes `1`, `throw` passes `2` — so the emitted
+    /// `if_false <continue>` asks whether this was an ordinary `next`:
+    ///
+    /// * `next(v)` → the magic is falsy, jump over the `return_async` and `drop` `v`.
+    /// * `return(v)`/`throw(e)` → fall into `return_async`, which finishes the generator
+    ///   and uses the value sitting under the magic number.
+    ///
+    /// A `throw` never reaches here: the interpreter unwinds instead (see
+    /// `Interp::resume_generator`), so the `return_async` arm only ever carries `return`.
+    fn yield_expression(
+        &mut self,
+        argument: Option<&Expr>,
+        delegate: bool,
+    ) -> Result<(), SyntaxError> {
+        if delegate {
+            return self.yield_star(argument);
+        }
+        match argument {
+            Some(value) => self.expr(value)?,
+            None => self.emit(Opcode::Undefined, &[]),
+        }
+        self.emit(Opcode::Yield, &[]);
+        let resume = self.new_label();
+        self.emit_jump(Opcode::IfFalse, resume, &[]);
+        self.emit(Opcode::ReturnAsync, &[]);
+        self.place_label(resume);
+        // Nothing is emitted here: the value the caller passed to `next` *is* the value
+        // of the `yield` expression, so `var x = yield 1` stores it and `yield 1;` drops
+        // it through the ordinary expression-statement discard.
+        Ok(())
+    }
+
+    /// `yield* iterable`.
+    ///
+    /// The shape is the reference's, and it is a fall-through chain rather than a
+    /// decision tree: drive the inner iterator, forward each value with `yield_star`, and
+    /// on resume decide what the caller asked for — `next` keeps looping, `return` closes
+    /// the inner iterator and finishes, `throw` forwards the exception into it and
+    /// continues only if it has a `throw` method.
+    ///
+    /// The stack is `iter next catch value` throughout, `catch` being the offset
+    /// `for_of_start` pushed; the `nip`s at the end uncover the value that is returned.
+    fn yield_star(&mut self, argument: Option<&Expr>) -> Result<(), SyntaxError> {
+        match argument {
+            Some(value) => self.expr(value)?,
+            // The parser rejects a bare `yield*`, so this is unreachable in practice.
+            None => return Err(SyntaxError::new("yield* needs an operand", Span::default())),
+        }
+        // `for_of_start` validates the iterable and pushes the iterator triple, which is
+        // the same protocol `for (… of …)` uses.
+        self.emit(Opcode::ForOfStart, &[]);
+        self.emit(Opcode::Drop, &[]);
+        self.emit(Opcode::Undefined, &[]);
+        self.emit(Opcode::Undefined, &[]);
+        let next = self.new_label();
+        let resume = self.new_label();
+        let finished = self.new_label();
+        let rethrow = self.new_label();
+        let throw_no_method = self.new_label();
+        let done = self.new_label();
+        self.place_label(next);
+        self.emit(Opcode::IteratorNext, &[]);
+        self.emit(Opcode::IteratorCheckObject, &[]);
+        self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text("done"))]);
+        self.emit_jump(Opcode::IfTrue, done, &[]);
+        // `yield_star` suspends with the inner result's value; `resume` is where the
+        // caller's answer arrives, as the value followed by the magic number.
+        self.place_label(resume);
+        self.emit(Opcode::YieldStar, &[]);
+        self.emit(Opcode::Dup, &[]);
+        self.emit_jump(Opcode::IfTrue, rethrow, &[]);
+        self.emit(Opcode::Drop, &[]);
+        self.emit_jump(Opcode::Goto, next, &[]);
+
+        // `return(v)` / `throw(e)`: `2 === magic` tells them apart.
+        self.place_label(rethrow);
+        self.emit(Opcode::PushI32, &[Op::Int(2)]);
+        self.emit(Opcode::StrictEq, &[]);
+        self.emit_jump(Opcode::IfTrue, throw_no_method, &[]);
+        // A `return` closes the inner iterator; if it had none, the delegate simply
+        // finishes with the requested value.
+        self.emit(Opcode::IteratorCall, &[Op::Int(0)]);
+        self.emit_jump(Opcode::IfTrue, finished, &[]);
+        self.emit(Opcode::IteratorCheckObject, &[]);
+        self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text("done"))]);
+        self.emit_jump(Opcode::IfFalse, resume, &[]);
+        self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text("value"))]);
+        self.place_label(finished);
+        self.emit(Opcode::Nip, &[]);
+        self.emit(Opcode::Nip, &[]);
+        self.emit(Opcode::Nip, &[]);
+        self.emit(Opcode::ReturnAsync, &[]);
+
+        // `throw(e)`: forward it into the inner iterator.
+        self.place_label(throw_no_method);
+        self.emit(Opcode::IteratorCall, &[Op::Int(1)]);
+        let no_throw = self.new_label();
+        self.emit_jump(Opcode::IfTrue, no_throw, &[]);
+        self.emit(Opcode::IteratorCheckObject, &[]);
+        self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text("done"))]);
+        self.emit_jump(Opcode::IfFalse, resume, &[]);
+        self.emit_jump(Opcode::Goto, done, &[]);
+        // No `throw` method: close the iterator, then report the spec's TypeError.
+        self.place_label(no_throw);
+        self.emit(Opcode::IteratorCall, &[Op::Int(2)]);
+        self.emit(Opcode::Drop, &[]);
+        self.emit(
+            Opcode::ThrowError,
+            &[Op::Atom(Atom::from_text("")), Op::Int(4)],
+        );
+
+        // The inner iterator finished: the delegate's value is the `yield*` expression's
+        // value, so it is left on the stack for whatever consumes it.
+        self.place_label(done);
+        self.emit(Opcode::GetField, &[Op::Atom(Atom::from_text("value"))]);
+        self.emit(Opcode::Nip, &[]);
+        self.emit(Opcode::Nip, &[]);
+        self.emit(Opcode::Nip, &[]);
+        Ok(())
+    }
+
+    /// `await expr`: one instruction, like `yield`, and the same magic-number protocol.
+    fn await_expression(&mut self, argument: &Expr) -> Result<(), SyntaxError> {
+        self.expr(argument)?;
+        self.emit(Opcode::Await, &[]);
+        let resume = self.new_label();
+        self.emit_jump(Opcode::IfFalse, resume, &[]);
+        self.emit(Opcode::ReturnAsync, &[]);
+        self.place_label(resume);
+        Ok(())
     }
 
     /// The `super` base: the receiver followed by the home object's prototype.
@@ -4463,13 +4623,12 @@ impl Compiler {
         func: &ast::Function,
         is_expression: bool,
     ) -> Result<CompiledFunction, SyntaxError> {
-        if func.is_generator || func.is_async {
-            return Err(SyntaxError::new(
-                "generators and async functions are not supported by the compiler yet",
-                func.span,
-            ));
-        }
-        let kind = FunctionKind::Normal;
+        let kind = match (func.is_generator, func.is_async) {
+            (false, false) => FunctionKind::Normal,
+            (true, false) => FunctionKind::Generator,
+            (false, true) => FunctionKind::Async,
+            (true, true) => FunctionKind::AsyncGenerator,
+        };
         let mut state = FnState::new(
             func.name
                 .as_ref()
@@ -4583,6 +4742,13 @@ impl Compiler {
             }
         }
         self.hoist(body, body_key)?;
+        // A suspending function starts by suspending: the reference's `initial_yield` is
+        // the first instruction, so creating a generator runs no body code until the
+        // first `next()`, and an async function has a point to resolve `this` from before
+        // anything else happens.
+        if self.cur().is_suspending() {
+            self.emit(Opcode::InitialYield, &[]);
+        }
         self.emit_scope_enter(body_key);
         // A constructor's prologue is not a parameter unpacking but the `this` binding:
         // a base constructor takes the receiver, a derived one starts in the dead zone
@@ -4622,7 +4788,15 @@ impl Compiler {
         // The implicit return only exists if control can actually get here: an
         // infinite loop never falls off the end.
         if self.end_is_reachable() {
-            self.emit_class_constructor_tail();
+            if self.cur().is_suspending() {
+                // Falling off the end finishes the generator with `undefined`, and the
+                // value is what tells the resume machinery "completed" rather than
+                // "suspended".
+                self.emit(Opcode::Undefined, &[]);
+                self.emit(Opcode::ReturnAsync, &[]);
+            } else {
+                self.emit_class_constructor_tail();
+            }
         }
         // Resolution runs while this function is still on the stack: capturing a
         // variable from an enclosing function means reaching into that

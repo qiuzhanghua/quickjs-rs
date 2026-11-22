@@ -223,6 +223,13 @@ pub enum ObjectKind {
     },
     /// A function or a class constructor.
     Function(Callable),
+    /// A generator object: a detached frame plus how far it got.
+    ///
+    /// The frame lives here rather than in the interpreter because a suspended generator
+    /// has to keep its locals and operand stack alive for as long as the script can reach
+    /// the generator object — and the collector has to see them, which it only does for
+    /// things hanging off a `Gc`.
+    Generator(Box<crate::interp::GeneratorState>),
 }
 
 impl Trace for ObjectKind {
@@ -235,6 +242,7 @@ impl Trace for ObjectKind {
                 }
             }
             ObjectKind::Function(callable) => callable.trace(tracer),
+            ObjectKind::Generator(state) => state.trace(tracer),
         }
     }
 }

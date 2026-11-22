@@ -1283,3 +1283,90 @@ fn a_short_circuited_optional_chain_is_still_a_receiver() {
         "true true {\"b\":{}}\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Generators
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_generator_pauses_and_resumes_its_frame() {
+    // The body does not run until the first `next()`, and the value passed to `next`
+    // becomes the value of the `yield` expression.
+    assert_eq!(
+        eval(
+            "function* g(){yield 1} var it=g(); print(JSON.stringify(it.next()),JSON.stringify(it.next()))"
+        ),
+        "{\"value\":1,\"done\":false} {\"done\":true}\n"
+    );
+    assert_eq!(
+        eval(
+            "function* g(){var x=yield 1; yield x*2} var it=g(); it.next(); print(JSON.stringify(it.next(5)))"
+        ),
+        "{\"value\":10,\"done\":false}\n"
+    );
+    // A `return` leaves the frame's locals and operand stack intact across the pause.
+    assert_eq!(
+        eval(
+            "function* g(){var a=1; yield a; a=2; yield a} var it=g(); it.next(); print(JSON.stringify(it.next()))"
+        ),
+        "{\"value\":2,\"done\":false}\n"
+    );
+    // `return(v)` finishes the generator with that value, even before it started.
+    assert_eq!(
+        eval("function* g(){yield 1} var it=g(); print(JSON.stringify(it.return(9)))"),
+        "{\"value\":9,\"done\":true}\n"
+    );
+    assert_eq!(
+        eval("function* g(){} var it=g(); print(JSON.stringify(it.return(5)))"),
+        "{\"value\":5,\"done\":true}\n"
+    );
+    // `throw(e)` is delivered at the `yield`, so the body's own `try` catches it.
+    assert_eq!(
+        eval(
+            "function* g(){try{yield 1}catch(e){yield 'caught:'+e}} var it=g(); it.next(); print(JSON.stringify(it.throw('boom')))"
+        ),
+        "{\"value\":\"caught:boom\",\"done\":false}\n"
+    );
+}
+
+#[test]
+fn yield_star_forwards_the_inner_iterator() {
+    assert_eq!(
+        eval(
+            "function* o(){yield* [2,3]} var it=o(); print(JSON.stringify(it.next()),JSON.stringify(it.next()),JSON.stringify(it.next()))"
+        ),
+        "{\"value\":2,\"done\":false} {\"value\":3,\"done\":false} {\"done\":true}\n"
+    );
+    // The delegate's return value becomes the value of the `yield*` expression.
+    assert_eq!(
+        eval(
+            "function* i(){yield 1; return 'end'} function* o(){var r=yield* i(); yield r} var it=o(); print(JSON.stringify(it.next())); print(JSON.stringify(it.next())); print(JSON.stringify(it.next()))"
+        ),
+        "{\"value\":1,\"done\":false}\n{\"value\":\"end\",\"done\":false}\n{\"done\":true}\n"
+    );
+}
+
+#[test]
+fn a_generator_is_iterable_and_not_a_constructor() {
+    // `for (… of …)` and the array spread both drive it through `next`.
+    assert_eq!(
+        eval(
+            "function* g(){yield 1; yield 2} var t=[]; for (var x of g()) t.push(x); print(t.join())"
+        ),
+        "1,2\n"
+    );
+    assert_eq!(
+        eval("function* g(){yield 1; yield 2} print([...g()].join())"),
+        "1,2\n"
+    );
+    // A pattern drains it, and a `return` value is not a yielded element.
+    assert_eq!(
+        eval("function* g(){return 0} var [x]=g(); print(x)"),
+        "undefined\n"
+    );
+    // A generator function has no `[[Construct]]`.
+    assert_eq!(
+        eval("function* G(){} try{new G()}catch(e){print(e.name, e.message)}"),
+        "TypeError G is not a constructor\n"
+    );
+}
