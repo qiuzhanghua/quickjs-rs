@@ -4,8 +4,9 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.2.0** —— 首个发布版本：`qjs` 能执行 JS，标准库第一波可用
-- 🚧 当前进度：**M0–M4 已完成**；M5（ES6+ 运行期）未开始
+- 📌 当前版本：**v0.3.0**（源码就绪，crates.io 上仍是 v0.2.0）—— ES6+ 运行期完成：class、解构、generator、`Proxy`、
+  `Promise`/async、`for await`；另有 `RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
+- 🚧 当前进度：**M0–M5 已完成**；M6（模块系统）起未开始
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 已确认决策
@@ -45,14 +46,14 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**已发布到 crates.io（v0.2.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
+**已发布到 crates.io（最新 v0.2.0，v0.3.0 准备中）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
 `quickjs-gc`/`quickjs-parse`/`quickjs-compile` 是其依赖。`quickjs-cli` 与
 `quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
 只是 dev-dependency。用法：
 
 ```toml
 [dependencies]
-quickjs = { package = "quickjs-pure", version = "0.2" }
+quickjs = { package = "quickjs-pure", version = "0.3" }
 ```
 
 M3（能执行 JS）与 M4（标准库第一波）都已达成：

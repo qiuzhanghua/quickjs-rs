@@ -26,6 +26,19 @@ cd "$(dirname "$0")/.."
 # harness is a dev-dependency that is stripped from every published manifest.
 ORDER=(quickjs-gc quickjs-parse quickjs-compile quickjs-pure)
 
+# Whether a cargo failure is the "my dependency is not on the registry yet" case,
+# which is *expected* on a first release of a version and must not be reported as a
+# failure.
+#
+# Two spellings, because cargo's wording changed: older versions say "no matching
+# package named", current ones say "failed to select a version for the requirement".
+# Matching only the old text made every preflight red from the moment a crate gained a
+# dependency its published version did not have — the check existed, it just could not
+# recognise the state it was built to tolerate.
+dependency_not_published() {
+    grep -qE "no matching package named|failed to select a version for the requirement"
+}
+
 upload=0
 dirty=()
 for arg in "$@"; do
@@ -76,7 +89,7 @@ for crate in "${ORDER[@]}"; do
     if ! package_log=$(cargo package --no-verify ${dirty[@]+"${dirty[@]}"} -p "$crate" 2>&1); then
         # Before the first release every crate but the first fails here, because its
         # path dependency has no published version to resolve against yet.
-        if grep -q "no matching package named" <<<"$package_log"; then
+        if printf '%s' "$package_log" | dependency_not_published; then
             printf '  %-18s skipped (a dependency is not published yet)\n' "$crate"
             continue
         fi
@@ -102,7 +115,7 @@ for crate in "${ORDER[@]}"; do
     else
         # Before the first release, every crate but the first fails here for the same
         # reason: its dependencies are not on the registry yet. That is expected.
-        if grep -q "no matching package named" /tmp/preflight.log; then
+        if dependency_not_published < /tmp/preflight.log; then
             echo "skipped (a dependency is not published yet)"
         else
             echo "FAILED"
