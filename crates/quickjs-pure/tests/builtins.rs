@@ -1453,3 +1453,73 @@ fn well_known_symbols_drive_the_protocols() {
         "a,b symbol\n"
     );
 }
+
+#[test]
+fn eval_hands_its_scope_to_the_closures_it_builds() {
+    // A closure created by `eval` outlives the eval, so it has to keep reading the
+    // caller's binding — and each iteration of `for (let i …)` is a *different*
+    // binding, because the loop variable is copied per iteration.
+    assert_eq!(
+        eval(
+            "var tab=[]; for(let i=0;i<3;i++) eval('tab.push(function(){return i})');\n\
+             print(tab[0](), tab[1](), tab[2]())"
+        ),
+        "0 1 2\n"
+    );
+    // The eval may sit in a nested function, in which case the binding it captures
+    // belongs to that function's *caller*.
+    assert_eq!(
+        eval(
+            "var tab=[];\n\
+             for(let i=0;i<3;i++){ let f=function(){ eval('tab.push(function(){return i})') }; f() }\n\
+             print(tab[0](), tab[1](), tab[2]())"
+        ),
+        "0 1 2\n"
+    );
+    // Two loops in a row use the same name, so name lookup alone cannot tell them
+    // apart: the compiler records which slot each call site means.
+    assert_eq!(
+        eval(
+            "var a=[], b=[];\n\
+             for(let i=0;i<3;i++) eval('a.push(function(){return i})');\n\
+             for(let i=0;i<3;i++) eval('b.push(function(){return i})');\n\
+             print(a.map(f=>f()).join(), b.map(f=>f()).join())"
+        ),
+        "0,1,2 0,1,2\n"
+    );
+}
+
+#[test]
+fn eval_respects_a_read_only_binding() {
+    // A local `const` is as read-only through `eval` as it is directly.
+    assert_eq!(
+        eval(
+            "function f(){const a=1; try{eval('a = 2'); print('no throw')}catch(e){print(e.name)}} f()"
+        ),
+        "TypeError\n"
+    );
+    // The name of a named function expression is read-only too, but only strict mode
+    // reports the attempt — a sloppy store is silently dropped, the same as a direct one.
+    assert_eq!(
+        eval("var f=function n(){eval('n = 1'); return n}; print(f()===f)"),
+        "true\n"
+    );
+    assert_eq!(
+        eval(
+            "var f=function n(){'use strict'; eval('n = 1')}; try{f(); print('no throw')}catch(e){print(e.name)}"
+        ),
+        "TypeError\n"
+    );
+    // …and the same holds when the assignment goes through a nested arrow, which
+    // reaches the binding via a closure entry rather than a local slot.
+    assert_eq!(
+        eval("var f=function n(){ (()=>{n=1})(); return n }; print(f()===f)"),
+        "true\n"
+    );
+    assert_eq!(
+        eval(
+            "var f=function n(){ 'use strict'; (()=>{n=1})() }; try{f(); print('no throw')}catch(e){print(e.name)}"
+        ),
+        "TypeError\n"
+    );
+}

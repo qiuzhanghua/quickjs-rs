@@ -22,8 +22,8 @@ use js_compile::opcode::{OpFormat, Opcode};
 use js_gc::{Gc, Heap};
 
 use crate::object::{
-    Callable, ClosureEnv, CompiledCode, JsObject, NativeFn, ObjectKind, Property, PropertyKey,
-    array_index, lookup, lookup_key,
+    Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, NativeFn, ObjectKind, Property,
+    PropertyKey, array_index, lookup, lookup_key,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -394,6 +394,12 @@ pub struct Interp<'a> {
     /// `None` outside an eval, which is what keeps a finished block's object from
     /// shadowing ordinary bytecode reads.
     eval_with: Option<Vec<Gc<JsObject>>>,
+    /// The bindings the running direct `eval` makes visible, as name → cell.
+    ///
+    /// Set for the duration of an eval and then restored, but every closure created
+    /// during it keeps a handle (see [`ClosureEnv::eval_scope`]), which is what lets
+    /// `eval("f = () => i")` work after the eval has returned.
+    active_eval_scope: Option<Gc<EvalScope>>,
     /// The caller's `new.target`, while an `eval` runs.
     ///
     /// The eval'd code is a script with no constructor of its own, so it inherits the
@@ -459,6 +465,7 @@ impl<'a> Interp<'a> {
             eval_bindings: Vec::new(),
             eval_arguments: None,
             eval_with: None,
+            active_eval_scope: None,
             pending_new_target: None,
             eval_new_target: None,
             native_frames: Vec::new(),
@@ -626,7 +633,58 @@ impl<'a> Interp<'a> {
         // Innermost frame first, so the first binding found for a name is the one that
         // shadows the rest. A script frame (`<eval>`) contributes nothing.
         let mut bindings: Vec<EvalBinding> = Vec::new();
+        // The calling function's own bindings, resolved by the compiler at the call
+        // site. That table is the only reliable answer when a name is declared twice in
+        // sibling scopes: the flat scan below cannot tell which `i` a `for (let i …)`
+        // body means, and guessing by declaration order picks the wrong one as soon as
+        // two loops in a row use the same name.
+        let mut resolved_here = false;
+        if let Some(frame) = self.frames.last() {
+            let (line, column) = frame
+                .code
+                .code
+                .position_at(frame.at as u32)
+                .unwrap_or_default();
+            // The nearest site at or before the current position, not an exact match:
+            // the recorded position of the `call` instruction is the callee's, which
+            // sits a few columns inside the call expression the compiler recorded. A
+            // site is unique per call, so "the closest one behind us" identifies it.
+            if let Some(site) = frame
+                .code
+                .code
+                .eval_sites
+                .iter()
+                .filter(|site| (site.line, site.column) <= (line, column))
+                .max_by_key(|site| (site.line, site.column))
+            {
+                resolved_here = true;
+                for binding in &site.bindings {
+                    // An enclosing function's frame sits `owner` levels below the one
+                    // running the call.
+                    let Some(frame) = self.frames.len().checked_sub(1 + binding.owner as usize)
+                    else {
+                        continue;
+                    };
+                    bindings.push(EvalBinding {
+                        name: binding.name.clone(),
+                        frame,
+                        slot: if binding.is_arg {
+                            EvalSlot::Arg
+                        } else {
+                            EvalSlot::Local
+                        },
+                        index: binding.index as usize,
+                    });
+                }
+            }
+        }
         for frame_index in (0..self.frames.len()).rev() {
+            // Skip the innermost frame's flat scan when the compiler already answered
+            // for it; an enclosing frame still needs one, because the eval resolves
+            // those names dynamically.
+            if resolved_here && frame_index == self.frames.len() - 1 {
+                continue;
+            }
             let frame = &self.frames[frame_index];
             for (index, arg) in frame.code.code.args.iter().enumerate() {
                 bindings.push(EvalBinding {
@@ -673,7 +731,16 @@ impl<'a> Interp<'a> {
         let previous_new_target = self
             .eval_new_target
             .replace(inherited_new_target.unwrap_or(Value::Undefined));
+        let eval_cells = self.eval_cells_for(&bindings);
         let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
+        // The cell-based view of the same bindings, which is what a closure created
+        // inside the eval keeps. Only cell-backed bindings can be shared, so a frame
+        // whose compiler did not put a binding in a cell simply does not appear here —
+        // reads and writes still work through `eval_bindings`, they just cannot outlive
+        // the eval.
+        let previous_eval_scope = self
+            .active_eval_scope
+            .replace(Gc::new(self.heap, EvalScope { names: eval_cells }));
         let compiled = Gc::new(self.heap, CompiledCode::new(code));
         let closure_vars = compiled.code.closure_vars.clone();
         let env = self.global_env(&closure_vars);
@@ -684,7 +751,46 @@ impl<'a> Interp<'a> {
         self.eval_with = previous_with;
         self.eval_new_target = previous_new_target;
         self.eval_bindings = previous_bindings;
+        self.active_eval_scope = previous_eval_scope;
         result
+    }
+
+    /// The cell-backed subset of `bindings`, in the same priority order.
+    ///
+    /// Both lookup routes have to agree — the eval's own reads go through
+    /// [`Interp::eval_binding_value`] and the closures it builds go through
+    /// [`ClosureEnv::eval_scope`] — so they are derived from one resolution rather than
+    /// scanning the frames twice and disagreeing about a shadowed name. A binding that
+    /// is not in a cell simply does not appear: reads and writes still work, they just
+    /// cannot be handed to a closure that outlives the eval.
+    fn eval_cells_for(&self, bindings: &[EvalBinding]) -> Vec<(String, Gc<Cell>)> {
+        let mut names: Vec<(String, Gc<Cell>)> = Vec::new();
+        for binding in bindings {
+            let Some(frame) = self.frames.get(binding.frame) else {
+                continue;
+            };
+            let cell = match binding.slot {
+                EvalSlot::Arg => frame
+                    .code
+                    .arg_cell
+                    .get(binding.index)
+                    .copied()
+                    .unwrap_or(-1),
+                EvalSlot::Local => frame
+                    .code
+                    .loc_cell
+                    .get(binding.index)
+                    .copied()
+                    .unwrap_or(-1),
+            };
+            if cell < 0 {
+                continue;
+            }
+            if let Some(cell) = frame.cells.get(cell as usize) {
+                names.push((binding.name.clone(), cell.clone()));
+            }
+        }
+        names
     }
 
     /// A `SyntaxError` that reports where in the source it happened.
@@ -758,7 +864,13 @@ impl<'a> Interp<'a> {
             };
             cells.push(cell);
         }
-        Gc::new(self.heap, ClosureEnv { cells })
+        Gc::new(
+            self.heap,
+            ClosureEnv {
+                cells,
+                eval_scope: None,
+            },
+        )
     }
 
     /// Push a frame and run until it returns.
@@ -1089,6 +1201,21 @@ impl<'a> Interp<'a> {
         if let Some(value) = self.eval_binding_value(&name) {
             return Ok(value);
         }
+        // A closure created by an `eval` resolves its free names against the bindings
+        // that eval saw, even after the eval (and its frames) are gone.
+        if let Some(cell) = self
+            .frame()
+            .env
+            .eval_scope
+            .as_ref()
+            .and_then(|scope| scope.get(&name))
+        {
+            let value = cell.get();
+            if matches!(value, Value::Uninitialized) {
+                return Err(self.throw_reference(&name));
+            }
+            return Ok(value);
+        }
         // A binding declared by the strict `eval` currently running shadows anything
         // further out, so `eval("var v = 1")`'s `v` is found before `globalThis.v`.
         if let Some(scope) = &self.eval_scope
@@ -1131,7 +1258,19 @@ impl<'a> Interp<'a> {
         }
         // A binding of the frame that called `eval` takes the write, which is what
         // makes `f("a = 3")` change the caller's `a`.
-        if self.set_eval_binding(&name, &value) {
+        if self.set_eval_binding(&name, &value)? {
+            return Ok(());
+        }
+        // A closure that outlived its `eval` writes through to the same cell it reads.
+        if let Some(cell) = self
+            .frame()
+            .env
+            .eval_scope
+            .as_ref()
+            .and_then(|scope| scope.get(&name))
+            .cloned()
+        {
+            cell.set(value);
             return Ok(());
         }
         // Inside a strict `eval`, a name it declared itself is stored there. An
@@ -1218,18 +1357,24 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Write to a binding of the frame that called `eval`. Returns whether one matched.
-    fn set_eval_binding(&mut self, name: &str, value: &Value) -> bool {
+    /// Write to a binding of the frame that called `eval`.
+    ///
+    /// `Ok(false)` means no binding matched and the caller should keep looking. A
+    /// matched binding can still refuse the store, which is why this is fallible: a
+    /// `const` is read-only everywhere, and a named function expression's own name is
+    /// read-only in strict mode.
+    fn set_eval_binding(&mut self, name: &str, value: &Value) -> JsResult<bool> {
         let Some(binding) = self
             .eval_bindings
             .iter()
             .find(|binding| binding.name == name)
         else {
-            return false;
+            return Ok(false);
         };
         let (slot, index, frame) = (binding.slot, binding.index, binding.frame);
+        let strict = self.current_strict();
         let Some(owner) = self.frames.get_mut(frame) else {
-            return false;
+            return Ok(false);
         };
         match slot {
             EvalSlot::Arg => match owner.code.arg_cell.get(index).copied().unwrap_or(-1) {
@@ -1245,12 +1390,22 @@ impl<'a> Interp<'a> {
                 }
             },
             EvalSlot::Local => {
-                // A sloppy `eval("m = 1")` where `m` is the name of a named function
-                // expression is ignored, the same as a direct store would be.
-                if owner.code.code.vars.get(index).is_some_and(|var| {
-                    var.kind == js_compile::VarKind::FunctionName && !var.is_const
-                }) {
-                    return true;
+                let declared = owner.code.code.vars.get(index);
+                // A `const` is read-only even through `eval`. The realm records this for
+                // globals (see `lexical_consts`), but a local's `const`-ness is only in
+                // the bytecode, so this is where it has to be enforced.
+                if declared.is_some_and(|var| var.is_const) {
+                    return Err(self.read_only_local(name));
+                }
+                // The name of a named function expression is read-only too, but only
+                // strict mode reports the attempt: a sloppy `eval("m = 1")` where `m` is
+                // such a name is ignored, the same as a direct store would be.
+                if declared.is_some_and(|var| var.kind == js_compile::VarKind::FunctionName) {
+                    return if strict {
+                        Err(self.read_only_local(name))
+                    } else {
+                        Ok(true)
+                    };
                 }
                 match owner.code.loc_cell.get(index).copied().unwrap_or(-1) {
                     cell if cell >= 0 => {
@@ -1266,7 +1421,12 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        true
+        Ok(true)
+    }
+
+    /// The `TypeError` an assignment to a read-only binding raises.
+    fn read_only_local(&self, name: &str) -> Signal {
+        Signal::Throw(self.make_error("TypeError", &format!("'{name}' is read-only")))
     }
 
     /// Whether the realm already has a binding for `name`, lexically or as an *own*
@@ -3697,7 +3857,13 @@ impl<'a> Interp<'a> {
         // of slots a pattern parameter needs.
         let length = function.defined_args;
         let code = Gc::new(self.heap, CompiledCode::new(*function));
-        let env = Gc::new(self.heap, ClosureEnv { cells });
+        // A closure built inside an `eval` inherits the eval's view of the enclosing
+        // bindings, so it can still read them once the eval has returned.
+        let eval_scope = self
+            .active_eval_scope
+            .clone()
+            .or_else(|| self.frame().env.eval_scope.clone());
+        let env = Gc::new(self.heap, ClosureEnv { cells, eval_scope });
         let object = JsObject::function(
             self.heap,
             Some(self.realm.function_proto.clone()),

@@ -40,7 +40,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +191,22 @@ fn write_function(out: &mut Vec<u8>, function: &Function) {
     out.extend_from_slice(&function.code);
     out.extend_from_slice(&function.stack_size.to_be_bytes());
     out.extend_from_slice(&function.var_ref_count.to_be_bytes());
+    // The eval-site table travels with the code for the same reason as the position
+    // table: it is what lets a direct `eval` resolve a shadowed name to the right slot,
+    // and it cannot be recomputed from the bytecode.
+    out.extend_from_slice(&(function.eval_sites.len() as u32).to_be_bytes());
+    for site in &function.eval_sites {
+        out.extend_from_slice(&site.line.to_be_bytes());
+        out.extend_from_slice(&site.column.to_be_bytes());
+        out.extend_from_slice(&(site.bindings.len() as u32).to_be_bytes());
+        for binding in &site.bindings {
+            write_string(out, &binding.name);
+            out.push(u8::from(binding.is_arg));
+            out.extend_from_slice(&binding.index.to_be_bytes());
+            out.extend_from_slice(&binding.owner.to_be_bytes());
+        }
+    }
+
     // The position table travels with the code: an AOT binary that dropped it would
     // lose `error.stack`'s file:line:col even though the bytecode is identical.
     out.extend_from_slice(&(function.positions.len() as u32).to_be_bytes());
@@ -360,6 +376,31 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let code = reader.take(code_length)?.to_vec();
     let stack_size = reader.u32()?;
     let var_ref_count = reader.u32()?;
+    let eval_site_count = reader.u32()? as usize;
+    let mut eval_sites = Vec::with_capacity(eval_site_count);
+    for _ in 0..eval_site_count {
+        let line = reader.u32()?;
+        let column = reader.u32()?;
+        let binding_count = reader.u32()? as usize;
+        let mut bindings = Vec::with_capacity(binding_count);
+        for _ in 0..binding_count {
+            let name = reader.string()?;
+            let is_arg = reader.take(1)?[0] != 0;
+            let index = reader.u32()?;
+            let owner = reader.u32()?;
+            bindings.push(crate::bytecode::EvalVisible {
+                name,
+                is_arg,
+                index,
+                owner,
+            });
+        }
+        eval_sites.push(crate::bytecode::EvalSite {
+            line,
+            column,
+            bindings,
+        });
+    }
     let position_count = reader.u32()? as usize;
     let mut positions = Vec::with_capacity(position_count);
     for _ in 0..position_count {
@@ -388,6 +429,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         line,
         column,
         filename: None,
+        eval_sites,
     })
 }
 
@@ -522,6 +564,26 @@ mod tests {
             args: vec![],
             defined_args: 0,
             vars: vec![VarDef::var("<ret>"), VarDef::constant("k")],
+            // A site with one binding of each shape, so the round trip covers the
+            // table a direct `eval` depends on.
+            eval_sites: vec![crate::bytecode::EvalSite {
+                line: 3,
+                column: 7,
+                bindings: vec![
+                    crate::bytecode::EvalVisible {
+                        name: "a".to_string(),
+                        is_arg: true,
+                        index: 0,
+                        owner: 0,
+                    },
+                    crate::bytecode::EvalVisible {
+                        name: "b".to_string(),
+                        is_arg: false,
+                        index: 1,
+                        owner: 2,
+                    },
+                ],
+            }],
             closure_vars: vec![ClosureVar {
                 name: "g".to_string(),
                 is_const: false,

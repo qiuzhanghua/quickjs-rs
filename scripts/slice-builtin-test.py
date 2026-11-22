@@ -38,8 +38,11 @@ tests = [name for _, name in starts if name.startswith("test_") or name == "test
 kept = [name for name in tests if name not in skip]
 
 body = [preamble]
+# Helpers are ordinary top-level functions the tests call, not tests themselves. `F` is
+# a constructor `test_op2` exercises with `new`; adding it here is what makes that test
+# about the engine rather than about the slice.
 for helper in ("throw_error", "assert", "assert_throws", "my_func", "get_string_pos", "check_error_pos",
-               "assert_json_error", "eval_error"):
+               "assert_json_error", "eval_error", "F"):
     if helper in functions and helper not in kept:
         body.append(functions[helper])
 for name in kept:

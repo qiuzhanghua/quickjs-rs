@@ -23,8 +23,8 @@
 
 use crate::bytecode::LineCol;
 use crate::bytecode::{
-    Atom, ClosureType, ClosureVar, Constant, Function as CompiledFunction, FunctionKind, VarDef,
-    VarKind,
+    Atom, ClosureType, ClosureVar, Constant, EvalSite, EvalVisible, Function as CompiledFunction,
+    FunctionKind, VarDef, VarKind,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
@@ -436,6 +436,22 @@ struct FnState {
     /// wrapped in another guard.
     emitting_with_guard: bool,
     self_name: Option<String>,
+    /// Whether the body contains a *direct* `eval(...)` call.
+    ///
+    /// A direct eval sees every binding of the function that called it, including ones
+    /// no other code mentions. It also hands those bindings to any closure it creates,
+    /// which can outlive the function. Both need the bindings to live in cells, so this
+    /// flag makes the function treat all of them as captured.
+    has_direct_eval: bool,
+    /// What each direct `eval(...)` in this function can see; see [`EvalSite`].
+    ///
+    /// Only filled in by [`Compiler::materialize_eval_sites`], because the answer is not
+    /// final while the body is still being compiled: a named function expression declares
+    /// its own name binding *after* the body, and that binding is exactly what
+    /// `eval("myfunc = 1")` has to find.
+    eval_sites: Vec<EvalSite>,
+    /// Direct `eval` call sites seen so far: where, and the block that was current.
+    pending_eval_sites: Vec<(Span, u64)>,
     /// Whether the self-name prologue (`special_object 2` then the store) has been
     /// emitted for this function.
     ///
@@ -517,6 +533,9 @@ impl FnState {
             with_names: Vec::new(),
             emitting_with_guard: false,
             self_name: None,
+            has_direct_eval: false,
+            eval_sites: Vec::new(),
+            pending_eval_sites: Vec::new(),
             self_name_initialized: false,
             leaves_value: false,
             stmt_depth: 0,
@@ -1573,9 +1592,12 @@ impl Compiler {
             return;
         }
         // Either the body refers to the name, or a nested function already forced the
-        // binding into existence while being resolved.
+        // binding into existence while being resolved. A direct `eval` can name it
+        // without mentioning it, so its presence is a third reason: in strict mode
+        // `eval("f = 1")` has to raise a `TypeError` rather than a `ReferenceError`, and
+        // that only happens if the binding exists.
         let declared = self.stack[current].vars.iter().any(|v| v.name == name);
-        if !declared && !self.mentions(&name) {
+        if !declared && !self.mentions(&name) && !self.stack[current].has_direct_eval {
             return;
         }
         self.stack[current].self_name_initialized = true;
@@ -2575,9 +2597,138 @@ impl Compiler {
     fn expr(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
         let saved = self.cur().cur_pos;
         self.state().cur_pos = Some(expr.op_pos.unwrap_or(expr.span.start));
+        // Note a direct `eval` call before compiling it, because the *whole* function
+        // is affected: an eval can name any binding the function declares, so every one
+        // of them has to live in a cell for a closure it creates to capture it.
+        if Self::is_direct_eval(expr) {
+            // Every enclosing function is affected too: the eval sees the whole scope
+            // chain, and a closure it creates can capture a binding of any of them.
+            // `for (let i …) { f() }` where `f` contains the eval still needs `i` in a
+            // cell, because the closure the eval builds outlives the loop iteration.
+            for state in &mut self.stack {
+                state.has_direct_eval = true;
+            }
+            let block = self.cur().current_block;
+            self.state().pending_eval_sites.push((expr.span, block));
+        }
         let result = self.expr_inner(expr);
         self.state().cur_pos = saved;
         result
+    }
+
+    /// Record which bindings are in scope at a direct `eval` call.
+    ///
+    /// Ordinary name lookup happens at compile time; a direct `eval` bypasses that and
+    /// resolves names from a string at run time, so the only chance to pin down *which*
+    /// slot a name means is here. Visibility is the lexical rule: a binding counts when
+    /// its block is the current block, an enclosing one, or the function scope.
+    fn materialize_eval_sites(&mut self) {
+        let pending = std::mem::take(&mut self.state().pending_eval_sites);
+        for (span, site_block) in pending {
+            self.resolve_eval_site(span, site_block);
+        }
+    }
+
+    /// Resolve the bindings visible at one `eval` call.
+    fn resolve_eval_site(&mut self, span: Span, site_block: u64) {
+        /// How near a binding is: function distance first, then block depth, then the
+        /// later declaration (which shadows the earlier one in the same block).
+        type ScopePriority = (usize, usize, std::cmp::Reverse<u32>);
+
+        // `(sort key, binding)`, where a smaller key wins. The whole scope chain is
+        // walked, innermost function first: a direct `eval` sees every enclosing
+        // function's bindings, and none of them can be resolved at run time because the
+        // runtime only has names to go on.
+        let mut bindings: Vec<(ScopePriority, EvalVisible)> = Vec::new();
+        let deepest = self.stack.len() - 1;
+        for (level, state) in self.stack.iter().enumerate().rev() {
+            let owner = (deepest - level) as u32;
+            // The innermost function's block is the one the call sat in, which is not
+            // the block the compiler is in now; the enclosing functions are still at
+            // the point where this one was created.
+            let here = if level == deepest {
+                site_block
+            } else {
+                state.current_block
+            };
+            // The chain of live blocks, innermost first, with a depth for each. The walk
+            // stops at `NO_PARENT`, which is a sentinel rather than `0` because a real
+            // block can start at source offset zero.
+            let mut live: Vec<(u64, usize)> = vec![(here, 0)];
+            let mut block = here;
+            while let Some(parent) = state
+                .blocks
+                .iter()
+                .find(|candidate| candidate.key == block)
+                .map(|candidate| candidate.parent)
+                .filter(|parent| *parent != NO_PARENT)
+                .filter(|parent| parent != &block)
+            {
+                live.push((parent, live.len()));
+                block = parent;
+            }
+            let depth_of = |key: u64| {
+                live.iter()
+                    .find(|(candidate, _)| *candidate == key)
+                    .map(|(_, depth)| *depth)
+                    // The function scope is the outermost depth there is. A binding of a
+                    // block this site is not inside lands here too, which pushes it
+                    // behind every live one — the right answer: it is out of scope.
+                    .unwrap_or(live.len())
+            };
+            for (index, arg) in state.args.iter().enumerate() {
+                bindings.push((
+                    (owner as usize, live.len(), std::cmp::Reverse(index as u32)),
+                    EvalVisible {
+                        name: arg.name.clone(),
+                        is_arg: true,
+                        index: index as u32,
+                        owner,
+                    },
+                ));
+            }
+            for (index, var) in state.vars.iter().enumerate() {
+                let block = state
+                    .var_block
+                    .get(index)
+                    .copied()
+                    .unwrap_or(FUNCTION_SCOPE);
+                bindings.push((
+                    (
+                        owner as usize,
+                        depth_of(block),
+                        std::cmp::Reverse(index as u32),
+                    ),
+                    EvalVisible {
+                        name: var.name.clone(),
+                        is_arg: false,
+                        index: index as u32,
+                        owner,
+                    },
+                ));
+            }
+        }
+        // Innermost function first, then innermost block, then the later declaration
+        // (which shadows the earlier one within a block).
+        bindings.sort_by_key(|(priority, _)| *priority);
+        let bindings = bindings.into_iter().map(|(_, visible)| visible).collect();
+        self.state().eval_sites.push(EvalSite {
+            line: span.start.line,
+            column: span.start.column,
+            bindings,
+        });
+    }
+
+    /// Whether `expr` is `eval(...)` — the direct form, which sees the caller's scope.
+    ///
+    /// `(0, eval)(…)` and `f.call(null, …)` are *indirect* and get no caller scope; only
+    /// a bare identifier callee counts.
+    fn is_direct_eval(expr: &Expr) -> bool {
+        matches!(
+            &expr.kind,
+            ExprKind::Call { callee, .. }
+                if matches!(&callee.unparen().kind, ExprKind::Ident(name) if name.name == "eval")
+        )
     }
 
     fn expr_inner(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
@@ -4804,6 +4955,28 @@ impl Compiler {
         Ok(self.finish_current())
     }
 
+    /// Put every binding of a function that contains a direct `eval` into a cell.
+    ///
+    /// A direct eval can name any binding in scope, and any closure it creates has to
+    /// keep sharing that binding after the function returns — `for (let i …)
+    /// eval("push(() => i)")` collects one closure per iteration and each must read its
+    /// own `i`. A copy in a side table would freeze the value, so the binding has to be
+    /// a cell. Doing this unconditionally for such functions is the cheap, honest
+    /// answer: the alternative is knowing at compile time which names a string will
+    /// mention.
+    fn capture_everything_for_eval(&mut self) {
+        let current = self.stack.len() - 1;
+        if !self.stack[current].has_direct_eval {
+            return;
+        }
+        for arg in &mut self.stack[current].args {
+            arg.is_captured = true;
+        }
+        for var in &mut self.stack[current].vars {
+            var.is_captured = true;
+        }
+    }
+
     /// Whether the current position in the instruction stream can be reached.
     ///
     /// A walk over the control-flow graph, using labels as instruction indices.
@@ -4821,6 +4994,8 @@ impl Compiler {
         self.provide_this_local();
         self.provide_new_target_local();
         self.provide_self_name();
+        self.materialize_eval_sites();
+        self.capture_everything_for_eval();
         let (mut resolved, resolved_pos) = resolve(&mut self.stack);
         // Captured bindings need a reference cell; the count goes in the header so
         // the runtime knows how many cells to allocate on entry.
@@ -4861,6 +5036,7 @@ impl Compiler {
             line: state.line,
             column: state.column,
             filename: None,
+            eval_sites: state.eval_sites,
         }
     }
 }
@@ -4999,12 +5175,29 @@ fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) 
                 // A store to the name of a named function expression is special: the
                 // reference drops it in sloppy mode and throws in strict mode, because
                 // the binding is immutable but only *checked* when the body is strict.
-                if matches!(action, VarAction::Put | VarAction::Set)
-                    && let Slot::Loc(index) = slot
-                    && let Some(var) = stack[current].vars.get(index as usize)
-                    && var.kind == VarKind::FunctionName
-                {
-                    out.push(Some(if var.is_const {
+                // The same rule applies when the name is reached through a closure:
+                // `var f = function myfunc() { (() => { myfunc = 1 })() }` has to drop
+                // the store in the arrow too, not just in the function that owns the
+                // binding. Reaching the owner means walking the chain of closure
+                // entries, which is what `self_name_binding` does.
+                let self_name = matches!(action, VarAction::Put | VarAction::Set)
+                    .then(|| {
+                        // A local of this function is the common case and needs no
+                        // chain walk; only an access that resolves elsewhere can be
+                        // pointing at an enclosing function's name binding.
+                        if let Slot::Loc(index) = slot {
+                            stack[current]
+                                .vars
+                                .get(index as usize)
+                                .filter(|var| var.kind == VarKind::FunctionName)
+                                .map(|var| var.is_const)
+                        } else {
+                            self_name_binding(stack, current, name, *block)
+                        }
+                    })
+                    .flatten();
+                if let Some(is_const) = self_name {
+                    out.push(Some(if is_const {
                         (
                             Opcode::ThrowError,
                             vec![
@@ -5102,6 +5295,64 @@ fn block_chain(state: &FnState, block: u64) -> Vec<u64> {
         current = state.blocks.iter().find(|b| b.key == key).map(|b| b.parent);
     }
     chain
+}
+
+/// The `const`-ness of a named function expression's own name, if `name` resolves to one.
+///
+/// The binding may be several functions away: an arrow nested in `function myfunc`
+/// reaches `myfunc` through a chain of closure entries, so finding out *what* it names
+/// means following `Ref` entries down and then reading the owning function's var table.
+fn self_name_binding(stack: &[FnState], current: usize, name: &str, block: u64) -> Option<bool> {
+    let state = stack.get(current)?;
+    // A parameter shadows everything and is never a function-expression name.
+    if state.args.iter().any(|arg| arg.name == name) {
+        return None;
+    }
+    // A local of this very function: the answer is in its var table.
+    if let Some(index) = local_slot_index(state, name, block) {
+        let var = state.vars.get(index)?;
+        return (var.kind == VarKind::FunctionName).then_some(var.is_const);
+    }
+    // Otherwise the name lives further out, and the closure entry says how to get
+    // there. `Local` names the owner's slot directly; `Ref` names the next level's
+    // closure entry, so the walk continues downwards.
+    let mut level = current;
+    let mut index = state
+        .closure_vars
+        .iter()
+        .position(|closure| closure.name == name)?;
+    loop {
+        let state = stack.get(level)?;
+        let closure = state.closure_vars.get(index)?;
+        match closure.closure_type {
+            ClosureType::Local => {
+                let owner = stack.get(level.checked_sub(1)?)?;
+                let var = owner.vars.get(closure.var_idx as usize)?;
+                return (var.kind == VarKind::FunctionName).then_some(var.is_const);
+            }
+            ClosureType::Arg => return None,
+            ClosureType::Ref => {
+                level -= 1;
+                index = closure.var_idx as usize;
+            }
+            // A global is never a function-expression name.
+            ClosureType::Global
+            | ClosureType::GlobalDecl
+            | ClosureType::GlobalRef
+            | ClosureType::ModuleDecl
+            | ClosureType::ModuleImport => return None,
+        }
+    }
+}
+
+/// The index of `name`'s binding in `state`, looked up the way [`resolve_slot`] does.
+fn local_slot_index(state: &FnState, name: &str, block: u64) -> Option<usize> {
+    block_chain(state, block).into_iter().find_map(|scope| {
+        state.vars.iter().enumerate().find_map(|(index, var)| {
+            (var.name == name && state.var_block.get(index).copied() == Some(scope))
+                .then_some(index)
+        })
+    })
 }
 
 fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -> Slot {

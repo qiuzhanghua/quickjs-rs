@@ -221,11 +221,52 @@ impl Trace for CompiledCode {
 pub struct ClosureEnv {
     /// Indexed the way the bytecode's closure-variable table indexes them.
     pub cells: Vec<Gc<Cell>>,
+    /// The `eval` scope this closure was created in, if any.
+    ///
+    /// A function built by `eval` has to keep seeing the caller's bindings after the
+    /// eval has returned — `for (let i …) eval("push(() => i)")` collects closures that
+    /// read `i` later. Those bindings live in the *caller's* frame, which is long gone
+    /// by then, so the environment carries them by name instead. Ordinary closures leave
+    /// this `None` and resolve globals exactly as before.
+    pub eval_scope: Option<Gc<EvalScope>>,
 }
 
 impl Trace for ClosureEnv {
     fn trace(&self, tracer: &mut Tracer) {
         for cell in &self.cells {
+            tracer.visit(cell);
+        }
+        if let Some(scope) = &self.eval_scope {
+            tracer.visit(scope);
+        }
+    }
+}
+
+/// The bindings a direct `eval` made visible, as name → cell.
+///
+/// Only bindings that already live in a cell appear here, because sharing their
+/// identity is the point: a closure created by the eval must observe later writes to
+/// the same variable, and a copy would not. The compiler puts every binding of a
+/// function that contains a direct `eval` into a cell, so in practice that is all of
+/// them.
+pub struct EvalScope {
+    /// In lookup order: the innermost binding for a name first.
+    pub names: Vec<(String, Gc<Cell>)>,
+}
+
+impl EvalScope {
+    /// The cell `name` resolves to, if this scope binds it.
+    pub fn get(&self, name: &str) -> Option<&Gc<Cell>> {
+        self.names
+            .iter()
+            .find(|(bound, _)| bound == name)
+            .map(|(_, cell)| cell)
+    }
+}
+
+impl Trace for EvalScope {
+    fn trace(&self, tracer: &mut Tracer) {
+        for (_, cell) in &self.names {
             tracer.visit(cell);
         }
     }

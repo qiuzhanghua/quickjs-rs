@@ -527,6 +527,50 @@ pub struct Function {
     pub column: u32,
     /// File name, if known.
     pub filename: Option<String>,
+    /// What each direct `eval(...)` call in this function can see.
+    ///
+    /// Slot resolution for ordinary code happens at compile time, but a direct `eval`
+    /// resolves names at *run* time, from a string the compiler never reads. Without
+    /// this table the runtime has to guess by name across the whole frame, which picks
+    /// the wrong binding when a name is declared twice in sibling scopes:
+    ///
+    /// ```text
+    /// for (let i = 0; i < 3; i++) f(eval);   // this `i`
+    /// for (let i = 0; i < 3; i++) f(eval);   // and this one
+    /// ```
+    ///
+    /// The compiler knows exactly which of them is in scope at each call, so it records
+    /// the answer here. It is data, not an instruction, so the bytecode stays identical
+    /// to the reference's.
+    pub eval_sites: Vec<EvalSite>,
+}
+
+/// One direct `eval(...)` call site and the bindings visible at it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalSite {
+    /// Source position of the call, which is how the runtime finds the site: it asks
+    /// for the position of the `call` instruction it is executing.
+    pub line: u32,
+    /// Column of the call.
+    pub column: u32,
+    /// Visible bindings, innermost scope first, so the first name match wins.
+    pub bindings: Vec<EvalVisible>,
+}
+
+/// One binding an `eval` can see.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalVisible {
+    /// The name the eval would write.
+    pub name: String,
+    /// Whether it is a parameter of the function rather than a local.
+    pub is_arg: bool,
+    /// The slot index within that table.
+    pub index: u32,
+    /// How many frames up the binding lives: `0` is the function containing the
+    /// `eval`, `1` its caller's definition and so on. A direct `eval` sees the whole
+    /// chain, and the slot for a name declared in an enclosing function is only known
+    /// at compile time.
+    pub owner: u32,
 }
 
 impl Function {
