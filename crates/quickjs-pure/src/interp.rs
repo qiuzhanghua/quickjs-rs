@@ -580,8 +580,16 @@ impl<'a> Interp<'a> {
         // native function does not push a frame of its own.
         let strict = self.current_strict();
         // `eval` runs in the caller's function context, so `new.target` is legal here
-        // even though the source is a bare script.
-        let parsed = js_parse::parse_eval_script(source, strict);
+        // even though the source is a bare script — and so is `super.x` when the caller
+        // is a method. The eval'd code has no `[[HomeObject]]` of its own; it reads the
+        // caller's, which is what `special_object 4` already does.
+        let context = js_parse::EvalContext {
+            in_method: self.enclosing_home_object().is_some(),
+            // `super()` belongs to a derived constructor, and an eval'd body is not a
+            // constructor at all: the caller frame's `this` is already built.
+            in_derived_constructor: false,
+        };
+        let parsed = js_parse::parse_eval_script_in(source, strict, context);
         let program = match parsed {
             Ok(program) => program,
             Err(error) => {
@@ -2227,6 +2235,18 @@ impl<'a> Interp<'a> {
                 &format!("special_object {other} is not implemented yet"),
             ))),
         }
+    }
+
+    /// `[[HomeObject]]` of the innermost function that has one, if any.
+    ///
+    /// An arrow has none, so the search walks out to the enclosing method — the same
+    /// rule `special_object 4` follows, and the reason `super` works inside an arrow
+    /// inside a method.
+    fn enclosing_home_object(&self) -> Option<Gc<JsObject>> {
+        self.frames
+            .iter()
+            .rev()
+            .find_map(|frame| frame.callee.as_object().and_then(|f| f.home_object()))
     }
 
     /// Call `callee`, or push its frame and let the main loop run it.

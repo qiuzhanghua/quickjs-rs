@@ -32,6 +32,22 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         interp,
     );
 
+    // `__proto__` is an accessor on `Object.prototype`, not a magic property of every
+    // object: `({}).__proto__` finds it here, and a plain `{__proto__: x}` literal never
+    // goes through it (the parser handles that form itself).
+    let getter = interp.new_native("get __proto__", 0, proto_getter);
+    let setter = interp.new_native("set __proto__", 1, proto_setter);
+    object_proto.define(
+        "__proto__",
+        Property {
+            getter: Some(Value::Object(getter)),
+            setter: Some(Value::Object(setter)),
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
+
     let constructor = interp.new_native("Object", 1, constructor);
     constructor.define(
         "prototype",
@@ -377,6 +393,59 @@ fn get_prototype_of(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> Js
         }
         _ => Ok(Value::Object(interp.realm.object_proto.clone())),
     }
+}
+
+/// The `__proto__` getter: the prototype of the receiver.
+fn proto_getter(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let Some(object) = this.as_object() else {
+        // A primitive receiver is boxed, so `(1).__proto__` is `Number.prototype`.
+        let boxed = crate::builtins::this_object(interp, &this)?;
+        return Ok(boxed.proto().map_or(Value::Null, Value::Object));
+    };
+    Ok(match object.proto() {
+        // A null prototype reports `null`, not `undefined`.
+        None => Value::Null,
+        Some(proto) => Value::Object(proto),
+    })
+}
+
+/// The `__proto__` setter: `o.__proto__ = p`, which is `[[SetPrototypeOf]]`.
+///
+/// Setting it on a non-extensible object, or to a value that is neither an object nor
+/// `null`, is silently ignored rather than an error — the setter is a plain assignment,
+/// and an assignment that cannot take effect is a no-op in sloppy mode.
+fn proto_setter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let Some(object) = this.as_object() else {
+        return Ok(Value::Undefined);
+    };
+    if !object.is_extensible() {
+        return Ok(Value::Undefined);
+    }
+    match arg(args, 0) {
+        Value::Object(proto) => {
+            // A cycle would make the prototype chain infinite, which the spec refuses.
+            if proto.ptr_eq(object) || inherits_from(&proto, object) {
+                return Ok(Value::Undefined);
+            }
+            object.set_proto(Some(proto));
+        }
+        Value::Null => object.set_proto(None),
+        _ => {}
+    }
+    let _ = interp;
+    Ok(Value::Undefined)
+}
+
+/// Whether `object`'s prototype chain passes through `target`.
+fn inherits_from(object: &Gc<JsObject>, target: &Gc<JsObject>) -> bool {
+    let mut current = object.proto();
+    while let Some(next) = current {
+        if next.ptr_eq(target) {
+            return true;
+        }
+        current = next.proto();
+    }
+    false
 }
 
 fn set_prototype_of(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {

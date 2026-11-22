@@ -40,7 +40,8 @@ mod unicode_id;
 pub use error::{LexError, ParseError, Result, SyntaxError};
 pub use lexer::Lexer;
 pub use parser::{
-    Parser, parse_eval_script, parse_expression, parse_module, parse_script, parse_script_strict,
+    EvalContext, Parser, parse_eval_script, parse_eval_script_in, parse_expression, parse_module,
+    parse_script, parse_script_strict,
 };
 
 /// Parser configuration constants and helpers.

@@ -270,8 +270,29 @@ pub fn parse_script_strict(src: &str) -> Result<Program> {
 /// no function of its own. `strict` is the caller's mode, which a sloppy eval does not
 /// derive from its own text.
 pub fn parse_eval_script(src: &str, strict: bool) -> Result<Program> {
+    parse_eval_script_in(src, strict, EvalContext::default())
+}
+
+/// What the code that called a direct `eval` allows its body to use.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalContext {
+    /// The caller is a method (or a nested arrow in one), so `super.x` is legal — the
+    /// eval'd code runs with the caller's `[[HomeObject]]`.
+    pub in_method: bool,
+    /// The caller is a derived class constructor, so `super()` is legal too.
+    pub in_derived_constructor: bool,
+}
+
+/// Parse `src` as a direct `eval` body with the caller's privileges.
+///
+/// An eval'd body is not a function of its own, but it runs *inside* one: `eval("super.f()")`
+/// is legal in a method, and `eval("new.target")` is legal in any function. The parser has
+/// to be told, because the source text alone has no way to know.
+pub fn parse_eval_script_in(src: &str, strict: bool, context: EvalContext) -> Result<Program> {
     let mut parser = Parser::new(src, false)?;
     parser.ctx.in_function = true;
+    parser.ctx.in_method = context.in_method;
+    parser.ctx.in_derived_constructor = context.in_derived_constructor;
     if strict {
         parser.enter_strict()?;
     }

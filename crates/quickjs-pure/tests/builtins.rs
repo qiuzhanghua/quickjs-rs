@@ -1607,3 +1607,58 @@ fn eval_in_a_parameter_list_belongs_to_the_caller() {
         "number\n"
     );
 }
+
+#[test]
+fn eval_inherits_the_callers_super() {
+    // An eval'd body is not a method, but it runs inside one: `super.x` resolves against
+    // the caller's `[[HomeObject]]`, which is what `special_object 4` already walks to.
+    assert_eq!(
+        eval(
+            "var o1 = { x: 1 };\n\
+             var o2 = { f() { return eval('super.x') } };\n\
+             o2.__proto__ = o1;\n\
+             print(o2.f())"
+        ),
+        "1\n"
+    );
+    // The receiver is still `this`, so a `super` method call gets the right one.
+    assert_eq!(
+        eval(
+            "var o1 = { f() { return this } };\n\
+             var o2 = { f() { return (() => eval('super.f()'))() } };\n\
+             o2.__proto__ = o1;\n\
+             print(o2.f() === o2)"
+        ),
+        "true\n"
+    );
+    // Outside a method there is no home object, so `super.x` stays a syntax error.
+    assert_eq!(
+        throws("eval('super.x')"),
+        "SyntaxError: invalid source: 1:1: invalid use of 'super' outside of a method"
+    );
+}
+
+#[test]
+fn object_prototype_has_a_proto_accessor() {
+    // `__proto__` is an ordinary accessor on `Object.prototype`, not a magic property of
+    // every object — scripts read and write it constantly.
+    assert_eq!(
+        eval(
+            "var o = {}; o.__proto__ = { x: 1 }; print(o.x, Object.getPrototypeOf(o) === o.__proto__)"
+        ),
+        "1 true\n"
+    );
+    assert_eq!(
+        eval("var o = Object.create(null); print(o.__proto__ === undefined)"),
+        "true\n"
+    );
+    // A primitive receiver is boxed, so it reports its wrapper's prototype.
+    assert_eq!(eval("print((1).__proto__ === Number.prototype)"), "true\n");
+    // A cycle is refused rather than creating an infinite chain.
+    assert_eq!(
+        eval(
+            "var a = {}, b = {}; a.__proto__ = b; b.__proto__ = a; print(Object.getPrototypeOf(b) === a)"
+        ),
+        "false\n"
+    );
+}
