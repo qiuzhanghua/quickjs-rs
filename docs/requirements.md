@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v1.0 —— M0–M6 已完成（`qjs` 能执行 JS 与 ES 模块，ES6+ 语言特性齐备）；v0.3.0 已发布
+> 状态：v1.0 —— M0–M6 已完成（`qjs` 能执行 JS 与 ES 模块）；v0.4.0 已发布
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -273,7 +273,7 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 
 ### 发布策略
 
-**结论：v0.2.0、v0.3.0 均已发布**（决策 5，经 M3/M4 两次修订，M5 完成后按同一策略再发一版）。
+**结论：v0.2.0、v0.3.0、v0.4.0 均已发布**（决策 5，经 M3/M4 两次修订，M5 完成后按同一策略再发一版）。
 v0.3.0 的边界是 M5 完成：语言特性齐了，但模块系统（M6）与 `std`/`os`（M9）仍缺，
 因此**尚不能跑真实脚本**——README 与 CHANGELOG 都把这条写在显眼处，而不是只说"已完成 M5"。
 
@@ -292,14 +292,14 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 `error.stack` 精确到 `file:line:column`。原先"连 `Object` 都没有"的理由消失了，
 发布线可以往前移。**剩余的已知缺口**应当写进发布说明，而不是假装不存在：
 
+这张表只列**当前**还缺的东西；已经做完的不再留在这里假装还缺。
+
 | 缺口 | 影响 | 计划 |
 |---|---|---|
-| `Date` | 已实现 | — |
-| `RegExp` / `Symbol` / `Map` / `Set` | 已实现 | — |
-| TypedArray / ArrayBuffer | 已实现 | — |
-| 生成器 / async | 已实现（`Promise`、`await`、`for await`、async generator） | — |
-| spread 调用参数 `f(...a)` | 已实现 | — |
-| 直接 `eval` 的变量作用域 | 已实现（`eval("var v=1")` 留在调用它的函数里） | — |
+| `std` / `os` 宿主模块、事件循环、Worker | 模块不存在，`setTimeout` 未定义——写不了读写文件的脚本 | M9 |
+| 私有类字段/方法 `#x` | 编译器报 `private class fields are not supported`；19 个 `private_*` opcode 已定义、VM 未实现 | M5 残留 |
+| TypedArray 的数组方法 | 只有 7/29（缺 `map`/`reduce`/`forEach`/`find`/`sort`…），且无 `Symbol.iterator`，`for…of` 遍历 typed array 会抛错 | M8 |
+| 通用语法错误的输出格式 | 我们 `file: line: col: msg`，参考 `SyntaxError: msg` + `at file:line:col`；消息文本已对齐 | 未排期 |
 | `Function.prototype.toString` | 返回 `[native code]` | 未排期 |
 | 字符串拼接 | O(n²)，大循环慢 | M11 |
 

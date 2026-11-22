@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.3.0**（M6 模块系统的源码已就绪、尚未发版）—— ES6+ 运行期完成：
+- 📌 当前版本：**v0.4.0** —— ES6+ 运行期与 ES 模块完成：
   class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
   循环导入、`import()`、JSON/text 模块）；另有 `RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
 - 🚧 当前进度：**M0–M6 已完成**；M7（正则引擎 + Unicode 表）起未开始
@@ -47,24 +47,32 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**已发布到 crates.io（v0.3.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
+**已发布到 crates.io（v0.4.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
 `quickjs-gc`/`quickjs-parse`/`quickjs-compile` 是其依赖。`quickjs-cli` 与
 `quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
 只是 dev-dependency。用法：
 
 ```toml
 [dependencies]
-quickjs = { package = "quickjs-pure", version = "0.3" }
+quickjs = { package = "quickjs-pure", version = "0.4" }
 ```
 
-M3（能执行 JS）与 M4（标准库第一波）都已达成：
-`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、`JSON`、
-`Reflect` 与错误类均可用，`qjs` 能跑通参考实现的 `test_builtin.js` 中 M4 覆盖的部分。
-`error.stack` 可用：位置来自编译期为每条指令记录的表，所以栈帧能报到
-`file:line:column`，抛错、`catch`、`JSON.parse` 的语法错误都带它。
-剩下的已知缺口（`Date`、`RegExp`、`Symbol`、`Map`/`Set`、TypedArray、生成器/async、
-spread 调用参数、直接 `eval` 的作用域、`Function.prototype.toString` 的源码回读、
-字符串拼接的 rope 优化）记在 `docs/requirements.md`，发布计划见同处的「发布策略」。
+语言与标准库：`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、
+`JSON`、`Reflect`、`Date`、`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray、
+错误类，以及 class/解构/generator/`Proxy`/`Promise`/async/`for await` 与 ES 模块。
+`error.stack` 精确到 `file:line:column`。
+
+**已知缺口**（都是响亮失败，不会给错答案）：
+
+| 缺口 | 行为 |
+|---|---|
+| `std`/`os` 宿主模块、事件循环、Worker（M9） | 模块不存在；`setTimeout` 未定义 |
+| 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported` |
+| TypedArray 的数组方法（`map`/`reduce`/`forEach`… 只有 7/29）与 `Symbol.iterator` | 方法为 `undefined` |
+| 通用语法错误的输出格式 | 我们 `<file>: <line>: <col>: <msg>`，参考 `SyntaxError: <msg>` + `at` 行 |
+
+完整清单（含每条的排期）见 `docs/requirements.md` 的「已知缺口」与
+`CHANGELOG.md`；发布计划见 `docs/requirements.md` 的「发布策略」。
 
 ## 开发
 
