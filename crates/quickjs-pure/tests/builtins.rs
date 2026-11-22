@@ -2584,3 +2584,110 @@ fn function_name_length_and_prototype_have_the_spec_attributes() {
     assert_eq!(value("var x = class {}; x.name"), "x");
     assert_eq!(value("var x = class {}; typeof x"), "function");
 }
+
+#[test]
+fn array_methods_are_generic_over_array_likes_and_read_the_receiver_lazily() {
+    // Every line here was wrong: the receiver was copied up front (so the third callback
+    // argument was an impostor and a callback that deleted an element still saw it),
+    // holes were dropped from `map`'s result, a primitive receiver was not boxed, and an
+    // absurd `length` looped instead of being refused.
+    assert_eq!(
+        eval(
+            r#"
+var o = {length: 2, 0: 1, 1: 2};
+var same = null;
+Array.prototype.map.call(o, function (v, i, x) { same = x; });
+print(same === o);
+
+var a = [1, 2];
+print(JSON.stringify(a.map(function (v, i, x) { if (i === 0) x[1] = 99; return v; })));
+print(JSON.stringify([1,,3].map(function (x) { return x; })));
+print(1 in [1,,3].map(function (x) { return x; }));
+print([1,,3].includes(undefined), [1,,3].indexOf(undefined));
+
+Boolean.prototype[0] = true;
+Boolean.prototype.length = 1;
+print(Array.prototype.map.call(false, function (v, i, x) {
+  return x instanceof Boolean;
+})[0]);
+
+print(JSON.stringify(Object.assign({}, "ab")));
+print(typeof Object.assign(1, {a: 1}));
+
+Array.prototype[1] = 9;
+var visited = [];
+[1,,3].forEach(function (v) { visited.push(v); });
+print(JSON.stringify(visited));
+delete Array.prototype[1];
+
+try {
+  Array.prototype.map.call({length: 4294967296}, function () {});
+  print("no throw");
+} catch (e) { print(e.name); }
+"#
+        ),
+        concat!(
+            "true\n",
+            "[1,99]\n",
+            "[1,null,3]\n",
+            "false\n",
+            "true -1\n",
+            "true\n",
+            "{\"0\":\"a\",\"1\":\"b\"}\n",
+            "object\n",
+            "[1,9,3]\n",
+            "RangeError\n",
+        )
+    );
+}
+
+#[test]
+fn define_property_follows_validate_and_apply() {
+    // `Object.defineProperties` did not exist, so "undefined is not a function" was the
+    // answer to everything — including the tests that assert a TypeError, which passed by
+    // accident. With it in place the validation rules had to be real.
+    assert_eq!(
+        eval(
+            r#"
+function attempt(source) {
+  try { return String(eval(source)); } catch (e) { return e.name; }
+}
+// An omitted attribute is kept, not defaulted to false.
+print(attempt("var o={a:1}; Object.defineProperty(o,'a',{value:5});" +
+              "JSON.stringify(Object.getOwnPropertyDescriptor(o,'a'))"));
+// A non-configurable property cannot be redefined...
+print(attempt("var o={}; Object.defineProperty(o,'p',{value:1});" +
+              "Object.defineProperty(o,'p',{value:2})"));
+// ...but redefining it with the same value is not a change, `NaN` included.
+print(attempt("var o={}; Object.defineProperty(o,'n',{value:NaN});" +
+              "Object.defineProperty(o,'n',{value:NaN}); 'ok'"));
+// A descriptor cannot be both a data and an accessor property.
+print(attempt("Object.defineProperty({},'x',{value:1,set:function(){}})"));
+// A non-extensible target refuses a new property.
+print(attempt("var o=Object.preventExtensions({}); Object.defineProperty(o,'p',{value:1})"));
+// An array's `length` is exotic.
+var a = [1, 2, 3];
+Object.defineProperty(a, "length", {value: 1});
+print(a.length, a[2]);
+print(attempt("Object.defineProperty([],'length',{enumerable:true})"));
+var b = [1, 2, 3];
+Object.defineProperty(b, "length", {writable: false});
+print(Object.getOwnPropertyDescriptor(b, "length").writable);
+print(attempt("Object.defineProperty(b,'3',{value:'x'})"));
+print(b.hasOwnProperty("3"));
+"#
+        ),
+        concat!(
+            "{\"value\":5,\"writable\":true,\"enumerable\":true,\"configurable\":true}\n",
+            "TypeError\n",
+            "ok\n",
+            "TypeError\n",
+            "TypeError\n",
+            "1 undefined\n",
+            "TypeError\n",
+            "false\n",
+            "TypeError\n",
+            "false\n",
+        )
+    );
+}

@@ -23,7 +23,7 @@ use js_gc::{Gc, Heap};
 
 use crate::object::{
     Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, LocalVars, NativeFn, ObjectKind,
-    Property, PropertyKey, array_index, lookup_key, same_proto,
+    Property, PropertyKey, array_index, has_own, lookup_key, same_proto,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -533,6 +533,9 @@ pub struct Interp<'a> {
     /// become a global. Name lookups still fall through to the realm, which is why
     /// `eval("a")` sees a global `a` and `eval("a = 3")` writes it.
     eval_scope: Option<BTreeMap<String, Value>>,
+    /// How deep the interpreter currently is inside an `eval`, so a `var` it declares can
+    /// be created configurable — the distinction `(1, eval)("var g")` exists to exploit.
+    eval_depth: usize,
     /// The calling frame's own bindings, which the running `eval` can read and write.
     ///
     /// Held separately from [`Interp::eval_scope`] because these already exist: reads
@@ -660,6 +663,7 @@ impl<'a> Interp<'a> {
             },
             frames: Vec::new(),
             eval_scope: None,
+            eval_depth: 0,
             eval_bindings: Vec::new(),
             eval_arguments: None,
             eval_with: None,
@@ -1427,7 +1431,7 @@ impl<'a> Interp<'a> {
         {
             return Some(Property {
                 value: Some(Value::Int(length as i32)),
-                writable: true,
+                writable: object.length_writable(),
                 enumerable: false,
                 configurable: false,
                 getter: None,
@@ -1458,6 +1462,82 @@ impl<'a> Interp<'a> {
     ) -> JsResult<bool> {
         if let Some(accepted) = self.proxy_define_property(object, key, property.clone())? {
             return Ok(accepted);
+        }
+        // An array index is stored in the element vector, which can hold a plain value and
+        // nothing else. An accessor — or a data property with non-default attributes —
+        // therefore has to live in the property table, and the element slot is blanked so
+        // the table is what a read finds. Without this `Object.defineProperty(a, "0",
+        // {get})` stored the accessor where no read ever looked, and the array kept
+        // answering its old value.
+        // An array's `length` is not stored in the property table, so defining it has to
+        // run `ArraySetLength`: it truncates or extends the element vector and refuses a
+        // value that is not a valid index. Without this `Object.defineProperty(a, "length",
+        // {value: 1})` reported success and changed nothing.
+        if key.as_str() == Some("length") && object.is_array() {
+            // `{writable: false}` on `length` does not change the length, but it does make
+            // it read-only — after which neither a later `{writable: true}` nor a store
+            // past the end may succeed.
+            if property.value.is_none() {
+                if !object.length_writable() && property.writable {
+                    return Ok(false);
+                }
+                object.set_length_writable(property.writable);
+                return Ok(true);
+            }
+            if !object.length_writable() {
+                return Ok(false);
+            }
+        }
+        if key.as_str() == Some("length")
+            && object.is_array()
+            && let Some(value) = property.value.clone()
+        {
+            let requested = value.to_number();
+            let valid = requested.is_finite()
+                && requested >= 0.0
+                && requested.fract() == 0.0
+                && requested <= u32::MAX as f64;
+            if !valid {
+                return Err(self.range_error("invalid array length"));
+            }
+            // Truncating deletes the elements above the new length, and a non-configurable
+            // one cannot be deleted: `Object.defineProperty(a, "3", {configurable: false})`
+            // makes `a.length = 2` fail rather than quietly drop it.
+            let current = object.array_length().unwrap_or(0);
+            let requested = requested as usize;
+            if requested < current
+                && (requested..current).any(|index| object.element_is_undeletable(index as u32))
+            {
+                return Ok(false);
+            }
+            object.array_set_length(requested);
+            return Ok(true);
+        }
+        let plain = property.writable
+            && property.enumerable
+            && property.configurable
+            && !property.is_accessor();
+        if let Some(index) = key.as_str().and_then(array_index)
+            && object.is_array()
+        {
+            // Growing the array needs a writable `length`: after
+            // `Object.defineProperty(a, "length", {writable: false})` a new index cannot
+            // be added.
+            if (index as usize) >= object.array_length().unwrap_or(0) && !object.length_writable() {
+                return Ok(false);
+            }
+            if plain && let Some(value) = property.value {
+                // An ordinary element: the vector is where a read looks first, so it has
+                // to be the vector that changes.
+                object.delete_key(key);
+                object.array_set(index as usize, value);
+                return Ok(true);
+            }
+            object.define_key(key, property);
+            // The slot stays, so `length` does not shrink; a hole is not an element, so
+            // the table entry is now what a read finds.
+            object.array_set(index as usize, Value::Hole);
+            return Ok(true);
         }
         object.define_key(key, property);
         Ok(true)
@@ -1547,6 +1627,15 @@ impl<'a> Interp<'a> {
     /// for a `Function` body; a *direct* eval that reads a local variable would need
     /// the compiler to hand its variable environment over, which is not implemented.
     pub fn eval_in_global(&mut self, source: &str) -> JsResult<Value> {
+        // Marked for the duration, so `declare_var_global` knows a `var` from here is an
+        // eval-created global binding — configurable, unlike a script's own `var`.
+        self.eval_depth += 1;
+        let result = self.eval_in_global_inner(source);
+        self.eval_depth -= 1;
+        result
+    }
+
+    fn eval_in_global_inner(&mut self, source: &str) -> JsResult<Value> {
         // The reference names eval'd code `<input>` rather than inheriting the caller's
         // file name, and stack traces show it, so `eval("1 + x")` failing reports
         // `(<input>:1:5)`.
@@ -2933,12 +3022,14 @@ impl<'a> Interp<'a> {
         if object.typed_array_parts().is_some() {
             return object.typed_array_element(index as usize);
         }
-        // A hole reads as `undefined` but is not a stored `undefined`; mapping it
-        // here keeps that distinction out of every read site.
-        object.array_get(index as usize).map(|value| match value {
-            Value::Hole => Value::Undefined,
+        // A hole answers `None`, not `undefined`: it is *not* an own property, so the read
+        // has to continue up the prototype chain. Mapping it to `undefined` here ended the
+        // search early, which is why `Array.prototype[1] = 9` could not be seen through
+        // `[1,,3][1]`.
+        match object.array_get(index as usize) {
+            Some(Value::Hole) | None => None,
             other => other,
-        })
+        }
     }
 
     /// Store `object[key] = value`, honouring setters and inherited properties.
@@ -3000,7 +3091,43 @@ impl<'a> Interp<'a> {
             && let Some(index) = array_index(text)
             && object.is_array()
         {
+            // An accessor defined on an index lives in the property table while the
+            // element slot is a hole, so the store has to go through the property first.
+            // Writing the vector directly skipped the setter entirely.
+            if let Some(existing) = object.own_property_key(key) {
+                if existing.is_accessor() {
+                    return match existing.setter.clone() {
+                        Some(setter) if !matches!(setter, Value::Undefined) => {
+                            let receiver = Value::Object(object.clone());
+                            self.call_value(setter, receiver, vec![value]).map(|_| ())
+                        }
+                        _ => match on_failure {
+                            DeleteFailure::Throw => Err(self.type_error(format!(
+                                "cannot set property '{text}', it has only a getter"
+                            ))),
+                            DeleteFailure::Ignore => Ok(()),
+                        },
+                    };
+                }
+                if !existing.writable {
+                    return match on_failure {
+                        DeleteFailure::Throw => {
+                            Err(self.type_error(format!("'{text}' is read-only")))
+                        }
+                        DeleteFailure::Ignore => Ok(()),
+                    };
+                }
+            }
             {
+                // Growing the array needs a writable `length`.
+                if (index as usize) >= object.array_length().unwrap_or(0)
+                    && !object.length_writable()
+                {
+                    return match on_failure {
+                        DeleteFailure::Throw => Err(self.type_error("'length' is read-only")),
+                        DeleteFailure::Ignore => Ok(()),
+                    };
+                }
                 // Adding an index past the end makes the array longer, which a
                 // non-extensible array refuses.
                 if index as usize >= object.array_length().unwrap_or(0) && !object.is_extensible() {
@@ -3024,6 +3151,12 @@ impl<'a> Interp<'a> {
             }
         }
         if text == Some("length") && object.is_array() {
+            if !object.length_writable() {
+                return match on_failure {
+                    DeleteFailure::Throw => Err(self.type_error("'length' is read-only")),
+                    DeleteFailure::Ignore => Ok(()),
+                };
+            }
             let length = value.to_number();
             if length.is_finite() && length >= 0.0 {
                 let length = length as usize;
@@ -3031,7 +3164,7 @@ impl<'a> Interp<'a> {
                 // drop that element, so the whole assignment fails. The spec makes
                 // this a `TypeError` rather than a silent no-op, in any mode.
                 if let Some(blocked) = (length..object.array_length().unwrap_or(0))
-                    .find(|index| object.element_is_locked(*index as u32))
+                    .find(|index| object.element_is_undeletable(*index as u32))
                 {
                     // Sloppy mode stops the truncation at the blocking element
                     // instead of failing; strict mode raises.
@@ -3106,18 +3239,21 @@ impl<'a> Interp<'a> {
         if let Some(answer) = self.proxy_delete(object, key)? {
             return Ok(answer);
         }
-        if let Some(index) = key.as_str().and_then(array_index) {
-            if let Some(elements) = object.array_elements()
-                && (index as usize) < elements.len()
-            {
-                // A hole rather than a shift: `delete a[0]` leaves `length` alone and
-                // the index stops answering `in`.
-                if object.element_is_locked(index) {
-                    return Ok(false);
-                }
-                object.array_set(index as usize, Value::Hole);
-                return Ok(true);
+        if let Some(index) = key.as_str().and_then(array_index)
+            && let Some(length) = object.array_length()
+            && (index as usize) < length
+        {
+            // An accessor defined on an index lives in the property table rather than the
+            // element vector, so both have to be cleared: `delete` after
+            // `Object.defineProperty(a, "1", {get})` used to leave the getter answering.
+            object.delete_key(key);
+            // A hole rather than a shift: `delete a[0]` leaves `length` alone and the
+            // index stops answering `in`.
+            if object.element_is_undeletable(index) {
+                return Ok(false);
             }
+            object.array_set(index as usize, Value::Hole);
+            return Ok(true);
         }
         Ok(object.delete_key(key))
     }
@@ -3677,27 +3813,28 @@ impl<'a> Interp<'a> {
     }
 
     /// `[[HasProperty]]` on an ordinary object, which the proxy fallback needs.
-    fn has_own_or_inherited(&mut self, object: &Gc<JsObject>, key: &PropertyKey) -> JsResult<bool> {
+    pub(crate) fn has_own_or_inherited(
+        &mut self,
+        object: &Gc<JsObject>,
+        key: &PropertyKey,
+    ) -> JsResult<bool> {
         // The object itself first: it may be a proxy, and then the answer is its trap's.
         if let Some(answer) = self.proxy_has(object, key)? {
             return Ok(answer);
         }
-        if object.own_property_key(key).is_some() {
+        // `has_own` rather than `own_property_key`: an array's elements and its derived
+        // `length` are invisible to the property table, and `Array.prototype` is an array.
+        if has_own(object, key) {
             return Ok(true);
         }
-        if let Some(index) = key.as_str().and_then(array_index)
-            && object
-                .array_get(index as usize)
-                .is_some_and(|value| !matches!(value, Value::Hole))
-        {
-            return Ok(true);
-        }
-        // A proxy further up the chain answers for itself.
+        // A hole is *not* the end of the search: the chain may still have the key, which
+        // is why `Array.prototype[4] = 5` makes `4 in [1,2,3,4,]` true.
         for ancestor in object.chain() {
+            // A proxy further up the chain answers for itself.
             if let Some(answer) = self.proxy_has(&ancestor, key)? {
                 return Ok(answer);
             }
-            if ancestor.own_property_key(key).is_some() {
+            if has_own(&ancestor, key) {
                 return Ok(true);
             }
         }
@@ -7095,7 +7232,7 @@ impl<'a> Interp<'a> {
     /// throws. The wrapper carries its primitive in `_value` — the same slot
     /// `new Number(x)` and friends fill in — so `valueOf` and the prototype methods work
     /// on a boxed value no constructor ever built.
-    fn object_from(&mut self, value: &Value) -> JsResult<Gc<JsObject>> {
+    pub(crate) fn object_from(&mut self, value: &Value) -> JsResult<Gc<JsObject>> {
         let (prototype, primitive) = match value {
             Value::Object(object) => return Ok(object.clone()),
             Value::String(text) => {
@@ -7125,6 +7262,13 @@ impl<'a> Interp<'a> {
             }
             Value::Int(_) | Value::Float(_) => (self.realm.number_proto.clone(), value.clone()),
             Value::Bool(_) => (self.realm.boolean_proto.clone(), value.clone()),
+            // A symbol and a bigint box into wrappers whose methods live on
+            // `Symbol.prototype` and `BigInt.prototype` — `Object(sym).description` and
+            // `Object(1n).toString(2)` both go through the wrapper. Falling into the
+            // branch below instead produced an object with *no* prototype, so those
+            // methods were unreachable on a box.
+            Value::Symbol(_) => (self.realm.symbol_proto.clone(), value.clone()),
+            Value::BigInt(_) => (self.realm.bigint_proto.clone(), value.clone()),
             Value::Undefined | Value::Null => {
                 return Err(Signal::Throw(self.make_error(
                     "TypeError",
@@ -7177,24 +7321,10 @@ impl<'a> Interp<'a> {
             ));
         };
         let key = self.propkey(key);
-        // `in` on a proxy is the `has` trap; the invariant that keeps a fixed property
-        // from being denied lives in `proxy_has`.
-        if object.proxy_state().is_some() {
-            return self.has_own_or_inherited(object, &key);
-        }
-        if object.own_property_key(&key).is_some() {
-            return Ok(true);
-        }
-        // An array hole is an index that exists as a slot but not as a property, so
-        // `1 in [1,,3]` is `false` even though reading `a[1]` yields `undefined`.
-        if let Some(index) = key.as_str().and_then(array_index)
-            && object
-                .array_get(index as usize)
-                .is_some_and(|value| !matches!(value, Value::Hole))
-        {
-            return Ok(true);
-        }
-        Ok(lookup_key(object, &key).is_some())
+        // `in` is `[[HasProperty]]`, over the whole chain and through a proxy's `has`
+        // trap. One implementation, so an array's derived `length` and its inherited holes
+        // cannot be right in one caller and wrong in another.
+        self.has_own_or_inherited(object, &key)
     }
 
     fn instance_of(&mut self, object: &Value, constructor: &Value) -> JsResult<bool> {
@@ -7780,13 +7910,18 @@ impl<'a> Interp<'a> {
         if global.own_property(name).is_some() {
             return;
         }
+        // A `var` in a *direct* declaration is non-configurable, but one introduced by an
+        // eval — `(1, eval)("var g")` — is created with `configurable: true`, which is the
+        // whole point of that trick and what lets `Object.defineProperty` reshape it
+        // afterwards. `eval_scope` is `Some` while an eval is running.
+        let from_eval = self.eval_depth > 0 || self.eval_scope.is_some();
         global.define(
             name,
             Property {
                 value: Some(Value::Undefined),
                 writable: true,
                 enumerable: true,
-                configurable: false,
+                configurable: from_eval,
                 ..Property::default()
             },
         );

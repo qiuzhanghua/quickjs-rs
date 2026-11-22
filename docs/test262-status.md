@@ -2,8 +2,8 @@
 
 测量时间：2026-02（提交 `4a30079`，v0.4.0 之后）
 
-**已修**：4.1（`name`/`length`/`prototype` 属性）与 4.7（匿名类表达式）已修复，
-可运行通过率 **42.7% → 45.8%**，净修好 561 例、新引入失败 0 例。见第 7 节。
+**已修**：4.1、4.2、4.4、4.7、4.8，可运行通过率 **42.7% → 53.0%**，
+净修好 1265 例、新引入失败 0 例。见第 7 节。
 
 复现：
 
@@ -30,9 +30,9 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 17665 |
 | **可运行中通过** | **7536（42.7%）** |
-| 可运行中失败 | 9568 |
-| ↳ 其中挂起（引擎不终止） | 44 |
-| ↳ 其中答错 | 9524 |
+| 可运行中失败 | 8303 |
+| ↳ 其中挂起（引擎不终止） | 45 |
+| ↳ 其中答错 | 8258 |
 | 跳过（引擎完全没这功能） | 6220 |
 
 跳过不是"通过"，所以它单列。按原因：
@@ -122,7 +122,7 @@ print(typeof (class {}))            // 实为 TypeError: undefined is not a func
 
 修好后 NamedEvaluation 也随之正确：`var x = class {}` 的 `x.name === "x"`，而 `(class {}).name === ""`。
 
-### 4.2 原始值接收者未装箱（ToObject）（约 192 + Array 一批）
+### 4.2 原始值接收者未装箱（ToObject）+ 数组方法快照接收者 — ✅ 已修
 
 ```js
 Array.prototype.map.call(false, function(v, i, o){ return o instanceof Boolean })
@@ -132,7 +132,24 @@ Object.assign(1, {a: 1})   // TypeError: Object.assign target is not an object�
 
 `Array.prototype.map`／`Object.assign` 等泛型方法必须先 `ToObject(this)`，不能把原始值直接当对象或直接拒绝。
 
-### 4.3 TypedArray 只是骨架（约 1900 条）
+修的过程中查出同一个病根下的三件更大的事：
+
+1. **`ToObject` 有两份实现。** `interp::object_from` 是对的，`builtins::this_object`
+   是个只写 `_value` 的残缺副本 —— 装箱后的字符串因此没有 `length` 也没有索引属性，
+   `map.call("ab", f)` 读不到任何元素。现在只有一份。
+2. **数组方法把接收者复制成快照。** 回调的第三个参数拿到的是副本（`o === 原对象` 为
+   false），而且回调里删掉的元素照样被访问 —— 规范要求每次读 `Get(O, k)`。对真数组
+   也一样错，6 条探针里 5 条答错。
+3. **`map` 丢掉空洞。** `[1,,3].map(f)` 返回 2 个元素，应为 `[f(1), <hole>, f(3)]`；
+   连带 `includes` 漏掉空洞（应以 `undefined` 命中）、`find`/`findIndex` 不访问空洞。
+
+修法：`receiver` 不再复制；新增 `receiver_element`（逐次 `[[Get]]`，`None` 与
+`Some(undefined)` 区分空洞与真值）；8 个改写方法保留旧的复制路径并**明确记为已知缺口**
+（见 4.9），因为它们有第二个更大的问题。
+
+`a.length` 上限（4.4）随之修好：`ArrayCreate` 的 `2^32-1` 校验补上，44 条挂起消失。
+
+### 4.3 TypedArray 只是骨架（1365/1453 条）— 未修
 
 ```js
 var t = new Uint8Array([1,2,3]);
@@ -145,7 +162,7 @@ typeof DataView         // undefined
 
 `length`/`byteLength`/`byteOffset`/`set`/`subarray`/`slice`/`join` 有，其余大面积缺失。这直接推翻了"FR-3 的 TypedArray 部分已完成"的说法。
 
-### 4.4 无长度上限校验导致挂起（44 条）
+### 4.4 无长度上限校验导致挂起（44 条）— ✅ 已修
 
 ```js
 Array.prototype.map.call(new Proxy([], {get: (_, k) => k === 'length' ? 2**32 : undefined}), f)
@@ -158,6 +175,36 @@ Array.prototype.map.call(new Proxy([], {get: (_, k) => k === 'length' ? 2**32 : 
 
 `RegExp.escape` 不存在；lookbehind、命名捕获组、`(?i:...)` modifiers 报 `invalid group`。
 
+### 4.8 `Object.defineProperties` 根本不存在 — ✅ 已修（连带修出 5 组规范规则）
+
+它没有被安装，所以一切"预期抛 TypeError"的用例都**因为报错而通过** ——
+"undefined is not a function" 恰好也是 TypeError。把方法补上之后，126 条用例从
+假通过变成真失败，其中 121 条暴露的是真正的语义缺失：
+
+- 描述符省略的属性应**继承**而非默认 `false`（`{value: 5}` 不该把属性锁死）；
+- 非可配置属性不可重定义，但**同值重定义不算变更**（`SameValue`，所以 `NaN` 可以）；
+- 数据属性描述符不可同时带 `get`/`set`；
+- 不可扩展对象不可新增属性；
+- 数组 `length` 是异类全局属性：不可配置、不可枚举、不可变访问器、可单独关闭可写性，
+  关闭后不可再打开、不可新增索引，截断时遇到不可删除的元素要失败。
+
+### 4.9 数组下标有两个真相源（已知缺口，未修）
+
+`Object.defineProperty(a, "0", {get})` 现在能生效了（访问器进属性表、元素槽置空洞），
+但架构上是"元素向量 + 属性表"两套存储，凡是要修改**接收者本身**的数组方法
+（`push`/`pop`/`shift`/`unshift`/`fill`/`splice`/`reverse`/`sort`）仍在写那份快照副本：
+
+```js
+Array.prototype.push.call(1, 2)                          // 应返回 1，现抛 TypeError
+var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",length:1}
+```
+
+读路径（`map`/`filter`/`forEach`/`some`/`every`/`reduce`/`find`/`indexOf`/`includes`/
+`join`/`slice`/`concat`/`flat`/`flatMap`/`at`）已按规范逐次 `[[Get]]`，不受影响。
+
+真正的修法是让 `[[Get]]`/`[[Set]]` 都只认属性表、元素向量退化为缓存，或让 8 个改写
+方法走 `set_property` 而不是 `array_set`。两种都是跨模块改动，单独排期。
+
 ## 5. 对里程碑结论的修正
 
 - FR-3 中 `TypedArray`／`DataView`／`BigInt64Array` 不能记为完成（4.3）。
@@ -169,10 +216,13 @@ Array.prototype.map.call(new Proxy([], {get: (_, k) => k === 'length' ? 2**32 : 
 优先级按"修一条能清掉多少条失败"排，而不是按里程碑顺序：
 
 1. ~~`name`/`length` 可配置（4.1）~~——已修，实测 +561 例。
-2. `ToObject` 装箱（4.2）——Array/Object 一批，约 300+ 条。
-3. `Promise`（真做）——251 条 Promise 加上 `flag:async` 632 条跳过的前置条件。
-4. TypedArray 补全（4.3）——约 1900 条，但工作量大，建议在 1–3 之后。
-5. 正则文法（4.5）——受 Unicode 表依赖，和 FR-8 一起做。
+2. ~~`ToObject` 装箱与数组接收者（4.2）~~——已修，连同 4.4、4.7、4.8 共 +704 例。
+3. `TypedArray` 补全（4.3）——1365/1453 条，**当前最大单块**。先补迭代器、
+   `at`/`map`/`filter`，再补 `BigInt64Array`（806 条）与 `DataView`（465 条）。
+4. `Iterator` helpers（664/684 条）——`Iterator` 全局对象整个没有。
+5. `Promise`（真做）——229 条 Promise，另加 `flag:async` 632 条跳过的前置条件。
+6. 正则文法（4.5）——1092 条，受 Unicode 表依赖，和 FR-8 一起做。
+7. 数组下标双真相源（4.9）——8 个改写方法的 array-like 语义。
 
 前两项是小改动大杠杆，也正好是"静默错答案"而非"报错"的那一类，风险高于数字所示。
 
@@ -193,3 +243,29 @@ Array.prototype.map.call(new Proxy([], {get: (_, k) => k === 'length' ? 2**32 : 
 回归保护：`crates/quickjs-pure/tests/builtins.rs` 的
 `function_name_length_and_prototype_have_the_spec_attributes`。已验证该测试在修复前
 会失败（`left: "false,false,false"`），不是装饰。
+
+### 4.2 + 4.4 + 4.7 + 4.8：数组接收者、长度上限、定义属性
+
+| | 修前 | 修后 |
+|---|---|---|
+| 可运行通过 | 8097（45.8%） | **9362（53.0%）** |
+| 可运行失败 | 9568 | 8303 |
+| 新引入失败 | — | **0** |
+
+逐用例对比：修好 1265 例，回归 0 例。改进分布：`TypedArray`（接收者现在能读到元素）、
+`Array` 的 `map`/`filter`/`forEach`/`some`/`every`/`reduce`/`indexOf` 全族、
+`Object.defineProperty`/`defineProperties`、`String`（装箱后的字符串有了 `length` 与索引）。
+
+过程中有三次"数字变好但其实是变差"，都在同一轮里查了出来：
+
+1. **把 126 条假通过变成了真失败。** 补上 `Object.defineProperties` 后，原先靠
+   "undefined is not a function 也是 TypeError"混过去的用例开始真正失败。
+2. **`receiver_element` 每次克隆整个元素向量**，把 100 万长度的稀疏数组变成 O(n²)，
+   6 条用例从通过变成挂起。改成原地读。
+3. **`isConcatSpreadable` 显式 `undefined` 被当成 false**，导致普通数组不再展开。
+
+三处都不是"顺带发现"，而是每次全量对比（按用例名求差集）报出来的。
+
+回归保护：`crates/quickjs-pure/tests/builtins.rs` 的
+`array_methods_are_generic_over_array_likes_and_read_the_receiver_lazily` 与
+`define_property_follows_validate_and_apply`。已验证两者在修复前都失败。

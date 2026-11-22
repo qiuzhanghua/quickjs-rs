@@ -11,7 +11,7 @@
 
 use crate::builtins::{arg, define_method};
 use crate::interp::{Interp, JsResult};
-use crate::object::{JsObject, Property};
+use crate::object::{JsObject, Property, PropertyKey};
 use crate::value::{Value, number_to_string};
 use js_gc::Gc;
 
@@ -56,6 +56,27 @@ fn stringify(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 ///
 /// `key` is the property name the value was read from, which `toJSON` receives; the
 /// root value is passed the empty string, as the spec's wrapper object does.
+/// The primitive inside a wrapper object, or the value unchanged.
+///
+/// `_value` is the slot this engine's `new Number(x)` and `Object(x)` fill in, so it is
+/// the same thing the spec's internal slots carry.
+fn unwrap_primitive_wrapper(value: &Value) -> Value {
+    let Some(object) = value.as_object() else {
+        return value.clone();
+    };
+    let Some(inner) = object.own_property("_value").and_then(|p| p.value) else {
+        return value.clone();
+    };
+    // Only a box of a *primitive*: an ordinary object that happens to have `_value` must
+    // keep serialising as an object.
+    match inner {
+        Value::Int(_) | Value::Float(_) | Value::String(_) | Value::Bool(_) | Value::BigInt(_) => {
+            inner
+        }
+        _ => value.clone(),
+    }
+}
+
 fn write_value(
     interp: &mut Interp<'_>,
     value: &Value,
@@ -68,6 +89,12 @@ fn write_value(
     // the replacement is not asked for `toJSON` again. This is how a `Date`
     // serialises to its ISO string.
     let value = &call_to_json(interp, value, key)?;
+    // A wrapper object serialises as the primitive it wraps: `JSON.stringify(Object(1))`
+    // is `"1"`, not `"{}"`. SerialiseJSONProperty unwraps `[[NumberData]]`,
+    // `[[StringData]]`, `[[BooleanData]]` and `[[BigIntData]]` before looking at the
+    // object's enumerable keys, and a wrapper has none of its own — which is why skipping
+    // the step printed an empty object.
+    let value = &unwrap_primitive_wrapper(value);
     match value {
         // A symbol serialises to nothing, exactly like `undefined`: `JSON.stringify`
         // drops it from an object and answers `undefined` for it at the top level.
@@ -148,7 +175,15 @@ fn write_array(
             out.push(',');
         }
         newline(out, indent, depth + 1);
-        let element = array.array_get(index).unwrap_or(Value::Undefined);
+        // `[[Get]]`, not the element vector: an accessor defined on an index lives in the
+        // property table and the slot it shadows is a hole, so reading the vector directly
+        // printed `null` for `Object.defineProperty(a, "0", {get})`.
+        let element = match array.array_get(index) {
+            Some(Value::Hole) | None => interp
+                .get_property_key(array, &PropertyKey::from(index.to_string()))?
+                .unwrap_or(Value::Undefined),
+            Some(value) => value,
+        };
         // A hole or an unserialisable element becomes `null`, because an array's
         // positions are part of its meaning.
         if !write_value(interp, &element, &index.to_string(), indent, out, depth + 1)? {

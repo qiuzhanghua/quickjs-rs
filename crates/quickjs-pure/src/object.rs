@@ -982,6 +982,12 @@ pub struct ObjectData {
     /// non-writable element is recorded in the property table instead, which is what
     /// `Object.defineProperty(a, "3", {configurable: false})` does.
     pub elements_writable: bool,
+    /// Whether an array's `length` may be changed.
+    ///
+    /// `Object.defineProperty(a, "length", {writable: false})` makes it read-only without
+    /// touching the elements, so it cannot share `elements_writable`: the two mean
+    /// different things and `Object.freeze` sets both.
+    pub length_writable: bool,
     /// The object a method was defined on, which is what `super` resolves against.
     ///
     /// Kept here rather than as a property because it is not observable: the spec calls
@@ -1026,6 +1032,7 @@ impl JsObject {
                 kind,
                 extensible: true,
                 elements_writable: true,
+                length_writable: true,
                 home_object: None,
                 class_constructor: false,
             }),
@@ -1199,7 +1206,7 @@ impl JsObject {
                     key,
                     Property {
                         value: Some(Value::Int(length as i32)),
-                        writable: true,
+                        writable: self.length_writable(),
                         enumerable: false,
                         configurable: false,
                         getter: None,
@@ -1476,6 +1483,16 @@ impl JsObject {
         self.data.borrow().elements_writable
     }
 
+    /// Whether an array's `length` may be changed.
+    pub fn length_writable(&self) -> bool {
+        self.data.borrow().length_writable
+    }
+
+    /// Record whether `length` may be changed.
+    pub fn set_length_writable(&self, writable: bool) {
+        self.data.borrow_mut().length_writable = writable;
+    }
+
     /// Make array elements read-only, as `Object.freeze` does.
     pub fn set_elements_writable(&self, writable: bool) {
         self.data.borrow_mut().elements_writable = writable;
@@ -1484,6 +1501,20 @@ impl JsObject {
     /// The attributes recorded for an array index, if `defineProperty` set any.
     pub fn element_attributes(&self, index: u32) -> Option<Property> {
         self.own_property(&index.to_string())
+    }
+
+    /// Whether `delete` at `index` would be rejected.
+    ///
+    /// Separate from [`JsObject::element_is_locked`]: a store needs the element to be
+    /// non-writable, but a *delete* — which is what truncating an array does — only needs
+    /// it to be non-configurable. `Object.defineProperty(a, "3", {configurable: false})`
+    /// leaves `a[3]` writable and yet undeletable, so `a.length = 2` must fail.
+    pub fn element_is_undeletable(&self, index: u32) -> bool {
+        if !self.elements_writable() {
+            return true;
+        }
+        self.element_attributes(index)
+            .is_some_and(|property| !property.configurable)
     }
 
     /// Whether a store at `index` would be rejected.
@@ -1580,12 +1611,71 @@ pub(crate) fn same_proto(a: Option<&Gc<JsObject>>, b: Option<&Gc<JsObject>>) -> 
 /// Returns the object that owns the property along with the property itself. The
 /// owner matters for a store: an inherited accessor is invoked on the receiver,
 /// while an inherited *data* property is shadowed by a new own property.
-pub fn lookup_key(object: &Gc<JsObject>, key: &PropertyKey) -> Option<(Gc<JsObject>, Property)> {
+/// The own property `key` names on `object`, arrays included.
+///
+/// An array keeps its elements in an element vector and derives its `length`, so its
+/// property table knows about neither: a hole is a slot in the vector, not a missing
+/// property, and `length` is not stored at all. `Array.prototype` is itself an array, so
+/// every walk down the chain needs this same care — without it `1 in [1,,3]` stayed false
+/// with `Array.prototype[1]` defined, `"length" in []` was false outright, and a hole did
+/// not read an inherited element.
+pub fn own_property_including_array(object: &Gc<JsObject>, key: &PropertyKey) -> Option<Property> {
     if let Some(property) = object.own_property_key(key) {
+        return Some(property);
+    }
+    // A typed array's indices are its elements in the buffer, which the property table
+    // does not hold either. Checked before the `is_array` return below, because a typed
+    // array is not one.
+    if object.typed_array_parts().is_some() {
+        // A detached view exposes no indices at all: `Reflect.has(detached, "0")` is false
+        // even though index 0 was in range before the buffer went away.
+        let index = key.as_str().and_then(array_index)?;
+        let in_range = (index as usize) < object.typed_array_length()?;
+        return match object.typed_array_element(index as usize) {
+            Some(value) if in_range => Some(Property::data(value)),
+            _ => None,
+        };
+    }
+    if !object.is_array() {
+        return None;
+    }
+    let text = key.as_str()?;
+    // `length` is non-enumerable and non-configurable; `writable` unless a definition
+    // turned it off.
+    if text == "length" {
+        return Some(Property {
+            value: Some(Value::Int(object.array_length()? as i32)),
+            writable: object.length_writable(),
+            enumerable: false,
+            configurable: false,
+            getter: None,
+            setter: None,
+        });
+    }
+    // An element is a plain writable/enumerable/configurable data property, and a hole is
+    // not one at all.
+    let index = array_index(text)?;
+    match object.array_get(index as usize) {
+        Some(Value::Hole) | None => None,
+        Some(value) => Some(Property::data(value)),
+    }
+}
+
+/// Whether `object` has `key` as an *own* property, arrays included.
+pub fn has_own(object: &Gc<JsObject>, key: &PropertyKey) -> bool {
+    own_property_including_array(object, key).is_some()
+}
+
+/// `key` on `object` or anywhere up its prototype chain, with the owner.
+///
+/// Array-aware at every step: an array's elements and its derived `length` are not in the
+/// property table, and `Array.prototype` is itself an array.
+pub fn lookup_key(object: &Gc<JsObject>, key: &PropertyKey) -> Option<(Gc<JsObject>, Property)> {
+    if let Some(property) = own_property_including_array(object, key) {
         return Some((object.clone(), property));
     }
     for ancestor in object.chain() {
-        if let Some(property) = ancestor.own_property_key(key) {
+        if let Some(property) = own_property_including_array(&ancestor, key) {
             return Some((ancestor, property));
         }
     }

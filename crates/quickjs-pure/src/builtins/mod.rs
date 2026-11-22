@@ -154,56 +154,15 @@ pub fn has_arg(args: &[Value], index: usize) -> bool {
 
 /// The `this` of a method call, as an object.
 ///
-/// A primitive receiver is boxed on demand: `"abc".indexOf(…)` reaches a method on
-/// `String.prototype` with a string `this`, and the method has to behave as if it
-/// had an object. The box is only for property access, so the text is read through
-/// [`this_string`] instead.
+/// A primitive receiver is boxed: `"abc".indexOf(…)` reaches a method on
+/// `String.prototype` with a string `this`, and the method behaves as if it had an object.
+///
+/// This used to be a second, incomplete `ToObject`: it boxed by defining `_value` and
+/// nothing else, so a boxed string had no `length` and no index properties, and
+/// `Array.prototype.map.call("ab", …)` read nothing at all. Boxing now goes through the
+/// interpreter's one implementation, which builds the String exotic object properly.
 pub fn this_object(interp: &mut Interp<'_>, this: &Value) -> crate::interp::JsResult<Gc<JsObject>> {
-    match this {
-        Value::Object(object) => Ok(object.clone()),
-        Value::Undefined | Value::Null => {
-            Err(interp.type_error("cannot convert undefined or null to object"))
-        }
-        Value::String(_) => {
-            let proto = interp.realm.string_proto.clone();
-            let boxed = interp.new_object(proto);
-            boxed.define(
-                "_value",
-                Property::with_attributes(this.clone(), false, false),
-            );
-            Ok(boxed)
-        }
-        Value::Int(_) | Value::Float(_) => {
-            let proto = interp.realm.number_proto.clone();
-            let boxed = interp.new_object(proto);
-            boxed.define(
-                "_value",
-                Property::with_attributes(this.clone(), false, false),
-            );
-            Ok(boxed)
-        }
-        Value::Bool(_) => {
-            let proto = interp.realm.boolean_proto.clone();
-            let boxed = interp.new_object(proto);
-            boxed.define(
-                "_value",
-                Property::with_attributes(this.clone(), false, false),
-            );
-            Ok(boxed)
-        }
-        // A symbol boxes like any other primitive, which is what makes `Object(sym)` a
-        // `Symbol` object whose `valueOf` hands the symbol back.
-        Value::Symbol(_) => {
-            let proto = interp.realm.symbol_proto.clone();
-            let boxed = interp.new_object(proto);
-            boxed.define(
-                "_value",
-                Property::with_attributes(this.clone(), false, false),
-            );
-            Ok(boxed)
-        }
-        _ => Err(interp.type_error("cannot convert value to object")),
-    }
+    interp.object_from(this)
 }
 
 /// The text a string method operates on, whether `this` is a primitive or a box.

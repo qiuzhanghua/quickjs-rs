@@ -176,6 +176,58 @@ fn of(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> 
 /// non-array receiver is copied up front, which is correct for every method that only
 /// reads, and harmless for the ones that also write.
 fn receiver(interp: &mut Interp<'_>, this: &Value) -> JsResult<Gc<JsObject>> {
+    this_object(interp, this)
+}
+
+/// The length a loop over the receiver runs to, read once before it starts.
+///
+/// Read once, not per iteration: the spec captures `len` up front, so a callback that
+/// pushes to the array does not extend the loop — but a callback that *deletes* does
+/// shorten what is seen, because each element is read when it is reached.
+fn receiver_length(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<usize> {
+    length_of(interp, &Value::Object(object.clone()))
+}
+
+/// Element `index`, or `None` when the receiver has no such property.
+///
+/// `None` and `Some(Value::Undefined)` are different answers on purpose: a hole is
+/// skipped by `map`, `forEach` and `reduce`, but read as `undefined` by `find` and
+/// `includes`. A snapshot of the element vector could not tell them apart at the right
+/// moment, and one that flattened the difference made `includes` miss holes entirely.
+///
+/// Cost matters here: this runs once per index, so it must not clone the element vector.
+/// An earlier version asked `array_elements()` — which clones all of it — and turned
+/// `[0,1,...,"five"]` with `arr[999999]` set (a hundred thousand holes) into quadratic
+/// work, which is how six conformance tests turned from passes into hangs.
+fn receiver_element(
+    interp: &mut Interp<'_>,
+    object: &Gc<JsObject>,
+    index: usize,
+) -> JsResult<Option<Value>> {
+    // A plain array element, read in place.
+    if object.proxy_state().is_none()
+        && object.is_array()
+        && let Some(value) = object.array_get(index)
+        && !matches!(value, Value::Hole)
+    {
+        return Ok(Some(value));
+    }
+    // Everything else is one `[[Get]]`: it consults a typed array's buffer, the property
+    // table and then the prototype chain, in that order, and answers `None` only when the
+    // property is genuinely absent. A hole is not an own property, so
+    // `Array.prototype[4] = 5` is still seen through `[1,2,3,4,]`.
+    interp.get_property_key(object, &PropertyKey::from(index.to_string()))
+}
+
+/// The copying receiver, still used by the methods that *write* to the receiver.
+///
+/// Those have a second, larger problem: `push.call({length: 0}, 1)` must define `"0"` on
+/// the argument object and return 1, and today it writes into a throwaway array and
+/// leaves the receiver untouched. Fixing that means rewriting the write path against
+/// `set_property` rather than the element vector; it is kept separate so that the read
+/// path could be measured on its own, and it is listed as a known gap in
+/// `docs/test262-status.md`.
+fn receiver_copy(interp: &mut Interp<'_>, this: &Value) -> JsResult<Gc<JsObject>> {
     // A string receiver is the common generic case — `Array.prototype.join.call("abc")`
     // — and its elements are its characters, not properties on the box.
     if let Value::String(text) = this {
@@ -264,7 +316,7 @@ fn normalise(index: f64, length: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 fn push(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     for value in args {
         let index = array.array_length().unwrap_or(0);
         // `push` adds an index past the end, which a non-extensible array refuses.
@@ -277,7 +329,7 @@ fn push(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 }
 
 fn pop(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let mut current = elements(interp, &array)?;
     let value = current.pop().unwrap_or(Value::Undefined);
     array.array_set_length(current.len());
@@ -285,7 +337,7 @@ fn pop(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value>
 }
 
 fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let mut current = elements(interp, &array)?;
     if current.is_empty() {
         return Ok(Value::Undefined);
@@ -299,7 +351,7 @@ fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Valu
 }
 
 fn unshift(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let current = elements(interp, &array)?;
     let mut combined: Vec<Value> = args.to_vec();
     combined.extend(current);
@@ -316,32 +368,71 @@ fn unshift(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Val
 
 fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(interp, &array)?;
-    let start = normalise(arg_int_or(args, 0, 0) as f64, current.len());
+    let count = receiver_length(interp, &array)?;
+    let length = array_create_length(interp, count)?;
+    let start = normalise(arg_int_or(args, 0, 0) as f64, length);
     let end = normalise(
         match args.get(1) {
-            None | Some(Value::Undefined) => current.len() as f64,
+            None | Some(Value::Undefined) => length as f64,
             Some(value) => value.to_number(),
         },
-        current.len(),
+        length,
     );
-    let out = if start >= end {
-        Vec::new()
-    } else {
-        current[start..end].to_vec()
-    };
+    let mut out = Vec::new();
+    for index in start..end.max(start) {
+        // A hole stays a hole: `[1,,3].slice(0)` keeps the gap.
+        out.push(receiver_element(interp, &array, index)?.unwrap_or(Value::Hole));
+    }
     let result = interp.new_array(out);
     Ok(Value::Object(result))
 }
 
+/// Whether `value` is spread by `concat`: an array, or anything that says so through
+/// `Symbol.isConcatSpreadable`.
+///
+/// A plain array-like object is *not* spread — `[{length: 2}]` concatenates one element —
+/// so `length` alone is not the test. Reading the symbol is what makes
+/// `Array.prototype.concat.call(arrayLike)` behave, and its absence is why those caught
+/// the receiver as a single element.
+fn is_concat_spreadable(interp: &mut Interp<'_>, value: &Value) -> JsResult<bool> {
+    let Some(object) = value.as_object() else {
+        return Ok(false);
+    };
+    let key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::IsConcatSpreadable);
+    // An explicit `undefined` does *not* mean "not spreadable": IsConcatSpreadable only
+    // consults the symbol when the value is not undefined, and otherwise falls back to
+    // `Array.isArray`. Reading it as a boolean made `a[Symbol.isConcatSpreadable] =
+    // undefined` stop a plain array from spreading.
+    if let Some(flag) = interp.get_property_key(object, &key)?
+        && !matches!(flag, Value::Undefined)
+    {
+        return Ok(flag.to_boolean());
+    }
+    Ok(object.is_array())
+}
+
 fn concat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let mut out = elements(interp, &array)?;
+    let mut out = Vec::new();
+    // The receiver is spread when it is spreadable, and otherwise appended whole:
+    // `concat.call(1)` is `[1]`, not the (empty) list of the box's indexed properties.
+    let receiver_value = Value::Object(array.clone());
+    if is_concat_spreadable(interp, &receiver_value)? {
+        out.extend(receiver_items(interp, &array)?);
+    } else {
+        out.push(receiver_value);
+    }
     for value in args {
-        // An array argument is flattened one level; anything else is appended.
-        match value.as_object() {
-            Some(object) if object.is_array() => out.extend(elements(interp, object)?),
-            _ => out.push(value.clone()),
+        if is_concat_spreadable(interp, value)? {
+            let Some(object) = value.as_object() else {
+                continue;
+            };
+            // A string is spread by code unit, not by code point.
+            out.extend(receiver_items(interp, object)?);
+        } else {
+            out.push(value.clone());
         }
     }
     let result = interp.new_array(out);
@@ -357,11 +448,12 @@ fn join(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     // A hole joins as an empty field, exactly as `undefined` does; the difference is
     // only visible to `forEach` and the debug printer. An element that is an object
     // goes through `ToString`, so a boxed number joins as `"1"`.
-    let mut parts = Vec::with_capacity(elements(interp, &array)?.len());
-    for value in elements(interp, &array)? {
-        let part = match value {
-            Value::Undefined | Value::Null | Value::Hole => String::new(),
-            other => interp.to_js_string(&other)?,
+    let length = receiver_length(interp, &array)?;
+    let mut parts = Vec::with_capacity(length);
+    for index in 0..length {
+        let part = match receiver_element(interp, &array, index)? {
+            None | Some(Value::Undefined) | Some(Value::Null) => String::new(),
+            Some(other) => interp.to_js_string(&other)?,
         };
         parts.push(part);
     }
@@ -374,57 +466,70 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
 
 fn index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(interp, &array)?;
+    let length = receiver_length(interp, &array)?;
     let needle = arg(args, 0);
-    let start = normalise(arg_int_or(args, 1, 0) as f64, current.len());
-    let found = current
-        .iter()
-        .enumerate()
-        .skip(start)
-        .find(|(_, value)| value.strict_equals(&needle))
-        .map(|(index, _)| index);
-    Ok(Value::Int(found.map_or(-1, |index| index as i32)))
+    let start = normalise(arg_int_or(args, 1, 0) as f64, length);
+    // A hole is skipped, which is why `[1,,3].indexOf(undefined)` is -1.
+    for index in start..length {
+        if let Some(value) = receiver_element(interp, &array, index)?
+            && value.strict_equals(&needle)
+        {
+            return Ok(Value::Int(index as i32));
+        }
+    }
+    Ok(Value::Int(-1))
 }
 
 fn last_index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(interp, &array)?;
+    let length = receiver_length(interp, &array)?;
     let needle = arg(args, 0);
-    let found = current
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, value)| value.strict_equals(&needle))
-        .map(|(index, _)| index);
-    Ok(Value::Int(found.map_or(-1, |index| index as i32)))
+    for index in (0..length).rev() {
+        if let Some(value) = receiver_element(interp, &array, index)?
+            && value.strict_equals(&needle)
+        {
+            return Ok(Value::Int(index as i32));
+        }
+    }
+    Ok(Value::Int(-1))
 }
 
 fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let needle = arg(args, 0);
-    let start = normalise(
-        arg_int_or(args, 1, 0) as f64,
-        elements(interp, &array)?.len(),
-    );
-    // `includes` uses SameValueZero, so it finds `NaN` where `indexOf` cannot.
-    let found = elements(interp, &array)?.iter().skip(start).any(|value| {
-        value.strict_equals(&needle)
+    let length = receiver_length(interp, &array)?;
+    let start = normalise(arg_int_or(args, 1, 0) as f64, length);
+    // `includes` uses SameValueZero, so it finds `NaN` where `indexOf` cannot — and it
+    // uses `Get`, so a hole reads as `undefined` and is found, unlike with `indexOf`.
+    for index in start..length {
+        let Some(value) = receiver_element(interp, &array, index)? else {
+            if matches!(needle, Value::Undefined) {
+                return Ok(Value::Bool(true));
+            }
+            continue;
+        };
+        if value.strict_equals(&needle)
             || (matches!(value, Value::Float(f) if f.is_nan())
                 && matches!(needle, Value::Float(f) if f.is_nan()))
-    });
-    Ok(Value::Bool(found))
+        {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 fn at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
-    let current = elements(interp, &array)?;
-    let length = current.len() as f64;
+    let count = receiver_length(interp, &array)?;
+    let length = count as f64;
     let raw = arg_int_or(args, 0, 0) as f64;
     let index = if raw < 0.0 { length + raw } else { raw };
     if index < 0.0 || index >= length {
         return Ok(Value::Undefined);
     }
-    Ok(current[index as usize].clone())
+    // A hole reads as `undefined` here, not as the `Hole` sentinel: the element vector
+    // is not what the spec reads.
+    Ok(receiver_element(interp, &array, index as usize)?.unwrap_or(Value::Undefined))
 }
 
 // ---------------------------------------------------------------------------
@@ -554,12 +659,40 @@ fn length_of(interp: &mut Interp<'_>, source: &Value) -> JsResult<usize> {
         .get_property(&object, "length")?
         .map(|value| value.to_number())
         .unwrap_or(0.0);
-    // A negative or `NaN` length is zero; a fractional one truncates.
-    Ok(if length.is_finite() && length > 0.0 {
-        length as usize
-    } else {
-        0
-    })
+    Ok(to_length(length))
+}
+
+/// `ToLength`: `NaN` and negatives are zero, fractions truncate, and the result saturates
+/// at `2^53-1` rather than staying infinite.
+///
+/// The saturation is not cosmetic. `{length: Infinity}` used to come back as `0` — the old
+/// code rejected any non-finite value — so a method over it did nothing at all instead of
+/// asking for an array of `2^53-1` elements and being refused.
+fn to_length(value: f64) -> usize {
+    const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
+    if value.is_nan() || value <= 0.0 {
+        return 0;
+    }
+    if value >= MAX_SAFE_INTEGER {
+        return MAX_SAFE_INTEGER as usize;
+    }
+    value as usize
+}
+
+/// The `ArrayCreate` length bound, and what makes an absurd `length` a `RangeError`
+/// rather than a loop that never ends.
+///
+/// `Array.prototype.map` builds its result with `ArraySpeciesCreate(O, len)`, so a receiver
+/// claiming `length: 4294967296` is refused there — the check belongs to array creation,
+/// not to the loop. Without it the loop tried to allocate four billion slots: 44
+/// conformance tests hung instead of throwing, and a hang costs a whole run's wall clock.
+const MAX_ARRAY_LENGTH: usize = (1 << 32) - 1;
+
+fn array_create_length(interp: &mut Interp<'_>, length: usize) -> JsResult<usize> {
+    if length > MAX_ARRAY_LENGTH {
+        return Err(interp.range_error("invalid array length"));
+    }
+    Ok(length)
 }
 
 /// One element of an array-like, read lazily.
@@ -585,17 +718,20 @@ fn element_at(interp: &mut Interp<'_>, source: &Value, index: usize) -> JsResult
 /// Run `callback` over the elements, the shape every iteration method needs.
 fn iterate(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Vec<(usize, Value)>> {
     let array = receiver(interp, &this)?;
+    // Length first, then the callback check: a getter on `length` runs either way.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
     let mut out = Vec::new();
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
+    for index in 0..length {
         // A hole is not an element: the iteration methods skip it entirely, so
         // `[1,,3].forEach(f)` calls `f` twice and the index passed is the real one.
-        if matches!(value, Value::Hole) {
+        // Read now rather than up front, so a callback that changes the array is seen.
+        let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
-        }
+        };
         interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -617,16 +753,24 @@ fn for_each(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
 
 fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // The result array's length is `ArraySpeciesCreate(O, len)`, so it is validated
+    // before the loop starts — and the length is read before the callback is looked at,
+    // both of which are observable orders.
+    let count = receiver_length(interp, &array)?;
+    let length = array_create_length(interp, count)?;
     let callback = arg(args, 0);
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
-    let mut out = Vec::new();
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
+    // Held to the receiver's length from the start, with `Hole` where the source had
+    // one: `[1,,3].map(f)` is `[f(1), <hole>, f(3)]`, not the two-element `[f(1), f(3)]`
+    // that dropping holes produced.
+    let mut out = vec![Value::Hole; length];
+    for (index, slot) in out.iter_mut().enumerate() {
+        let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
-        }
-        out.push(interp.call_value(
+        };
+        *slot = interp.call_value(
             callback.clone(),
             Value::Undefined,
             vec![
@@ -634,7 +778,7 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
                 Value::Int(index as i32),
                 Value::Object(array.clone()),
             ],
-        )?);
+        )?;
     }
     let result = interp.new_array(out);
     Ok(Value::Object(result))
@@ -642,15 +786,19 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
 
 fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
     let mut out = Vec::new();
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
+    for index in 0..length {
+        let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
-        }
+        };
         let keep = interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -683,21 +831,29 @@ fn reduce_with(
     right_to_left: bool,
 ) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
-    let current: Vec<(usize, Value)> = elements(interp, &array)?
-        .into_iter()
-        .enumerate()
-        .filter(|(_, value)| !matches!(value, Value::Hole))
-        .collect();
-    let ordered: Vec<(usize, Value)> = if right_to_left {
-        current.into_iter().rev().collect()
+    let indices: Vec<usize> = if right_to_left {
+        (0..length).rev().collect()
     } else {
-        current
+        (0..length).collect()
     };
-    let mut ordered = ordered.into_iter();
+    let mut ordered = indices
+        .into_iter()
+        .filter_map(|index| match receiver_element(interp, &array, index) {
+            // A hole is skipped, so `[1,,3].reduce(f)` adds two elements.
+            Ok(Some(value)) => Some(Ok((index, value))),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<JsResult<Vec<(usize, Value)>>>()?
+        .into_iter();
     let mut accumulator = match args.get(1) {
         Some(value) if !matches!(value, Value::Undefined) => value.clone(),
         _ => match ordered.next() {
@@ -724,11 +880,18 @@ fn reduce_with(
 
 fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    for index in 0..length {
+        let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
-        }
+        };
         let answer = interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -747,11 +910,18 @@ fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 
 fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    for index in 0..length {
+        let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
-        }
+        };
         let answer = interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -770,11 +940,16 @@ fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
 
 fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
-            continue;
-        }
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    for index in 0..length {
+        let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
         let answer = interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -793,11 +968,16 @@ fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 
 fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
+    // `ToLength(Get(O, "length"))` is read before the callback is validated: a getter on
+    // `length` runs even when the call is about to be refused for a non-callable
+    // callback, and reading it late left `accessed !== true`.
+    let length = receiver_length(interp, &array)?;
     let callback = arg(args, 0);
-    for (index, value) in elements(interp, &array)?.into_iter().enumerate() {
-        if matches!(value, Value::Hole) {
-            continue;
-        }
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    for index in 0..length {
+        let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
         let answer = interp.call_value(
             callback.clone(),
             Value::Undefined,
@@ -815,7 +995,7 @@ fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<
 }
 
 fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let current_len = elements(interp, &array)?.len();
     let value = arg(args, 0);
     let start = normalise(arg_int_or(args, 1, 0) as f64, current_len);
@@ -837,7 +1017,7 @@ fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 // ---------------------------------------------------------------------------
 
 fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let mut current = elements(interp, &array)?;
     let length = current.len();
     let start = normalise(arg_int_or(args, 0, 0) as f64, length);
@@ -861,7 +1041,7 @@ fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
 }
 
 fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let mut current = elements(interp, &array)?;
     current.reverse();
     for (index, value) in current.into_iter().enumerate() {
@@ -875,7 +1055,7 @@ fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
 /// That default is the surprising part of the spec: `[10, 9].sort()` is `[10, 9]`
 /// because `"10" < "9"`. Kept as-is because the reference does the same.
 fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let array = receiver(interp, &this)?;
+    let array = receiver_copy(interp, &this)?;
     let mut current = elements(interp, &array)?;
     let comparator = args
         .first()
@@ -981,10 +1161,23 @@ fn flat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         Some(value) => value.to_number() as i64,
     };
     let mut out = Vec::new();
-    let items = elements(interp, &array)?;
+    let items = receiver_items(interp, &array)?;
     flatten(interp, &items, depth, &mut out)?;
     let result = interp.new_array(out);
     Ok(Value::Object(result))
+}
+
+/// Every element of the receiver, holes included, read through the generic path.
+///
+/// `elements()` answers from the element vector and returns nothing at all for an
+/// array-like, which is why `flat` over `{length: 2, 0: 1, 1: 2}` came back empty.
+fn receiver_items(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Value>> {
+    let length = receiver_length(interp, object)?;
+    let mut out = Vec::with_capacity(length.min(1024));
+    for index in 0..length {
+        out.push(receiver_element(interp, object, index)?.unwrap_or(Value::Hole));
+    }
+    Ok(out)
 }
 
 fn flatten(
@@ -994,6 +1187,10 @@ fn flatten(
     out: &mut Vec<Value>,
 ) -> JsResult<()> {
     for value in source {
+        // A hole stays out of the result: `[1,,3].flat()` is `[1, 3]`.
+        if matches!(value, Value::Hole) {
+            continue;
+        }
         match value.as_object() {
             Some(object) if depth > 0 && object.is_array() => {
                 let nested = elements(interp, object)?;

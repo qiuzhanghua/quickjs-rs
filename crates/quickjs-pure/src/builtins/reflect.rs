@@ -102,8 +102,8 @@ fn define_property(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsR
     }
     // The definition itself is shared with `Object.defineProperty`; only the failure
     // reporting differs, and that is the `false` above.
-    crate::builtins::object::define_property_on(interp, &object, args)?;
-    Ok(Value::Bool(true))
+    let accepted = crate::builtins::object::define_property_on(interp, &object, args)?;
+    Ok(Value::Bool(accepted))
 }
 
 fn delete_property(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {

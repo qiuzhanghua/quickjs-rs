@@ -66,6 +66,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         ("getPrototypeOf", 1, get_prototype_of),
         ("setPrototypeOf", 2, set_prototype_of),
         ("defineProperty", 3, define_property),
+        ("defineProperties", 2, define_properties),
         ("getOwnPropertyNames", 1, get_own_property_names),
         ("getOwnPropertySymbols", 1, get_own_property_symbols),
         ("getOwnPropertyDescriptor", 2, get_own_property_descriptor),
@@ -366,14 +367,20 @@ fn entries(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
 }
 
 fn assign(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let target = arg(args, 0);
-    let Value::Object(target_object) = &target else {
-        return Err(interp.type_error("Object.assign target is not an object"));
-    };
+    // `ToObject(target)`: a primitive target is boxed and the box is returned, so
+    // `Object.assign(1, {a: 1})` answers a Number object. Refusing the primitive
+    // outright was wrong, and it is the shape most `Object.assign` tests use.
+    let target_object = interp.object_from(&arg(args, 0))?;
+    let target = Value::Object(target_object.clone());
     for source in args.iter().skip(1) {
-        let Value::Object(_) = source else {
+        // `ToObject(source)` too: a string source has index properties, so
+        // `Object.assign({}, "ab")` copies `0` and `1`. `null`/`undefined` are skipped
+        // rather than converted, which is the one exception the spec makes here.
+        if matches!(source, Value::Undefined | Value::Null) {
             continue;
-        };
+        }
+        let source_object = interp.object_from(source)?;
+        let source = &Value::Object(source_object);
         // `Object.assign` copies exactly the own enumerable keys, so it goes through
         // `[[OwnPropertyKeys]]` and `[[Get]]` — which is what makes it see a proxy's
         // handler rather than the empty property table behind it.
@@ -382,7 +389,7 @@ fn assign(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Val
                 interp.get_property_key(source.as_object().expect("checked above"), &as_key)?
             {
                 interp.set_property_with_key(
-                    target_object,
+                    &target_object,
                     &as_key,
                     found,
                     crate::interp::DeleteFailure::Throw,
@@ -495,7 +502,50 @@ fn define_property(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsR
     let Value::Object(object) = &target else {
         return Err(interp.type_error("Object.defineProperty target is not an object"));
     };
-    define_property_on(interp, object, args)?;
+    if !define_property_on(interp, object, args)? {
+        return Err(interp.type_error("cannot redefine property"));
+    }
+    Ok(target)
+}
+
+/// `Object.defineProperties(target, descriptors)`.
+///
+/// Missing outright until now, which surfaced as "undefined is not a function" rather than
+/// as an absent feature — a missing method and a broken one look identical from a test.
+/// The descriptors are collected first and applied second, as the spec does, so one that
+/// throws leaves the target untouched.
+fn define_properties(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let target = arg(args, 0);
+    let Value::Object(object) = &target else {
+        return Err(interp.type_error("Object.defineProperties target is not an object"));
+    };
+    let Some(descriptors) = arg(args, 1).as_object().cloned() else {
+        return Err(interp.type_error("Object.defineProperties descriptors is not an object"));
+    };
+    // Collect first, apply second: a descriptor that throws must leave the target alone.
+    let mut pending: Vec<(Value, Value)> = Vec::new();
+    for key in interp.object_own_property_keys(&descriptors)? {
+        // Only the *enumerable* own properties of the descriptor map are used, which is
+        // what makes `Object.defineProperties(o, {a: {...}})` skip a non-enumerable `a`.
+        let enumerable = crate::object::own_property_including_array(&descriptors, &key)
+            .is_some_and(|property| property.enumerable);
+        if !enumerable {
+            continue;
+        }
+        let Some(descriptor) = interp.get_property_key(&descriptors, &key)? else {
+            continue;
+        };
+        let key_value = match &key {
+            PropertyKey::String(text) => interp.string_wtf8(text.clone()),
+            PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
+        };
+        pending.push((key_value, descriptor));
+    }
+    for (key_value, descriptor) in pending {
+        if !define_property_on(interp, object, &[target.clone(), key_value, descriptor])? {
+            return Err(interp.type_error("cannot redefine property"));
+        }
+    }
     Ok(target)
 }
 
@@ -507,23 +557,79 @@ pub fn define_property_on(
     interp: &mut Interp<'_>,
     object: &Gc<JsObject>,
     args: &[Value],
-) -> JsResult<()> {
+) -> JsResult<bool> {
     let key = interp.property_key(&arg(args, 1));
     let Value::Object(descriptor) = arg(args, 2) else {
         return Err(interp.type_error("property descriptor must be an object"));
     };
-    let previous = object.own_property_key(&key);
-    let writable = descriptor_bool(interp, &descriptor, "writable")?.unwrap_or(false);
-    let enumerable = descriptor_bool(interp, &descriptor, "enumerable")?.unwrap_or(false);
-    let configurable = descriptor_bool(interp, &descriptor, "configurable")?.unwrap_or(false);
+    // Array-aware: an element lives in the element vector, so a descriptor that changes
+    // only attributes (`{configurable: false}`) must still see the current value rather
+    // than fall back to `undefined` and blank the element.
+    let previous = crate::object::own_property_including_array(object, &key);
     let getter = interp.get_property(&descriptor, "get")?;
     let setter = interp.get_property(&descriptor, "set")?;
-    let has_accessor = getter
+    // ToPropertyDescriptor: a `get`/`set` that is present must be callable. `undefined`
+    // means "absent" and is allowed, but `get: null` is a TypeError — accepting it stored
+    // a non-callable getter that no read could run.
+    for function in [&getter, &setter].into_iter().flatten() {
+        if !matches!(function, Value::Undefined)
+            && !matches!(function.as_object(), Some(object) if object.is_callable())
+        {
+            return Err(interp.type_error("getter or setter is not callable"));
+        }
+    }
+    let has_get = getter
         .as_ref()
-        .is_some_and(|v| !matches!(v, Value::Undefined))
-        || setter
-            .as_ref()
-            .is_some_and(|v| !matches!(v, Value::Undefined));
+        .is_some_and(|v| !matches!(v, Value::Undefined));
+    let has_set = setter
+        .as_ref()
+        .is_some_and(|v| !matches!(v, Value::Undefined));
+    let has_accessor = has_get || has_set;
+    // Kept for the validation below, which runs after `property` has taken ownership.
+    let requested_getter = getter.clone();
+    let requested_setter = setter.clone();
+    // A descriptor may not be both kinds: `{value: 12, set: f}` is a TypeError, which
+    // `ToPropertyDescriptor` refuses rather than silently preferring one half.
+    if has_accessor
+        && (interp.get_property(&descriptor, "value")?.is_some()
+            || interp.get_property(&descriptor, "writable")?.is_some())
+    {
+        return Err(interp.type_error("cannot have both a value and a getter/setter"));
+    }
+    // An attribute the descriptor does not mention is *kept* when the property already
+    // exists and is of the same kind — `Object.defineProperty({a: 1}, "a", {value: 5})`
+    // leaves `a` writable, enumerable and configurable. Only a brand-new property, or a
+    // switch between a data and an accessor property, defaults the omitted ones to false
+    // (ValidateAndApplyPropertyDescriptor steps 8 and 9). Defaulting everything to false
+    // silently locked a property down on every attribute-only redefine.
+    // The two *generic* attributes are always inherited when the descriptor omits them,
+    // even across a data/accessor conversion: ValidateAndApplyPropertyDescriptor steps 9
+    // and 10 convert the property while keeping `[[Configurable]]` and `[[Enumerable]]`
+    // from the existing one. `writable` and `value` are not generic — an accessor has
+    // neither — so they are only inherited when both sides are data properties.
+    let same_kind = previous
+        .as_ref()
+        .is_some_and(|existing| existing.is_accessor() == has_accessor);
+    let inherited = |named: Option<bool>, pick: fn(&Property) -> bool, across: bool| -> bool {
+        named
+            .or_else(|| previous.as_ref().filter(|_| across || same_kind).map(pick))
+            .unwrap_or(false)
+    };
+    let enumerable = inherited(
+        descriptor_bool(interp, &descriptor, "enumerable")?,
+        |p| p.enumerable,
+        true,
+    );
+    let configurable = inherited(
+        descriptor_bool(interp, &descriptor, "configurable")?,
+        |p| p.configurable,
+        true,
+    );
+    let writable = inherited(
+        descriptor_bool(interp, &descriptor, "writable")?,
+        |p| p.writable,
+        false,
+    );
     // `defineProperty` defaults every attribute to `false` when the descriptor omits
     // it, but keeps the *value* when the descriptor is a pure attribute change.
     let property = if has_accessor {
@@ -552,12 +658,104 @@ pub fn define_property_on(
             setter: None,
         }
     };
+    // An array's `length` is exotic: it is not in the property table, and it has its own
+    // writability. Handled here because only this function knows which descriptor fields
+    // were actually present — `object_define_own_property` receives a filled-in `Property`
+    // and cannot tell `{writable: false}` from `{value: 3, writable: false}`.
+    if object.is_array() && key.as_str() == Some("length") {
+        let requested_value = interp.get_property(&descriptor, "value")?;
+        let requested_writable = descriptor_bool(interp, &descriptor, "writable")?;
+        // `length` may only ever be a non-enumerable data property: it cannot become
+        // configurable, enumerable, or an accessor.
+        if configurable
+            || descriptor_bool(interp, &descriptor, "enumerable")? == Some(true)
+            || (has_get || has_set)
+        {
+            return Ok(false);
+        }
+        if !object.length_writable() {
+            // A read-only `length` refuses both a new value and being made writable again.
+            if requested_writable == Some(true) {
+                return Ok(false);
+            }
+            if requested_value
+                .is_some_and(|value| value.to_number() != object.array_length().unwrap_or(0) as f64)
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+        if let Some(value) = requested_value {
+            let requested = value.to_number();
+            let valid = requested.is_finite()
+                && requested >= 0.0
+                && requested.fract() == 0.0
+                && requested <= u32::MAX as f64;
+            if !valid {
+                return Err(interp.range_error("invalid array length"));
+            }
+            let current = object.array_length().unwrap_or(0);
+            let requested = requested as usize;
+            if requested < current
+                && (requested..current).any(|index| object.element_is_undeletable(index as u32))
+            {
+                return Ok(false);
+            }
+            object.array_set_length(requested);
+        }
+        if let Some(writable) = requested_writable {
+            object.set_length_writable(writable);
+        }
+        return Ok(true);
+    }
+    // A new property may not appear on a non-extensible object.
+    if previous.is_none() && !object.is_extensible() {
+        return Ok(false);
+    }
+    // ValidateAndApplyPropertyDescriptor: a non-configurable property may not be
+    // redefined, except to the same values. Without this every redefine "succeeded" and
+    // silently overwrote a property the script had locked.
+    if let Some(existing) = &previous
+        && !existing.configurable
+    {
+        let kind_changed = existing.is_accessor() != property.is_accessor();
+        let attribute_changed = enumerable != existing.enumerable
+            || configurable
+            || (kind_changed)
+            || (property.is_accessor()
+                // A getter/setter may only change while the property is configurable;
+                // defining the *same* one again is not a change.
+                && ((has_get
+                    && !requested_getter
+                        .as_ref()
+                        .is_some_and(|f| existing.getter.as_ref().is_some_and(|e| e.same_value(f))))
+                    || (has_set
+                        && !requested_setter.as_ref().is_some_and(|f| existing
+                            .setter
+                            .as_ref()
+                            .is_some_and(|e| e.same_value(f))))));
+        let data_changed = !kind_changed
+            && existing.is_accessor() == property.is_accessor()
+            && !existing.writable
+            && (writable
+                // `SameValue`, not `===`: redefining a frozen `NaN` property with `NaN`
+                // is not a change, because `SameValue(NaN, NaN)` holds.
+                || property.value.as_ref().is_some_and(|value| {
+                    !existing
+                        .value
+                        .as_ref()
+                        .is_some_and(|old| old.same_value(value))
+                }));
+        if attribute_changed || data_changed {
+            // `false`, not a throw: the two entry points disagree about reporting, and
+            // `Reflect.defineProperty` must answer `false` where `Object.defineProperty`
+            // raises. The conversion happens in the callers.
+            return Ok(false);
+        }
+    }
     // A proxy decides through `defineProperty`, and a refusal is a `TypeError` here
     // because `Object.defineProperty` reports failure that way.
-    if !interp.object_define_own_property(object, &key, property)? {
-        return Err(interp.type_error("proxy 'defineProperty' refused"));
-    }
-    Ok(())
+    interp.object_define_own_property(object, &key, property)
 }
 /// One boolean field of a property descriptor, or `None` when it is absent.
 fn descriptor_bool(
@@ -664,8 +862,10 @@ fn freeze(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
     let target = arg(args, 0);
     if let Some(object) = target.as_object() {
         object.set_extensible(false);
-        // Array elements are not in the property table, so they carry their own flag.
+        // Array elements and `length` are not in the property table, so they carry their
+        // own flags; freezing sets both.
         object.set_elements_writable(false);
+        object.set_length_writable(false);
         let names = object.own_keys();
         for name in names {
             let key = PropertyKey::from(name);
