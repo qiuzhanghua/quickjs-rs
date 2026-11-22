@@ -12,6 +12,7 @@
 //!   test suite asserts on `instanceof` and on `e.name`.
 
 mod array;
+pub mod bigint;
 pub(crate) mod date;
 pub mod disposable;
 mod error;
@@ -63,6 +64,7 @@ pub fn install(interp: &mut Interp<'_>) {
     array::install(interp, &array_proto);
     string::install(interp, &string_proto);
     number::install(interp, &number_proto);
+    bigint::install(interp, &object_proto);
     math::install(interp);
     json::install(interp);
     reflect::install(interp);

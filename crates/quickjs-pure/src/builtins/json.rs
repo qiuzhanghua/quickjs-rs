@@ -71,6 +71,9 @@ fn write_value(
     match value {
         // A symbol serialises to nothing, exactly like `undefined`: `JSON.stringify`
         // drops it from an object and answers `undefined` for it at the top level.
+        // A bigint has no JSON form, and the spec makes that an error rather than a
+        // silent omission — losing a number is not the same as losing `undefined`.
+        Value::BigInt(_) => Err(interp.type_error("BigInt value can't be serialized in JSON")),
         Value::Undefined
         | Value::Symbol(_)
         | Value::Uninitialized

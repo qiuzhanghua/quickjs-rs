@@ -555,6 +555,11 @@ pub enum Value {
     Object(Gc<JsObject>),
     /// A symbol: a unique property key that is not a string.
     Symbol(Gc<JsSymbol>),
+    /// A `BigInt`: an integer of any size, stored on the GC heap.
+    ///
+    /// A separate variant rather than a number because the two never mix: `1n + 1` is a
+    /// `TypeError`, and `1n === 1` is false.
+    BigInt(Gc<crate::bigint::BigInt>),
     /// A try-handler target, pushed by `catch` and scanned for when an exception
     /// is raised.
     ///
@@ -655,6 +660,7 @@ impl Value {
             Value::Int(_) | Value::Float(_) => "number",
             Value::String(_) => "string",
             Value::Symbol(_) => "symbol",
+            Value::BigInt(_) => "bigint",
             Value::Object(object) => {
                 if object.is_callable() {
                     "function"
@@ -682,6 +688,8 @@ impl Value {
             Value::String(s) => !s.wtf8().is_empty(),
             // Every symbol is truthy, even the one with no description.
             Value::Symbol(_) => true,
+            // …and so is every bigint, including `0n`.
+            Value::BigInt(_) => true,
             // Every object is truthy, including `new Boolean(false)`.
             Value::Object(_) => true,
             Value::Uninitialized
@@ -706,9 +714,10 @@ impl Value {
             Value::Int(i) => *i as f64,
             Value::Float(f) => *f,
             Value::String(s) => string_to_number(&s.to_string_lossy()),
-            // `ToNumber` of a symbol is a `TypeError`; `NaN` keeps this infallible
-            // helper total, and the arithmetic operators reject symbols first.
+            // `ToNumber` of a symbol or a bigint is a `TypeError`; `NaN` keeps this
+            // infallible helper total, and the operators reject them first.
             Value::Symbol(_) => f64::NAN,
+            Value::BigInt(_) => f64::NAN,
             // `ToNumber` of an object runs `ToPrimitive` first, which needs the
             // value-of/valueOf machinery; until that lands an object is `NaN`
             // rather than a panic.
@@ -747,6 +756,7 @@ impl Value {
             // Lossy only for a string with an unpaired surrogate, which has no `&str`
             // form at all; every other string borrows and copies nothing extra.
             Value::String(s) => s.to_string_lossy().into_owned(),
+            Value::BigInt(big) => big.to_decimal_string(),
             // `ToString` of a symbol is a `TypeError`; this descriptive form is what
             // `String(sym)` and the error messages use. Callers that must throw go
             // through `Interp::checked_to_string`.
@@ -770,6 +780,9 @@ impl Value {
                 a == b
             }
             (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
+            // Two bigints compare by value, because the representation is canonical —
+            // `2n ** 1000n` computed twice is one value, not two handles.
+            (Value::BigInt(a), Value::BigInt(b)) => **a == **b,
             // A symbol is equal only to itself: the same description means nothing.
             (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             // Objects compare by identity, never structurally.
@@ -796,6 +809,27 @@ impl Value {
             (Value::String(a), Value::String(b)) => a.as_str() == b.as_str(),
             (Value::Symbol(a), Value::Symbol(b)) => a.ptr_eq(b),
             (Value::Bool(a), Value::Bool(b)) => a == b,
+            // A bigint equals another bigint by value, a string that spells it exactly, or a
+            // number with the same mathematical value — that last one is why `1n == 1` is
+            // true while `1n === 1` is false.
+            (Value::BigInt(a), Value::BigInt(b)) => **a == **b,
+            (Value::BigInt(a), Value::String(b)) | (Value::String(b), Value::BigInt(a)) => {
+                crate::bigint::BigInt::from_string(&b.to_string_lossy()).as_ref() == Some(&**a)
+            }
+            (Value::BigInt(a), other) => match other {
+                Value::Int(_) | Value::Float(_) => {
+                    let number = other.to_number();
+                    number.is_finite() && number == a.to_f64() && number.fract() == 0.0
+                }
+                _ => false,
+            },
+            (other, Value::BigInt(_)) => match other {
+                Value::Int(_) | Value::Float(_) => {
+                    let number = other.to_number();
+                    number.is_finite() && number.fract() == 0.0 && number == self.to_number()
+                }
+                _ => false,
+            },
             // Everything else compares numerically, which covers `"1" == 1`,
             // `true == 1` and `Int` against `Float`.
             _ => self.to_number() == other.to_number(),
@@ -817,6 +851,9 @@ impl Value {
             // A symbol stays distinct from a string here so `==` does not treat it as
             // one; only an object's `ToPrimitive` can produce a symbol from an object.
             Value::Symbol(s) => Primitive::Symbol(s.clone()),
+            // A bigint reaches `Primitive` as its decimal text, which is enough for the
+            // loose comparisons that go through here; the operators reject it first.
+            Value::BigInt(big) => Primitive::String(big.to_decimal_string()),
             Value::Object(_) => Primitive::String(self.to_js_string()),
             Value::Uninitialized
             | Value::Hole
@@ -1054,6 +1091,7 @@ impl fmt::Debug for Value {
             Value::String(s) => write!(f, "{:?}", s.as_str()),
             Value::Object(_) => f.write_str("[object]"),
             Value::Symbol(s) => f.write_str(&s.to_display_string()),
+            Value::BigInt(big) => write!(f, "{}n", big.to_decimal_string()),
             Value::Uninitialized => f.write_str("<uninitialised>"),
             Value::Hole => f.write_str("<hole>"),
             Value::CatchOffset(offset) => write!(f, "<catch {offset}>"),

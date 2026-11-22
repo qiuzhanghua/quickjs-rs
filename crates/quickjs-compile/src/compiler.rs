@@ -3137,6 +3137,7 @@ impl Compiler {
             ExprKind::Bool(false) => self.emit(Opcode::PushFalse, &[]),
             ExprKind::Null => self.emit(Opcode::Null, &[]),
             ExprKind::String(text) => self.push_string(text),
+            ExprKind::BigInt { digits, radix } => self.push_bigint(digits, *radix),
             ExprKind::Ident(name) => self.emit_var(VarAction::Get, &name.name),
             ExprKind::This => self.this_expression(),
             ExprKind::NewTarget => self.new_target_expression(),
@@ -3851,6 +3852,26 @@ impl Compiler {
             return;
         }
         let index = self.push_constant(Constant::Number(value));
+        self.emit(Opcode::PushConst, &[Op::Const(index)]);
+    }
+
+    /// Push a `BigInt` literal.
+    ///
+    /// A value that fits an `i32` uses the immediate form, which is what the reference
+    /// emits too; anything larger goes into the constant pool, because the operand of
+    /// `push_bigint` is only four bytes wide.
+    fn push_bigint(&mut self, digits: &str, radix: u32) {
+        if radix == 10
+            && let Ok(value) = digits.parse::<i64>()
+            && (i32::MIN as i64..=i32::MAX as i64).contains(&value)
+        {
+            self.emit(Opcode::PushBigintI32, &[Op::Int(value as i32)]);
+            return;
+        }
+        let index = self.push_constant(Constant::BigInt {
+            digits: digits.to_string(),
+            radix,
+        });
         self.emit(Opcode::PushConst, &[Op::Const(index)]);
     }
 

@@ -107,6 +107,8 @@ pub struct Realm {
     pub number_proto: Option<Gc<JsObject>>,
     /// `Boolean.prototype`.
     pub boolean_proto: Option<Gc<JsObject>>,
+    /// `BigInt.prototype`.
+    pub bigint_proto: Option<Gc<JsObject>>,
     /// `Error.prototype`, the prototype of every error instance.
     pub error_proto: Gc<JsObject>,
     /// `Date.prototype`, so the constructor can build an instance in the
@@ -490,6 +492,7 @@ impl<'a> Interp<'a> {
                 string_proto: None,
                 number_proto: None,
                 boolean_proto: None,
+                bigint_proto: None,
                 error_proto: JsObject::ordinary(heap, None),
                 date_proto: JsObject::ordinary(heap, None),
                 generator_proto: JsObject::ordinary(heap, None),
@@ -524,6 +527,13 @@ impl<'a> Interp<'a> {
     // -- allocation helpers -------------------------------------------------
 
     /// A new string value.
+    /// A `BigInt` value from a computed big integer.
+    pub fn bigint(&self, value: crate::bigint::BigInt) -> Value {
+        Value::BigInt(Gc::new(self.heap, value))
+    }
+
+    /// A string value from bytes that are already WTF-8, which is how a string with an
+    /// unpaired surrogate reaches a `Value`.
     pub fn string_wtf8(&self, text: crate::value::Wtf8) -> Value {
         Value::string_wtf8(self.heap, text)
     }
@@ -3053,6 +3063,12 @@ impl<'a> Interp<'a> {
                 self.push(Value::Int(value));
             }
             PushI8 | PushI16 | PushI32 => self.push(Value::Int(a as i32)),
+            PushBigintI32 => {
+                // The immediate form of a `BigInt` literal; the reference has the same
+                // split between this and a constant-pool entry.
+                let value = crate::bigint::BigInt::from_i64(a as i64);
+                self.push(self.bigint(value));
+            }
             PushTrue => self.push(Value::Bool(true)),
             PushFalse => self.push(Value::Bool(false)),
             PushEmptyString => self.push(self.string("")),
@@ -3404,16 +3420,35 @@ impl<'a> Interp<'a> {
             // -- arithmetic -------------------------------------------------
             Add => self.binary_add()?,
             Sub | Mul | Div | Mod | Pow | And | Or | Xor | Shl | Sar | Shr => {
-                let raw = self.pop();
-                let right = self.numeric(raw)?;
-                let raw = self.pop();
-                let left = self.numeric(raw)?;
-                self.push(arithmetic(op, left, right)?);
+                let raw_right = self.pop();
+                let raw_left = self.pop();
+                // BigInt arithmetic is a separate path, and not only for the type of the
+                // result: `ToNumber` of a bigint throws, so mixing the two must be an error
+                // rather than a silent conversion.
+                if matches!(raw_left, Value::BigInt(_)) || matches!(raw_right, Value::BigInt(_)) {
+                    let left = self.primitive_of(raw_left)?;
+                    let right = self.primitive_of(raw_right)?;
+                    let value = self.bigint_arithmetic(op, left, right)?;
+                    self.push(value);
+                } else {
+                    let right = self.numeric(raw_right)?;
+                    let left = self.numeric(raw_left)?;
+                    self.push(arithmetic(op, left, right)?);
+                }
             }
             Neg => {
                 let raw = self.pop();
-                let value = self.numeric(raw)?;
-                self.push(negate(value));
+                match raw {
+                    // A bigint negates exactly, however wide it is.
+                    Value::BigInt(big) => {
+                        let negated = big.negate();
+                        self.push(self.bigint(negated));
+                    }
+                    other => {
+                        let value = self.numeric(other)?;
+                        self.push(negate(value));
+                    }
+                }
             }
             Plus => {
                 let value = self.pop();
@@ -3448,8 +3483,17 @@ impl<'a> Interp<'a> {
             }
             Not => {
                 let raw = self.pop();
-                let value = self.numeric(raw)?;
-                self.push(Value::Int(!value.to_int32()));
+                match raw {
+                    // `~x` on a bigint is `-x - 1`, exact at any width.
+                    Value::BigInt(big) => {
+                        let inverted = big.bitnot();
+                        self.push(self.bigint(inverted));
+                    }
+                    other => {
+                        let value = self.numeric(other)?;
+                        self.push(Value::Int(!value.to_int32()));
+                    }
+                }
             }
             Lnot => {
                 let value = self.pop();
@@ -3460,7 +3504,8 @@ impl<'a> Interp<'a> {
             Lt | Lte | Gt | Gte => {
                 let right = self.pop();
                 let left = self.pop();
-                self.push(compare(op, left, right, self));
+                let answer = self.relational(op, left, right);
+                self.push(answer);
             }
             Eq | Neq => {
                 let right = self.pop();
@@ -4184,6 +4229,18 @@ impl<'a> Interp<'a> {
         Ok(match &constant {
             Some(Constant::Number(number)) => Value::Float(*number),
             Some(Constant::String(text)) => self.string(text.clone()),
+            Some(Constant::BigInt { digits, radix }) => {
+                match crate::bigint::BigInt::from_radix(digits, *radix) {
+                    Some(big) => self.bigint(big),
+                    // A literal the parser accepted is always parseable; a failure here
+                    // would be a compiler bug, so it reads as an `InternalError`.
+                    None => {
+                        return Err(Signal::Throw(
+                            self.make_error("InternalError", "unparseable bigint literal"),
+                        ));
+                    }
+                }
+            }
             Some(Constant::Function(_)) => {
                 return Err(Signal::Throw(
                     self.make_error("InternalError", "a bare function constant"),
@@ -4404,12 +4461,140 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The operand of a `BigInt` operation, or the `TypeError` that mixing raises.
+    fn bigint_operand(&self, value: &Value, op: Opcode) -> JsResult<crate::bigint::BigInt> {
+        match value {
+            Value::BigInt(big) => Ok((**big).clone()),
+            _ => Err(Signal::Throw(self.make_error(
+                "TypeError",
+                &format!(
+                    "cannot mix BigInt and other types, use explicit conversions ({})",
+                    op.name()
+                ),
+            ))),
+        }
+    }
+
+    /// Arithmetic where at least one operand is a `BigInt`.
+    ///
+    /// The two numeric types never mix, so a bigint paired with anything else is an error
+    /// rather than a conversion: `1n + 1` throws, and so does `1n < 1` only in the sense
+    /// that the relational operators handle it separately.
+    fn bigint_arithmetic(&mut self, op: Opcode, left: Value, right: Value) -> JsResult<Value> {
+        use Opcode::*;
+        let a = self.bigint_operand(&left, op)?;
+        let b = self.bigint_operand(&right, op)?;
+        let result = match op {
+            Add => a.add(&b),
+            Sub => a.sub(&b),
+            Mul => a.mul(&b),
+            Div | Mod => {
+                let Some((quotient, remainder)) = a.div_rem(&b) else {
+                    return Err(Signal::Throw(
+                        self.make_error("RangeError", "division by zero"),
+                    ));
+                };
+                if op == Div { quotient } else { remainder }
+            }
+            Pow => {
+                let Some(value) = a.pow(&b) else {
+                    return Err(Signal::Throw(self.make_error(
+                        "RangeError",
+                        "BigInt exponent must be non-negative and not absurdly large",
+                    )));
+                };
+                value
+            }
+            And => a.bitand(&b),
+            Or => a.bitor(&b),
+            Xor => a.bitxor(&b),
+            Shl | Sar => {
+                // A shift count is a `BigInt` here, and both directions are exact; a
+                // negative count would be the other direction, which the spec forbids.
+                let Some(count) = b.to_i64() else {
+                    return Err(Signal::Throw(
+                        self.make_error("RangeError", "BigInt shift count is too large"),
+                    ));
+                };
+                if count < 0 {
+                    return Err(Signal::Throw(self.make_error(
+                        "RangeError",
+                        "BigInt shift count must be non-negative",
+                    )));
+                }
+                if op == Shl {
+                    a.shl(count as u64)
+                } else {
+                    a.shr(count as u64)
+                }
+            }
+            // `>>>` is defined only for 32-bit integers, so a bigint has no unsigned shift.
+            _ => {
+                return Err(Signal::Throw(self.make_error(
+                    "TypeError",
+                    "BigInts have no unsigned right shift, use >> instead",
+                )));
+            }
+        };
+        Ok(self.bigint(result))
+    }
+
+    /// `<`, `<=`, `>`, `>=`, which accept a `BigInt` and a Number alongside each other.
+    ///
+    /// Unlike arithmetic, relation is defined across the two numeric types: the comparison
+    /// is on the mathematical values, and nothing is rounded first.
+    fn relational(&mut self, op: Opcode, left: Value, right: Value) -> Value {
+        use Opcode::*;
+        let ordering = match (&left, &right) {
+            (Value::String(a), Value::String(b)) => {
+                Some(a.to_string_lossy().cmp(&b.to_string_lossy()))
+            }
+            (Value::BigInt(a), Value::BigInt(b)) => Some(a.cmp(b)),
+            // A bigint against a number compares the *mathematical* values, so `2n < 2.5`
+            // is true even though `2.5` has no bigint form.
+            (Value::BigInt(a), other) if !matches!(other, Value::BigInt(_)) => {
+                let b = other.to_number();
+                if b.is_nan() {
+                    None
+                } else {
+                    compare_bigint_and_f64(a, b)
+                }
+            }
+            (other, Value::BigInt(b)) if !matches!(other, Value::BigInt(_)) => {
+                let a = other.to_number();
+                if a.is_nan() {
+                    None
+                } else {
+                    compare_bigint_and_f64(b, a).map(std::cmp::Ordering::reverse)
+                }
+            }
+            _ => left.to_number().partial_cmp(&right.to_number()),
+        };
+        let _ = self;
+        let answer = match (op, ordering) {
+            (_, None) => false,
+            (Lt, Some(ordering)) => ordering.is_lt(),
+            (Lte, Some(ordering)) => ordering.is_le(),
+            (Gt, Some(ordering)) => ordering.is_gt(),
+            (Gte, Some(ordering)) => ordering.is_ge(),
+            _ => false,
+        };
+        Value::Bool(answer)
+    }
+
     fn binary_add(&mut self) -> JsResult<()> {
         let right = self.pop();
         let left = self.pop();
         // `+` concatenates when either operand is a string *after* `ToPrimitive`.
         let left = self.primitive_of(left)?;
         let right = self.primitive_of(right)?;
+        // The two numeric types never mix, and `+` is no exception: `1n + 1` is an error,
+        // not a conversion.
+        if matches!(left, Value::BigInt(_)) || matches!(right, Value::BigInt(_)) {
+            let value = self.bigint_arithmetic(Opcode::Add, left, right)?;
+            self.push(value);
+            return Ok(());
+        }
         if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
             // `ToString` on both sides, which rejects a symbol: `"" + Symbol()` is a
             // `TypeError`, the one place a symbol and a string do not mix.
@@ -4609,6 +4794,9 @@ impl<'a> Interp<'a> {
                 // A symbol's methods live on `Symbol.prototype`, reached the same way —
                 // `sym.description` reads through the prototype, not off the symbol.
                 Value::Symbol(_) => self.realm.symbol_proto.clone(),
+                // …and a bigint's on `BigInt.prototype`, which is how
+                // `(255n).toString(16)` reaches its method.
+                Value::BigInt(_) => self.realm.bigint_proto.clone(),
                 _ => None,
             };
             if let Some(prototype) = prototype
@@ -5472,6 +5660,12 @@ impl Printer<'_, '_> {
             | Value::CatchOffset(_)
             | Value::ReturnAddress(_) => self.out.push_str("undefined"),
             Value::Symbol(symbol) => self.out.push_str(&symbol.to_display_string()),
+            // The printer writes a bigint the way the language spells one, so a dump is
+            // unambiguous about which kind of number it is showing.
+            Value::BigInt(big) => {
+                self.out.push_str(&big.to_decimal_string());
+                self.out.push('n');
+            }
             Value::Null => self.out.push_str("null"),
             Value::Bool(true) => self.out.push_str("true"),
             Value::Bool(false) => self.out.push_str("false"),
@@ -5792,27 +5986,44 @@ fn decrement(value: Value) -> Value {
     }
 }
 
-/// The relational operators.
+/// Compare a `BigInt` with an `f64` on their mathematical values.
 ///
-/// Strings compare by UTF-16 code unit when both sides are strings, which is why
-/// `"10" < "9"` is true.
-fn compare(op: Opcode, left: Value, right: Value, interp: &Interp<'_>) -> Value {
-    use Opcode::*;
-    let ordering = if let (Value::String(a), Value::String(b)) = (&left, &right) {
-        Some(a.to_string_lossy().cmp(&b.to_string_lossy()))
-    } else {
-        let (a, b) = (left.to_number(), right.to_number());
-        // Any comparison involving `NaN` is false, which `partial_cmp` expresses.
-        a.partial_cmp(&b)
-    };
-    let _ = interp;
-    let answer = match (op, ordering) {
-        (_, None) => false,
-        (Lt, Some(ordering)) => ordering.is_lt(),
-        (Lte, Some(ordering)) => ordering.is_le(),
-        (Gt, Some(ordering)) => ordering.is_gt(),
-        (Gte, Some(ordering)) => ordering.is_ge(),
-        _ => false,
-    };
-    Value::Bool(answer)
+/// Neither side is rounded to the other's precision: the number is split into its integer
+/// part (compared as an exact bigint) and its fraction, which is what decides the answer
+/// when the integer parts are equal. An infinite value is larger than every bigint.
+fn compare_bigint_and_f64(big: &crate::bigint::BigInt, number: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if number.is_nan() {
+        return None;
+    }
+    if number.is_infinite() {
+        return Some(if number > 0.0 {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+    let truncated = number.trunc();
+    // A number wider than `i128` still has an exact integer part, but no bigint form we can
+    // build cheaply; the sign of the difference is all that is needed, so compare against
+    // the bigint's own magnitude instead.
+    if truncated.abs() >= 1.7e38 {
+        let big_as_f64 = big.to_f64();
+        return big_as_f64.partial_cmp(&number);
+    }
+    let integer = crate::bigint::BigInt::from_f64_truncated(truncated);
+    match big.cmp(&integer) {
+        Ordering::Equal => {
+            // Same integer part: the fraction decides, and a negative number's fraction is
+            // below the integer (`-1.5` truncates to `-1`).
+            if number > truncated {
+                Some(Ordering::Less)
+            } else if number < truncated {
+                Some(Ordering::Greater)
+            } else {
+                Some(Ordering::Equal)
+            }
+        }
+        other => Some(other),
+    }
 }

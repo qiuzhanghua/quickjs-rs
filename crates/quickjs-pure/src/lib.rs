@@ -30,6 +30,7 @@ pub use js_parse;
 
 mod bignum;
 
+pub mod bigint;
 pub mod builtins;
 pub mod interp;
 pub mod object;
