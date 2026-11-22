@@ -1948,3 +1948,101 @@ fn disposable_stack_moves_through_the_intrinsic_prototype() {
         "body,inner\n"
     );
 }
+
+#[test]
+fn boxed_primitives_report_their_own_tag() {
+    // `Object(sym)` is a real wrapper: `valueOf` hands the symbol back and the object tags
+    // as a Symbol rather than an Object.
+    assert_eq!(
+        eval(
+            "var s = Symbol('aaa'); var b = Object(s);\n\
+              print(b.valueOf() === s, b.toString(), typeof b, Object.prototype.toString.call(b))"
+        ),
+        "true Symbol(aaa) object [object Symbol]\n"
+    );
+    assert_eq!(
+        eval(
+            "print(Object.prototype.toString.call('x'),\n\
+                   Object.prototype.toString.call(1),\n\
+                   Object.prototype.toString.call(true),\n\
+                   Object.prototype.toString.call({}))"
+        ),
+        "[object String] [object Number] [object Boolean] [object Object]\n"
+    );
+}
+
+#[test]
+fn generator_resumes_after_calling_a_function() {
+    // A generator body that calls an ordinary function must survive the call: the callee's
+    // `return` ends *its* frame, not the generator's. Getting this wrong is silent — the
+    // generator reports the callee's value as its own result and marks itself done.
+    assert_eq!(
+        eval(
+            "function *f() { var r = yield 1; return 3 }\n\
+             function *g() { var r = yield 1; (function () {}()); return 3 }\n\
+             function *h() { var r = yield 1; return r }\n\
+             var a = f(); a.next(); var ra = a.next(9);\n\
+             var b = g(); b.next(); var rb = b.next(9);\n\
+             var c = h(); c.next(); var rc = c.next(9);\n\
+             print(ra.value, ra.done, rb.value, rb.done, rc.value, rc.done)"
+        ),
+        "3 true 3 true 9 true\n"
+    );
+    // A throw from a called function still reaches the generator's own `catch`.
+    assert_eq!(
+        eval(
+            "function boom() { throw new Error('boom') }\n\
+             function *a() { try { yield 1; boom() } catch (e) { yield 'caught:' + e.message } }\n\
+             var g = a(); g.next(); var v = g.next();\n\
+             print(v.value, v.done)"
+        ),
+        "caught:boom false\n"
+    );
+}
+
+#[test]
+fn regexp_unicode_mode_and_case_folding() {
+    // `u` tightens the grammar: `{`, `}` and `]` must be escaped, unlike Annex B, where
+    // they are ordinary literals.
+    for pattern in ["aaa]", "a}", "a{"] {
+        assert!(
+            throws(&format!("new RegExp({pattern:?}, 'u')")).starts_with("SyntaxError"),
+            "{pattern} should be a SyntaxError under u"
+        );
+        assert_eq!(
+            eval(&format!(
+                "try {{ new RegExp({pattern:?}); print('ok') }} catch (e) {{ print(e.name) }}"
+            )),
+            "ok
+",
+            "{pattern} is a literal without u"
+        );
+    }
+    // `\b` is backspace inside a class and a word boundary outside it.
+    assert_eq!(
+        eval("print(/[\\b]/.test('\\b'), /\\b/.test('a'))"),
+        "true true\n"
+    );
+    // Property escapes, and the case folding that applies to them.
+    assert_eq!(
+        eval("print('aAbBcC#4'.replace(/\\p{Lower}/gu, 'X'))"),
+        "XAXBXC#4\n"
+    );
+    assert_eq!(
+        eval("print('aAbBcC#4'.replace(/\\p{Upper}/gui, 'X'))"),
+        "XXXXXX#4\n"
+    );
+    // Negation applies to the *set*, then the character is canonicalised — so `\P{Lower}`
+    // matches `a` under `i`, because `a` canonicalises to the `A` that is in the complement.
+    assert_eq!(
+        eval("print('aAbBcC#4'.replace(/\\P{Lower}/gui, 'X'))"),
+        "XXXXXXXX\n"
+    );
+    // A case-insensitive range has to fold both sides, not only the input.
+    assert_eq!(eval("print(/[A-Z]/i.test('a'))"), "true\n");
+    // …without breaking a range whose bounds do not survive folding.
+    assert_eq!(
+        eval("print(/[A-_]/.test('a'), /[A-_]/.test('^'))"),
+        "false true\n"
+    );
+}

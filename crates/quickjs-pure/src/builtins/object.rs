@@ -125,6 +125,22 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             "Generator" => "Generator".to_string(),
             "RegExp" => "RegExp".to_string(),
             other => {
+                // A boxed primitive reports the primitive's own tag: `Object(sym)` is
+                // `[object Symbol]`, not `[object Object]`. `_value` is precisely the "this
+                // object is a box" marker, and nothing else uses it — a Date keeps its
+                // timestamp in `_date_value`.
+                if let Some(boxed) = object.own_property("_value").and_then(|p| p.value) {
+                    let tag = match boxed {
+                        Value::Bool(_) => Some("Boolean"),
+                        Value::String(_) => Some("String"),
+                        Value::Int(_) | Value::Float(_) => Some("Number"),
+                        Value::Symbol(_) => Some("Symbol"),
+                        _ => None,
+                    };
+                    if let Some(tag) = tag {
+                        return tag.to_string();
+                    }
+                }
                 // An arguments object, a RegExp and so on are distinguished by an
                 // internal tag; `_class` carries it for the classes that have one
                 // (Date, the error classes), and everything else answers `Object`,

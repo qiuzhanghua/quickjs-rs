@@ -98,6 +98,24 @@ impl Matcher<'_> {
         }
     }
 
+    /// Whether `c` is in a character class's ranges.
+    ///
+    /// Case-insensitive matching has to fold *both* sides of the comparison, which
+    /// `chars_equal` does for literals. A range is not a
+    /// single character, so it is folded at its bounds: `[A-Z]` folds to `a`..`z` and
+    /// therefore matches `a`. The folded form is only used while it is still ordered —
+    /// `[A-_]` has a non-letter upper bound, and folding `A` to `a` would put the bound
+    /// *below* `_`, so the unfolded comparison stays authoritative for that range.
+    fn in_class(&self, c: char, ranges: &[(char, char)]) -> bool {
+        let folded = self.fold(c);
+        ranges.iter().any(|(lo, hi)| {
+            (*lo..=*hi).contains(&c) || (*lo..=*hi).contains(&folded) || {
+                let (folded_lo, folded_hi) = (self.fold(*lo), self.fold(*hi));
+                folded_lo <= folded_hi && (folded_lo..=folded_hi).contains(&folded)
+            }
+        })
+    }
+
     /// Match a sequence of nodes, calling `k` at each position the whole sequence can end.
     fn seq(
         &self,
@@ -133,16 +151,32 @@ impl Matcher<'_> {
                 _ => false,
             },
             Node::Class(negated, ranges) => match self.at(position) {
+                Some(c) if self.in_class(c, ranges) != *negated => k(position + 1, caps),
+                _ => false,
+            },
+            Node::Property { kind, negated } => match self.at(position) {
+                // Case-insensitive matching canonicalises the character before the property
+                // is consulted, and negation applies to the *set*, not to the result: `\P
+                // {Lower}` is "everything that is not a lowercase letter", which contains
+                // `A` — so `/[\P{Lower}]/ui` matches `a`, because `a` canonicalises to `A`.
+                // That is why the negated flag sits inside the "any variant" test instead of
+                // outside it. Both fold directions are tried, because simple case folding
+                // does not pair every character symmetrically.
                 Some(c) => {
-                    let folded = self.fold(c);
-                    let inside = ranges
-                        .iter()
-                        .any(|(lo, hi)| (*lo..=*hi).contains(&folded) || (*lo..=*hi).contains(&c));
-                    if inside != *negated {
-                        k(position + 1, caps)
-                    } else {
-                        false
+                    let mut candidates = vec![c];
+                    if self.flags.ignore_case {
+                        candidates.push(self.fold(c));
+                        if let Some(upper) = c.to_uppercase().next() {
+                            candidates.push(upper);
+                        }
+                        if let Some(lower) = c.to_lowercase().next() {
+                            candidates.push(lower);
+                        }
                     }
+                    let holds = candidates
+                        .into_iter()
+                        .any(|candidate| kind.holds(candidate) != *negated);
+                    if holds { k(position + 1, caps) } else { false }
                 }
                 None => false,
             },

@@ -37,17 +37,20 @@ struct Parser {
     chars: Vec<char>,
     pos: usize,
     groups: usize,
+    /// Whether the `u` flag is set, which turns several Annex B liberties into syntax
+    /// errors. See [`Parser::annex_b_char`].
+    unicode: bool,
 }
 
 /// Parse `source` with `flags`.
 pub fn parse(source: &str, flags: crate::regexp::Flags) -> Result<Parsed, PatternError> {
-    // `flags` reaches the matcher through the compiled [`Regex`], not the parser: nothing
-    // in the syntax depends on them except the semantic decisions the matcher makes.
-    let _ = flags;
+    // `u` is the one flag the *syntax* depends on: it decides whether the Annex B
+    // liberties below are allowed at all.
     let mut parser = Parser {
         chars: source.chars().collect(),
         pos: 0,
         groups: 0,
+        unicode: flags.unicode,
     };
     let node = parser.disjunction(0)?;
     if parser.pos < parser.chars.len() {
@@ -132,11 +135,25 @@ impl Parser {
             '*' | '+' | '?' => Err(self.error("nothing to repeat")),
             ')' => Err(self.error("unmatched ')'")),
             _ => {
-                // A lone `{` that is not a quantifier is literal; `}` is always literal.
                 self.pos += 1;
-                Ok(Node::Char(c))
+                Ok(Node::Char(self.annex_b_char(c)?))
             }
         }
+    }
+
+    /// A character that only the Annex B grammar lets stand alone.
+    ///
+    /// Outside a character class, `{`, `}` and `]` are ordinary literals in a sloppy
+    /// pattern — that is the web-compatibility grammar, and `/a]/` matches `a]`. Under `u`
+    /// (or `v`) the grammar is the strict one, where those three must be escaped or be
+    /// part of a real construct, so `/a]/u` is a `SyntaxError`. Reporting it is what the
+    /// reference does, and a pattern that silently means something different under `u` than
+    /// the spec says is worse than one that refuses to compile.
+    fn annex_b_char(&self, c: char) -> Result<char, PatternError> {
+        if self.unicode && matches!(c, '{' | '}' | ']') {
+            return Err(self.error(&format!("lone '{c}' in unicode mode")));
+        }
+        Ok(c)
     }
 
     fn quantifier(&mut self, term: Node) -> Result<Node, PatternError> {
@@ -305,6 +322,10 @@ impl Parser {
                 self.pos += 1;
                 Ok(Node::Class(class_for(c).0, class_for(c).1))
             }
+            'p' | 'P' => {
+                self.pos += 1;
+                self.property_escape(c == 'P')
+            }
             '1'..='9' => {
                 let start = self.pos;
                 while matches!(self.peek(), Some(d) if d.is_ascii_digit()) {
@@ -336,9 +357,42 @@ impl Parser {
         }
     }
 
+    /// `\p{Name}` or `\P{Name}`, with the `p`/`P` consumed.
+    ///
+    /// The property escapes are part of the strict (`u`) grammar: without `u`, `\p` is an
+    /// identity escape for the letter `p` and the `{…}` that follows is ordinary text. That
+    /// is why the flag is checked here rather than the construct being rejected outright.
+    fn property_escape(&mut self, negated: bool) -> Result<Node, PatternError> {
+        if !self.unicode {
+            // Annex B: `\p` is an identity escape for `p`, and the `{…}` that follows is
+            // read as ordinary text. The `p` is already consumed.
+            return Ok(Node::Char(if negated { 'P' } else { 'p' }));
+        }
+        if !self.eat('{') {
+            return Err(self.error("expecting '{' after \\p"));
+        }
+        let start = self.pos;
+        while matches!(self.peek(), Some(c) if c != '}') {
+            self.pos += 1;
+        }
+        if !self.eat('}') {
+            return Err(self.error("expecting '}' after property name"));
+        }
+        let name: String = self.chars[start..self.pos - 1].iter().collect();
+        let kind = super::PropertyKind::from_name(&name)
+            .ok_or_else(|| self.error(&format!("unsupported property name '{name}'")))?;
+        Ok(Node::Property { kind, negated })
+    }
+
     /// The character a `\x` escape stands for, with `c` already consumed.
+    ///
+    /// `escape_char` is only reached from inside a character class and from
+    /// [`Parser::atom_escape`]'s fallback, which is why `\b` means backspace here: outside a
+    /// class it never gets this far, because `atom_escape` reads it as a word boundary
+    /// first.
     fn escape_char(&mut self, c: char) -> Result<char, PatternError> {
         Ok(match c {
+            'b' => '\u{8}',
             'n' => '\n',
             'r' => '\r',
             't' => '\t',
@@ -451,6 +505,11 @@ impl Parser {
                 }
                 Ok(ClassAtom::Set(ranges))
             }
+            // A property escape is a set, not a range, and a class atom can only be one or
+            // the other. Refusing beats reading `\p` as the letter `p`, which is what the
+            // Annex B fallback below would otherwise do — silently, and with the wrong
+            // meaning.
+            'p' | 'P' => Err(self.error("property escapes inside [...] are not supported")),
             _ => {
                 self.pos += 1;
                 let ch = self.escape_char(e)?;

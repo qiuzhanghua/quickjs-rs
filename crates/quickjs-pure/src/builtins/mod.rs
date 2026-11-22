@@ -177,6 +177,17 @@ pub fn this_object(interp: &mut Interp<'_>, this: &Value) -> crate::interp::JsRe
             );
             Ok(boxed)
         }
+        // A symbol boxes like any other primitive, which is what makes `Object(sym)` a
+        // `Symbol` object whose `valueOf` hands the symbol back.
+        Value::Symbol(_) => {
+            let proto = interp.realm.symbol_proto.clone();
+            let boxed = interp.new_object(proto);
+            boxed.define(
+                "_value",
+                Property::with_attributes(this.clone(), false, false),
+            );
+            Ok(boxed)
+        }
         _ => Err(interp.type_error("cannot convert value to object")),
     }
 }

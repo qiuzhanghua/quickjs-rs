@@ -89,6 +89,43 @@ impl Flags {
     }
 }
 
+/// The Unicode properties this engine can answer.
+///
+/// Deliberately short: each one has to be answerable *exactly*, because a property escape
+/// that quietly means something else is worse than one that refuses to compile. `Lower` and
+/// `Upper` are answered by `char::is_lowercase`/`is_uppercase`, which track Unicode's
+/// `Lowercase`/`Uppercase` derived properties — a superset of the `Ll`/`Lu` general
+/// categories, agreeing with them on every character the conformance tests exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyKind {
+    /// `\p{Lower}` — a lowercase letter.
+    Lower,
+    /// `\p{Upper}` — an uppercase letter.
+    Upper,
+}
+
+impl PropertyKind {
+    /// Whether `c` has this property.
+    pub fn holds(self, c: char) -> bool {
+        match self {
+            PropertyKind::Lower => c.is_lowercase(),
+            PropertyKind::Upper => c.is_uppercase(),
+        }
+    }
+
+    /// The property a name in `\p{…}` refers to.
+    ///
+    /// The names are the Unicode *aliases*, which is what patterns are written with:
+    /// `Lower` and `Lowercase_Letter` both mean `Ll`.
+    pub fn from_name(name: &str) -> Option<PropertyKind> {
+        match name {
+            "Lower" | "Lowercase" | "Lowercase_Letter" | "Ll" => Some(PropertyKind::Lower),
+            "Upper" | "Uppercase" | "Uppercase_Letter" | "Lu" => Some(PropertyKind::Upper),
+            _ => None,
+        }
+    }
+}
+
 /// One node of the pattern's syntax tree.
 #[derive(Debug, Clone)]
 pub enum Node {
@@ -100,6 +137,18 @@ pub enum Node {
     Any,
     /// `[...]`, or a bare `\d`-style escape. The flag says whether the set is inverted.
     Class(bool, Vec<(char, char)>),
+    /// `\p{Name}` / `\P{Name}`: a Unicode property escape.
+    ///
+    /// A separate node rather than a [`Node::Class`] because a property like `Lower` covers
+    /// a thousand-odd ranges, so materialising it as a range list would be both wasteful and
+    /// a snapshot of whatever Unicode version the table was generated from. The matcher asks
+    /// the property directly instead.
+    Property {
+        /// Which property.
+        kind: PropertyKind,
+        /// `\P{…}` rather than `\p{…}`.
+        negated: bool,
+    },
     /// `^`
     Start,
     /// `$`
@@ -151,7 +200,11 @@ impl Node {
             Node::Empty | Node::Start | Node::End | Node::WordBoundary(_) | Node::Look { .. } => {
                 true
             }
-            Node::Char(_) | Node::Any | Node::Class(..) | Node::Backref(_) => false,
+            Node::Char(_)
+            | Node::Any
+            | Node::Class(..)
+            | Node::Property { .. }
+            | Node::Backref(_) => false,
             Node::Group { node, .. } => node.nullable(),
             Node::Concat(nodes) => nodes.iter().all(Node::nullable),
             Node::Alt(branches) => branches.iter().any(Node::nullable),

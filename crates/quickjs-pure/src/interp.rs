@@ -2563,10 +2563,16 @@ impl<'a> Interp<'a> {
             }
         }
 
+        // Only the generator's *own* frame ends the generator. The body may call ordinary
+        // functions, and those push frames of their own: a `Step::Return` from one of them
+        // is a nested call finishing, not the generator completing. Miscounting that is
+        // silent — the generator reports the callee's value as its own result and marks
+        // itself done — so the depth comparison is load-bearing, not defensive.
+        let own_frame = depth + 1;
         loop {
             match self.step() {
                 Ok(Step::Continue) => {}
-                Ok(Step::Suspend(reason)) => {
+                Ok(Step::Suspend(reason)) if self.frames.len() == own_frame => {
                     let mut frame = self.frames.pop().expect("a frame is live");
                     // `yield` left the value on the stack; `initial_yield` left nothing.
                     let yielded = if reason == SuspendKind::Initial {
@@ -2585,22 +2591,59 @@ impl<'a> Interp<'a> {
                     // one — which is why the third field says "already a result".
                     return Ok((yielded, false, reason == SuspendKind::YieldStar));
                 }
+                Ok(Step::Suspend(_)) => {
+                    // A `yield` in a frame other than the generator's would mean a
+                    // generator body entered as an ordinary call, which
+                    // `call_or_push` prevents.
+                    self.unwind_to(depth);
+                    state.phase = GeneratorPhase::Completed;
+                    return Err(Signal::Throw(self.make_error(
+                        "InternalError",
+                        "a generator body ran as an ordinary call",
+                    )));
+                }
                 Ok(Step::Return(value)) => {
                     self.frames.pop();
+                    if self.frames.len() > depth {
+                        // A nested call finished: hand the value back to its caller and
+                        // keep running the generator body.
+                        self.frames
+                            .last_mut()
+                            .expect("a caller is live")
+                            .stack
+                            .push(value);
+                        continue;
+                    }
                     state.phase = GeneratorPhase::Completed;
                     // The reference closes the generator's closure variables here; ours
                     // live in cells the frame owned, which the drop below releases.
                     return Ok((value, true, false));
                 }
                 Err(Signal::Throw(exception)) => {
-                    self.frames.pop();
-                    state.phase = GeneratorPhase::Completed;
-                    return Err(Signal::Throw(exception));
+                    // The frame that threw gets the first chance to catch, exactly as in
+                    // the ordinary call loop; a frame above the generator's is popped and
+                    // the exception carries on down.
+                    let exception = exception;
+                    loop {
+                        if self.frames.len() <= depth {
+                            // The generator's own frame is gone, so nothing here caught it.
+                            state.phase = GeneratorPhase::Completed;
+                            return Err(Signal::Throw(exception));
+                        }
+                        if self.catch_here(exception.clone()).is_some() {
+                            break;
+                        }
+                        self.frames.pop();
+                    }
                 }
                 Err(Signal::OutOfMemory) => return Err(Signal::OutOfMemory),
             }
-            let _ = depth;
         }
+    }
+
+    /// Pop frames until `depth` are left.
+    fn unwind_to(&mut self, depth: usize) {
+        self.frames.truncate(depth);
     }
     fn call_or_push(
         &mut self,

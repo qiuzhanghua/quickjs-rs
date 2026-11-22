@@ -170,8 +170,17 @@ fn key_for(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
 fn this_symbol(interp: &Interp<'_>, this: &Value) -> JsResult<Gc<JsSymbol>> {
     match this {
         Value::Symbol(symbol) => Ok(symbol.clone()),
-        // A boxed symbol (`Object(sym)`) would unwrap here once `[[SymbolData]]` exists;
-        // nothing produces one yet.
+        // `Object(sym)` boxes the symbol, and `valueOf`/`toString` have to reach through
+        // the box — that is the whole point of the wrapper.
+        Value::Object(object) => match object
+            .own_property("_value")
+            .and_then(|property| property.value)
+        {
+            Some(Value::Symbol(symbol)) => Ok(symbol),
+            _ => Err(Signal::Throw(
+                interp.make_error("TypeError", "not a symbol"),
+            )),
+        },
         _ => Err(Signal::Throw(
             interp.make_error("TypeError", "not a symbol"),
         )),
@@ -194,8 +203,10 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
 }
 
 /// `Symbol.prototype.valueOf`, which answers the symbol itself.
-fn value_of(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(this)
+fn value_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    // Unwrap the box, so `Object(sym).valueOf()` hands back the symbol itself — the
+    // counterpart of `Symbol.prototype.toString`, which needs the same unwrapping.
+    Ok(Value::Symbol(this_symbol(interp, &this)?))
 }
 
 /// `Symbol.prototype[Symbol.toPrimitive]`.
