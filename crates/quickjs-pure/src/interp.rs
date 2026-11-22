@@ -1231,6 +1231,26 @@ impl<'a> Interp<'a> {
     /// same frame-detach-and-resume the generator protocol uses, so this reuses it rather
     /// than growing a second state machine. The difference is only in the ending — a
     /// `return` fulfils the caller's promise here instead of producing `{value, done}`.
+    /// Run `code` as an async function body, answering the promise it settles.
+    ///
+    /// Used for a module with top-level `await`: its body is an async function whose
+    /// caller is the host, so there is no function object to pass through
+    /// [`Interp::new_async_function`].
+    pub fn run_async_body(
+        &mut self,
+        code: Gc<CompiledCode>,
+        env: Gc<ClosureEnv>,
+    ) -> JsResult<Value> {
+        let promise = self.new_promise();
+        let coroutine = self.new_coroutine_from(code, env, Value::Undefined, Vec::new())?;
+        if let Err(Signal::Throw(reason)) =
+            self.drive_async(&coroutine, &promise, ResumeKind::Start, Value::Undefined)
+        {
+            self.reject_promise(&promise, reason);
+        }
+        Ok(Value::Object(promise))
+    }
+
     fn new_coroutine(
         &mut self,
         function: Value,
@@ -1243,6 +1263,18 @@ impl<'a> Interp<'a> {
         let Some((code, env)) = bytecode_of(&object) else {
             return Err(self.type_error("not a function"));
         };
+        self.new_coroutine_from(code, env, this, args)
+    }
+
+    /// Build a coroutine over an already-resolved body.
+    fn new_coroutine_from(
+        &mut self,
+        code: Gc<CompiledCode>,
+        env: Gc<ClosureEnv>,
+        this: Value,
+        args: Vec<Value>,
+    ) -> JsResult<Gc<JsObject>> {
+        let function = Value::Undefined;
         self.push_frame(code, env, this, args, function)?;
         let frame = self.frames.pop().expect("push_frame just pushed it");
         let state = GeneratorState {
@@ -7547,6 +7579,30 @@ impl<'a> Interp<'a> {
             object: iterator,
             next,
         })
+    }
+
+    /// Drain anything with a `Symbol.iterator` method, or answer `None` when the value is
+    /// not iterable.
+    ///
+    /// Shared so that `Array.from`, the `Promise` combinators and `for…of` all agree on
+    /// what "iterable" means. A `Map` and a `Set` have no `length`, so an array-like-only
+    /// reader silently produced an empty array for both — `Array.from(new Set([1,2]))`
+    /// was `[]`.
+    pub fn iterable_values(&mut self, value: &Value) -> JsResult<Option<Vec<Value>>> {
+        let key = self.realm.well_known_key(WellKnown::Iterator);
+        let method = self.read_field_key(value, &key)?;
+        if !matches!(&method, Value::Object(object) if object.is_callable()) {
+            return Ok(None);
+        }
+        let iterator = self.get_iterator(value)?;
+        let mut out = Vec::new();
+        loop {
+            let (element, done) = self.iterator_step(&iterator)?;
+            if done {
+                return Ok(Some(out));
+            }
+            out.push(element);
+        }
     }
 
     /// One step of an internal iterator: the value and whether it is exhausted.

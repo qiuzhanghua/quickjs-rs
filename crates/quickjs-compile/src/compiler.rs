@@ -505,6 +505,12 @@ struct FnState {
     eval_sites: Vec<EvalSite>,
     /// Direct `eval` call sites seen so far: where, and the block that was current.
     pending_eval_sites: Vec<(Span, u64, bool)>,
+    /// Whether this body contains `await`.
+    ///
+    /// For a *module* this decides whether its body is an async function: top-level
+    /// `await` makes the whole graph's evaluation asynchronous, which is why the flag has
+    /// to survive to the compiled function rather than being a local of the compiler.
+    has_await: bool,
     /// The module tables, when this body is a module.
     ///
     /// Only the top-level state ever has one: `export` and `import` are top-level
@@ -608,6 +614,7 @@ impl FnState {
             created_in_params: false,
             eval_sites: Vec::new(),
             pending_eval_sites: Vec::new(),
+            has_await: false,
             module: None,
             self_name_initialized: false,
             leaves_value: false,
@@ -725,6 +732,13 @@ impl Compiler {
             // A module has no completion value; its body simply ends.
             self.emit(Opcode::Undefined, &[]);
             self.emit(Opcode::ReturnAsync, &[]);
+            // Top-level `await` makes the body an async function, so the host runs it as
+            // a coroutine and waits. Without this the `await` opcode would suspend in a
+            // body that nothing knows how to resume — which is what "a generator body ran
+            // as an ordinary call" was reporting.
+            if self.cur().has_await {
+                self.state().kind = FunctionKind::Async;
+            }
         } else {
             // The program's value is whatever the last expression statement stored in
             // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common
@@ -1339,7 +1353,7 @@ impl Compiler {
                 self.try_stmt(stmt, block, handler, finalizer.as_deref())?;
             }
             StmtKind::ForIn { left, right, body } => {
-                self.for_in_of(stmt, left, right, body, ForLoopKind::In)?;
+                self.for_in_of(stmt, left, right, body, ForLoopKind::In, labels)?;
             }
             StmtKind::ForOf {
                 left,
@@ -1352,7 +1366,7 @@ impl Compiler {
                 } else {
                     ForLoopKind::Of
                 };
-                self.for_in_of(stmt, left, right, body, kind)?;
+                self.for_in_of(stmt, left, right, body, kind, labels)?;
             }
             StmtKind::With { object, body } => self.with_stmt(object, body)?,
             StmtKind::ClassDecl(class) => self.class_definition(class, false)?,
@@ -2949,6 +2963,7 @@ impl Compiler {
         right: &Expr,
         body: &Stmt,
         kind: ForLoopKind,
+        labels: &[String],
     ) -> Result<(), SyntaxError> {
         self.reset_value();
 
@@ -2974,7 +2989,10 @@ impl Compiler {
         self.emit_jump(Opcode::Goto, test, &[]);
 
         self.push_jump_target(JumpTarget {
-            names: Vec::new(),
+            // `outer: for (x of xs) … break outer` needs the name here. Without it the
+            // loop had no label to break to, and the compiler reported "break has no
+            // enclosing loop" for a loop that was plainly enclosing it.
+            names: labels.to_vec(),
             break_label: Some(break_target),
             continue_label: Some(test),
             // Passing through the loop has to dispose of its record. A `for`/`of`
@@ -3023,6 +3041,7 @@ impl Compiler {
                 // The reference's shape: step, `await` the result, then unpack it.
                 self.emit(Opcode::ForAwaitOfNext, &[Op::Int(0)]);
                 self.emit(Opcode::Await, &[]);
+                self.state().has_await = true;
                 self.emit(Opcode::IteratorGetValueDone, &[]);
             }
         }
@@ -4565,6 +4584,7 @@ impl Compiler {
     fn await_expression(&mut self, argument: &Expr) -> Result<(), SyntaxError> {
         self.expr(argument)?;
         self.emit(Opcode::Await, &[]);
+        self.state().has_await = true;
         Ok(())
     }
 

@@ -48,3 +48,38 @@ fn runtime_can_run_the_collector() {
     let stats = rt.run_gc();
     assert_eq!((stats.before, stats.collected, stats.after), (0, 0, 0));
 }
+
+/// Run `source` and answer what it printed.
+fn run_output(source: &str) -> String {
+    let rt = quickjs::Runtime::new();
+    let mut ctx = quickjs::Context::new(&rt);
+    ctx.eval(source)
+        .unwrap_or_else(|error| panic!("{source:?} failed: {error}"));
+    ctx.output().to_string()
+}
+
+#[test]
+fn a_label_on_a_for_of_loop_can_be_broken_and_continued() {
+    // The target a `break label` reaches is recorded on the loop's jump target, and the
+    // `for…of`/`for…in` compiler did not pass the label names through — so a labelled
+    // loop reported "break has no enclosing loop" about a loop that plainly enclosed it.
+    assert_eq!(
+        run_output(
+            r#"
+var log = [];
+outer: for (const i of [1, 2, 3]) {
+  for (const j of [1, 2]) {
+    if (j === 2) continue outer;
+    if (i === 3) break outer;
+    log.push(i + ":" + j);
+  }
+}
+a: for (const k in {x: 1, y: 2}) { break a }
+var n = 0;
+b: while (true) { n++; if (n > 2) break b }
+print(log.join(" ") + " n=" + n);
+"#
+        ),
+        "1:1 2:1 n=3\n"
+    );
+}

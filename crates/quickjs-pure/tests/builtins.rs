@@ -2491,3 +2491,40 @@ fn regexp_code_point_escapes_and_code_unit_offsets() {
         "0\n"
     );
 }
+
+#[test]
+fn a_sets_default_iterator_yields_values_not_entries() {
+    // A `Map` iterates `[key, value]` pairs and a `Set` iterates its values. Wiring both
+    // to `entries` made `[...new Set([3])]` produce `[[3, 3]]` — one pair — which reads
+    // like a working iterator until you look at the elements.
+    assert_eq!(
+        eval(
+            r#"
+print([...new Set([3])].join());
+print([...new Set([1,2,2,3])].join());
+for (const v of new Set(["a"])) print("v:" + v);
+print([...new Map([["k", 1]])].join("|"));
+"#
+        ),
+        "3\n1,2,3\nv:a\nk,1\n"
+    );
+}
+
+#[test]
+fn array_from_reads_an_iterable_not_only_an_array_like() {
+    // A `Map` and a `Set` have no `length`, so an array-like-only reader answered `[]`
+    // for both — the wrong answer rather than an error.
+    assert_eq!(
+        eval(
+            r#"
+print(JSON.stringify(Array.from(new Set([1,2]))));
+print(JSON.stringify(Array.from(new Map([[1,2]]))));
+print(JSON.stringify(Array.from("ab")));
+print(JSON.stringify(Array.from([1,2])));
+print(JSON.stringify(Array.from({length: 2, 0: "x", 1: "y"})));
+print(JSON.stringify(Array.from(new Set([1,2]), v => v * 10)));
+"#
+        ),
+        "[1,2]\n[[1,2]]\n[\"a\",\"b\"]\n[1,2]\n[\"x\",\"y\"]\n[10,20]\n"
+    );
+}

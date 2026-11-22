@@ -328,3 +328,68 @@ fn import_meta_names_the_module_and_marks_the_entry() {
         "file:///m/lib.js\nfalse\nfile:///m/main.js\n"
     );
 }
+
+#[test]
+fn top_level_await_makes_evaluation_asynchronous() {
+    // A module body with top-level `await` is compiled as an async function, so the host
+    // runs it as a coroutine and waits. Without that the `await` suspends in a body
+    // nothing knows how to resume — which surfaced as "a generator body ran as an
+    // ordinary call", an internal error rather than a wrong answer.
+    assert_eq!(
+        run(&[(
+            "main.js",
+            r#"
+const v = await Promise.resolve(7);
+print("awaited:" + v);
+export const out = v;
+"#
+        ),]),
+        "awaited:7\n"
+    );
+}
+
+#[test]
+fn a_dependency_with_top_level_await_is_waited_for() {
+    // The parent has no `await` of its own, but its dependency does: the graph's
+    // evaluation is still asynchronous, so the parent's body must not run until the
+    // dependency has settled.
+    assert_eq!(
+        run(&[
+            (
+                "main.js",
+                "import { ready } from \"./dep.js\";\nprint(\"main sees: \" + ready);\n"
+            ),
+            (
+                "dep.js",
+                "const p = Promise.resolve(\"ready\");\nawait p;\n\
+                 print(\"dep done\");\nexport const ready = \"ready\";\n"
+            ),
+        ]),
+        "dep done\nmain sees: ready\n"
+    );
+}
+
+#[test]
+fn a_rejection_at_the_top_level_stops_the_module() {
+    let text = fails(&[(
+        "main.js",
+        "await Promise.reject(new Error(\"top-level\"));\nprint(\"never\");\n",
+    )]);
+    assert!(text.contains("top-level"), "unexpected error: {text}");
+}
+
+#[test]
+fn a_caught_top_level_rejection_continues() {
+    assert_eq!(
+        run(&[(
+            "main.js",
+            r#"
+try { await Promise.reject(new Error("caught-here")) } catch (e) {
+  print("caught:" + e.message);
+}
+print("after");
+"#
+        )]),
+        "caught:caught-here\nafter\n"
+    );
+}

@@ -228,7 +228,7 @@ crates/
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 反汇编输出可读；往返稳定 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | ✅ 能跑递归/fib/数组/闭包脚本 |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/栈回溯） | ✅ M4 范围内 `test_builtin.js` 全通过；`Date` 未做 |
-| M5 ✅ | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | 已完成：`test_language.js`、`test_closure.js` 全部通过；`Promise`/async/`for await`/async generator 就位 |
+| M5 ✅ | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | 已完成：`test_language.js`、`test_closure.js` 全部通过；`Promise`/async/`for await`/async generator 就位。**残留**：私有类字段（`#x`）编译器明确报错，19 个私有 opcode 已定义、VM 未实现 |
 | M6 ✅ | 模块系统 + 动态 import + JSON 模块 | 已完成：`test_cyclic_import.js`、`hello_module.js` 与参考**逐字节一致**；循环导入、live binding、`export *`、`with { type }`、`import.meta`、`import()` 全对拍 |
 | M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
 | M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | test262 对应目录达标 |

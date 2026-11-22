@@ -44,8 +44,35 @@ v0.3.0 之前是"把模块变量当全局"的占位。剩下的全是"谁填这�
 新增覆盖：`crates/quickjs-pure/tests/module.rs`（9 个用例，内存加载器，不碰文件系统）、
 conformance 里整文件跑 `test_cyclic_import.js` + `hello_module.js` + 循环三文件用例。
 
+### 修：三个静默错答案（都在扫"真实程序能不能跑"时撞出来的）
+
+推进 M6 之后拿一段普通业务代码去跑，暴露出三处**给错答案却不报错**的实现，
+和之前几轮那类"字节码不同"的问题不是一回事：
+
+* **`Set` 的默认迭代器接成了 `entries`。** `Map` 迭代 `[key, value]` 对，`Set` 迭代
+  值——两个集合共用了同一个 `Symbol.iterator` 安装函数，于是
+  `[...new Set([3])]` 得到 `[[3, 3]]`（一个 pair）而不是 `[3]`。
+* **`Array.from` 只认字符串和 array-like。** `Map`/`Set` 没有 `length`，于是
+  `Array.from(new Set([1,2]))` 返回 `[]`——错答案，不是报错。改为先走
+  `Symbol.iterator`，落后才按 array-like 读。
+* **`break label` 在 `for…of` / `for…in` 上失效。** 循环的跳转目标要记住它被哪些
+  标签命名，而 `for_in_of` 没接收这些名字，把 `names` 写死成空——于是
+  `outer: for (const x of xs) … break outer` 报 "break has no enclosing loop"，
+  说的却是一个明明包围它的循环。`for(;;)` 一直是对的，所以没人发现。
+
+### 加：模块的顶层 `await`
+
+`await` 出现在模块顶层时（现在很常见：`const db = await connect()`），模块体要编成
+async 函数、由宿主当协程跑完再继续。此前模块体恒为普通函数，一挂起就报
+`InternalError: a generator body ran as an ordinary call`——`hello_module.js` 不含 TLA，
+所以 M6 的验收物没照到这条。依赖带 TLA、父模块不带的情况也覆盖了。
+
 ### 已知差异（记录，不隐藏）
 
+* **私有类字段（`#x`）未实现。** 编译器报 `private class fields are not supported by
+  the compiler yet`，19 个 `private_*` opcode 已在 `opcode.rs` 定义但 VM 没有实现。
+  FR-1/FR-3 把它算在 M5 范围内，所以 M5 的"完成"有这一处残留——v0.3.0 发布时
+  写的"M5 完成"是过度断言。它是**响亮失败**，不会给错答案。
 * **通用语法错误的输出格式不同。** 参考是 `SyntaxError: <消息>` 加一行
   `    at <file>:<line>:<col>`；我们是 `<file>: <line>: <col>: <消息>`，且列号有时偏向
   词法起点。与模块无关，早就存在，因为差分套件只比 stdout 与退出码所以一直没暴露。

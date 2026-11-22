@@ -733,14 +733,52 @@ impl<'a> Interp<'a> {
         // The hoisted bindings already exist: `link_module` ran the prologue pass with a
         // truthy `this`, which is what the guard in the compiled prefix detects. Here the
         // receiver is `undefined`, so the body itself runs.
+        //
+        // A body with top-level `await` is compiled as an async function, so it answers a
+        // promise instead of a value. The evaluation is then driven to completion here:
+        // draining the queue is what advances the coroutine, and there is nothing else
+        // pending at this point, since module evaluation is what started it.
+        let async_body = code.code.kind.is_async();
         self.module_stack.push(name);
-        let result = self.execute(code, env, Value::Undefined, Vec::new(), Value::Undefined);
+        let result = if async_body {
+            self.run_async_body(code, env)
+                .and_then(|promise| self.await_module_promise(promise))
+        } else {
+            self.execute(code, env, Value::Undefined, Vec::new(), Value::Undefined)
+        };
         self.module_stack.pop();
         result.map(|_| ()).inspect_err(|_| {
             // A body that threw leaves the module unevaluated, so a later import of it
             // retries rather than silently reporting success.
             module.with_mut(|r| r.status = ModuleStatus::Linked);
         })
+    }
+
+    /// Drive a module's own promise to a settled state.
+    ///
+    /// `js_execute_sync_module` in the reference does the same thing and calls a pending
+    /// promise an error ("promise is pending"); draining first is the difference, and it
+    /// is correct here because nothing else can be waiting: this runs before the host has
+    /// been given control, and the only queued jobs are the ones this body queued for
+    /// itself.
+    fn await_module_promise(&mut self, promise: Value) -> JsResult<Value> {
+        let Value::Object(promise) = promise else {
+            return Ok(Value::Undefined);
+        };
+        self.drain_jobs()?;
+        let state = self.promise_state(&promise);
+        let Some(state) = state else {
+            return Ok(Value::Undefined);
+        };
+        let status = state.borrow().status.clone();
+        match status {
+            crate::object::PromiseStatus::Fulfilled(value) => Ok(value),
+            crate::object::PromiseStatus::Rejected(reason) => Err(Signal::Throw(reason)),
+            crate::object::PromiseStatus::Pending => Err(Signal::Throw(self.make_error(
+                "TypeError",
+                "promise is pending: top-level await never settled",
+            ))),
+        }
     }
 
     /// `import(specifier)`: load, link, evaluate — asynchronously.

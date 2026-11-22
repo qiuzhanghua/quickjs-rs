@@ -56,7 +56,7 @@ fn install_map(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         define_method(&proto, name, length, func, interp);
     }
     install_size(&proto, interp);
-    install_iterable(&proto, interp);
+    install_iterable(&proto, interp, true);
     interp.realm.map_proto = Some(proto);
     let global = interp.realm.global.clone();
     global.define(
@@ -89,7 +89,7 @@ fn install_set(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         define_method(&proto, name, length, func, interp);
     }
     install_size(&proto, interp);
-    install_iterable(&proto, interp);
+    install_iterable(&proto, interp, false);
     interp.realm.set_proto = Some(proto);
     let global = interp.realm.global.clone();
     global.define(
@@ -113,10 +113,20 @@ fn install_size(proto: &Gc<JsObject>, interp: &Interp<'_>) {
 }
 
 /// `Symbol.iterator`, plus the `Symbol.toStringTag` the tag question needs.
-fn install_iterable(proto: &Gc<JsObject>, interp: &mut Interp<'_>) {
-    let entries_fn = method(interp, "[Symbol.iterator]", 0, entries).expect("a method");
+///
+/// The default iterator differs by collection, and it is easy to get wrong in a way that
+/// looks almost right: a `Map` iterates `[key, value]` pairs (the same as `entries`), but
+/// a `Set` iterates its *values*. Wiring both to `entries` made `[...new Set([3])]`
+/// produce `[[3, 3]]` — one pair — instead of `[3]`.
+fn install_iterable(proto: &Gc<JsObject>, interp: &mut Interp<'_>, is_map: bool) {
+    let func = if is_map {
+        entries as crate::object::NativeFn
+    } else {
+        values
+    };
+    let iterator_fn = method(interp, "[Symbol.iterator]", 0, func).expect("a method");
     let key = interp.realm.well_known_key(WellKnown::Iterator);
-    proto.define_key(&key, Property::data(entries_fn));
+    proto.define_key(&key, Property::data(iterator_fn));
 }
 
 /// A collection's entries, named so the signatures below stay readable.

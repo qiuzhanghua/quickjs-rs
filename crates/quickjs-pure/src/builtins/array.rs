@@ -121,8 +121,11 @@ fn is_array(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 fn from(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let source = arg(args, 0);
     let mut out = Vec::new();
-    // A string is iterable and yields its characters; an array-like has a length.
-    if let Value::String(text) = &source {
+    // An iterable is read through `Symbol.iterator` first: a `Map` and a `Set` have no
+    // `length`, so the array-like branch below finds nothing in them.
+    if let Some(values) = interp.iterable_values(&source)? {
+        out = values;
+    } else if let Value::String(text) = &source {
         for point in text.wtf8().code_points() {
             out.push(interp.string_wtf8(point));
         }
