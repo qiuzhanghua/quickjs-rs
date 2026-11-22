@@ -258,12 +258,24 @@ pub struct ObjectData {
     /// non-writable element is recorded in the property table instead, which is what
     /// `Object.defineProperty(a, "3", {configurable: false})` does.
     pub elements_writable: bool,
+    /// The object a method was defined on, which is what `super` resolves against.
+    ///
+    /// Kept here rather than as a property because it is not observable: the spec calls
+    /// it `[[HomeObject]]` and no script can read it, so putting it in the property
+    /// table would leak it to `Object.getOwnPropertyNames` and `JSON.stringify`.
+    pub home_object: Option<Gc<JsObject>>,
+    /// Whether this function is a class constructor, which may not be called without
+    /// `new`.
+    pub class_constructor: bool,
 }
 
 impl Trace for ObjectData {
     fn trace(&self, tracer: &mut Tracer) {
         if let Some(proto) = &self.proto {
             tracer.visit(proto);
+        }
+        if let Some(home) = &self.home_object {
+            tracer.visit(home);
         }
         for (_, property) in &self.props {
             property.trace(tracer);
@@ -289,6 +301,8 @@ impl JsObject {
                 kind,
                 extensible: true,
                 elements_writable: true,
+                home_object: None,
+                class_constructor: false,
             }),
         }
     }
@@ -347,6 +361,26 @@ impl JsObject {
     /// Replace the prototype.
     pub fn set_proto(&self, proto: Option<Gc<JsObject>>) {
         self.data.borrow_mut().proto = proto;
+    }
+
+    /// The object a method was defined on, for `super` to resolve against.
+    pub fn home_object(&self) -> Option<Gc<JsObject>> {
+        self.data.borrow().home_object.clone()
+    }
+
+    /// Record the object a method was defined on.
+    pub fn set_home_object(&self, home: Option<Gc<JsObject>>) {
+        self.data.borrow_mut().home_object = home;
+    }
+
+    /// Whether this is a class constructor.
+    pub fn is_class_constructor(&self) -> bool {
+        self.data.borrow().class_constructor
+    }
+
+    /// Mark this function as a class constructor.
+    pub fn set_class_constructor(&self, yes: bool) {
+        self.data.borrow_mut().class_constructor = yes;
     }
 
     /// The elements of an array object, if this is one.

@@ -1159,3 +1159,127 @@ fn eval_inherits_the_callers_this_and_new_target() {
         "true\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Classes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn class_members_land_on_the_right_object() {
+    // Methods and accessors go on the prototype, `static` ones on the constructor —
+    // and none of them is enumerable, which is the whole difference from an object
+    // literal.
+    assert_eq!(eval("class A{m(){return 1}} print(new A().m())"), "1\n");
+    assert_eq!(eval("class A{static s(){return 2}} print(A.s())"), "2\n");
+    assert_eq!(eval("class A{get g(){return 3}} print(new A().g)"), "3\n");
+    assert_eq!(
+        eval("class A{m(){}} print(Object.keys(A.prototype).length)"),
+        "0\n"
+    );
+    // `static` is a legal method *name* as well as a modifier.
+    assert_eq!(
+        eval(
+            "class P{get=()=>'123'; static(){return 42}} var p=new P(); print(p.get(),p.static())"
+        ),
+        "123 42\n"
+    );
+    // A class constructor may not be called without `new`.
+    assert_eq!(
+        eval("class A{} try{A()}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+}
+
+#[test]
+fn a_class_binds_its_own_name_inside_the_body() {
+    assert_eq!(
+        eval("var E1=class E{static F(){return E}}; print(E1===E1.F())"),
+        "true\n"
+    );
+    assert_eq!(
+        eval("class A{static m(){return A}} print(A.m()===A)"),
+        "true\n"
+    );
+    // The static field initialiser sees the class too — and inside a *function*, where the
+    // binding is a closure variable rather than a local.
+    assert_eq!(
+        eval("class S{static x=42;static y=S.x;static z=this.x} print(S.x,S.y,S.z)"),
+        "42 42 42\n"
+    );
+    assert_eq!(
+        eval("function f(){class S{static x=42;static y=S.x} return S.y} print(f())"),
+        "42\n"
+    );
+}
+
+#[test]
+fn extends_inherits_both_chains() {
+    assert_eq!(
+        eval("class A{f(){return 1}} class B extends A{} print(new B().f())"),
+        "1\n"
+    );
+    // The instance must be a `new.target` instance, so a derived constructor's `super()`
+    // has to build an object of the *subclass* prototype.
+    assert_eq!(
+        eval("class A{constructor(){this.v=1}} class B extends A{} print(new B().v)"),
+        "1\n"
+    );
+    assert_eq!(
+        eval(
+            "class A{constructor(){this.v=1}} class B extends A{} class C extends B{} print(new C().v)"
+        ),
+        "1\n"
+    );
+    // `new` on a bound function constructs its target, so the instance is a target one.
+    assert_eq!(
+        eval(
+            "function C(a){this.x=a} var g=C.bind(null,1); var r=new g(); print(r.x, r instanceof C)"
+        ),
+        "1 true\n"
+    );
+}
+
+#[test]
+fn super_reads_writes_and_calls_through_the_home_object() {
+    assert_eq!(
+        eval("class A{f(){return 1}} class B extends A{h(){return super.f()}} print(new B().h())"),
+        "1\n"
+    );
+    assert_eq!(
+        eval(
+            "class A{static F(){return -1}} class B extends A{static H(){return super['F']()}} print(B.H())"
+        ),
+        "-1\n"
+    );
+    // A getter found on the parent prototype runs with the *instance* as `this`.
+    assert_eq!(
+        eval(
+            "class A{get g(){return this.v}} class B extends A{constructor(){super();this.v=9} h(){return super.g}} print(new B().h())"
+        ),
+        "9\n"
+    );
+    // `delete super.x` is refused rather than deleting the parent's property.
+    assert_eq!(
+        eval("var a={f(){delete super.a}}; try{a.f()}catch(e){print(e.name)}"),
+        "ReferenceError\n"
+    );
+}
+
+#[test]
+fn a_short_circuited_optional_chain_is_still_a_receiver() {
+    // `(a?.b)()` keeps `a` as `this`, and a short-circuited one calls `undefined` so the
+    // call throws instead of silently yielding `undefined`.
+    assert_eq!(
+        eval("var a={b(){return this._b},_b:{c:42}}; print((a?.b)().c, (a?.['b'])().c)"),
+        "42 42\n"
+    );
+    assert_eq!(
+        eval("var z=null; try{(z?.b)()}catch(e){print(e.name)}"),
+        "TypeError\n"
+    );
+    // `delete` on a skipped chain answers `true`: there was nothing to delete.
+    assert_eq!(
+        eval("var a={b:{c:2}},z=null; print(delete z?.b.c, delete a?.b.c, JSON.stringify(a))"),
+        "true true {\"b\":{}}\n"
+    );
+}

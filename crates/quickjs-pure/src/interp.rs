@@ -1163,6 +1163,161 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `super.key` — start the search at `proto`, but report to `receiver`.
+    ///
+    /// The difference from [`Interp::get_property`] is exactly the receiver: a getter
+    /// found on the prototype of a class has to see the *instance* as `this`, and a
+    /// plain property read off `proto` would lose that.
+    fn super_read(&mut self, receiver: &Value, proto: &Value, key: &Value) -> JsResult<Value> {
+        let start = self.require_object(proto)?;
+        let text = self.propkey_of(key);
+        // `super.x` on a null prototype (a class extending `null`) resolves to nothing.
+        if matches!(proto, Value::Null) {
+            return Ok(Value::Undefined);
+        }
+        match lookup(&start, &text) {
+            Some((_, property)) if property.is_accessor() => match &property.getter {
+                Some(getter) if !matches!(getter, Value::Undefined) => {
+                    self.call_value(getter.clone(), receiver.clone(), Vec::new())
+                }
+                _ => Ok(Value::Undefined),
+            },
+            Some((_, property)) => Ok(property.value.unwrap_or(Value::Undefined)),
+            None => Ok(Value::Undefined),
+        }
+    }
+
+    /// `super.key = value` — a store that starts at `proto` but lands on `receiver`.
+    ///
+    /// A setter found on the prototype runs with `receiver` as `this`; a data property
+    /// is shadowed by a new own property on the receiver, the same rule an ordinary
+    /// assignment follows.
+    fn super_write(
+        &mut self,
+        receiver: &Value,
+        proto: &Value,
+        key: &Value,
+        value: Value,
+    ) -> JsResult<()> {
+        let target = self.require_object(receiver)?;
+        let text = self.propkey_of(key);
+        if !matches!(proto, Value::Null)
+            && let Some((owner, property)) = lookup(&self.require_object(proto)?, &text)
+        {
+            if property.is_accessor() {
+                if let Some(setter) = &property.setter
+                    && !matches!(setter, Value::Undefined)
+                {
+                    self.call_value(setter.clone(), receiver.clone(), vec![value])?;
+                }
+                return Ok(());
+            }
+            // A data property on the prototype is writable or not; reading `owner` at
+            // all is only for the attribute check.
+            if !property.writable {
+                return Err(self.type_error(format!("'{text}' is read-only")));
+            }
+            let _ = owner;
+        }
+        self.set_property_with(&target, &text, value, DeleteFailure::Throw)
+    }
+
+    /// The object a `super` operation needs, or the `TypeError` the spec raises.
+    fn require_object(&self, value: &Value) -> JsResult<Gc<JsObject>> {
+        match value.as_object() {
+            Some(object) => Ok(object.clone()),
+            None => Err(Signal::Throw(
+                self.make_error("TypeError", "value is not an object"),
+            )),
+        }
+    }
+
+    /// Build the class object `define_class` produces.
+    ///
+    /// `[parent, ctor]` becomes `[ctor, proto]`: the constructor becomes a constructor
+    /// whose prototype property is a fresh object inheriting from the parent's
+    /// prototype, and whose own prototype is the parent constructor — which is what makes
+    /// a static method inherited too.
+    fn define_class(&mut self, name: &str, flags: u32) -> JsResult<(Value, Gc<JsObject>)> {
+        let ctor = self.pop();
+        let parent = self.pop();
+        let Value::Object(function) = &ctor else {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "class constructor must be a function"),
+            ));
+        };
+        // A heritage of `null` keeps `Object.prototype` as the constructor's prototype
+        // but gives the instances no prototype at all.
+        let (parent_ctor, parent_proto) = if flags & 1 != 0 {
+            match &parent {
+                Value::Null => (Some(self.realm.function_proto.clone()), None),
+                Value::Object(parent_class) => {
+                    if !parent_class.is_callable() {
+                        return Err(Signal::Throw(
+                            self.make_error("TypeError", "parent class must be constructor"),
+                        ));
+                    }
+                    let proto = self.get_property(parent_class, "prototype")?;
+                    match proto {
+                        Some(Value::Object(proto)) => (Some(parent_class.clone()), Some(proto)),
+                        Some(Value::Null) => (Some(parent_class.clone()), None),
+                        _ => {
+                            return Err(Signal::Throw(self.make_error(
+                                "TypeError",
+                                "parent prototype must be an object or null",
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Signal::Throw(
+                        self.make_error("TypeError", "parent class must be constructor"),
+                    ));
+                }
+            }
+        } else {
+            (
+                Some(self.realm.function_proto.clone()),
+                Some(self.realm.object_proto.clone()),
+            )
+        };
+        let proto = self.new_object(parent_proto);
+        function.set_proto(parent_ctor);
+        // A class is not callable without `new`, and its `prototype` is not writable —
+        // both follow from being a class and are what `class A {}; A()` throws on.
+        function.set_class_constructor(true);
+        function.set_home_object(None);
+        self.set_function_name(&ctor, name);
+        self.define_class_properties(function, &ctor, &proto)?;
+        Ok((ctor, proto))
+    }
+
+    /// Give the constructor its `prototype` and `length`, and the prototype its
+    /// `constructor` back-pointer.
+    fn define_class_properties(
+        &mut self,
+        function: &Gc<JsObject>,
+        ctor: &Value,
+        proto: &Gc<JsObject>,
+    ) -> JsResult<()> {
+        proto.define(
+            "constructor",
+            Property::with_attributes(ctor.clone(), true, false),
+        );
+        function.define(
+            "prototype",
+            Property::with_attributes(Value::Object(proto.clone()), false, false),
+        );
+        if let Some((code, _)) = bytecode_of(function) {
+            let length = code.code.defined_args;
+            function.define(
+                "length",
+                Property::with_attributes(Value::Int(length as i32), false, true),
+            );
+        }
+        Ok(())
+    }
+
     /// The own array element `key` names, if this object has one.
     fn own_element(&self, object: &Gc<JsObject>, key: &str) -> Option<Value> {
         let index = array_index(key)?;
@@ -1410,6 +1565,15 @@ impl<'a> Interp<'a> {
                 .eval_new_target
                 .clone()
                 .unwrap_or_else(|| self.frame().new_target.clone())),
+            // `[[HomeObject]]` of the function being run: what `super` is relative to.
+            // An arrow has none of its own, so the lookup walks out to the enclosing
+            // method — which is why `super` works inside an arrow inside a method.
+            4 => Ok(self
+                .frames
+                .iter()
+                .rev()
+                .find_map(|frame| frame.callee.as_object().and_then(|f| f.home_object()))
+                .map_or(Value::Undefined, Value::Object)),
             other => Err(Signal::Throw(self.make_error(
                 "InternalError",
                 &format!("special_object {other} is not implemented yet"),
@@ -1491,6 +1655,7 @@ impl<'a> Interp<'a> {
         // Without this unwrapping, `constructor1.bind(null, 1)` called under `new`
         // ran the body with `this === null` and threw on `this.x = a`.
         let mut callee = callee;
+        let mut new_target = new_target;
         let mut args = args;
         loop {
             let Some(object) = callee.as_object().cloned() else {
@@ -1512,14 +1677,30 @@ impl<'a> Interp<'a> {
             let mut all = leading;
             all.extend(args);
             args = all;
+            // A bound function that is its own `new.target` stands in for its target:
+            // `new (C.bind(null))()` makes a `C` instance, so the object has to come
+            // from `C.prototype`, not from the bound wrapper (which has no `prototype`).
+            let same_wrapper = match (new_target.as_object(), callee.as_object()) {
+                (Some(new_target), Some(bound)) => new_target.ptr_eq(bound),
+                _ => false,
+            };
+            if same_wrapper {
+                new_target = target.clone();
+            }
             callee = target;
         }
         let Value::Object(function) = &callee else {
             unreachable!("the loop above only breaks on an object");
         };
-        // `new` on a native builtin: hand it the fresh object, which is how the
-        // error classes and the object wrappers will initialise their own fields.
-        let prototype = self.get_property(function, "prototype")?;
+        // The fresh object's prototype comes from `new.target`, not from the callee: a
+        // derived constructor reaches here through `super()`, and the instance must be a
+        // `new.target` instance, so `class D extends C { constructor(){ super() } }` makes
+        // an object inheriting `D.prototype` rather than `C.prototype`.
+        let prototype_source = match new_target.as_object() {
+            Some(target) => target.clone(),
+            None => function.clone(),
+        };
+        let prototype = self.get_property(&prototype_source, "prototype")?;
         let prototype = match prototype {
             Some(Value::Object(proto)) => Some(proto),
             _ => Some(self.realm.object_proto.clone()),
@@ -1949,6 +2130,51 @@ impl<'a> Interp<'a> {
                     self.put_loc(slot, value);
                 }
             }
+            PutLocCheckInit => {
+                // The one store that *initialises* a lexical slot: `this` in a derived
+                // constructor, which only exists after `super()` has run. A second
+                // initialisation is the error the reference reports as
+                // "'this' can be initialized only once".
+                let slot = self.slot_operand(op, a);
+                let value = self.pop();
+                if !matches!(self.get_loc(slot), Value::Uninitialized) {
+                    return Err(Signal::Throw(self.make_error(
+                        "ReferenceError",
+                        "'this' can be initialized only once",
+                    )));
+                }
+                self.put_loc(slot, value);
+            }
+            CheckCtor => {
+                // A class constructor may only run under `new`, which is what makes
+                // `class A {}; A()` a TypeError.
+                if matches!(self.frame().new_target, Value::Undefined) {
+                    return Err(Signal::Throw(self.make_error(
+                        "TypeError",
+                        "class constructors must be invoked with 'new'",
+                    )));
+                }
+            }
+            InitCtor => {
+                // The body a derived class gets when it declares no constructor:
+                // forward every argument to the parent constructor, keeping `new.target`.
+                if matches!(self.frame().new_target, Value::Undefined) {
+                    return Err(Signal::Throw(self.make_error(
+                        "TypeError",
+                        "class constructors must be invoked with 'new'",
+                    )));
+                }
+                let Some(callee) = self.current_callee() else {
+                    return Err(Signal::Throw(
+                        self.make_error("TypeError", "no constructor to inherit from"),
+                    ));
+                };
+                let parent = callee.proto().map_or(Value::Null, Value::Object);
+                let new_target = self.frame().new_target.clone();
+                let args = self.frame().passed.clone();
+                let result = self.construct(parent, new_target, args)?;
+                self.push(result);
+            }
             SetLocUninitialized => {
                 let slot = self.slot_operand(op, a);
                 self.put_loc(slot, Value::Uninitialized);
@@ -2231,6 +2457,20 @@ impl<'a> Interp<'a> {
                     0 => ("TypeError", format!("'{name}' is read-only")),
                     1 => ("SyntaxError", format!("redeclaration of '{name}'")),
                     2 => ("ReferenceError", format!("'{name}' is not initialized")),
+                    // `delete super.x` is a syntax-level mistake the reference reports
+                    // with this wording, not a property-access failure.
+                    3 => (
+                        "ReferenceError",
+                        "unsupported reference to 'super'".to_string(),
+                    ),
+                    4 => (
+                        "TypeError",
+                        "iterator does not have a throw method".to_string(),
+                    ),
+                    5 => (
+                        "ReferenceError",
+                        "invalid assignment left-hand side".to_string(),
+                    ),
                     _ => ("TypeError", format!("invalid operation on '{name}'")),
                 };
                 return Err(Signal::Throw(self.make_error(class, &message)));
@@ -2403,10 +2643,69 @@ impl<'a> Interp<'a> {
                 self.write_field(&object, &text, value)?;
                 self.push(key);
             }
+            SetHomeObject => {
+                // `obj func -> obj func`: records the object a method was defined on so
+                // `super` inside it resolves against that object's prototype.
+                let function = self.peek(0);
+                let home = self.peek(1);
+                if let (Value::Object(function), Value::Object(home)) = (&function, &home) {
+                    function.set_home_object(Some(home.clone()));
+                }
+            }
+            GetSuper => {
+                // `obj -> obj's prototype`: the starting point of a `super` lookup.
+                let object = self.pop();
+                let proto = match &object {
+                    Value::Object(object) => object.proto().map_or(Value::Null, Value::Object),
+                    _ => Value::Null,
+                };
+                self.push(proto);
+            }
+            GetSuperValue => {
+                // `receiver proto key -> value`, searching from `proto` but reporting to
+                // `receiver`, which is what `super.g` must do for a getter to see `this`.
+                let key = self.pop();
+                let proto = self.pop();
+                let receiver = self.peek(0);
+                let value = self.super_read(&receiver, &proto, &key)?;
+                self.push(value);
+            }
+            PutSuperValue => {
+                // `receiver proto key value ->`: a store that starts at `proto` but
+                // assigns to `receiver`.
+                let value = self.pop();
+                let key = self.pop();
+                let proto = self.pop();
+                let receiver = self.pop();
+                self.super_write(&receiver, &proto, &key, value)?;
+            }
+            DefineClass => {
+                // `parent ctor -> ctor proto`: the constructor becomes the class and a
+                // fresh prototype object lands on top for the methods to go on.
+                let name = self.atom_text(a as usize);
+                let (ctor, proto) = self.define_class(&name, b)?;
+                self.push(ctor);
+                self.push(Value::Object(proto));
+            }
+            DefineClassComputed => {
+                // `parent ctor key -> ctor proto key`: the computed name stays put so
+                // `define_field`-style consumers can still read it.
+                let key = self.pop();
+                let name = self.propkey_of(&key);
+                let (ctor, proto) = self.define_class(&name, b)?;
+                self.push(ctor);
+                self.push(Value::Object(proto));
+                self.push(key);
+            }
             DefineMethod => {
                 let function = self.pop();
                 let object = self.pop();
                 let key = self.atom_text(a as usize);
+                // A method's `[[HomeObject]]` is the object it was defined on, which is
+                // what `super` inside it resolves against.
+                if let (Value::Object(function), Value::Object(object)) = (&function, &object) {
+                    function.set_home_object(Some(object.clone()));
+                }
                 self.set_function_name(&function, &key_with_accessor_prefix(&key, b));
                 if let Some(array) = object.as_object() {
                     define_function_property(array, &key, function, b);
@@ -2550,6 +2849,13 @@ impl<'a> Interp<'a> {
                         !(key == "length"
                             || array_index(&key)
                                 .is_some_and(|index| (index as usize) < text.utf16_len()))
+                    }
+                    // "delete null.a" is a TypeError, not a no-op: the operator needs an
+                    // object to delete from, and only a *boxable* primitive has one.
+                    Value::Undefined | Value::Null => {
+                        return Err(Signal::Throw(
+                            self.make_error("TypeError", "cannot convert to object"),
+                        ));
                     }
                     // Any other primitive has no own properties; deleting nothing
                     // succeeds.

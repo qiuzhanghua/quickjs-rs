@@ -262,7 +262,6 @@ fn unsupported_constructs_fail_loudly() {
         // gaps, in that order of cost.
         "for (const [x] of xs) ;",
         "async function f(xs){ for await (const x of xs) ; }",
-        "class A { }",
         "function* g() { }",
         "async function f() { }",
     ] {

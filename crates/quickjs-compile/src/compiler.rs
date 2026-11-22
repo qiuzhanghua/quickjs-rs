@@ -103,6 +103,15 @@ enum VarAction {
     PutInit,
     /// Write, leaving the value on the stack.
     Set,
+    /// Initialise a binding that may only be initialised once, such as a derived
+    /// constructor's `this`.
+    PutInitChecked,
+    /// Initialise, leaving the value on the stack and without the `const` check.
+    ///
+    /// A class's own scope binding is a `const` that has to be initialised in the middle
+    /// of the definition — after the constructor exists but before the static fields run
+    /// — and the value has to survive for the outer store to use.
+    SetInit,
     /// Write a binding that lives in a reference cell.
     PutRef,
 }
@@ -204,6 +213,34 @@ fn spread_argument(spread: &Expr) -> &Expr {
 ///
 /// The low two bits pick value/getter/setter; bit 2 marks the property
 /// enumerable, which every object-literal method is.
+/// What kind of class constructor a function is being compiled as.
+///
+/// A constructor is not an ordinary method: a base one materialises `this` and refuses
+/// to run without `new`, and a derived one starts with `this` in the dead zone until
+/// `super()` produces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CtorKind {
+    /// Not a class constructor.
+    None,
+    /// A constructor of a class without `extends`.
+    Base,
+    /// A constructor of a class with `extends`.
+    Derived,
+}
+
+/// The flag byte `define_method` takes for a class member.
+///
+/// The low two bits pick value/getter/setter; bit 2 marks the property enumerable, which
+/// a class method is *not* — that is the whole difference from an object-literal method,
+/// and the reason `Object.keys(C.prototype)` stays empty.
+fn class_method_flags(kind: MethodKind) -> i32 {
+    match kind {
+        MethodKind::Constructor | MethodKind::Method => 0,
+        MethodKind::Get => 1,
+        MethodKind::Set => 2,
+    }
+}
+
 fn define_method_flags(kind: PropertyKind) -> i32 {
     let base = match kind {
         PropertyKind::Value | PropertyKind::Method => 0,
@@ -322,6 +359,11 @@ struct FnState {
     blocks: Vec<Block>,
     /// The block currently being parsed or compiled.
     current_block: u64,
+    /// The block a *nested* function was created in, so a capture made from here can be
+    /// resolved against the enclosing function's lexical scopes rather than against a
+    /// flat name table. Without it, `function f(){ class S{} }` capturing `S` found the
+    /// function's own `let S` instead of the class body's `const S`.
+    created_in_block: u64,
     /// The block each local was declared in, parallel to `vars`. `0` means the
     /// function scope, where `var` bindings live.
     var_block: Vec<u64>,
@@ -369,6 +411,13 @@ struct FnState {
     defined_args: u32,
     /// Parameters that are not a plain name, with the argument slot each came from.
     param_prologue: Vec<(usize, Pattern)>,
+    /// What kind of class constructor this function is, if any.
+    ctor_kind: CtorKind,
+    /// Whether the class has instance fields, so the constructor has to run their
+    /// initialiser before it returns.
+    has_instance_fields: bool,
+    /// What the nested function about to be compiled should be told about its class.
+    class_ctor_pending: Option<(CtorKind, bool)>,
     /// Whether this function needs the hidden `this` local, because an arrow inside it
     /// refers to `this`.
     ///
@@ -434,6 +483,7 @@ impl FnState {
             atoms: Vec::new(),
             blocks: Vec::new(),
             current_block: 0,
+            created_in_block: NO_PARENT,
             var_block: Vec::new(),
             no_value: false,
             label_since_insn: false,
@@ -450,6 +500,9 @@ impl FnState {
             is_arrow: false,
             defined_args: 0,
             param_prologue: Vec::new(),
+            ctor_kind: CtorKind::None,
+            has_instance_fields: false,
+            class_ctor_pending: None,
             needs_this_local: false,
             needs_arguments_local: false,
             needs_new_target_local: false,
@@ -1136,12 +1189,7 @@ impl Compiler {
                 self.for_in_of(stmt, left, right, body, ForLoopKind::Of)?;
             }
             StmtKind::With { object, body } => self.with_stmt(object, body)?,
-            StmtKind::ClassDecl(_) => {
-                return Err(SyntaxError::new(
-                    "class declarations are not supported by the compiler yet",
-                    stmt.span,
-                ));
-            }
+            StmtKind::ClassDecl(class) => self.class_definition(class, false)?,
             StmtKind::Import(_) | StmtKind::Export(_) => {
                 return Err(SyntaxError::new(
                     "modules are not supported by the compiler yet",
@@ -2611,6 +2659,8 @@ impl Compiler {
                 }
                 self.emit(Opcode::CallConstructor, &[Op::Int(args.len() as i32)]);
             }
+            ExprKind::Class(class) => self.class_definition(class, true)?,
+            ExprKind::SuperCall(arguments) => self.super_call(arguments)?,
             ExprKind::Arrow(func) => {
                 let function = self.compile_function(func)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
@@ -2909,6 +2959,27 @@ impl Compiler {
                 property,
                 optional,
             } => {
+                // `super.x` is not a lookup on a value: it starts at the home object's
+                // prototype and keeps `this` as the receiver, so it cannot go through
+                // `chain_link` and the ordinary field read.
+                if matches!(object.unparen().kind, ExprKind::SuperProp) {
+                    self.super_base();
+                    match property {
+                        MemberProp::Ident(name) => self.emit(
+                            Opcode::PushAtomValue,
+                            &[Op::Atom(Atom::from_text(&name.name))],
+                        ),
+                        MemberProp::Computed(index) => self.expr(index)?,
+                        MemberProp::Private(_) => {
+                            return Err(SyntaxError::new(
+                                "private fields are not supported by the compiler yet",
+                                expr.span,
+                            ));
+                        }
+                    }
+                    self.emit(Opcode::GetSuperValue, &[]);
+                    return Ok(());
+                }
                 self.chain_link(object, end)?;
                 if *optional {
                     self.optional_guard(end);
@@ -2954,6 +3025,39 @@ impl Compiler {
                     optional: member_optional,
                 } = &callee.unparen().kind
                 {
+                    // `super.m()` reads the method off the home object's prototype but
+                    // calls it with `this`, so the receiver goes under the read instead of
+                    // being replaced by it.
+                    if matches!(object.unparen().kind, ExprKind::SuperProp) {
+                        self.super_base();
+                        match property {
+                            MemberProp::Ident(name) => self.emit(
+                                Opcode::PushAtomValue,
+                                &[Op::Atom(Atom::from_text(&name.name))],
+                            ),
+                            MemberProp::Computed(index) => self.expr(index)?,
+                            MemberProp::Private(_) => {
+                                return Err(SyntaxError::new(
+                                    "private fields are not supported by the compiler yet",
+                                    expr.span,
+                                ));
+                            }
+                        }
+                        // The two-output form would drop the receiver; this one replaces
+                        // the prototype and the key, leaving `this` underneath.
+                        self.emit(Opcode::GetArrayEl, &[]);
+                        if Self::has_spread(arguments) {
+                            self.argument_array(arguments)?;
+                            self.emit(Opcode::Perm3, &[]);
+                            self.emit(Opcode::Apply, &[Op::Int(0)]);
+                            return Ok(());
+                        }
+                        for argument in arguments {
+                            self.expr(argument)?;
+                        }
+                        self.emit(Opcode::CallMethod, &[Op::Int(arguments.len() as i32)]);
+                        return Ok(());
+                    }
                     self.chain_link(object, end)?;
                     if *member_optional {
                         self.optional_guard(end);
@@ -2978,6 +3082,57 @@ impl Compiler {
                     if Self::has_spread(arguments) {
                         // Stack is `obj func`; the array goes on top, then `perm3`
                         // reorders to the `func this array` that `apply` wants.
+                        self.argument_array(arguments)?;
+                        self.emit(Opcode::Perm3, &[]);
+                        self.emit(Opcode::Apply, &[Op::Int(0)]);
+                        return Ok(());
+                    }
+                    for argument in arguments {
+                        self.expr(argument)?;
+                    }
+                    self.emit(Opcode::CallMethod, &[Op::Int(arguments.len() as i32)]);
+                    return Ok(());
+                }
+                // `(a?.b)()` keeps `a` as the receiver: the reference reads the method
+                // with `get_field2` so the base stays under it, and on the short-circuit
+                // path pushes an extra `undefined` as a placeholder receiver — the call
+                // then throws, which is what calling a missing optional chain should do.
+                if let ExprKind::OptionalChain(inner) = &callee.unparen().kind
+                    && let ExprKind::Member {
+                        object,
+                        property,
+                        optional: member_optional,
+                    } = &inner.unparen().kind
+                {
+                    let call = self.new_label();
+                    // A guard target of its own: the outer `end` skips the whole
+                    // expression, and a short-circuited receiver still has to reach the
+                    // call so that calling it throws.
+                    let short = self.new_label();
+                    self.chain_link(object, end)?;
+                    if *member_optional {
+                        self.optional_guard(short);
+                    }
+                    match property {
+                        MemberProp::Ident(name) => {
+                            self.emit(Opcode::GetField2, &[Op::Atom(Atom::from_text(&name.name))])
+                        }
+                        MemberProp::Computed(index) => {
+                            self.expr(index)?;
+                            self.emit(Opcode::GetArrayEl2, &[]);
+                        }
+                        MemberProp::Private(_) => {
+                            return Err(SyntaxError::new(
+                                "private fields are not supported by the compiler yet",
+                                expr.span,
+                            ));
+                        }
+                    }
+                    self.emit_jump(Opcode::Goto, call, &[]);
+                    self.place_label(short);
+                    self.emit(Opcode::Undefined, &[]);
+                    self.place_label(call);
+                    if Self::has_spread(arguments) {
                         self.argument_array(arguments)?;
                         self.emit(Opcode::Perm3, &[]);
                         self.emit(Opcode::Apply, &[Op::Int(0)]);
@@ -3033,6 +3188,26 @@ impl Compiler {
             optional: false,
         } = &callee.unparen().kind
         {
+            // `super.m()` in tail position is still an ordinary method call with `this`
+            // as the receiver; only the read of the method differs.
+            if matches!(object.unparen().kind, ExprKind::SuperProp) {
+                self.super_base();
+                match property {
+                    MemberProp::Ident(name) => self.emit(
+                        Opcode::PushAtomValue,
+                        &[Op::Atom(Atom::from_text(&name.name))],
+                    ),
+                    MemberProp::Computed(index) => self.expr(index)?,
+                    MemberProp::Private(_) => return Ok(false),
+                }
+                self.emit(Opcode::GetArrayEl, &[]);
+                for argument in arguments {
+                    self.expr(argument)?;
+                }
+                self.emit(Opcode::TailCallMethod, &[Op::Int(arguments.len() as i32)]);
+                self.place_label(end);
+                return Ok(true);
+            }
             self.chain_link(object, end)?;
             match property {
                 MemberProp::Ident(name) => {
@@ -3124,6 +3299,463 @@ impl Compiler {
         }
     }
 
+    /// Compile a function body that exists only in the compiler's head — a class's
+    /// implicit constructor or its field initialiser.
+    ///
+    /// Everything structural is the same as a written function: a fresh `FnState`, its
+    /// own body block, and resolution while the frame is still on the stack. Only the
+    /// statements differ.
+    fn compile_synthetic_function(
+        &mut self,
+        name: &str,
+        strict: bool,
+        span: Span,
+        body: impl FnOnce(&mut Self) -> Result<(), SyntaxError>,
+    ) -> Result<CompiledFunction, SyntaxError> {
+        let mut state = FnState::new(name.to_string(), FunctionKind::Normal);
+        state.strict = strict;
+        state.created_in_block = self.cur().current_block;
+        state.with_names = self.cur().with_names.clone();
+        state.line = span.start.line;
+        state.column = span.start.column;
+        let depth = self.stack.len();
+        self.stack.push(state);
+        let body_key = span.start.offset as u64;
+        self.push_block(body_key, NO_PARENT);
+        self.state().body_block = body_key;
+        let result = (|| {
+            self.emit_scope_enter(body_key);
+            body(self)?;
+            if self.end_is_reachable() {
+                self.emit(Opcode::ReturnUndef, &[]);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.stack.truncate(depth);
+            return result.map(|()| unreachable!());
+        }
+        Ok(self.finish_current())
+    }
+
+    /// The implicit return of a class constructor.
+    ///
+    /// A constructor that falls off the end initialises its instance fields first, and a
+    /// derived one returns `this` — which is what makes `new D()` the object `super()`
+    /// built rather than `undefined`.
+    fn emit_class_constructor_tail(&mut self) {
+        match self.cur().ctor_kind {
+            CtorKind::None => self.emit(Opcode::ReturnUndef, &[]),
+            CtorKind::Base => {
+                if self.cur().has_instance_fields {
+                    self.call_field_initialiser();
+                }
+                self.emit(Opcode::ReturnUndef, &[]);
+            }
+            CtorKind::Derived => {
+                if self.cur().has_instance_fields {
+                    self.call_field_initialiser();
+                }
+                // `get_loc_check` rather than `get_loc`: reaching the end without ever
+                // running `super()` is a ReferenceError, not `undefined`.
+                self.emit_var(VarAction::Get, "this");
+                self.emit(Opcode::Return, &[]);
+            }
+        }
+    }
+
+    /// The `super` base: the receiver followed by the home object's prototype.
+    ///
+    /// Everything `super` does needs both. A *read* starts at the prototype but reports
+    /// to the receiver (so a getter sees `this`), and a *call* reads the method off the
+    /// prototype but calls it with the receiver.
+    fn super_base(&mut self) {
+        self.this_expression();
+        self.emit(Opcode::SpecialObject, &[Op::Int(4)]);
+        self.emit(Opcode::GetSuper, &[]);
+    }
+
+    /// `super(args)`: construct the parent class and adopt the result as `this`.
+    ///
+    /// The parent is the prototype of the constructor that is running, which is exactly
+    /// what `extends` set up. `new.target` is passed through unchanged so that
+    /// `new.target` inside the parent is the class actually being constructed.
+    fn super_call(&mut self, arguments: &[Expr]) -> Result<(), SyntaxError> {
+        self.emit(Opcode::SpecialObject, &[Op::Int(2)]);
+        self.emit(Opcode::GetSuper, &[]);
+        self.emit(Opcode::SpecialObject, &[Op::Int(3)]);
+        if Self::has_spread(arguments) {
+            self.argument_array(arguments)?;
+            self.emit(Opcode::Apply, &[Op::Int(1)]);
+        } else {
+            for argument in arguments {
+                self.expr(argument)?;
+            }
+            self.emit(Opcode::CallConstructor, &[Op::Int(arguments.len() as i32)]);
+        }
+        // The value stays on the stack: `super()` is an expression, and a derived
+        // constructor's `this` may only be initialised once.
+        self.emit(Opcode::Dup, &[]);
+        self.emit_var(VarAction::PutInitChecked, "this");
+        Ok(())
+    }
+
+    /// `this` as a local, which every class constructor and field initialiser needs.
+    ///
+    /// The reference materialises the receiver into a local rather than reading
+    /// `push_this` inline, because `super()` in a derived constructor *replaces* `this`
+    /// and a field initialiser has to see the final value.
+    fn begin_this_local(&mut self) {
+        self.declare_hidden_local("this", VarKind::Normal);
+        self.emit(Opcode::PushThis, &[]);
+        self.emit_var(VarAction::Put, "this");
+    }
+
+    /// Compile a constructor the class wrote.
+    ///
+    /// The flags have to be in place before the body is compiled, but
+    /// `compile_function_with_name` creates its own state — so the caller's state is
+    /// marked instead and the new one inherits it. That is the same trick the parameter
+    /// prologue uses, and it keeps one code path for both.
+    fn compile_class_constructor(
+        &mut self,
+        func: &ast::Function,
+        has_heritage: bool,
+        has_instance_fields: bool,
+    ) -> Result<CompiledFunction, SyntaxError> {
+        let saved = (self.cur().ctor_kind, self.cur().has_instance_fields);
+        self.state().class_ctor_pending = Some((
+            if has_heritage {
+                CtorKind::Derived
+            } else {
+                CtorKind::Base
+            },
+            has_instance_fields,
+        ));
+        let result = self.compile_function_with_name(func, false);
+        self.state().ctor_kind = saved.0;
+        self.state().has_instance_fields = saved.1;
+        self.state().class_ctor_pending = None;
+        result
+    }
+
+    /// The constructor a class gets when it does not declare one.
+    ///
+    /// A base class's is empty; a derived class's forwards every argument to the parent
+    /// and is expressed by `init_ctor`, which also keeps `new.target`. Both run the
+    /// instance field initialiser afterwards when the class has fields, which is why the
+    /// initialiser is captured rather than inlined.
+    fn compile_implicit_constructor(
+        &mut self,
+        class: &Class,
+        has_heritage: bool,
+    ) -> Result<CompiledFunction, SyntaxError> {
+        let has_fields = class.elements.iter().any(|element| {
+            matches!(
+                element,
+                ClassElement::Field {
+                    is_static: false,
+                    ..
+                }
+            )
+        });
+        self.compile_synthetic_function("", true, class.span, |compiler| {
+            if has_heritage {
+                // A derived constructor's `this` does not exist until `super()` returns,
+                // so it starts in the dead zone and `init_ctor` fills it.
+                compiler.declare("this", VarDef::lexical("this"));
+                compiler.emit(
+                    Opcode::SetLocUninitialized,
+                    &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
+                );
+                compiler.emit(Opcode::InitCtor, &[]);
+                compiler.emit(
+                    Opcode::PutLocCheckInit,
+                    &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
+                );
+            } else {
+                compiler.begin_this_local();
+                compiler.emit(Opcode::CheckCtor, &[]);
+            }
+            if has_fields {
+                compiler.call_field_initialiser();
+            }
+            // A derived constructor returns `this`, the object `super()` built. Without
+            // this the implicit constructor fell through to `return_undef`, and `new B()`
+            // handed back the empty object `construct` had made instead of the one the
+            // parent constructor initialised.
+            if has_heritage {
+                compiler.emit_var(VarAction::Get, "this");
+                compiler.emit(Opcode::Return, &[]);
+            }
+            Ok(())
+        })
+    }
+
+    /// Emit the call to `<class_fields_init>`, guarded by an `undefined` test.
+    ///
+    /// A class with no instance fields leaves the binding `undefined`, and calling it
+    /// would throw; the reference emits the same guard rather than branching at compile
+    /// time because a class can be extended by a subclass whose fields still have to run.
+    fn call_field_initialiser(&mut self) {
+        let skip = self.new_label();
+        self.emit_var(VarAction::Get, "<class_fields_init>");
+        self.emit(Opcode::Dup, &[]);
+        self.emit_jump(Opcode::IfFalse, skip, &[]);
+        self.emit_var(VarAction::Get, "this");
+        self.emit(Opcode::Swap, &[]);
+        self.emit(Opcode::CallMethod, &[Op::Int(0)]);
+        self.place_label(skip);
+        self.emit(Opcode::Drop, &[]);
+    }
+
+    /// The function that defines one class's fields on `this`.
+    ///
+    /// `define_field` rather than `put_field`: a field is an own property created
+    /// without consulting a setter on the prototype, so `class C { set x(v){} }` with an
+    /// `x = 1` field must not call the setter.
+    fn compile_field_initialiser(
+        &mut self,
+        fields: &[(&PropName, Option<&Expr>)],
+        span: Span,
+    ) -> Result<CompiledFunction, SyntaxError> {
+        self.compile_synthetic_function("", true, span, |compiler| {
+            compiler.begin_this_local();
+            for (key, value) in fields {
+                compiler.emit_var(VarAction::Get, "this");
+                match value {
+                    Some(value) => compiler.expr(value)?,
+                    None => compiler.emit(Opcode::Undefined, &[]),
+                }
+                match key {
+                    PropName::Literal(literal) => {
+                        let text = compiler.property_key_text(literal, span)?;
+                        compiler.emit(Opcode::DefineField, &[Op::Atom(Atom::from_text(&text))]);
+                    }
+                    PropName::Computed(index) => {
+                        compiler.expr(index)?;
+                        compiler.emit(Opcode::DefineArrayEl, &[]);
+                        compiler.emit(Opcode::Drop, &[]);
+                    }
+                    PropName::Private(_) => {
+                        return Err(SyntaxError::new(
+                            "private class fields are not supported by the compiler yet",
+                            span,
+                        ));
+                    }
+                }
+                compiler.emit(Opcode::Drop, &[]);
+            }
+            Ok(())
+        })
+    }
+
+    /// Compile a class, leaving the constructor on the stack when `keep`.
+    ///
+    /// The shape follows the reference: the class body is its own scope holding the
+    /// class's *inner* name as a `const` — which is what lets a method refer to the
+    /// class by name — plus a `<class_fields_init>` binding for the initialiser function.
+    /// `define_class` turns `parent ctor` into `ctor proto`, then the members are defined
+    /// on the top of the stack: the prototype for instance members, the constructor
+    /// itself for `static` ones, which is why a static member costs an extra `swap`.
+    fn class_definition(&mut self, class: &Class, keep: bool) -> Result<(), SyntaxError> {
+        let parent_block = self.cur().current_block;
+        let key = class.span.start.offset as u64;
+        self.push_block(key, parent_block);
+        let name = class.name.as_ref().map(|ident| ident.name.clone());
+        // The class's own name is bound inside the body, so `class E { static F(){ return E } }`
+        // resolves `E` without a global lookup. An *unnamed* class expression has no such
+        // binding, and `define_class` is handed the empty name.
+        if let Some(name) = &name {
+            self.declare(name, VarDef::constant(name.clone()));
+        }
+        // `let` rather than `const`: the binding starts in the dead zone and is filled
+        // once the initialiser has been compiled, which a `const` would refuse as a second
+        // store.
+        self.declare(
+            "<class_fields_init>",
+            VarDef::lexical("<class_fields_init>"),
+        );
+        self.emit_scope_enter(key);
+
+        // The heritage clause is evaluated outside the class's own scope: it cannot see
+        // the class binding it is about to initialise.
+        let saved_block = self.cur().current_block;
+        self.state().current_block = parent_block;
+        match &class.super_class {
+            Some(parent) => self.expr(parent)?,
+            None => self.emit(Opcode::Undefined, &[]),
+        }
+        self.state().current_block = saved_block;
+        let has_heritage = class.super_class.is_some();
+
+        // The constructor is compiled before `define_class` because that instruction
+        // consumes it; a class without one gets the implicit version.
+        let constructor = class.elements.iter().find_map(|element| match element {
+            ClassElement::Method {
+                kind: MethodKind::Constructor,
+                func,
+                ..
+            } => Some(&**func),
+            _ => None,
+        });
+        // A constructor is compiled differently from a method: it owns `this`. The flags
+        // go on the *enclosing* state because a constructor is a nested function and
+        // `compile_function_with_name` starts a fresh one.
+        let has_instance_fields = class.elements.iter().any(|element| {
+            matches!(
+                element,
+                ClassElement::Field {
+                    is_static: false,
+                    ..
+                }
+            )
+        });
+        let ctor = match constructor {
+            Some(func) => {
+                self.compile_class_constructor(func, has_heritage, has_instance_fields)?
+            }
+            None => self.compile_implicit_constructor(class, has_heritage)?,
+        };
+        let ctor_index = self.push_constant(Constant::Function(Box::new(ctor)));
+        // A closure, not the bare constant: the constructor captures
+        // `<class_fields_init>`, which is only filled after `define_class` has run, so it
+        // has to hold the cell rather than a copy of its value.
+        self.emit(Opcode::Fclosure, &[Op::Const(ctor_index)]);
+        let flags = if has_heritage { 1 } else { 0 };
+        self.emit(
+            Opcode::DefineClass,
+            &[
+                Op::Atom(Atom::from_text(name.as_deref().unwrap_or(""))),
+                Op::Int(flags),
+            ],
+        );
+
+        // Instance fields and static fields are two different functions: the first runs
+        // per instance from the constructor, the second runs once, here.
+        let mut instance_fields: Vec<(&PropName, Option<&Expr>)> = Vec::new();
+        let mut static_fields: Vec<(&PropName, Option<&Expr>)> = Vec::new();
+        for element in &class.elements {
+            match element {
+                ClassElement::Method {
+                    key: member_key,
+                    is_static,
+                    kind,
+                    func,
+                    span,
+                } => {
+                    if *kind == MethodKind::Constructor {
+                        continue;
+                    }
+                    // `static(x)` is a *method* named `static`, not a static method; the
+                    // parser already decided which by putting it in `kind`.
+                    if *is_static {
+                        self.emit(Opcode::Swap, &[]);
+                    }
+                    let function = self.compile_function_with_name(func, true)?;
+                    let index = self.push_constant(Constant::Function(Box::new(function)));
+                    self.emit(Opcode::Fclosure, &[Op::Const(index)]);
+                    match member_key {
+                        PropName::Computed(key) => {
+                            self.emit(Opcode::Swap, &[]);
+                            self.expr(key)?;
+                            self.emit(
+                                Opcode::DefineMethodComputed,
+                                &[Op::Int(class_method_flags(*kind))],
+                            );
+                            // `define_method_computed` leaves the key; drop it.
+                            self.emit(Opcode::Drop, &[]);
+                        }
+                        PropName::Literal(literal) => {
+                            let text = self.property_key_text(literal, *span)?;
+                            self.emit(
+                                Opcode::DefineMethod,
+                                &[
+                                    Op::Atom(Atom::from_text(&text)),
+                                    Op::Int(class_method_flags(*kind)),
+                                ],
+                            );
+                        }
+                        PropName::Private(_) => {
+                            return Err(SyntaxError::new(
+                                "private class members are not supported by the compiler yet",
+                                *span,
+                            ));
+                        }
+                    }
+                    if *is_static {
+                        self.emit(Opcode::Swap, &[]);
+                    }
+                }
+                ClassElement::Field {
+                    key: field_key,
+                    is_static,
+                    value,
+                    span,
+                } => {
+                    if matches!(field_key, PropName::Private(_)) {
+                        return Err(SyntaxError::new(
+                            "private class fields are not supported by the compiler yet",
+                            *span,
+                        ));
+                    }
+                    if *is_static {
+                        static_fields.push((field_key, value.as_deref()));
+                    } else {
+                        instance_fields.push((field_key, value.as_deref()));
+                    }
+                }
+                ClassElement::StaticBlock { span, .. } => {
+                    return Err(SyntaxError::new(
+                        "static blocks are not supported by the compiler yet",
+                        *span,
+                    ));
+                }
+            }
+        }
+
+        // `<class_fields_init>` holds the instance initialiser, or `undefined` when the
+        // class has no instance fields. The constructor calls it only when it is defined.
+        if instance_fields.is_empty() {
+            self.emit(Opcode::Undefined, &[]);
+        } else {
+            let initialiser = self.compile_field_initialiser(&instance_fields, class.span)?;
+            let index = self.push_constant(Constant::Function(Box::new(initialiser)));
+            self.emit(Opcode::Fclosure, &[Op::Const(index)]);
+            // `set_home_object` reads `obj func`, so the prototype stays where it is.
+            self.emit(Opcode::SetHomeObject, &[]);
+        }
+        self.emit_var(VarAction::PutInit, "<class_fields_init>");
+        // The prototype has done its job: every instance member is defined on it. What
+        // is left under it is the constructor.
+        self.emit(Opcode::Drop, &[]);
+
+        // The class binding is initialised *before* static fields run, so a static field
+        // can refer to the class by name (`static y = S.x`).
+        // `set_loc` leaves the constructor on the stack, which is what the static field
+        // call and the outer store both consume.
+        self.emit_var(VarAction::SetInit, &name.clone().unwrap_or_default());
+        if !static_fields.is_empty() {
+            let initialiser = self.compile_field_initialiser(&static_fields, class.span)?;
+            let index = self.push_constant(Constant::Function(Box::new(initialiser)));
+            self.emit(Opcode::Dup, &[]);
+            self.emit(Opcode::Fclosure, &[Op::Const(index)]);
+            self.emit(Opcode::SetHomeObject, &[]);
+            self.emit(Opcode::CallMethod, &[Op::Int(0)]);
+            self.emit(Opcode::Drop, &[]);
+        }
+        self.emit_scope_leave(key);
+        self.state().current_block = parent_block;
+        if keep {
+            // A class *expression* is its own value; the class-scope binding was only
+            // ever an alias for it.
+            return Ok(());
+        }
+        // A declaration stores into the binding the enclosing statement declared.
+        self.emit_var(VarAction::PutInit, &name.unwrap_or_default());
+        Ok(())
+    }
+
     fn push_this(&mut self) {
         self.emit(Opcode::PushThis, &[]);
     }
@@ -3135,6 +3767,13 @@ impl Compiler {
     /// variable. That is why `(() => this)()` inside `f` yields `f`'s receiver even when
     /// the arrow is called with none.
     fn this_expression(&mut self) {
+        // In a class constructor `this` is a local: a derived constructor only gets one
+        // when `super()` returns, and reading the raw receiver would give the *outer*
+        // one instead.
+        if self.cur().ctor_kind != CtorKind::None {
+            self.emit_var(VarAction::Get, "this");
+            return;
+        }
         if !self.cur().is_arrow {
             self.push_this();
             return;
@@ -3296,6 +3935,53 @@ impl Compiler {
                 // declared global are all non-configurable, which the reference encodes
                 // as a constant `push_false` rather than a runtime check. Only a
                 // property access has anything to do at run time.
+                // `delete super.x` is not a delete at all: the spec refuses it, and the
+                // reference encodes the refusal as a `throw_error`. The receiver and the
+                // key are still evaluated first, which is what keeps the evaluation order
+                // of the operand intact.
+                // `delete z?.b.c` answers `true` when the chain short-circuits: there is
+                // nothing to delete, and a failed delete is not the same as a skipped
+                // one. The reference emits the guards so they land on a `drop; push_true`
+                // tail, which is what this reproduces.
+                if let ExprKind::OptionalChain(inner) = &argument.unparen().kind
+                    && let ExprKind::Member {
+                        object, property, ..
+                    } = &inner.unparen().kind
+                {
+                    let end = self.new_label();
+                    let done = self.new_label();
+                    self.chain_link(object, end)?;
+                    match property {
+                        MemberProp::Ident(name) => self.emit(
+                            Opcode::PushAtomValue,
+                            &[Op::Atom(Atom::from_text(&name.name))],
+                        ),
+                        MemberProp::Computed(index) => self.expr(index)?,
+                        MemberProp::Private(_) => {
+                            return Err(SyntaxError::new(
+                                "deleting a private field is not allowed",
+                                argument.span,
+                            ));
+                        }
+                    }
+                    self.emit(Opcode::Delete, &[]);
+                    self.emit_jump(Opcode::Goto, done, &[]);
+                    self.place_label(end);
+                    self.emit(Opcode::Drop, &[]);
+                    self.emit(Opcode::PushTrue, &[]);
+                    self.place_label(done);
+                    return Ok(());
+                }
+                if let ExprKind::Member { object, .. } = &argument.unparen().kind
+                    && matches!(object.unparen().kind, ExprKind::SuperProp)
+                {
+                    self.super_base();
+                    self.emit(
+                        Opcode::ThrowError,
+                        &[Op::Atom(Atom::from_text("")), Op::Int(3)],
+                    );
+                    return Ok(());
+                }
                 match &argument.kind {
                     ExprKind::Member {
                         object, property, ..
@@ -3800,6 +4486,12 @@ impl Compiler {
         // variables exactly like any other captured binding.
         state.with_names = self.cur().with_names.clone();
         state.is_arrow = func.is_arrow;
+        state.created_in_block = self.cur().current_block;
+        // A class constructor knows what it is only because the class told it.
+        if let Some((kind, has_fields)) = self.cur().class_ctor_pending {
+            state.ctor_kind = kind;
+            state.has_instance_fields = has_fields;
+        }
         // A named *expression* binds its own name; a declaration's name is already
         // bound in the enclosing scope.
         state.self_name = if is_expression && !func.is_arrow {
@@ -3892,6 +4584,22 @@ impl Compiler {
         }
         self.hoist(body, body_key)?;
         self.emit_scope_enter(body_key);
+        // A constructor's prologue is not a parameter unpacking but the `this` binding:
+        // a base constructor takes the receiver, a derived one starts in the dead zone
+        // because only `super()` may produce it.
+        match self.cur().ctor_kind {
+            CtorKind::None => {}
+            CtorKind::Base => {
+                self.begin_this_local();
+                self.emit(Opcode::CheckCtor, &[]);
+            }
+            CtorKind::Derived => {
+                self.declare("this", VarDef::lexical("this"));
+                let slot = self.cur().vars.len() as u32 - 1;
+                self.emit(Opcode::SetLocUninitialized, &[Op::Slot(Slot::Loc(slot))]);
+                self.emit(Opcode::CheckCtor, &[]);
+            }
+        }
         for (index, pattern) in &prologue {
             match &pattern.kind {
                 // `...rest` collects what is left rather than reading one slot.
@@ -3914,7 +4622,7 @@ impl Compiler {
         // The implicit return only exists if control can actually get here: an
         // infinite loop never falls off the end.
         if self.end_is_reachable() {
-            self.emit(Opcode::ReturnUndef, &[]);
+            self.emit_class_constructor_tail();
         }
         // Resolution runs while this function is still on the stack: capturing a
         // variable from an enclosing function means reaching into that
@@ -4276,8 +4984,38 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
     }
 
     for owner in (0..current).rev() {
+        // The nested function was created inside one of this frame's blocks, and the
+        // outermost visible binding is the innermost block on that chain — not whatever
+        // comes first in the variable table. `function f(){ class S{} }` has two `S`
+        // bindings: the `let S` inside `f` and the `const S` inside the class body, and
+        // the class body is the one a method may see.
+        let entry = stack
+            .get(owner + 1)
+            .map(|s| s.created_in_block)
+            .unwrap_or(0);
+        let lexical = block_chain(&stack[owner], entry)
+            .into_iter()
+            .find_map(|scope| {
+                stack[owner]
+                    .vars
+                    .iter()
+                    .enumerate()
+                    .find(|(index, var)| {
+                        var.name == name
+                            && stack[owner].var_block.get(*index).copied() == Some(scope)
+                    })
+                    .map(|(index, _)| index)
+            });
         let found = if let Some(index) = stack[owner].args.iter().position(|a| a.name == name) {
             Some(Found::Local(ClosureType::Arg, index as u32, false, false))
+        } else if let Some(index) = lexical {
+            let var = &stack[owner].vars[index];
+            Some(Found::Local(
+                ClosureType::Local,
+                index as u32,
+                var.is_const,
+                var.is_lexical,
+            ))
         } else if let Some(index) = stack[owner].vars.iter().position(|v| v.name == name) {
             let var = &stack[owner].vars[index];
             Some(Found::Local(
@@ -4505,6 +5243,15 @@ fn variable_instruction(
         (VarAction::Put, Slot::GlobalDecl(_)) => (Opcode::PutVar, operand),
         // Initialisation is what ends the dead zone, so it never checks.
         (VarAction::PutInit, Slot::Loc(_)) => (Opcode::PutLoc, operand),
+        (VarAction::PutInitChecked, Slot::Loc(_)) => (Opcode::PutLocCheckInit, operand),
+        // `this` in a derived constructor is always a local, so these cannot happen;
+        // routing them to the ordinary forms keeps the match total without inventing
+        // opcodes the reference does not have.
+        (VarAction::PutInitChecked, Slot::Arg(_)) => (Opcode::PutArg, operand),
+        (VarAction::PutInitChecked, Slot::VarRef(_)) => (Opcode::PutVarRef, operand),
+        (VarAction::PutInitChecked, Slot::Global(_) | Slot::GlobalDecl(_)) => {
+            (Opcode::PutVarInit, operand)
+        }
         (VarAction::PutInit, Slot::Arg(_)) => (Opcode::PutArg, operand),
         (VarAction::PutInit, Slot::VarRef(_)) => (Opcode::PutVarRef, operand),
         (VarAction::PutInit, Slot::Global(_) | Slot::GlobalDecl(_)) => {
@@ -4518,6 +5265,10 @@ fn variable_instruction(
             },
             operand,
         ),
+        (VarAction::SetInit, Slot::Loc(_)) => (Opcode::SetLoc, operand),
+        (VarAction::SetInit, Slot::Arg(_)) => (Opcode::SetArg, operand),
+        (VarAction::SetInit, Slot::VarRef(_)) => (Opcode::SetVarRef, operand),
+        (VarAction::SetInit, Slot::Global(_) | Slot::GlobalDecl(_)) => (Opcode::PutVar, operand),
         (VarAction::Set, Slot::Arg(_)) => (Opcode::SetArg, operand),
         (VarAction::Set, Slot::VarRef(_)) => (Opcode::SetVarRef, operand),
         (VarAction::Set, Slot::Global(_)) => (Opcode::PutVar, operand),
