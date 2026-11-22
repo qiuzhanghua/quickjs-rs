@@ -791,6 +791,21 @@ impl Value {
         }
     }
 
+    /// `SameValueZero`, the equality a `Map` key and a `Set` element use.
+    ///
+    /// It differs from `===` in exactly one place: `NaN` equals itself. That is what makes
+    /// `map.set(NaN, 1); map.get(NaN)` work, and it is why a `Map` cannot use `strict_equals`
+    /// directly. A bigint compares by value, since its representation is canonical.
+    pub fn same_value_zero(&self, other: &Value) -> bool {
+        if let (Value::Float(a), Value::Float(b)) = (self, other)
+            && a.is_nan()
+            && b.is_nan()
+        {
+            return true;
+        }
+        self.strict_equals(other)
+    }
+
     /// `==`, with the coercion rules.
     ///
     /// `NaN` compares unequal to everything including itself, which the numeric

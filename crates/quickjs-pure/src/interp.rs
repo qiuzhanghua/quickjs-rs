@@ -135,6 +135,10 @@ pub struct Realm {
     pub suppressed_error_proto: Option<Gc<JsObject>>,
     /// The `DisposableStack` prototype, for `move`'s intrinsic construction.
     pub disposable_stack_proto: Option<Gc<JsObject>>,
+    /// `Map.prototype`.
+    pub map_proto: Option<Gc<JsObject>>,
+    /// `Set.prototype`.
+    pub set_proto: Option<Gc<JsObject>>,
     /// `ArrayBuffer.prototype`.
     pub array_buffer_proto: Option<Gc<JsObject>>,
     /// `%TypedArray%.prototype`, the prototype every view type inherits from.
@@ -502,6 +506,8 @@ impl<'a> Interp<'a> {
                 regexp_ctor: None,
                 suppressed_error_proto: None,
                 disposable_stack_proto: None,
+                map_proto: None,
+                set_proto: None,
                 array_buffer_proto: None,
                 typed_array_proto: None,
                 async_disposable_stack_proto: None,
@@ -4462,16 +4468,14 @@ impl<'a> Interp<'a> {
     }
 
     /// The operand of a `BigInt` operation, or the `TypeError` that mixing raises.
-    fn bigint_operand(&self, value: &Value, op: Opcode) -> JsResult<crate::bigint::BigInt> {
+    fn bigint_operand(&self, value: &Value) -> JsResult<crate::bigint::BigInt> {
         match value {
             Value::BigInt(big) => Ok((**big).clone()),
-            _ => Err(Signal::Throw(self.make_error(
-                "TypeError",
-                &format!(
-                    "cannot mix BigInt and other types, use explicit conversions ({})",
-                    op.name()
-                ),
-            ))),
+            // The reference words this the same way for every operator, so a failing
+            // script reads identically; the operator itself adds nothing a caller can use.
+            _ => Err(Signal::Throw(
+                self.make_error("TypeError", "cannot convert bigint to number"),
+            )),
         }
     }
 
@@ -4482,8 +4486,8 @@ impl<'a> Interp<'a> {
     /// that the relational operators handle it separately.
     fn bigint_arithmetic(&mut self, op: Opcode, left: Value, right: Value) -> JsResult<Value> {
         use Opcode::*;
-        let a = self.bigint_operand(&left, op)?;
-        let b = self.bigint_operand(&right, op)?;
+        let a = self.bigint_operand(&left)?;
+        let b = self.bigint_operand(&right)?;
         let result = match op {
             Add => a.add(&b),
             Sub => a.sub(&b),

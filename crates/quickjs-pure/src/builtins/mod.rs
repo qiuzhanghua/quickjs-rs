@@ -20,6 +20,7 @@ mod function;
 mod generator;
 mod global;
 mod json;
+pub mod map;
 mod math;
 mod number;
 mod object;
@@ -65,6 +66,7 @@ pub fn install(interp: &mut Interp<'_>) {
     string::install(interp, &string_proto);
     number::install(interp, &number_proto);
     bigint::install(interp, &object_proto);
+    map::install(interp, &object_proto);
     math::install(interp);
     json::install(interp);
     reflect::install(interp);

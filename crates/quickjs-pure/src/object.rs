@@ -45,6 +45,27 @@ impl JsObject {
         self.data.borrow_mut().kind = ObjectKind::ArrayBuffer(storage);
     }
 
+    /// The entries of this object, when it is a `Map` or a `Set`.
+    pub fn collection_entries(&self) -> Option<Vec<(Value, Value)>> {
+        match &self.data.borrow().kind {
+            ObjectKind::Collection { entries, .. } => Some(entries.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether this object is a `Set` rather than a `Map`.
+    pub fn collection_is_set(&self) -> Option<bool> {
+        match &self.data.borrow().kind {
+            ObjectKind::Collection { is_set, .. } => Some(*is_set),
+            _ => None,
+        }
+    }
+
+    /// Make this object a `Map` or `Set` holding `entries`.
+    pub fn set_collection(&self, entries: Vec<(Value, Value)>, is_set: bool) {
+        self.data.borrow_mut().kind = ObjectKind::Collection { entries, is_set };
+    }
+
     /// `(buffer, element, offset, length)`, when this object is a typed-array view.
     pub fn typed_array_parts(
         &self,
@@ -478,6 +499,16 @@ pub enum ObjectKind {
     /// of the buffer sees the same storage; the *views* hold the `Gc<JsObject>` of this
     /// buffer, which is what keeps it alive and what the collector traces.
     ArrayBuffer(std::rc::Rc<std::cell::RefCell<BufferStorage>>),
+    /// A `Map` or a `Set`: insertion-ordered entries with `SameValueZero` key equality.
+    ///
+    /// One variant for both, because a `Set` is exactly a `Map` whose value is unused — the
+    /// difference is a flag, and `is_set` is what makes `entries` yield `[v, v]` pairs.
+    Collection {
+        /// The entries, in insertion order.
+        entries: Vec<(Value, Value)>,
+        /// Whether this is a `Set` rather than a `Map`.
+        is_set: bool,
+    },
     /// A typed-array view: a window onto an `ArrayBuffer`.
     TypedArray {
         /// The buffer whose bytes this view reads.
@@ -509,6 +540,12 @@ impl Trace for ObjectKind {
             // buffer alive through the `Gc` it carries.
             ObjectKind::ArrayBuffer(_) => {}
             ObjectKind::TypedArray { buffer, .. } => tracer.visit(buffer),
+            ObjectKind::Collection { entries, .. } => {
+                for (key, value) in entries {
+                    key.trace(tracer);
+                    value.trace(tracer);
+                }
+            }
             ObjectKind::Ordinary => {}
             ObjectKind::Array { elements } => {
                 for element in elements {

@@ -2230,3 +2230,130 @@ fn indexing_a_long_string_stays_linear() {
         "60000 0\n"
     );
 }
+
+#[test]
+fn bigint_is_exact_at_any_width() {
+    // The canonical representation is what makes a computed value equal to itself.
+    assert_eq!(
+        eval("print(2n ** 1000n === 2n ** 1000n, 2n ** 1000n - (2n ** 1000n - 1n))"),
+        "true 1n\n"
+    );
+    assert_eq!(
+        eval("print(1n + 2n, 10n - 3n, 6n * 7n, 7n / 2n, 7n % 2n, 1n << 128n)"),
+        "3n 7n 42n 3n 1n 340282366920938463463374607431768211456n\n"
+    );
+    assert_eq!(eval("print(typeof 1n, -5n, ~0n)"), "bigint -5n -1n\n");
+    // `>>` is arithmetic: `-1n >> 1n` is `-1n`, not `0n`.
+    assert_eq!(
+        eval("print(-1n >> 1n, -3n >> 1n, -1n & 3n, -1n | 3n)"),
+        "-1n -2n 3n -1n\n"
+    );
+}
+
+#[test]
+fn bigint_and_number_never_mix_in_arithmetic() {
+    for expression in ["1n + 1", "1n * 2", "1 - 1n"] {
+        assert_eq!(
+            throws(expression),
+            "TypeError: cannot convert bigint to number",
+            "{expression}"
+        );
+    }
+    // Relation is the exception: it compares the mathematical values, not rounded ones.
+    assert_eq!(
+        eval("print(-1n < 1n, 2n < 2.5, 3n > 2.5)"),
+        "true true true\n"
+    );
+    // …and loose equality crosses the types while strict does not.
+    assert_eq!(
+        eval("print(1n == 1, 1n === 1, 1n == '1')"),
+        "true false true\n"
+    );
+}
+
+#[test]
+fn bigint_conversion_is_exact_or_refuses() {
+    assert_eq!(
+        eval("print(BigInt(5), BigInt('123'), BigInt(true), BigInt('0x1f'))"),
+        "5n 123n 1n 31n\n"
+    );
+    // A fraction has no exact bigint form, so it is a `RangeError` rather than a truncation.
+    assert!(throws("BigInt(1.5)").starts_with("RangeError"));
+    // A bigint is a primitive, so there is no wrapper to construct.
+    assert_eq!(
+        throws("new BigInt(1)"),
+        "TypeError: BigInt is not a constructor"
+    );
+    assert_eq!(
+        eval("print((255n).toString(16), BigInt.asIntN(8, 128n))"),
+        "ff -128n\n"
+    );
+}
+
+#[test]
+fn map_keys_use_same_value_zero() {
+    // `NaN` equals itself as a key, which `===` does not give.
+    assert_eq!(
+        eval("var m = new Map(); m.set(NaN, 'nan'); print(m.get(NaN), m.size)"),
+        "nan 1\n"
+    );
+    // Numbers, strings and bigints are three different keys even when they look alike.
+    assert_eq!(
+        eval(
+            "var m = new Map(); m.set(1, 'n'); m.set('1', 's'); m.set(1n, 'b');\n\
+              print(m.size, m.get(1), m.get('1'), m.get(1n))"
+        ),
+        "3 n s b\n"
+    );
+    // Objects key by identity, never structurally.
+    assert_eq!(
+        eval(
+            "var m = new Map(); var a = {}, b = {}; m.set(a, 'a');\n\
+              print(m.get(a), m.get(b))"
+        ),
+        "a undefined\n"
+    );
+    // Insertion order is iteration order, and a re-set key keeps its position.
+    assert_eq!(
+        eval(
+            "var m = new Map(); m.set(1, 'a'); m.set(2, 'b'); m.set(1, 'c');\n\
+              var log = []; m.forEach(function (v, k) { log.push(k + ':' + v) });\n\
+              print(m.size, log.join(','))"
+        ),
+        "2 1:c,2:b\n"
+    );
+}
+
+#[test]
+fn map_and_set_surface() {
+    assert_eq!(
+        eval(
+            "var m = new Map([[1, 'a'], [2, 'b']]);\n\
+              print(m.size, m.has(1), m.delete(1), m.has(1), m.size)"
+        ),
+        "2 true true false 1\n"
+    );
+    // A `Set` deduplicates and its entries repeat the value.
+    assert_eq!(
+        eval(
+            "var s = new Set([1, 2, 2, 3]);\n\
+              print(s.size, [...s.entries()].map(e => e.join('=')).join(','))"
+        ),
+        "3 1=1,2=2,3=3\n"
+    );
+    assert_eq!(
+        eval(
+            "print(Object.prototype.toString.call(new Map()),\n\
+                    Object.prototype.toString.call(new Set()))"
+        ),
+        "[object Map] [object Set]\n"
+    );
+    assert_eq!(
+        eval(
+            "var s = new Set(['a']); var out = [];\n\
+              s.forEach(function (v, k) { out.push(v === k) });\n\
+              print(out.join(','))"
+        ),
+        "true\n"
+    );
+}

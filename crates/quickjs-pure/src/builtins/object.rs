@@ -119,6 +119,13 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::RegExp(_) => "RegExp",
             ObjectKind::DisposableStack(_) => "Object",
             ObjectKind::ArrayBuffer(_) => "ArrayBuffer",
+            ObjectKind::Collection { is_set, .. } => {
+                if *is_set {
+                    "Set"
+                } else {
+                    "Map"
+                }
+            }
             ObjectKind::TypedArray { .. } => "Object",
             ObjectKind::Ordinary => "Object",
         }) {

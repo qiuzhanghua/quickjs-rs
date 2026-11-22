@@ -424,14 +424,21 @@ fn entries(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
 }
 
 /// What an array iterator yields.
+///
+/// Shared with `Map` and `Set`, which hand their own snapshot to the same machinery rather
+/// than growing a second iterator implementation.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum IteratorKind {
+pub(crate) enum IteratorKind {
     Value,
     Key,
     Entry,
 }
 
-fn iterator(interp: &mut Interp<'_>, this: Value, kind: IteratorKind) -> JsResult<Value> {
+pub(crate) fn iterator(
+    interp: &mut Interp<'_>,
+    this: Value,
+    kind: IteratorKind,
+) -> JsResult<Value> {
     // The source is kept as given, **not** materialised: the array methods copy an
     // array-like up front, but an iterator must not, because
     // `Array.prototype.keys.call({length: 2**32 + 1})` is legal and only advances a
