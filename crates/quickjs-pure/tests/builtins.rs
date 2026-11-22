@@ -2137,3 +2137,96 @@ fn typed_array_reads_and_detachment() {
         "16\n"
     );
 }
+
+#[test]
+fn strings_hold_unpaired_surrogates() {
+    // The whole reason for the WTF-8 representation: `String.fromCharCode` takes a code
+    // unit, and a unit with no partner is a legal string.
+    assert_eq!(
+        eval(
+            "var s = String.fromCharCode(0xD800);\n\
+              print(s.length, s.charCodeAt(0))"
+        ),
+        "1 55296\n"
+    );
+    // Building a run of units, which is what a script does when it assembles a string.
+    assert_eq!(
+        eval(
+            "var s = ''; for (var i = 0; i < 5; i++) s += String.fromCharCode(0xD800 + i);\n\
+              print(s.length, s.charCodeAt(0), s.charCodeAt(4), String(s.charCodeAt(9)))"
+        ),
+        "5 55296 55300 NaN\n"
+    );
+    // `length` and indexing count code *units*, so an astral character is two of them.
+    assert_eq!(
+        eval("print('\\u{1F600}'.length, String.fromCharCode(0xD800, 0xDC00).length)"),
+        "2 2\n"
+    );
+    // `codePointAt` recombines a pair; `charCodeAt` does not.
+    assert_eq!(
+        eval(
+            "var s = String.fromCharCode(0xD800, 0xDC00);\n\
+              print(s.codePointAt(0), s.charCodeAt(0), s.charCodeAt(1))"
+        ),
+        "65536 55296 56320\n"
+    );
+}
+
+#[test]
+fn concatenation_keeps_the_encoding_canonical() {
+    // A surrogate pair split across a `+` must produce the *same* string as the astral
+    // character, or equality and property keys would disagree with the language.
+    assert_eq!(
+        eval("print(String.fromCharCode(0xD800) + String.fromCharCode(0xDC00) === '\\u{10000}')"),
+        "true\n"
+    );
+    assert_eq!(
+        eval("print((String.fromCharCode(0xD800) + String.fromCharCode(0xDC00)).length)"),
+        "2\n"
+    );
+    // …and the same through `+=`, which is how a script usually builds one.
+    assert_eq!(
+        eval(
+            "var s = ''; s += String.fromCharCode(0xD83D); s += String.fromCharCode(0xDE00);\n\
+              print(s.length, s === '\\u{1F600}')"
+        ),
+        "2 true\n"
+    );
+    // Two unpaired surrogates that are *not* a pair stay two separate units.
+    assert_eq!(
+        eval("print((String.fromCharCode(0xD800) + String.fromCharCode(0xD800)).length)"),
+        "2\n"
+    );
+}
+
+#[test]
+fn a_lone_surrogate_key_is_its_own_property() {
+    // A key with an unpaired surrogate must not collide with the replacement character,
+    // which is what a lossy conversion would do.
+    assert_eq!(
+        eval(
+            "var o = {};\n\
+              o[String.fromCharCode(0xD800)] = 1;\n\
+              o[String.fromCharCode(0xFFFD)] = 2;\n\
+              print(o[String.fromCharCode(0xD800)], o[String.fromCharCode(0xFFFD)],\n\
+                    Object.keys(o).length)"
+        ),
+        "1 2 2\n"
+    );
+}
+
+#[test]
+fn indexing_a_long_string_stays_linear() {
+    // `charCodeAt` in a loop must not re-decode from the start each time: it is the one
+    // shape a script uses to walk a whole string, so the code units are cached on first
+    // use. 60k units is enough that a quadratic implementation would take minutes.
+    assert_eq!(
+        eval(
+            "var s = ''; for (var i = 0; i < 60000; i++) s += String.fromCharCode(i & 0xffff);\n\
+              var bad = 0;\n\
+              for (var i = 0; i < 60000; i++) if (s.charCodeAt(i) !== (i & 0xffff)) bad++;\n\
+              print(s.length, bad)"
+        ),
+        "60000 0\n"
+    );
+}

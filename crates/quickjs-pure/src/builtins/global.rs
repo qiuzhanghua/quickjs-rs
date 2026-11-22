@@ -84,7 +84,7 @@ fn js_print(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<V
 /// wrong for a direct eval that closes over local variables.
 fn eval(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let source = match args.first() {
-        Some(Value::String(text)) => text.as_str().to_string(),
+        Some(Value::String(text)) => text.to_string_lossy().into_owned(),
         // Anything that is not a string is returned unchanged, per the spec.
         Some(other) => return Ok(other.clone()),
         None => return Ok(Value::Undefined),

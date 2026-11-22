@@ -14,31 +14,410 @@ use js_gc::{Gc, Trace, Tracer};
 
 use crate::object::JsObject;
 
+/// A JavaScript string's bytes, in **WTF-8**.
+///
+/// A JS string is a sequence of UTF-16 *code units*, and that sequence may contain an
+/// unpaired surrogate: `String.fromCharCode(0xD800)` produces exactly one, and
+/// `"\uD800".length` is 1. Rust's `String` cannot represent that, so the bytes here are
+/// WTF-8 — ordinary UTF-8, except that a code unit with no partner is written as the
+/// three-byte sequence UTF-8 would use for U+D800..U+DFFF.
+///
+/// # The encoding is canonical, and that is load-bearing
+///
+/// A *surrogate pair* is written as the single four-byte sequence of the astral code point
+/// it spells, never as two three-byte sequences. Without that rule the bytes of `"\uD800" +
+/// "\uDC00"` would differ from the bytes of `"\u{10000}"` while the two strings are
+/// observably identical — same length, same `charCodeAt` at every index — and every
+/// equality, property key and `switch` arm in the engine would disagree with the language.
+///
+/// The canonical form makes **byte equality exactly code-unit equality**, which is what lets
+/// a property key be compared without decoding it.
+#[derive(Clone)]
+pub struct Wtf8 {
+    /// The WTF-8 bytes.
+    bytes: Box<[u8]>,
+    /// Whether `bytes` is valid UTF-8, meaning the string has no unpaired surrogate.
+    ///
+    /// A `Wtf8` is immutable, so this stays correct for its whole life.
+    valid: bool,
+}
+
+impl Wtf8 {
+    /// Wrap a Rust string, which is valid UTF-8 by construction.
+    pub fn new(text: impl Into<String>) -> Wtf8 {
+        Wtf8 {
+            bytes: text.into().into_bytes().into_boxed_slice(),
+            valid: true,
+        }
+    }
+
+    /// Build from UTF-16 code units, which is the form a JS string really has.
+    ///
+    /// An unpaired surrogate survives; a pair is folded into its astral code point.
+    pub fn from_units(units: &[u16]) -> Wtf8 {
+        let mut bytes = Vec::with_capacity(units.len());
+        let mut valid = true;
+        let mut index = 0;
+        while index < units.len() {
+            let unit = units[index];
+            match units.get(index + 1) {
+                Some(&low) if is_high(unit) && is_low(low) => {
+                    push_code_point(&mut bytes, combine(unit, low));
+                    index += 2;
+                }
+                _ if is_surrogate(unit) => {
+                    // A lone surrogate keeps its own three-byte form, so it round-trips and
+                    // still counts as one code unit.
+                    valid = false;
+                    push_surrogate(&mut bytes, unit);
+                    index += 1;
+                }
+                _ => {
+                    push_code_point(&mut bytes, unit as u32);
+                    index += 1;
+                }
+            }
+        }
+        Wtf8 {
+            bytes: bytes.into_boxed_slice(),
+            valid,
+        }
+    }
+
+    /// The text, when it is valid UTF-8.
+    ///
+    /// `None` only for a string containing an unpaired surrogate — there is no `&str` for
+    /// one. Callers that only need to display or compare use [`Wtf8::to_string_lossy`].
+    pub fn as_str(&self) -> Option<&str> {
+        if self.valid {
+            // SAFETY: `valid` is only set by the encoder above, which produces valid UTF-8
+            // exactly when no surrogate was written on its own, and the bytes never change.
+            Some(unsafe { std::str::from_utf8_unchecked(&self.bytes) })
+        } else {
+            None
+        }
+    }
+
+    /// The text with unpaired surrogates replaced by U+FFFD.
+    ///
+    /// Borrowed, and therefore free, for the ordinary string that has no surrogate.
+    pub fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
+        match self.as_str() {
+            Some(text) => std::borrow::Cow::Borrowed(text),
+            None => String::from_utf8_lossy(&self.bytes),
+        }
+    }
+
+    /// The WTF-8 bytes. Two `Wtf8`s are equal exactly when these are.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The UTF-16 code units, which is what indexing and `charCodeAt` count.
+    pub fn to_units(&self) -> Vec<u16> {
+        let mut units = Vec::with_capacity(self.utf16_len());
+        self.push_units(&mut units);
+        units
+    }
+
+    /// Length in UTF-16 code units, which is what `String.prototype.length` reports.
+    ///
+    /// Counted from the encoding rather than by decoding, so it does not allocate: a
+    /// four-byte sequence is a surrogate pair and therefore two units, everything else is
+    /// one.
+    pub fn utf16_len(&self) -> usize {
+        self.bytes
+            .iter()
+            .filter(|byte| (**byte & 0xC0) != 0x80)
+            .map(|byte| if *byte >= 0xF0 { 2 } else { 1 })
+            .sum()
+    }
+
+    /// The code unit at `index`, or `None` past the end.
+    pub fn code_unit_at(&self, index: usize) -> Option<u16> {
+        // Walking instead of decoding keeps `charCodeAt` in a loop linear rather than
+        // quadratic, which matters because that is exactly how a script inspects a string.
+        let mut position = 0;
+        let mut at = 0;
+        while at < self.bytes.len() {
+            let (units, count, width) = self.sequence_at(at);
+            if position + count > index {
+                return Some(units[index - position]);
+            }
+            position += count;
+            at += width;
+        }
+        None
+    }
+
+    /// Whether the string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// One code unit as a string, which is what `s[i]` yields.
+    ///
+    /// A single unit, not a code point: `"\u{1F600}"[0]` is the lone high surrogate, because
+    /// indexing a string in JS works on code units.
+    pub fn unit_at(&self, index: usize) -> Option<Wtf8> {
+        self.code_unit_at(index)
+            .map(|unit| Wtf8::from_units(&[unit]))
+    }
+
+    /// The code units `start..end`, re-encoded canonically.
+    pub fn slice_units(&self, start: usize, end: usize) -> Wtf8 {
+        let units = self.to_units();
+        let start = start.min(units.len());
+        let end = end.clamp(start, units.len());
+        Wtf8::from_units(&units[start..end])
+    }
+
+    /// One element per code *point*, which is how a string is iterated.
+    ///
+    /// Iteration and indexing disagree on purpose: `[...str]` splits an astral character
+    /// into one element while `str[0]` splits it into half a surrogate pair.
+    pub fn code_points(&self) -> Vec<Wtf8> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at < self.bytes.len() {
+            let (_, _, width) = self.sequence_at(at);
+            let mut bytes = Vec::with_capacity(width);
+            bytes.extend_from_slice(&self.bytes[at..at + width]);
+            // A single sequence is always canonical on its own: a four-byte one is already
+            // an astral code point and a three-byte one is a BMP code point or a lone
+            // surrogate.
+            out.push(Wtf8 {
+                valid: std::str::from_utf8(&bytes).is_ok(),
+                bytes: bytes.into_boxed_slice(),
+            });
+            at += width;
+        }
+        out
+    }
+
+    /// Concatenate, keeping the encoding canonical.
+    ///
+    /// Byte concatenation is already canonical *except* where a high surrogate at the end of
+    /// `self` meets a low surrogate at the start of `other`: those two must fold into one
+    /// astral sequence, or the result would be a different string from the one the language
+    /// says `+` produces.
+    pub fn concat(&self, other: &Wtf8) -> Wtf8 {
+        let bridges =
+            ends_with_high_surrogate(&self.bytes) && starts_with_low_surrogate(&other.bytes);
+        if !bridges {
+            let mut bytes = Vec::with_capacity(self.bytes.len() + other.bytes.len());
+            bytes.extend_from_slice(&self.bytes);
+            bytes.extend_from_slice(&other.bytes);
+            return Wtf8 {
+                bytes: bytes.into_boxed_slice(),
+                valid: self.valid && other.valid,
+            };
+        }
+        let mut units = self.to_units();
+        units.extend(other.to_units());
+        Wtf8::from_units(&units)
+    }
+
+    /// Append the code units to `out`.
+    fn push_units(&self, out: &mut Vec<u16>) {
+        let mut at = 0;
+        while at < self.bytes.len() {
+            let (units, count, width) = self.sequence_at(at);
+            out.extend_from_slice(&units[..count]);
+            at += width;
+        }
+    }
+
+    /// The code units the sequence starting at `at` stands for, how many of them there are,
+    /// and its byte width.
+    fn sequence_at(&self, at: usize) -> ([u16; 2], usize, usize) {
+        let byte = self.bytes[at];
+        let byte_at = |offset: usize| self.bytes.get(at + offset).copied().unwrap_or(0) as u32;
+        if byte < 0x80 {
+            ([byte as u16, 0], 1, 1)
+        } else if byte >> 5 == 0b110 {
+            (
+                [
+                    (((byte as u32 & 0x1F) << 6) | (byte_at(1) & 0x3F)) as u16,
+                    0,
+                ],
+                1,
+                2,
+            )
+        } else if byte >> 4 == 0b1110 {
+            // A three-byte sequence is either a BMP code point or a lone surrogate; either
+            // way it is exactly one code unit.
+            (
+                [
+                    ((byte as u32 & 0x0F) << 12 | ((byte_at(1) & 0x3F) << 6) | (byte_at(2) & 0x3F))
+                        as u16,
+                    0,
+                ],
+                1,
+                3,
+            )
+        } else {
+            let code = (byte as u32 & 0x07) << 18
+                | ((byte_at(1) & 0x3F) << 12)
+                | ((byte_at(2) & 0x3F) << 6)
+                | (byte_at(3) & 0x3F);
+            let code = code.wrapping_sub(0x10000);
+            (
+                [
+                    0xD800u16.wrapping_add((code >> 10) as u16),
+                    0xDC00u16.wrapping_add((code & 0x3FF) as u16),
+                ],
+                2,
+                4,
+            )
+        }
+    }
+}
+
+fn is_surrogate(unit: u16) -> bool {
+    (0xD800..0xE000).contains(&unit)
+}
+
+fn is_high(unit: u16) -> bool {
+    (0xD800..0xDC00).contains(&unit)
+}
+
+fn is_low(unit: u16) -> bool {
+    (0xDC00..0xE000).contains(&unit)
+}
+
+/// The astral code point a surrogate pair spells.
+fn combine(high: u16, low: u16) -> u32 {
+    0x10000 + ((high as u32 - 0xD800) << 10) + (low as u32 - 0xDC00)
+}
+
+/// Write a code point as UTF-8.
+fn push_code_point(out: &mut Vec<u8>, code: u32) {
+    if code < 0x80 {
+        out.push(code as u8);
+    } else if code < 0x800 {
+        out.push(0xC0 | (code >> 6) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else if code < 0x10000 {
+        out.push(0xE0 | (code >> 12) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (code >> 18) as u8);
+        out.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    }
+}
+
+/// Write an unpaired surrogate as the three-byte sequence WTF-8 gives it.
+fn push_surrogate(out: &mut Vec<u8>, unit: u16) {
+    out.push(0xE0 | (unit >> 12) as u8);
+    out.push(0x80 | ((unit >> 6) & 0x3F) as u8);
+    out.push(0x80 | (unit & 0x3F) as u8);
+}
+
+/// Whether the bytes end with an unpaired high surrogate.
+///
+/// High surrogates are `ED A0..AF 80..BF` and low ones `ED B0..BF 80..BF`, so the test is on
+/// the second byte of the trailing three-byte sequence.
+fn ends_with_high_surrogate(bytes: &[u8]) -> bool {
+    let len = bytes.len();
+    len >= 3 && bytes[len - 3] == 0xED && (0xA0..0xB0).contains(&bytes[len - 2])
+}
+
+/// Whether the bytes start with an unpaired low surrogate.
+fn starts_with_low_surrogate(bytes: &[u8]) -> bool {
+    bytes.len() >= 3 && bytes[0] == 0xED && (0xB0..0xC0).contains(&bytes[1])
+}
+
+impl PartialEq for Wtf8 {
+    /// Byte equality, which the canonical encoding makes equal to code-unit equality.
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for Wtf8 {}
+
+impl fmt::Debug for Wtf8 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?}", self.to_string_lossy())
+    }
+}
+
 /// An immutable string, stored on the GC heap.
 ///
-/// QuickJS interns strings (`JSString`) and shares them between values, so a
-/// `Value` only ever holds a handle. Strings here are not yet interned as atoms —
-/// that arrives with the property-key work in M4 — so two equal strings are two
-/// allocations that compare by content.
+/// The content is a [`Wtf8`]; the wrapper exists so a `Value` can hold a `Gc` handle rather
+/// than the bytes.
 pub struct JsString {
-    text: String,
+    text: Wtf8,
+    /// The code units, built on first use.
+    ///
+    /// Indexing is the one operation a script performs in a loop over a whole string —
+    /// `for (i = 0; i < s.length; i++) s.charCodeAt(i)` — and decoding from the start each
+    /// time would make that quadratic. Built once, it makes every later access `O(1)`.
+    /// Nothing here is a GC value, so the cache needs no tracing.
+    units: RefCell<Option<std::rc::Rc<Vec<u16>>>>,
 }
 
 impl JsString {
     /// Wrap `text`.
-    pub fn new(text: String) -> JsString {
-        JsString { text }
+    pub fn new(text: impl Into<String>) -> JsString {
+        JsString {
+            text: Wtf8::new(text),
+            units: RefCell::new(None),
+        }
     }
 
-    /// The text.
-    pub fn as_str(&self) -> &str {
+    /// Wrap WTF-8 that is already encoded.
+    pub fn from_wtf8(text: Wtf8) -> JsString {
+        JsString {
+            text,
+            units: RefCell::new(None),
+        }
+    }
+
+    /// The code units, decoding once and remembering the result.
+    pub fn units_cached(&self) -> std::rc::Rc<Vec<u16>> {
+        if let Some(units) = self.units.borrow().as_ref() {
+            return units.clone();
+        }
+        let units = std::rc::Rc::new(self.text.to_units());
+        *self.units.borrow_mut() = Some(units.clone());
+        units
+    }
+
+    /// The code unit at `index`, in `O(1)` once the cache is warm.
+    pub fn code_unit_at(&self, index: usize) -> Option<u16> {
+        self.units_cached().get(index).copied()
+    }
+
+    /// The string's bytes.
+    pub fn wtf8(&self) -> &Wtf8 {
         &self.text
+    }
+
+    /// The text, when it has no unpaired surrogate.
+    pub fn as_str(&self) -> Option<&str> {
+        self.text.as_str()
+    }
+
+    /// The text with unpaired surrogates replaced by U+FFFD.
+    pub fn to_string_lossy(&self) -> std::borrow::Cow<'_, str> {
+        self.text.to_string_lossy()
+    }
+
+    /// The UTF-16 code units.
+    pub fn to_units(&self) -> Vec<u16> {
+        self.units_cached().as_ref().clone()
     }
 
     /// Length in UTF-16 code units, which is what `String.prototype.length` and
     /// the string indexing rules count.
     pub fn utf16_len(&self) -> usize {
-        self.text.encode_utf16().count()
+        // Cheap from the encoding, and the common case never builds the cache.
+        self.text.utf16_len()
     }
 }
 
@@ -211,7 +590,13 @@ pub enum Value {
 impl Value {
     /// A string value on `heap`.
     pub fn string(heap: &js_gc::Heap, text: impl Into<String>) -> Value {
-        Value::String(Gc::new(heap, JsString::new(text.into())))
+        Value::String(Gc::new(heap, JsString::new(text)))
+    }
+
+    /// A string from bytes that are already WTF-8, which is how a string containing an
+    /// unpaired surrogate reaches a `Value`.
+    pub fn string_wtf8(heap: &js_gc::Heap, text: Wtf8) -> Value {
+        Value::String(Gc::new(heap, JsString::from_wtf8(text)))
     }
 
     /// The number as a double, widening an [`Value::Int`].
@@ -223,10 +608,19 @@ impl Value {
         }
     }
 
-    /// The value as a string, if it is one.
+    /// The value as a string, if it is one with no unpaired surrogate.
     pub fn as_str(&self) -> Option<&str> {
         match self {
-            Value::String(s) => Some(s.as_str()),
+            Value::String(s) => s.as_str(),
+            _ => None,
+        }
+    }
+
+    /// The value's string content as WTF-8, which covers every string including one with an
+    /// unpaired surrogate.
+    pub fn as_wtf8(&self) -> Option<&Wtf8> {
+        match self {
+            Value::String(s) => Some(s.wtf8()),
             _ => None,
         }
     }
@@ -285,7 +679,7 @@ impl Value {
             Value::Int(i) => *i != 0,
             // `NaN` is falsy, and so is `-0`.
             Value::Float(f) => *f != 0.0 && !f.is_nan(),
-            Value::String(s) => !s.as_str().is_empty(),
+            Value::String(s) => !s.wtf8().is_empty(),
             // Every symbol is truthy, even the one with no description.
             Value::Symbol(_) => true,
             // Every object is truthy, including `new Boolean(false)`.
@@ -311,7 +705,7 @@ impl Value {
             }
             Value::Int(i) => *i as f64,
             Value::Float(f) => *f,
-            Value::String(s) => string_to_number(s.as_str()),
+            Value::String(s) => string_to_number(&s.to_string_lossy()),
             // `ToNumber` of a symbol is a `TypeError`; `NaN` keeps this infallible
             // helper total, and the arithmetic operators reject symbols first.
             Value::Symbol(_) => f64::NAN,
@@ -350,7 +744,9 @@ impl Value {
             Value::Bool(false) => "false".to_string(),
             Value::Int(i) => i.to_string(),
             Value::Float(f) => number_to_string(*f),
-            Value::String(s) => s.as_str().to_string(),
+            // Lossy only for a string with an unpaired surrogate, which has no `&str`
+            // form at all; every other string borrows and copies nothing extra.
+            Value::String(s) => s.to_string_lossy().into_owned(),
             // `ToString` of a symbol is a `TypeError`; this descriptive form is what
             // `String(sym)` and the error messages use. Callers that must throw go
             // through `Interp::checked_to_string`.
@@ -417,7 +813,7 @@ impl Value {
             Value::Bool(b) => Primitive::Bool(*b),
             Value::Int(i) => Primitive::Number(*i as f64),
             Value::Float(f) => Primitive::Number(*f),
-            Value::String(s) => Primitive::String(s.as_str().to_string()),
+            Value::String(s) => Primitive::String(s.to_string_lossy().into_owned()),
             // A symbol stays distinct from a string here so `==` does not treat it as
             // one; only an object's `ToPrimitive` can produce a symbol from an object.
             Value::Symbol(s) => Primitive::Symbol(s.clone()),

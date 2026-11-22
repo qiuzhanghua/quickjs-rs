@@ -144,7 +144,7 @@ fn bind(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     if let Some(object) = this.as_object()
         && let Some(Value::String(name)) = object.own_property("name").and_then(|p| p.value)
     {
-        let text = format!("bound {}", name.as_str());
+        let text = format!("bound {}", name.to_string_lossy());
         bound.define(
             "name",
             Property::with_attributes(interp.string(text), false, false),

@@ -123,8 +123,8 @@ fn from(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
     let mut out = Vec::new();
     // A string is iterable and yields its characters; an array-like has a length.
     if let Value::String(text) = &source {
-        for character in text.as_str().chars() {
-            out.push(interp.string(character.to_string()));
+        for point in text.wtf8().code_points() {
+            out.push(interp.string_wtf8(point));
         }
     } else if let Some(object) = source.as_object() {
         let length = interp
@@ -177,9 +177,10 @@ fn receiver(interp: &mut Interp<'_>, this: &Value) -> JsResult<Gc<JsObject>> {
     // — and its elements are its characters, not properties on the box.
     if let Value::String(text) = this {
         let elements: Vec<Value> = text
-            .as_str()
-            .chars()
-            .map(|character| interp.string(character.to_string()))
+            .wtf8()
+            .code_points()
+            .into_iter()
+            .map(|point| interp.string_wtf8(point))
             .collect();
         let copy = interp.new_array(elements);
         // A box's indices are read-only, which is why `sort.call("aa")` throws.
@@ -528,9 +529,8 @@ fn length_of(interp: &mut Interp<'_>, source: &Value) -> JsResult<usize> {
 /// One element of an array-like, read lazily.
 fn element_at(interp: &mut Interp<'_>, source: &Value, index: usize) -> JsResult<Value> {
     if let Value::String(text) = source {
-        let units: Vec<u16> = text.as_str().encode_utf16().collect();
-        return Ok(match units.get(index) {
-            Some(unit) => interp.string(String::from_utf16_lossy(&[*unit])),
+        return Ok(match text.wtf8().unit_at(index) {
+            Some(unit) => interp.string_wtf8(unit),
             None => Value::Undefined,
         });
     }

@@ -216,7 +216,7 @@ fn value_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<V
 /// the arithmetic path rejects a symbol that comes back unchanged.
 fn to_primitive(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     if let Some(Value::String(hint)) = args.first()
-        && hint.as_str() == "string"
+        && hint.as_str() == Some("string")
         && let Value::Symbol(symbol) = &this
     {
         return Ok(interp.string(symbol.to_display_string()));

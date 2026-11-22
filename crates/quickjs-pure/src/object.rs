@@ -531,8 +531,9 @@ impl Trace for ObjectKind {
 /// property table rather than being flattened into a name.
 #[derive(Clone)]
 pub enum PropertyKey {
-    /// An ordinary string key.
-    String(String),
+    /// An ordinary string key, held as WTF-8 so a key containing an unpaired surrogate
+    /// addresses one property rather than colliding with its `U+FFFD` replacement.
+    String(crate::value::Wtf8),
     /// A symbol key.
     Symbol(Gc<JsSymbol>),
 }
@@ -544,6 +545,14 @@ impl PropertyKey {
     /// which is what makes `get_field` on a symbol key fall through to the general
     /// path instead of silently reading a same-named string property.
     pub fn as_str(&self) -> Option<&str> {
+        match self {
+            PropertyKey::String(text) => text.as_str(),
+            PropertyKey::Symbol(_) => None,
+        }
+    }
+
+    /// The key's bytes, which a string key always has and a symbol never does.
+    pub fn as_wtf8(&self) -> Option<&crate::value::Wtf8> {
         match self {
             PropertyKey::String(text) => Some(text),
             PropertyKey::Symbol(_) => None,
@@ -561,7 +570,7 @@ impl fmt::Display for PropertyKey {
     /// `Symbol(description)` form.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PropertyKey::String(text) => write!(f, "{text}"),
+            PropertyKey::String(text) => write!(f, "{}", text.to_string_lossy()),
             PropertyKey::Symbol(symbol) => write!(f, "{}", symbol.to_display_string()),
         }
     }
@@ -580,7 +589,19 @@ impl PartialEq for PropertyKey {
 
 impl From<&str> for PropertyKey {
     fn from(text: &str) -> PropertyKey {
-        PropertyKey::String(text.to_string())
+        PropertyKey::String(crate::value::Wtf8::new(text))
+    }
+}
+
+impl From<String> for PropertyKey {
+    fn from(text: String) -> PropertyKey {
+        PropertyKey::String(crate::value::Wtf8::new(text))
+    }
+}
+
+impl From<crate::value::Wtf8> for PropertyKey {
+    fn from(text: crate::value::Wtf8) -> PropertyKey {
+        PropertyKey::String(text)
     }
 }
 
@@ -1023,23 +1044,23 @@ impl JsObject {
 
     /// The own property *names*, in definition order. Symbol keys are excluded:
     /// `Object.keys` and `for…in` cannot see them.
-    pub fn own_keys(&self) -> Vec<String> {
+    pub fn own_keys(&self) -> Vec<crate::value::Wtf8> {
         self.data
             .borrow()
             .props
             .iter()
-            .filter_map(|(key, _)| key.as_str().map(str::to_string))
+            .filter_map(|(key, _)| key.as_wtf8().cloned())
             .collect()
     }
 
     /// The own *enumerable* property names, in definition order.
-    pub fn own_enumerable_keys(&self) -> Vec<String> {
+    pub fn own_enumerable_keys(&self) -> Vec<crate::value::Wtf8> {
         self.data
             .borrow()
             .props
             .iter()
             .filter(|(_, property)| property.enumerable)
-            .filter_map(|(key, _)| key.as_str().map(str::to_string))
+            .filter_map(|(key, _)| key.as_wtf8().cloned())
             .collect()
     }
 

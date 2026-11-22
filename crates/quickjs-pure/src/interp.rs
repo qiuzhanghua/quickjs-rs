@@ -23,7 +23,7 @@ use js_gc::{Gc, Heap};
 
 use crate::object::{
     Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, LocalVars, NativeFn, ObjectKind,
-    Property, PropertyKey, array_index, lookup, lookup_key,
+    Property, PropertyKey, array_index, lookup_key,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -388,7 +388,7 @@ impl Realm {
             Value::Symbol(symbol) => PropertyKey::Symbol(symbol),
             // Unreachable once `Symbol` has installed; an empty string key matches
             // nothing, which degrades to "the object has no such method".
-            _ => PropertyKey::String(String::new()),
+            _ => PropertyKey::from(String::new()),
         }
     }
 }
@@ -524,6 +524,11 @@ impl<'a> Interp<'a> {
     // -- allocation helpers -------------------------------------------------
 
     /// A new string value.
+    pub fn string_wtf8(&self, text: crate::value::Wtf8) -> Value {
+        Value::string_wtf8(self.heap, text)
+    }
+
+    /// A new string value, from text that is valid UTF-8.
     pub fn string(&self, text: impl Into<String>) -> Value {
         Value::string(self.heap, text)
     }
@@ -1821,12 +1826,12 @@ impl<'a> Interp<'a> {
     /// plain property read off `proto` would lose that.
     fn super_read(&mut self, receiver: &Value, proto: &Value, key: &Value) -> JsResult<Value> {
         let start = self.require_object(proto)?;
-        let text = self.propkey_of(key);
+        let key = self.propkey(key);
         // `super.x` on a null prototype (a class extending `null`) resolves to nothing.
         if matches!(proto, Value::Null) {
             return Ok(Value::Undefined);
         }
-        match lookup(&start, &text) {
+        match lookup_key(&start, &key) {
             Some((_, property)) if property.is_accessor() => match &property.getter {
                 Some(getter) if !matches!(getter, Value::Undefined) => {
                     self.call_value(getter.clone(), receiver.clone(), Vec::new())
@@ -1851,9 +1856,9 @@ impl<'a> Interp<'a> {
         value: Value,
     ) -> JsResult<()> {
         let target = self.require_object(receiver)?;
-        let text = self.propkey_of(key);
+        let key = self.propkey(key);
         if !matches!(proto, Value::Null)
-            && let Some((owner, property)) = lookup(&self.require_object(proto)?, &text)
+            && let Some((owner, property)) = lookup_key(&self.require_object(proto)?, &key)
         {
             if property.is_accessor() {
                 if let Some(setter) = &property.setter
@@ -1866,11 +1871,11 @@ impl<'a> Interp<'a> {
             // A data property on the prototype is writable or not; reading `owner` at
             // all is only for the attribute check.
             if !property.writable {
-                return Err(self.type_error(format!("'{text}' is read-only")));
+                return Err(self.type_error(format!("'{key}' is read-only")));
             }
             let _ = owner;
         }
-        self.set_property_with(&target, &text, value, DeleteFailure::Throw)
+        self.set_property_with_key(&target, &key, value, DeleteFailure::Throw)
     }
 
     /// The object a `super` operation needs, or the `TypeError` the spec raises.
@@ -3723,7 +3728,7 @@ impl<'a> Interp<'a> {
                     // into the target of a destructuring assignment.
                     self.push(match &key {
                         PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
-                        PropertyKey::String(text) => self.string(text.clone()),
+                        PropertyKey::String(text) => self.string_wtf8(text.clone()),
                     });
                 }
                 self.push(value);
@@ -3878,7 +3883,7 @@ impl<'a> Interp<'a> {
                 // `parent ctor key -> ctor proto key`: the computed name stays put so
                 // `define_field`-style consumers can still read it.
                 let key = self.pop();
-                let name = self.propkey_of(&key);
+                let name = self.propkey_of(&key).to_string_lossy().into_owned();
                 let (ctor, proto) = self.define_class(&name, b)?;
                 self.push(ctor);
                 self.push(Value::Object(proto));
@@ -3933,7 +3938,7 @@ impl<'a> Interp<'a> {
                 let value = self.pop();
                 let key = match self.propkey(&value) {
                     PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
-                    PropertyKey::String(text) => self.string(text),
+                    PropertyKey::String(text) => self.string_wtf8(text),
                 };
                 self.push(key);
             }
@@ -3945,7 +3950,7 @@ impl<'a> Interp<'a> {
             SetNameComputed => {
                 let key = self.peek(1);
                 let function = self.peek(0);
-                let name = self.propkey_of(&key);
+                let name = self.propkey_of(&key).to_string_lossy().into_owned();
                 self.set_function_name(&function, &name);
             }
 
@@ -4408,10 +4413,12 @@ impl<'a> Interp<'a> {
         if matches!(left, Value::String(_)) || matches!(right, Value::String(_)) {
             // `ToString` on both sides, which rejects a symbol: `"" + Symbol()` is a
             // `TypeError`, the one place a symbol and a string do not mix.
-            let left = self.checked_to_string(&left)?;
-            let right = self.checked_to_string(&right)?;
-            let text = format!("{left}{right}");
-            self.push(self.string(text));
+            let left = self.checked_to_wtf8(&left)?;
+            let right = self.checked_to_wtf8(&right)?;
+            // Not `format!`: `Wtf8::concat` is what keeps a surrogate pair split across the
+            // join canonical, so `"\uD800" + "\uDC00"` equals `"\u{10000}"`.
+            let text = left.concat(&right);
+            self.push(self.string_wtf8(text));
             return Ok(());
         }
         let left = self.numeric(left)?;
@@ -4494,6 +4501,27 @@ impl<'a> Interp<'a> {
         Ok(value.to_js_string())
     }
 
+    /// `ToString` that keeps the string's code units instead of flattening them.
+    ///
+    /// This is what `+` needs: `String.fromCharCode(0xD800) + "a"` must keep the unpaired
+    /// surrogate, and a lossy `String` in between would turn it into U+FFFD.
+    pub fn checked_to_wtf8(&mut self, value: &Value) -> JsResult<crate::value::Wtf8> {
+        if matches!(value, Value::Symbol(_)) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "cannot convert symbol to string"),
+            ));
+        }
+        // An object runs `ToPrimitive` first, which may itself produce a symbol.
+        let value = self.to_primitive(value.clone(), Hint::String)?;
+        match value {
+            Value::Symbol(_) => Err(Signal::Throw(
+                self.make_error("TypeError", "cannot convert symbol to string"),
+            )),
+            Value::String(text) => Ok(text.wtf8().clone()),
+            other => Ok(crate::value::Wtf8::new(other.to_js_string())),
+        }
+    }
+
     /// `ToNumber` with the object case going through `ToPrimitive`.
     pub fn to_js_number(&mut self, value: &Value) -> JsResult<f64> {
         if matches!(value, Value::Object(_)) {
@@ -4515,15 +4543,21 @@ impl<'a> Interp<'a> {
     }
 
     /// `ToPropertyKey` for the callers that can only use a string key.
-    fn propkey_of(&mut self, value: &Value) -> String {
+    fn propkey_of(&mut self, value: &Value) -> crate::value::Wtf8 {
+        use crate::value::Wtf8;
         match value {
-            Value::Int(_) | Value::Float(_) => number_to_string(value.to_number()),
+            // A string key keeps its code units. Going through a lossy `String` would make
+            // `o["\uD800"]` and `o["\uFFFD"]` the same property.
+            Value::String(text) => text.wtf8().clone(),
+            Value::Int(_) | Value::Float(_) => Wtf8::new(number_to_string(value.to_number())),
             // An object key runs `ToPropertyKey`, which needs `ToPrimitive` first;
             // falling back to its `ToString` would print `[object Object]`.
-            Value::Object(_) => self
-                .to_js_string(value)
-                .unwrap_or_else(|_| "[object Object]".to_string()),
-            other => other.to_js_string(),
+            Value::Object(_) => match self.to_primitive(value.clone(), Hint::String) {
+                Ok(Value::String(text)) => text.wtf8().clone(),
+                Ok(other) => Wtf8::new(other.to_js_string()),
+                Err(_) => Wtf8::new("[object Object]"),
+            },
+            other => Wtf8::new(other.to_js_string()),
         }
     }
 
@@ -4560,12 +4594,8 @@ impl<'a> Interp<'a> {
                     return Ok(Value::Int(value.utf16_len() as i32));
                 }
                 if let Some(index) = array_index(text) {
-                    let units: Vec<u16> = value.as_str().encode_utf16().collect();
-                    return Ok(match units.get(index as usize) {
-                        Some(unit) => {
-                            let character = String::from_utf16_lossy(&[*unit]);
-                            self.string(character)
-                        }
+                    return Ok(match value.wtf8().unit_at(index as usize) {
+                        Some(unit) => self.string_wtf8(unit),
                         None => Value::Undefined,
                     });
                 }
@@ -4648,7 +4678,7 @@ impl<'a> Interp<'a> {
     /// `Object.getOwnPropertySymbols` put in their result array.
     pub fn key_value(&self, key: &PropertyKey) -> Value {
         match key {
-            PropertyKey::String(text) => self.string(text.clone()),
+            PropertyKey::String(text) => self.string_wtf8(text.clone()),
             PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
         }
     }
@@ -4671,11 +4701,15 @@ impl<'a> Interp<'a> {
                     "length",
                     Property::with_attributes(Value::Int(text.utf16_len() as i32), false, false),
                 );
-                for (index, character) in text.as_str().chars().enumerate() {
-                    object.define(
-                        &index.to_string(),
-                        Property::with_attributes(self.string(character.to_string()), false, true),
-                    );
+                // The indices are *code units*, so an astral character occupies two of
+                // them — the same rule `s.length` and `s[i]` follow.
+                for index in 0..text.utf16_len() {
+                    if let Some(unit) = text.wtf8().unit_at(index) {
+                        object.define(
+                            &index.to_string(),
+                            Property::with_attributes(self.string_wtf8(unit), false, true),
+                        );
+                    }
                 }
                 object.define(
                     "_value",
@@ -4789,8 +4823,11 @@ impl<'a> Interp<'a> {
         let source_object = match source {
             Value::Object(object) => object.clone(),
             Value::String(text) => {
-                for (index, character) in text.as_str().chars().enumerate() {
-                    target.define_data(&index.to_string(), self.string(character.to_string()));
+                // Untaken keys are the string's indices, which are code units.
+                for index in 0..text.utf16_len() {
+                    if let Some(unit) = text.wtf8().unit_at(index) {
+                        target.define_data(&index.to_string(), self.string_wtf8(unit));
+                    }
                 }
                 return Ok(());
             }
@@ -4800,7 +4837,7 @@ impl<'a> Interp<'a> {
         // an array of strings; a spread passes `null`, which excludes nothing. Only the
         // string keys of the exclusion array are meaningful, so an array is read by its
         // elements rather than by its own property names.
-        let mut excluded: Vec<String> = Vec::new();
+        let mut excluded: Vec<crate::value::Wtf8> = Vec::new();
         if let Value::Object(list) = exclusion
             && let Some(length) = list.array_length()
         {
@@ -4813,7 +4850,7 @@ impl<'a> Interp<'a> {
         let source = &source_object;
         let mut keys = source.own_enumerable_keys();
         if let Some(length) = source.array_length() {
-            keys.retain(|key| key != "length");
+            keys.retain(|key| key.as_str() != Some("length"));
             for index in 0..length {
                 if let Some(value) = source.array_get(index) {
                     target.define_data(&index.to_string(), value);
@@ -4824,10 +4861,11 @@ impl<'a> Interp<'a> {
             if excluded.contains(&key) {
                 continue;
             }
-            if let Some(property) = source.own_property(&key)
+            let as_key = PropertyKey::from(key);
+            if let Some(property) = source.own_property_key(&as_key)
                 && let Some(value) = property.value
             {
-                target.define_data(&key, value);
+                target.define_data_key(&as_key, value);
             }
         }
         Ok(())
@@ -4842,17 +4880,17 @@ impl<'a> Interp<'a> {
     /// inherited ones, and a shadowed key only appears once.
     fn for_in_record(&mut self, value: &Value) -> Gc<JsObject> {
         let record = self.new_object(None);
-        let mut keys: Vec<String> = Vec::new();
+        let mut keys: Vec<crate::value::Wtf8> = Vec::new();
         if let Value::Object(object) = value {
             let mut chain = vec![object.clone()];
             chain.extend(object.chain());
             for object in chain {
                 let mut own = object.own_enumerable_keys();
                 if let Some(length) = object.array_length() {
-                    own.retain(|key| key != "length");
+                    own.retain(|key| key.as_str() != Some("length"));
                     for index in 0..length {
                         if object.array_get(index).is_some() {
-                            own.push(index.to_string());
+                            own.push(crate::value::Wtf8::new(index.to_string()));
                         }
                     }
                 }
@@ -4863,19 +4901,27 @@ impl<'a> Interp<'a> {
                 }
             }
         }
-        let indices: Vec<String> = {
-            let mut numeric: Vec<u32> = keys.iter().filter_map(|k| array_index(k)).collect();
+        // Integer-like keys come first in ascending order, then the rest in insertion
+        // order; an index is ASCII, so a key without a `&str` form is never one.
+        let indices: Vec<crate::value::Wtf8> = {
+            let mut numeric: Vec<u32> = keys
+                .iter()
+                .filter_map(|k| k.as_str().and_then(array_index))
+                .collect();
             numeric.sort_unstable();
-            numeric.into_iter().map(|n| n.to_string()).collect()
+            numeric
+                .into_iter()
+                .map(|n| crate::value::Wtf8::new(n.to_string()))
+                .collect()
         };
-        let strings: Vec<String> = keys
+        let strings: Vec<crate::value::Wtf8> = keys
             .into_iter()
-            .filter(|key| array_index(key).is_none())
+            .filter(|key| key.as_str().and_then(array_index).is_none())
             .collect();
         let mut ordered = indices;
         ordered.extend(strings);
         for (index, key) in ordered.into_iter().enumerate() {
-            record.define_data(&index.to_string(), self.string(key));
+            record.define_data(&index.to_string(), self.string_wtf8(key));
         }
         record.define_data("__index", Value::Int(0));
         record
@@ -5056,8 +5102,8 @@ impl<'a> Interp<'a> {
                     object
                         .own_property("name")
                         .and_then(|property| match property.value {
-                            Some(Value::String(text)) if !text.as_str().is_empty() => {
-                                Some(text.as_str().to_string())
+                            Some(Value::String(text)) if !text.wtf8().is_empty() => {
+                                Some(text.to_string_lossy().into_owned())
                             }
                             _ => None,
                         })
@@ -5091,7 +5137,7 @@ impl<'a> Interp<'a> {
             return;
         };
         if let Some(Value::String(existing)) = object.own_property("name").and_then(|p| p.value)
-            && !existing.as_str().is_empty()
+            && !existing.wtf8().is_empty()
         {
             return;
         }
@@ -5368,7 +5414,7 @@ pub fn debug_display(interp: &Interp<'_>, value: &Value) -> String {
     // A string argument is printed raw: `js_print` converts it with `ToString`
     // instead of dumping it, and the quoting only appears inside a container.
     if let Value::String(text) = value {
-        return text.as_str().to_string();
+        return text.to_string_lossy().into_owned();
     }
     let mut printer = Printer {
         interp,
@@ -5434,7 +5480,7 @@ impl Printer<'_, '_> {
                 self.out
                     .push_str(&crate::value::number_to_string_for_print(*number));
             }
-            Value::String(text) => self.print_string(text.as_str()),
+            Value::String(text) => self.print_string(&text.to_string_lossy()),
             Value::Object(object) => self.object(object, level),
         }
     }
@@ -5584,7 +5630,7 @@ impl Printer<'_, '_> {
         self.out.push_str("{ ");
         let mut first = true;
         for key in object.own_keys() {
-            let Some(property) = object.own_property(&key) else {
+            let Some(property) = object.own_property_key(&PropertyKey::from(key.clone())) else {
                 continue;
             };
             if !property.enumerable {
@@ -5595,7 +5641,9 @@ impl Printer<'_, '_> {
             }
             first = false;
             self.out
-                .push_str(&js_compile::disasm::print_atom(&Atom::from_text(&key)));
+                .push_str(&js_compile::disasm::print_atom(&Atom::from_text(
+                    &key.to_string_lossy(),
+                )));
             self.out.push_str(": ");
             // An accessor has no value to dump; the reference names the half that
             // exists instead of calling it.
@@ -5751,7 +5799,7 @@ fn decrement(value: Value) -> Value {
 fn compare(op: Opcode, left: Value, right: Value, interp: &Interp<'_>) -> Value {
     use Opcode::*;
     let ordering = if let (Value::String(a), Value::String(b)) = (&left, &right) {
-        Some(a.as_str().cmp(b.as_str()))
+        Some(a.to_string_lossy().cmp(&b.to_string_lossy()))
     } else {
         let (a, b) = (left.to_number(), right.to_number());
         // Any comparison involving `NaN` is false, which `partial_cmp` expresses.

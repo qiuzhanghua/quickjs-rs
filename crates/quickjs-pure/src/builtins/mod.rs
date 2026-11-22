@@ -199,7 +199,7 @@ pub fn this_object(interp: &mut Interp<'_>, this: &Value) -> crate::interp::JsRe
 /// The text a string method operates on, whether `this` is a primitive or a box.
 pub fn this_string(interp: &Interp<'_>, this: &Value) -> Option<String> {
     match this {
-        Value::String(text) => Some(text.as_str().to_string()),
+        Value::String(text) => Some(text.to_string_lossy().into_owned()),
         Value::Object(object) => object
             .own_property("_value")
             .and_then(|property| property.value)

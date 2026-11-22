@@ -167,7 +167,7 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
             .realm
             .well_known_key(crate::interp::WellKnown::ToStringTag);
         if let Some(Value::String(tag)) = interp.get_property_key(object, &key)? {
-            let tag = tag.as_str().to_string();
+            let tag = tag.to_string_lossy().into_owned();
             return Ok(interp.string(format!("[object {tag}]")));
         }
     }
@@ -242,15 +242,12 @@ pub fn own_property_keys(value: &Value) -> Vec<PropertyKey> {
     let Some(object) = value.as_object() else {
         if let Value::String(text) = value {
             return (0..text.utf16_len())
-                .map(|i| PropertyKey::String(i.to_string()))
+                .map(|i| PropertyKey::from(i.to_string()))
                 .collect();
         }
         return Vec::new();
     };
-    let mut out: Vec<PropertyKey> = own_keys(value)
-        .into_iter()
-        .map(PropertyKey::String)
-        .collect();
+    let mut out: Vec<PropertyKey> = own_keys(value).into_iter().map(PropertyKey::from).collect();
     for symbol in object.own_symbol_keys() {
         out.push(PropertyKey::Symbol(symbol));
     }
@@ -259,23 +256,27 @@ pub fn own_property_keys(value: &Value) -> Vec<PropertyKey> {
 
 /// The own keys of `value`, in the order the spec requires: integer-like keys
 /// ascending, then the rest in insertion order.
-pub fn own_keys(value: &Value) -> Vec<String> {
+pub fn own_keys(value: &Value) -> Vec<crate::value::Wtf8> {
     let Some(object) = value.as_object() else {
         // A string has index keys and `length`.
         if let Value::String(text) = value {
-            return (0..text.utf16_len()).map(|i| i.to_string()).collect();
+            return (0..text.utf16_len())
+                .map(|i| crate::value::Wtf8::new(i.to_string()))
+                .collect();
         }
         return Vec::new();
     };
     let mut numeric: Vec<u32> = Vec::new();
-    let mut strings: Vec<String> = Vec::new();
+    let mut strings: Vec<crate::value::Wtf8> = Vec::new();
     for index in 0..object.array_length().unwrap_or(0) {
         if object.array_get(index).is_some() {
             numeric.push(index as u32);
         }
     }
     for key in object.own_keys() {
-        match array_index(&key) {
+        // An array index is ASCII, so it always has a `&str` form; anything else is an
+        // ordinary key and keeps its code units.
+        match key.as_str().and_then(array_index) {
             Some(index) => {
                 if !numeric.contains(&index) {
                     numeric.push(index);
@@ -285,7 +286,10 @@ pub fn own_keys(value: &Value) -> Vec<String> {
         }
     }
     numeric.sort_unstable();
-    let mut out: Vec<String> = numeric.into_iter().map(|n| n.to_string()).collect();
+    let mut out: Vec<crate::value::Wtf8> = numeric
+        .into_iter()
+        .map(|n| crate::value::Wtf8::new(n.to_string()))
+        .collect();
     out.extend(strings);
     out
 }
@@ -312,11 +316,11 @@ fn keys(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
         .into_iter()
         .filter(|key| {
             object
-                .own_property(key)
+                .own_property_key(&PropertyKey::from(key.clone()))
                 .map(|property| property.enumerable)
                 .unwrap_or(true)
         })
-        .map(|key| interp.string(key))
+        .map(|key| interp.string_wtf8(key))
         .collect();
     let array = interp.new_array(keys);
     Ok(Value::Object(array))
@@ -327,14 +331,15 @@ fn values(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
     let mut out = Vec::new();
     if let Value::Object(object) = &value {
         for key in own_keys(&value) {
+            let as_key = PropertyKey::from(key.clone());
             let enumerable = object
-                .own_property(&key)
+                .own_property_key(&as_key)
                 .map(|property| property.enumerable)
                 .unwrap_or(true);
             if !enumerable {
                 continue;
             }
-            if let Some(found) = interp.get_property(object, &key)? {
+            if let Some(found) = interp.get_property_key(object, &as_key)? {
                 out.push(found);
             }
         }
@@ -349,15 +354,16 @@ fn entries(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
     let mut out = Vec::new();
     if let Value::Object(object) = &value {
         for key in own_keys(&value) {
+            let as_key = PropertyKey::from(key.clone());
             let enumerable = object
-                .own_property(&key)
+                .own_property_key(&as_key)
                 .map(|property| property.enumerable)
                 .unwrap_or(true);
             if !enumerable {
                 continue;
             }
-            if let Some(found) = interp.get_property(object, &key)? {
-                let pair = interp.new_array(vec![interp.string(key), found]);
+            if let Some(found) = interp.get_property_key(object, &as_key)? {
+                let pair = interp.new_array(vec![interp.string_wtf8(key), found]);
                 out.push(Value::Object(pair));
             }
         }
@@ -376,15 +382,21 @@ fn assign(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Val
             continue;
         };
         for key in own_keys(source) {
+            let as_key = PropertyKey::from(key);
             let enumerable = source_object
-                .own_property(&key)
+                .own_property_key(&as_key)
                 .map(|property| property.enumerable)
                 .unwrap_or(true);
             if !enumerable {
                 continue;
             }
-            if let Some(found) = interp.get_property(source_object, &key)? {
-                interp.set_property(target_object, &key, found)?;
+            if let Some(found) = interp.get_property_key(source_object, &as_key)? {
+                interp.set_property_with_key(
+                    target_object,
+                    &as_key,
+                    found,
+                    crate::interp::DeleteFailure::Throw,
+                )?;
             }
         }
     }
@@ -572,9 +584,12 @@ fn get_own_property_names(
     if matches!(&value, Value::Object(object) if object.is_array())
         || matches!(&value, Value::String(_))
     {
-        names.push("length".to_string());
+        names.push(crate::value::Wtf8::new("length"));
     }
-    let names: Vec<Value> = names.into_iter().map(|name| interp.string(name)).collect();
+    let names: Vec<Value> = names
+        .into_iter()
+        .map(|name| interp.string_wtf8(name))
+        .collect();
     let array = interp.new_array(names);
     Ok(Value::Object(array))
 }
@@ -641,10 +656,11 @@ fn freeze(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Va
         object.set_elements_writable(false);
         let names = object.own_keys();
         for name in names {
-            if let Some(mut property) = object.own_property(&name) {
+            let key = PropertyKey::from(name);
+            if let Some(mut property) = object.own_property_key(&key) {
                 property.writable = false;
                 property.configurable = false;
-                object.define(&name, property);
+                object.define_key(&key, property);
             }
         }
     }
@@ -657,9 +673,10 @@ fn seal(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
         object.set_extensible(false);
         let names = object.own_keys();
         for name in names {
-            if let Some(mut property) = object.own_property(&name) {
+            let key = PropertyKey::from(name);
+            if let Some(mut property) = object.own_property_key(&key) {
                 property.configurable = false;
-                object.define(&name, property);
+                object.define_key(&key, property);
             }
         }
     }
@@ -678,7 +695,7 @@ fn is_frozen(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult
     let anything_writable = object
         .own_keys()
         .into_iter()
-        .filter_map(|name| object.own_property(&name))
+        .filter_map(|name| object.own_property_key(&PropertyKey::from(name)))
         .any(|property| property.configurable || property.writable);
     Ok(Value::Bool(
         !object.is_extensible() && !anything_writable && !object.elements_writable(),
@@ -696,7 +713,7 @@ fn is_sealed(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult
     let anything_configurable = object
         .own_keys()
         .into_iter()
-        .filter_map(|name| object.own_property(&name))
+        .filter_map(|name| object.own_property_key(&PropertyKey::from(name)))
         .any(|property| property.configurable);
     Ok(Value::Bool(
         !object.is_extensible() && !anything_configurable,

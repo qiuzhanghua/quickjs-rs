@@ -40,10 +40,7 @@ fn stringify(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
             let count = arg(args, 2).to_number().clamp(0.0, 10.0) as usize;
             " ".repeat(count)
         }
-        Value::String(text) => {
-            let text = text.as_str();
-            text.chars().take(10).collect()
-        }
+        Value::String(text) => text.to_string_lossy().chars().take(10).collect(),
         _ => String::new(),
     };
     let mut out = String::new();
@@ -99,7 +96,7 @@ fn write_value(
             Ok(true)
         }
         Value::String(text) => {
-            write_string(text.as_str(), out);
+            write_string(&text.to_string_lossy(), out);
             Ok(true)
         }
         Value::Object(object) => {
@@ -169,33 +166,35 @@ fn write_object(
 ) -> JsResult<()> {
     // Enumerable own keys in the spec's order, skipping keys whose values do not
     // serialise (a function-valued property is omitted, not `null`).
-    let keys: Vec<String> = crate::builtins::object::own_keys(&Value::Object(object.clone()))
-        .into_iter()
-        .filter(|key| {
-            object
-                .own_property(key)
-                .map(|property| property.enumerable)
-                .unwrap_or(true)
-        })
-        .collect();
+    let keys: Vec<crate::value::Wtf8> =
+        crate::builtins::object::own_keys(&Value::Object(object.clone()))
+            .into_iter()
+            .filter(|key| {
+                object
+                    .own_property_key(&crate::object::PropertyKey::from(key.clone()))
+                    .map(|property| property.enumerable)
+                    .unwrap_or(true)
+            })
+            .collect();
     let mut written = 0usize;
     let mut body = String::new();
     for key in keys {
-        let Some(value) = interp.get_property(object, &key)? else {
+        let key_text = key.to_string_lossy().into_owned();
+        let Some(value) = interp.get_property(object, &key_text)? else {
             continue;
         };
         let mut piece = String::new();
         // Render the value first so an unrepresentable one can be skipped whole.
-        if !write_value(interp, &value, &key, indent, &mut piece, depth + 1)? {
+        if !write_value(interp, &value, &key_text, indent, &mut piece, depth + 1)? {
             continue;
         }
         if written > 0 {
             body.push(',');
         }
         newline(&mut body, indent, depth + 1);
-        let mut key_text = String::new();
-        write_string(&key, &mut key_text);
-        body.push_str(&key_text);
+        let mut escaped = String::new();
+        write_string(&key_text, &mut escaped);
+        body.push_str(&escaped);
         body.push(':');
         if !indent.is_empty() {
             body.push(' ');

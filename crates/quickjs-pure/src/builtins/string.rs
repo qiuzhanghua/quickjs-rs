@@ -137,19 +137,33 @@ fn from_char_code(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsRe
         .iter()
         .map(|value| (value.to_number() as i64 & 0xffff) as u16)
         .collect();
-    Ok(interp.string(String::from_utf16_lossy(&units)))
+    // Not `String::from_utf16_lossy`: a unit with no partner is a legal JS string, and
+    // replacing it with U+FFFD is exactly the bug this representation exists to avoid.
+    Ok(interp.string_wtf8(crate::value::Wtf8::from_units(&units)))
 }
 
 fn from_code_point(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let mut text = String::new();
+    let mut units = Vec::with_capacity(args.len());
     for value in args {
         let code = value.to_number();
         if !(0.0..=0x10ffff as f64).contains(&code) {
             return Err(interp.range_error("invalid code point"));
         }
-        text.push(char::from_u32(code as u32).unwrap_or('\u{fffd}'));
+        let code = code as u32;
+        // A code point in the surrogate range is not a `char`, but it is a legal argument
+        // here: the spec's only rejection is the range check above.
+        if (0xd800..0xe000).contains(&code) {
+            units.push(code as u16);
+        } else {
+            let mut buffer = [0u16; 2];
+            units.extend_from_slice(
+                char::from_u32(code)
+                    .unwrap_or('\u{fffd}')
+                    .encode_utf16(&mut buffer),
+            );
+        }
     }
-    Ok(interp.string(text))
+    Ok(interp.string_wtf8(crate::value::Wtf8::from_units(&units)))
 }
 
 // ---------------------------------------------------------------------------
@@ -161,14 +175,38 @@ fn text_of(interp: &Interp<'_>, this: &Value) -> Result<String, crate::interp::S
     this_string(interp, this).ok_or_else(|| interp.type_error("String method on a non-string"))
 }
 
-/// The UTF-16 code units of `text`, which is what index arithmetic counts.
-fn units(text: &str) -> Vec<u16> {
-    text.encode_utf16().collect()
+/// The receiver's code units without flattening an unpaired surrogate.
+///
+/// The "at" family indexes code units, so it must not read through [`text_of`]: a lossy
+/// `String` would report `0xFFFD` where the string holds `0xD800`.
+fn wtf8_of(interp: &Interp<'_>, this: &Value) -> Result<crate::value::Wtf8, crate::interp::Signal> {
+    string_object(interp, this).map(|text| text.wtf8().clone())
 }
 
-/// Rebuild a string from `units`.
-fn from_units(units: &[u16]) -> String {
-    String::from_utf16_lossy(units)
+/// The receiver's string object, so a caller can use its cached code units.
+fn string_object(
+    interp: &Interp<'_>,
+    this: &Value,
+) -> Result<js_gc::Gc<crate::value::JsString>, crate::interp::Signal> {
+    match this {
+        Value::String(text) => Ok(text.clone()),
+        // A boxed string carries the primitive in `_value`.
+        Value::Object(object) => match object.own_property("_value").and_then(|p| p.value) {
+            Some(Value::String(text)) => Ok(text),
+            _ => Err(interp.type_error("String method on a non-string")),
+        },
+        _ => Err(interp.type_error("String method on a non-string")),
+    }
+}
+
+/// The UTF-16 code units of `text`, which is what index arithmetic counts.
+fn units(text: &crate::value::Wtf8) -> Vec<u16> {
+    text.to_units()
+}
+
+/// Rebuild a string from code units, keeping unpaired surrogates intact.
+fn from_units(units: &[u16]) -> crate::value::Wtf8 {
+    crate::value::Wtf8::from_units(units)
 }
 
 /// Normalise a possibly negative start/end index for a code-unit range.
@@ -191,13 +229,13 @@ fn clamp(index: f64, length: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 fn char_at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     // A negative index is out of range, not clamped to zero: `"a".charAt(-1)` is
     // `""`, which is different from `"a".charAt(0)`.
     let Some(index) = unit_index(arg_int_or(args, 0, 0), text.len()) else {
         return Ok(interp.string(String::new()));
     };
-    Ok(interp.string(from_units(&text[index..index + 1])))
+    Ok(interp.string_wtf8(from_units(&text[index..index + 1])))
 }
 
 /// A non-negative index into a string of `length` code units, or `None`.
@@ -213,16 +251,21 @@ fn unit_index(index: i64, length: usize) -> Option<usize> {
 }
 
 fn char_code_at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
-    let index = unit_index(arg_int_or(args, 0, 0), text.len());
-    Ok(match index.and_then(|index| text.get(index)) {
-        Some(unit) => Value::Int(*unit as i32),
+    // Straight at the receiver's cached units rather than through a decoded copy: this is
+    // the operation a `for` loop over a string repeats, so it has to be `O(1)`.
+    let object = string_object(interp, &this)?;
+    let index = arg_int_or(args, 0, 0);
+    if index < 0 {
+        return Ok(Value::Float(f64::NAN));
+    }
+    Ok(match object.code_unit_at(index as usize) {
+        Some(unit) => Value::Int(unit as i32),
         None => Value::Float(f64::NAN),
     })
 }
 
 fn code_point_at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     let Some(index) = unit_index(arg_int_or(args, 0, 0), text.len()) else {
         return Ok(Value::Undefined);
     };
@@ -240,7 +283,7 @@ fn code_point_at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResu
 }
 
 fn at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     let raw = arg_int_or(args, 0, 0);
     let index = if raw < 0 {
         text.len() as i64 + raw
@@ -250,7 +293,7 @@ fn at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     if index < 0 || index as usize >= text.len() {
         return Ok(Value::Undefined);
     }
-    Ok(interp.string(from_units(&text[index as usize..index as usize + 1])))
+    Ok(interp.string_wtf8(from_units(&text[index as usize..index as usize + 1])))
 }
 
 // ---------------------------------------------------------------------------
@@ -347,13 +390,13 @@ fn locale_compare(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
 // ---------------------------------------------------------------------------
 
 fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     let start = clamp(arg_int_or(args, 0, 0) as f64, text.len());
     let end = match args.get(1) {
         None | Some(Value::Undefined) => text.len(),
         Some(value) => clamp(value.to_number(), text.len()),
     };
-    Ok(interp.string(from_units(if start < end {
+    Ok(interp.string_wtf8(from_units(if start < end {
         &text[start..end]
     } else {
         &[]
@@ -361,7 +404,7 @@ fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
 }
 
 fn substring(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     // `substring` clamps to `[0, length]` and swaps its arguments when start > end;
     // it does not accept negative indices, which is the whole difference from `slice`.
     let length = text.len() as f64;
@@ -381,11 +424,11 @@ fn substring(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<V
             (b as usize, a as usize)
         }
     };
-    Ok(interp.string(from_units(&text[start..end])))
+    Ok(interp.string_wtf8(from_units(&text[start..end])))
 }
 
 fn substr(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = units(&text_of(interp, &this)?);
+    let text = units(&wtf8_of(interp, &this)?);
     let length = text.len();
     let start = clamp(arg_int_or(args, 0, 0) as f64, length);
     let count = match args.get(1) {
@@ -393,7 +436,7 @@ fn substr(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
         Some(value) => value.to_number().max(0.0) as usize,
     };
     let end = (start + count).min(length);
-    Ok(interp.string(from_units(&text[start..end])))
+    Ok(interp.string_wtf8(from_units(&text[start..end])))
 }
 
 fn split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -415,13 +458,15 @@ fn split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
             }
         }
         Value::String(separator) => {
-            let separator = separator.as_str();
+            // A separator with an unpaired surrogate has no `&str` form; splitting by its
+            // replacement character is the documented lossy fallback.
+            let separator = separator.to_string_lossy();
             if separator.is_empty() {
                 text.chars()
                     .map(|character| interp.string(character.to_string()))
                     .collect()
             } else {
-                text.split(separator)
+                text.split(&*separator)
                     .map(|part| interp.string(part.to_string()))
                     .collect()
             }
