@@ -1,6 +1,6 @@
 # quickjs-rs 需求分析（纯 Rust 重写 QuickJS）
 
-> 状态：v1.0 —— M0–M5 已完成（`qjs` 能执行 JS，ES6+ 语言特性齐备：class/解构/generator/`Proxy`/`Promise`/async）；已发布 v0.3.0
+> 状态：v1.0 —— M0–M6 已完成（`qjs` 能执行 JS 与 ES 模块，ES6+ 语言特性齐备）；v0.3.0 已发布
 > 上游基线：`https://github.com/bellard/quickjs` `master`，`VERSION = 2026-06-04`
 
 ---
@@ -229,7 +229,7 @@ crates/
 | M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | ✅ 能跑递归/fib/数组/闭包脚本 |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/栈回溯） | ✅ M4 范围内 `test_builtin.js` 全通过；`Date` 未做 |
 | M5 ✅ | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | 已完成：`test_language.js`、`test_closure.js` 全部通过；`Promise`/async/`for await`/async generator 就位 |
-| M6 | 模块系统 + 动态 import + JSON 模块 | `test_cyclic_import.js`、`hello_module.js` 通过 |
+| M6 ✅ | 模块系统 + 动态 import + JSON 模块 | 已完成：`test_cyclic_import.js`、`hello_module.js` 与参考**逐字节一致**；循环导入、live binding、`export *`、`with { type }`、`import.meta`、`import()` 全对拍 |
 | M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
 | M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | test262 对应目录达标 |
 | M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | `test_std.js`、`test_worker.js`、CLI 选项矩阵 |

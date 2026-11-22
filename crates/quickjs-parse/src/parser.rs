@@ -1043,7 +1043,17 @@ impl<'a> Parser<'a> {
             return Err(self.error("invalid 'class' declaration in a single statement context"));
         }
         if self.at_keyword(Keyword::Import) {
-            return Err(self.error("'import' can only appear at the top level of a module"));
+            // `import(...)` and `import.meta` are *expressions*, so they are an ordinary
+            // expression statement here. Only a declaration is restricted to the top
+            // level of a module.
+            let peek = self.peek()?;
+            let expression = matches!(
+                peek.kind,
+                TokenKind::Punct(Punct::LParen) | TokenKind::Punct(Punct::Dot)
+            );
+            if !expression {
+                return Err(self.error("'import' can only appear at the top level of a module"));
+            }
         }
         if self.at_keyword(Keyword::Export) {
             return Err(self.error("'export' can only appear at the top level of a module"));
@@ -2552,6 +2562,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(Punct::LBrace) {
             self.bump()?;
             let mut specifiers = Vec::new();
+            let mut candidates: Vec<(String, Span)> = Vec::new();
             let mut source = None;
             while !self.at_punct(Punct::RBrace) {
                 let spec_start = self.current.span.start;
@@ -2561,10 +2572,11 @@ impl<'a> Parser<'a> {
                 } else {
                     local.clone()
                 };
-                if source.is_none() {
-                    if let ModuleName::Ident(id) = &local {
-                        self.pending_exports.push((id.name.clone(), id.span));
-                    }
+                // Deferred: whether these name *local* bindings (and so have to be
+                // checked against the module's declarations) depends on whether a
+                // `from` follows, which is not known until the closing brace.
+                if let ModuleName::Ident(id) = &local {
+                    candidates.push((id.name.clone(), id.span));
                 }
                 specifiers.push(ExportSpecifier {
                     local,
@@ -2577,7 +2589,14 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct(Punct::RBrace)?;
             let mut attributes = Vec::new();
-            if self.eat_contextual("from")? {
+            let has_from = self.eat_contextual("from")?;
+            if !has_from {
+                // `export { a }` re-exports a binding of this module and must name one;
+                // `export { a } from "m"` names an export of `m` and is checked when the
+                // module is linked, not here.
+                self.pending_exports.extend(candidates);
+            }
+            if has_from {
                 let TokenKind::String(value) = self.current.kind.clone() else {
                     return Err(self.error("expecting a module name string"));
                 };
@@ -3699,7 +3718,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(Punct::Dot) {
             if !self.module {
                 return Err(self.error_at(
-                    "invalid use of 'import.meta' outside of a module",
+                    "import.meta only valid in module code",
                     self.span_from(start),
                 ));
             }

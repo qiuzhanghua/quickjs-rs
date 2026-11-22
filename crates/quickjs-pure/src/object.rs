@@ -336,6 +336,15 @@ pub enum Callable {
         /// Whether this delivers the value or raises the reason.
         kind: crate::interp::ResumeKind,
     },
+    /// Reads a module namespace's binding out of the cell it is stored in.
+    ///
+    /// A namespace object is an ordinary object whose exports are getters, so a getter
+    /// is what `ns.x` calls — and it has to be a callable object carrying the cell, for
+    /// the same reason `PromiseResolve` carries its promise.
+    ModuleBinding {
+        /// The binding's cell, shared with the exporting module.
+        cell: Gc<Cell>,
+    },
     /// Answer a pending async-generator method with `{value, done: false}`.
     ///
     /// `yield v` in an async generator awaits `v` first, so the value can arrive after
@@ -403,6 +412,7 @@ impl Trace for Callable {
                 tracer.visit(promise);
             }
             Callable::YieldResult { promise, .. } => tracer.visit(promise),
+            Callable::ModuleBinding { cell } => tracer.visit(cell),
             Callable::DisposeStep {
                 remaining,
                 promise,

@@ -23,8 +23,9 @@
 
 use crate::bytecode::LineCol;
 use crate::bytecode::{
-    Atom, ClosureType, ClosureVar, Constant, EvalSite, EvalVisible, Function as CompiledFunction,
-    FunctionKind, VarDef, VarKind,
+    Atom, ClosureType, ClosureVar, Constant, EvalSite, EvalVisible, ExportEntry,
+    Function as CompiledFunction, FunctionKind, ImportEntry, ModuleMeta, ModuleRequest, VarDef,
+    VarKind,
 };
 use crate::disasm;
 use crate::opcode::Opcode;
@@ -431,6 +432,12 @@ struct FnState {
     /// global properties rather than locals, which is why they show up as
     /// closure variables with `[global_decl]`.
     is_script: bool,
+    /// Whether this is a module body.
+    ///
+    /// A module body is a script in every respect that matters here — no `arguments`,
+    /// no `this` of its own — but its top-level declarations are *module*-scoped
+    /// instead of global, which is what this flag changes.
+    is_module: bool,
     /// Whether the function is an arrow, which never gets its own `arguments`.
     is_arrow: bool,
     /// The name a *named function expression* binds inside its own body.
@@ -498,6 +505,11 @@ struct FnState {
     eval_sites: Vec<EvalSite>,
     /// Direct `eval` call sites seen so far: where, and the block that was current.
     pending_eval_sites: Vec<(Span, u64, bool)>,
+    /// The module tables, when this body is a module.
+    ///
+    /// Only the top-level state ever has one: `export` and `import` are top-level
+    /// statements, so nothing nested can add to these tables.
+    module: Option<ModuleMeta>,
     /// Whether the self-name prologue (`special_object 2` then the store) has been
     /// emitted for this function.
     ///
@@ -575,6 +587,7 @@ impl FnState {
             line: 1,
             column: 1,
             is_script: false,
+            is_module: false,
             is_arrow: false,
             defined_args: 0,
             param_prologue: Vec::new(),
@@ -595,6 +608,7 @@ impl FnState {
             created_in_params: false,
             eval_sites: Vec::new(),
             pending_eval_sites: Vec::new(),
+            module: None,
             self_name_initialized: false,
             leaves_value: false,
             stmt_depth: 0,
@@ -614,6 +628,12 @@ impl FnState {
     /// `var` is function-scoped, so a `var i` in a `for` head is still the same
     /// binding as a `var i` in the body, even though the head has its own block.
     fn declares_globally(&self, def: &VarDef) -> bool {
+        // A module's top-level declarations are *module*-scoped: they live in the module
+        // record, never on the global object. Two modules can both declare `var x`
+        // without seeing each other, which is the whole point.
+        if self.is_module {
+            return false;
+        }
         self.is_script && (!def.is_lexical || self.current_block == self.body_block)
     }
 }
@@ -647,7 +667,14 @@ impl Compiler {
     /// Compile a whole program into its top-level function.
     pub fn compile(mut self, program: &Program) -> Result<CompiledFunction, SyntaxError> {
         let mut state = FnState::new("<eval>", FunctionKind::Normal);
-        state.is_script = true;
+        // A module body is *not* a script: it has no completion value, so no hidden
+        // `<ret>` local and no `put_loc0` before each statement. What it shares with one
+        // is having no `arguments` of its own and no receiver — see `is_module`.
+        state.is_script = !self.module;
+        state.is_module = self.module;
+        if self.module {
+            state.module = Some(ModuleMeta::default());
+        }
         state.strict = program.strict || self.module;
         state.line = program.span.start.line;
         state.column = program.span.start.column;
@@ -658,8 +685,10 @@ impl Compiler {
         // binding's block and silently loses the temporal-dead-zone marking for
         // the script's own blocks. A function frame has no `<ret>`, which is why
         // the misalignment only showed up at the top level.
-        state.vars.push(VarDef::var("<ret>"));
-        state.var_block.push(FUNCTION_SCOPE);
+        if !self.module {
+            state.vars.push(VarDef::var("<ret>"));
+            state.var_block.push(FUNCTION_SCOPE);
+        }
         self.stack.push(state);
         // The body is its own scope, keyed by the position of the program.
         // The script body needs a key no statement can produce. Statement keys are
@@ -669,16 +698,40 @@ impl Compiler {
         let body_key = SCRIPT_BODY;
         self.push_block(body_key, NO_PARENT);
         self.state().body_block = body_key;
+        // A module body opens with a re-entry guard. The host evaluates a module exactly
+        // once, so the guard never fires in practice — but the reference emits it, and a
+        // module function called a second time (through `eval` of its own source, say)
+        // must not run its body again.
+        let module_guard = self.module.then(|| self.new_label());
+        if let Some(body) = module_guard {
+            // The guard wraps the *hoisting* too: a second evaluation of the same module
+            // body must not even re-create its function declarations.
+            self.emit(Opcode::PushThis, &[]);
+            self.emit_jump(Opcode::IfFalse, body, &[]);
+        }
         self.hoist(&program.body, body_key)?;
+        // The scope entry is what emits the hoisted `fclosure`/store pairs, so it has to
+        // come before the guard's `return_undef`: the reference's jump target sits past
+        // both, and a second evaluation therefore re-creates nothing.
         self.emit_scope_enter(body_key);
+        if let Some(body) = module_guard {
+            self.emit(Opcode::ReturnUndef, &[]);
+            self.place_label(body);
+        }
         // Through `stmts` rather than the loop, so a `using` region at the top level of an
         // eval'd body or a module gets its disposal epilogue like any other block.
         self.stmts(&program.body)?;
-        // The program's value is whatever the last expression statement stored in
-        // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common
-        // case into a single `set_loc0`.
-        self.emit(Opcode::GetLoc, &[Op::Slot(Slot::Loc(0))]);
-        self.emit(Opcode::Return, &[]);
+        if self.module {
+            // A module has no completion value; its body simply ends.
+            self.emit(Opcode::Undefined, &[]);
+            self.emit(Opcode::ReturnAsync, &[]);
+        } else {
+            // The program's value is whatever the last expression statement stored in
+            // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common
+            // case into a single `set_loc0`.
+            self.emit(Opcode::GetLoc, &[Op::Slot(Slot::Loc(0))]);
+            self.emit(Opcode::Return, &[]);
+        }
         Ok(self.finish_current())
     }
 
@@ -1008,6 +1061,11 @@ impl Compiler {
     }
 
     fn declare(&mut self, name: &str, def: VarDef) -> u32 {
+        if self.cur().is_module && self.cur().current_block == self.cur().body_block {
+            // Only the body's own block: a `let` inside a module-level `{}` is still an
+            // ordinary local of that block, not a module variable.
+            return self.declare_module(name, &def);
+        }
         if self.cur().declares_globally(&def) {
             self.declare_global(name, &def);
             return 0;
@@ -1298,12 +1356,10 @@ impl Compiler {
             }
             StmtKind::With { object, body } => self.with_stmt(object, body)?,
             StmtKind::ClassDecl(class) => self.class_definition(class, false)?,
-            StmtKind::Import(_) | StmtKind::Export(_) => {
-                return Err(SyntaxError::new(
-                    "modules are not supported by the compiler yet",
-                    stmt.span,
-                ));
-            }
+            // `import` emits nothing: hoisting already bound its names, and the host
+            // fills their cells before the body runs.
+            StmtKind::Import(_) => {}
+            StmtKind::Export(decl) => self.export_stmt(decl)?,
         }
         Ok(())
     }
@@ -1655,6 +1711,11 @@ impl Compiler {
                     self.declare(&name.name.clone(), VarDef::lexical(name.name.clone()));
                 }
             }
+            // A module's imports are bound before any of its code runs, and its exports
+            // declare the very bindings they export — so both hoist the declarations
+            // their `StmtKind` arm will later emit code for.
+            StmtKind::Import(decl) => self.hoist_import(decl)?,
+            StmtKind::Export(decl) => self.hoist_export(decl)?,
             StmtKind::Block(inner) => self.hoist_block(stmt.span.start.offset as u64, inner)?,
             StmtKind::If { cons, alt, .. } => {
                 self.hoist_stmt(cons)?;
@@ -1774,6 +1835,10 @@ impl Compiler {
 
     /// Declare a `var`: it lives in the function's own scope, not the block's.
     fn declare_var(&mut self, name: &str, def: VarDef) {
+        if self.cur().is_module {
+            self.declare_module(name, &def);
+            return;
+        }
         if self.cur().declares_globally(&def) {
             self.declare_global(name, &def);
             return;
@@ -1860,7 +1925,9 @@ impl Compiler {
     /// `special_object`; that is the reference's shape, so the disassembly agrees.
     fn provide_arguments(&mut self) {
         let current = self.stack.len() - 1;
-        if self.stack[current].is_script {
+        if self.stack[current].is_script || self.stack[current].is_module {
+            // A module has no `arguments` binding; referring to it is a ReferenceError,
+            // which is exactly what an unbound name produces.
             return;
         }
         // An arrow has no `arguments` of its own: the binding belongs to the enclosing
@@ -2049,6 +2116,344 @@ impl Compiler {
             closure_type: ClosureType::GlobalDecl,
             var_idx: 0,
         });
+    }
+
+    /// Record a module-level declaration as a module variable.
+    ///
+    /// The binding is a closure variable of the module body, so reads and writes are
+    /// ordinary `var_ref` opcodes — the same shape a captured local has. What differs is
+    /// *who fills the cell*: the module record does, before the body runs, and an import
+    /// points its cell at the exporting module's, which is what makes bindings live and
+    /// cycles work.
+    fn declare_module(&mut self, name: &str, def: &VarDef) -> u32 {
+        let state = self.state();
+        if let Some(existing) = state.closure_vars.iter_mut().find(|c| c.name == name) {
+            // The name may have been referenced before this declaration was hoisted,
+            // which resolved it as a plain global. Correct that here, the way
+            // `declare_global` does.
+            if matches!(existing.closure_type, ClosureType::Global) {
+                existing.closure_type = ClosureType::ModuleDecl;
+                existing.is_const = def.is_const;
+                existing.is_lexical = def.is_lexical;
+            }
+            return 0;
+        }
+        state.closure_vars.push(ClosureVar {
+            name: name.to_string(),
+            is_const: def.is_const,
+            is_lexical: def.is_lexical,
+            closure_type: ClosureType::ModuleDecl,
+            var_idx: 0,
+        });
+        0
+    }
+
+    /// Declare a module variable and answer its closure-variable index.
+    ///
+    /// [`Compiler::declare_module`] answers `0` because its callers want a *slot*, and a
+    /// module variable is not one. The import table needs the real index instead, because
+    /// that is the position the host writes the cell into.
+    fn declare_module_var(&mut self, name: &str, def: &VarDef) -> u32 {
+        self.declare_module(name, def);
+        self.cur()
+            .closure_vars
+            .iter()
+            .position(|c| c.name == name)
+            .map(|index| index as u32)
+            .unwrap_or(0)
+    }
+
+    /// Declare one imported binding as a module variable.
+    ///
+    /// Returns the closure-variable index, which is what the import table records: the
+    /// host writes the exporter's cell into that slot before the body runs.
+    fn declare_import(&mut self, name: &str, is_const: bool) -> u32 {
+        let state = self.state();
+        if let Some(index) = state.closure_vars.iter().position(|c| c.name == name) {
+            // Keep the slot, fix the kind: the name may already have been referenced.
+            state.closure_vars[index].closure_type = ClosureType::ModuleImport;
+            state.closure_vars[index].is_const = is_const;
+            return index as u32;
+        }
+        state.closure_vars.push(ClosureVar {
+            name: name.to_string(),
+            // An imported binding cannot be assigned: `x = 1` on an import is a
+            // `TypeError` at run time, which the const flag is what produces.
+            is_const: true,
+            // Lexical, so reads go through `get_var_ref_check`: before linking has filled
+            // the cell an import is in its dead zone, and reading it there must say so
+            // rather than answer `undefined`.
+            is_lexical: true,
+            closure_type: ClosureType::ModuleImport,
+            var_idx: 0,
+        });
+        state.closure_vars.len() as u32 - 1
+    }
+
+    /// Emit the code an `export` needs.
+    ///
+    /// Only `export default <expr>` has any: everything else is a table entry whose
+    /// binding is declared elsewhere. The expression is stored into the hidden
+    /// `*default*` variable rather than returned, because the module body has no value
+    /// to speak of.
+    fn export_stmt(&mut self, decl: &ExportDecl) -> Result<(), SyntaxError> {
+        match &decl.kind {
+            ExportKind::Declaration(stmt) => self.stmt(stmt),
+            ExportKind::Default(expr) => {
+                // A named default function/class is already a module binding; the export
+                // points at it and there is nothing to evaluate.
+                if matches!(&expr.kind, ExprKind::Function(func) if func.name.is_some())
+                    || matches!(&expr.kind, ExprKind::Class(class) if class.name.is_some())
+                {
+                    return Ok(());
+                }
+                self.expr(expr)?;
+                let index = self.declare_export_default();
+                self.emit(Opcode::PutVarRef, &[Op::Slot(Slot::VarRef(index))]);
+                Ok(())
+            }
+            ExportKind::Named { .. } | ExportKind::All { .. } => Ok(()),
+        }
+    }
+
+    /// A module name as the string it denotes.
+    fn module_name_text(name: &ModuleName) -> &str {
+        match name {
+            ModuleName::Ident(ident) => &ident.name,
+            ModuleName::Str(text) => text,
+        }
+    }
+
+    /// Bind `import`'s local names and record where each one comes from.
+    ///
+    /// Nothing is emitted: an import is not an instruction, it is a promise that the
+    /// binding's cell will be filled before the body runs. The cell lands in the module's
+    /// environment at a fixed index, and the host fills it from the exporter's cell —
+    /// which is why a cyclic import can bind before the other module has evaluated.
+    fn hoist_import(&mut self, decl: &ImportDecl) -> Result<(), SyntaxError> {
+        let request = self.module_request(&decl.source, &decl.attributes);
+        for specifier in &decl.specifiers {
+            let (local, name, is_star) = match specifier {
+                ImportSpecifier::Default(ident) => {
+                    (ident.name.clone(), "default".to_string(), false)
+                }
+                ImportSpecifier::Namespace(ident) => (ident.name.clone(), String::new(), true),
+                ImportSpecifier::Named { imported, local } => (
+                    local.name.clone(),
+                    Self::module_name_text(imported).to_string(),
+                    false,
+                ),
+            };
+            // `import * as ns` is *not* a live binding of another module's variable —
+            // it is a value of its own, which is why the reference declares it like a
+            // module variable and the host stores the namespace object in that cell.
+            let var_idx = if is_star {
+                // `const`: a namespace object is a value, and the binding is immutable.
+                self.declare_module_var(&local, &VarDef::constant(local.clone()))
+            } else {
+                self.declare_import(&local, true)
+            };
+            self.module_meta().imports.push(ImportEntry {
+                module: request,
+                name,
+                var_idx,
+                is_star,
+            });
+        }
+        Ok(())
+    }
+
+    /// Record what an `export` offers, declaring the binding it exports.
+    ///
+    /// `export var x = 1` is a declaration like any other; only the table entry is extra.
+    fn hoist_export(&mut self, decl: &ExportDecl) -> Result<(), SyntaxError> {
+        match &decl.kind {
+            ExportKind::Declaration(stmt) => {
+                // The inner declaration keeps its own hoisting, then every name it binds
+                // becomes an export of the same name.
+                self.hoist_stmt(stmt)?;
+                let mut names = Vec::new();
+                Self::declared_names(stmt, &mut names);
+                for name in names {
+                    let var_idx = self.module_binding_index(&name);
+                    self.exports_local(&name, var_idx);
+                }
+            }
+            ExportKind::Default(expr) => {
+                // The reference puts a default export in a hidden `*default*` variable,
+                // so `export default function f(){}` can export a *value* while `f` stays
+                // a binding of the module.
+                if let ExprKind::Function(func) = &expr.kind
+                    && let Some(name) = &func.name
+                {
+                    let text = name.name.clone();
+                    self.hoist_stmt(&Stmt {
+                        kind: StmtKind::FuncDecl(func.clone()),
+                        span: expr.span,
+                    })?;
+                    let var_idx = self.module_binding_index(&text);
+                    self.module_meta().exports.push(ExportEntry::Local {
+                        export_name: "default".to_string(),
+                        var_idx,
+                    });
+                    return Ok(());
+                }
+                if let ExprKind::Class(class) = &expr.kind
+                    && let Some(name) = &class.name
+                {
+                    let text = name.name.clone();
+                    self.hoist_stmt(&Stmt {
+                        kind: StmtKind::ClassDecl(class.clone()),
+                        span: expr.span,
+                    })?;
+                    let var_idx = self.module_binding_index(&text);
+                    let _ = var_idx;
+                }
+                let var_idx = self.declare_export_default();
+                self.module_meta().exports.push(ExportEntry::Local {
+                    export_name: "default".to_string(),
+                    var_idx,
+                });
+            }
+            ExportKind::Named {
+                specifiers,
+                source,
+                attributes,
+            } => match source {
+                Some(source) => {
+                    let request = self.module_request(source, attributes);
+                    for specifier in specifiers {
+                        self.module_meta().exports.push(ExportEntry::Indirect {
+                            export_name: Self::module_name_text(&specifier.exported).to_string(),
+                            module: request,
+                            import_name: Self::module_name_text(&specifier.local).to_string(),
+                        });
+                    }
+                }
+                None => {
+                    for specifier in specifiers {
+                        let local = Self::module_name_text(&specifier.local).to_string();
+                        let var_idx = self.module_binding_index(&local);
+                        let export_name = Self::module_name_text(&specifier.exported).to_string();
+                        self.module_meta().exports.push(ExportEntry::Local {
+                            export_name,
+                            var_idx,
+                        });
+                    }
+                }
+            },
+            ExportKind::All {
+                source,
+                exported,
+                attributes,
+            } => {
+                let request = self.module_request(source, attributes);
+                match exported {
+                    Some(name) => {
+                        self.module_meta().exports.push(ExportEntry::StarAs {
+                            export_name: Self::module_name_text(name).to_string(),
+                            module: request,
+                        });
+                    }
+                    None => {
+                        self.module_meta()
+                            .exports
+                            .push(ExportEntry::Star { module: request });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The names a declaration binds, which is what `export <decl>` exports.
+    fn declared_names(stmt: &Stmt, out: &mut Vec<String>) {
+        match &stmt.kind {
+            StmtKind::VarDecl(decl) => {
+                for declarator in &decl.declarators {
+                    let mut names = Vec::new();
+                    declarator.target.bound_names(&mut names);
+                    out.extend(names.into_iter().map(|name| name.name));
+                }
+            }
+            StmtKind::FuncDecl(func) => {
+                if let Some(name) = &func.name {
+                    out.push(name.name.clone());
+                }
+            }
+            StmtKind::ClassDecl(class) => {
+                if let Some(name) = &class.name {
+                    out.push(name.name.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The closure-variable index of a module binding, declaring it if the name was
+    /// exported without being declared here.
+    ///
+    /// `export { x }` where `x` is not declared in the module is a link-time
+    /// `SyntaxError`, not a compile-time one, so the slot still has to exist.
+    fn module_binding_index(&mut self, name: &str) -> u32 {
+        if let Some(index) = self.cur().closure_vars.iter().position(|c| c.name == name) {
+            return index as u32;
+        }
+        self.declare_module_var(name, &VarDef::lexical(name.to_string()))
+    }
+
+    fn exports_local(&mut self, export_name: &str, var_idx: u32) {
+        self.module_meta().exports.push(ExportEntry::Local {
+            export_name: export_name.to_string(),
+            var_idx,
+        });
+    }
+
+    /// The hidden `*default*` binding `export default <expr>` stores into.
+    fn declare_export_default(&mut self) -> u32 {
+        const DEFAULT: &str = "*default*";
+        if let Some(index) = self
+            .cur()
+            .closure_vars
+            .iter()
+            .position(|c| c.name == DEFAULT)
+        {
+            return index as u32;
+        }
+        self.declare_module_var(DEFAULT, &VarDef::lexical(DEFAULT.to_string()))
+    }
+
+    /// The module tables, which only the top-level state has.
+    fn module_meta(&mut self) -> &mut ModuleMeta {
+        self.state()
+            .module
+            .as_mut()
+            .expect("module tables are only touched while compiling a module")
+    }
+
+    /// The index of `specifier`'s request, adding it if it is new.
+    ///
+    /// Deduplicated on the specifier *and* its attributes: the same file imported once as
+    /// JSON and once as text is two modules with two different contents, which is exactly
+    /// what `hello_module.js` does.
+    fn module_request(&mut self, specifier: &str, attributes: &[ImportAttribute]) -> u32 {
+        let attributes: Vec<(String, String)> = attributes
+            .iter()
+            .map(|attribute| (attribute.key.clone(), attribute.value.clone()))
+            .collect();
+        let meta = self.module_meta();
+        if let Some(index) = meta
+            .requests
+            .iter()
+            .position(|request| request.specifier == specifier && request.attributes == attributes)
+        {
+            return index as u32;
+        }
+        meta.requests.push(ModuleRequest {
+            specifier: specifier.to_string(),
+            attributes,
+        });
+        meta.requests.len() as u32 - 1
     }
 
     /// Compile a loop body with a `break`/`continue` target pushed for it.
@@ -3298,6 +3703,18 @@ impl Compiler {
                 let function = self.compile_function_with_name(func, true)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));
                 self.emit(Opcode::Fclosure, &[Op::Const(index)]);
+            }
+            // `import.meta`: the host fills a per-module object at link time.
+            ExprKind::ImportMeta => {
+                self.emit(Opcode::SpecialObject, &[Op::Int(6)]);
+            }
+            // `import("x")` compiles to a two-slot push followed by one opcode: the
+            // specifier, then the options object (`undefined` here, since this compiler
+            // does not accept the second argument yet).
+            ExprKind::ImportCall(specifier) => {
+                self.expr(specifier)?;
+                self.emit(Opcode::Undefined, &[]);
+                self.emit(Opcode::Import, &[]);
             }
             _ => {
                 return Err(SyntaxError::new(
@@ -5567,7 +5984,7 @@ impl Compiler {
         let (code, stack_size, positions) =
             assemble(&mut resolved, &resolved_pos, &mut self.stack[current]);
         let _ = &mut resolved;
-        let state = self.stack.pop().expect("a function is being compiled");
+        let mut state = self.stack.pop().expect("a function is being compiled");
         CompiledFunction {
             name: state.name,
             kind: state.kind,
@@ -5590,6 +6007,7 @@ impl Compiler {
             column: state.column,
             filename: None,
             eval_sites: state.eval_sites,
+            module: state.module.take().map(Box::new),
         }
     }
 }
@@ -6128,11 +6546,18 @@ fn resolve_slot(
                 // the reader look for a cell no frame ever fills. That is how a second
                 // function using `eval` in its parameter list read `undefined` after a
                 // sibling had already made `eval` a closure entry.
-                ClosureType::Global
-                | ClosureType::GlobalDecl
-                | ClosureType::GlobalRef
-                | ClosureType::ModuleDecl
-                | ClosureType::ModuleImport => Found::Global(index as u32),
+                ClosureType::Global | ClosureType::GlobalDecl | ClosureType::GlobalRef => {
+                    Found::Global(index as u32)
+                }
+                // A module variable is a cell in the *module's* environment, which is
+                // the module body's parent as far as a nested function is concerned — so
+                // it is captured as a plain reference, not looked up as a global.
+                ClosureType::ModuleDecl | ClosureType::ModuleImport => Found::Local(
+                    ClosureType::Ref,
+                    index as u32,
+                    closure.is_const,
+                    closure.is_lexical,
+                ),
                 _ => Found::Local(
                     ClosureType::Ref,
                     index as u32,
@@ -6245,9 +6670,11 @@ fn slot_for_closure(closure: &ClosureVar, index: u32) -> Slot {
         // A `global_ref` only says *how* the binding is found (through the
         // parent's closure table); the access itself is an ordinary global one.
         ClosureType::Global | ClosureType::GlobalRef => Slot::Global(index),
-        ClosureType::GlobalDecl | ClosureType::ModuleDecl | ClosureType::ModuleImport => {
-            Slot::GlobalDecl(index)
-        }
+        ClosureType::GlobalDecl => Slot::GlobalDecl(index),
+        // A module variable is a real cell in the module's environment, so it is reached
+        // exactly like a captured local — the host, not the global object, is what fills
+        // the slot.
+        ClosureType::ModuleDecl | ClosureType::ModuleImport => Slot::VarRef(index),
         _ => Slot::VarRef(index),
     }
 }

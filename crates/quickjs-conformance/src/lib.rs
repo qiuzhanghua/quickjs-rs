@@ -481,6 +481,10 @@ pub fn script_cases(quickjs_root: &Path) -> Vec<Case> {
         "test_loop.js",
         "test_bjson.js",
         "test_std.js",
+        // A module with a cycle in it. It is a whole file rather than a set of tests, so
+        // it cannot be sliced the way `scripts/lang-diff.py` slices the others — running
+        // it whole is what exercises linking, which is the point.
+        "test_cyclic_import.js",
     ]
     .into_iter()
     .map(|name| tests.join(name))

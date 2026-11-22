@@ -558,6 +558,88 @@ pub struct Function {
     /// the answer here. It is data, not an instruction, so the bytecode stays identical
     /// to the reference's.
     pub eval_sites: Vec<EvalSite>,
+    /// The module this body is, when it is one.
+    ///
+    /// `None` for a script and for every nested function. A module's *requests*,
+    /// *imports* and *exports* are data rather than instructions — the body itself reads
+    /// its bindings through ordinary closure-variable opcodes, and this is what the host
+    /// needs in order to wire those cells up before the body runs.
+    pub module: Option<Box<ModuleMeta>>,
+}
+
+/// What a module body needs from the host, recorded at compile time.
+///
+/// The three tables mirror §16.2.1.5's `[[RequestedModules]]`, `[[ImportEntries]]` and
+/// `[[LocalExportEntries]]`/`[[IndirectExportEntries]]`/`[[StarExportEntries]]`. They are
+/// kept as plain data so linking can be done without looking at bytecode.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModuleMeta {
+    /// The modules this one asks for, in source order and de-duplicated by specifier.
+    pub requests: Vec<ModuleRequest>,
+    /// Where each imported binding lands.
+    pub imports: Vec<ImportEntry>,
+    /// What this module offers.
+    pub exports: Vec<ExportEntry>,
+}
+
+/// One `from "…"` of a module.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModuleRequest {
+    /// The specifier as written.
+    pub specifier: String,
+    /// `with { type: "json" }` and friends, in source order.
+    pub attributes: Vec<(String, String)>,
+}
+
+/// One imported binding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportEntry {
+    /// Index into [`ModuleMeta::requests`].
+    pub module: u32,
+    /// The name imported from it; ignored when `is_star`.
+    pub name: String,
+    /// Which module variable holds it — the closure-variable index in the body.
+    pub var_idx: u32,
+    /// `import * as ns from "m"`: the binding is the module's namespace object.
+    pub is_star: bool,
+}
+
+/// One exported name.
+///
+/// The four forms are the ones §16.2.1.5 distinguishes, and they resolve differently:
+/// a local export names a variable of this module, an indirect one names a name in
+/// another module, a star export forwards everything, and a star-as export forwards the
+/// whole namespace under one name.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExportEntry {
+    /// `export { a }` / `export var a` / `export default …`
+    Local {
+        /// The name the outside sees.
+        export_name: String,
+        /// The module variable behind it.
+        var_idx: u32,
+    },
+    /// `export { a as b } from "m"`
+    Indirect {
+        /// The name the outside sees.
+        export_name: String,
+        /// Index into [`ModuleMeta::requests`].
+        module: u32,
+        /// The name to look up in that module.
+        import_name: String,
+    },
+    /// `export * from "m"`
+    Star {
+        /// Index into [`ModuleMeta::requests`].
+        module: u32,
+    },
+    /// `export * as ns from "m"`
+    StarAs {
+        /// The name the outside sees.
+        export_name: String,
+        /// Index into [`ModuleMeta::requests`].
+        module: u32,
+    },
 }
 
 /// One direct `eval(...)` call site and the bindings visible at it.

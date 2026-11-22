@@ -4,9 +4,10 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.3.0** —— ES6+ 运行期完成：class、解构、generator、`Proxy`、
-  `Promise`/async、`for await`；另有 `RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
-- 🚧 当前进度：**M0–M5 已完成**；M6（模块系统）起未开始
+- 📌 当前版本：**v0.3.0**（M6 模块系统的源码已就绪、尚未发版）—— ES6+ 运行期完成：
+  class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
+  循环导入、`import()`、JSON/text 模块）；另有 `RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
+- 🚧 当前进度：**M0–M6 已完成**；M7（正则引擎 + Unicode 表）起未开始
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 已确认决策

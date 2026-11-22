@@ -281,6 +281,15 @@ pub enum Job {
         /// The promise being resolved.
         promise: Gc<JsObject>,
     },
+    /// A pending `import(specifier)`.
+    Import {
+        /// The specifier, already converted to a string.
+        specifier: String,
+        /// The module that asked, which the specifier resolves against.
+        referrer: String,
+        /// The promise `import()` handed back.
+        promise: Gc<JsObject>,
+    },
     /// An async generator resuming after the value it awaited settled.
     GeneratorResume {
         /// The async generator to continue.
@@ -339,6 +348,7 @@ impl js_gc::Trace for Job {
                 tracer.visit(promise);
                 value.trace(tracer);
             }
+            Job::Import { promise, .. } => tracer.visit(promise),
             Job::GeneratorResume {
                 generator,
                 promise,
@@ -577,13 +587,24 @@ pub struct Interp<'a> {
     pub output: String,
     /// The most frames that may be live at once.
     pub max_frames: usize,
-    /// The microtask queue.
+    /// The microtask queue, but see `Interp::jobs` — shared with the module machinery.
     ///
     /// Script execution does not return until this has drained, which is what makes
     /// `Promise.resolve().then(f)` run `f` before the next statement of the *host* rather
     /// than never. Reactions append to it while it drains, so the loop is a `while` and
     /// not a `for`.
-    jobs: std::collections::VecDeque<Job>,
+    pub(crate) jobs: std::collections::VecDeque<Job>,
+    /// The module registry, keyed by canonical name.
+    pub modules: std::collections::BTreeMap<String, Gc<crate::module::ModuleRecord>>,
+    /// How the host turns a specifier into bytes.
+    pub module_loader: Option<Box<dyn crate::module::ModuleLoader>>,
+    /// The module the host was asked to run, for `import.meta.main`.
+    pub main_module_name: Option<String>,
+    /// Module bodies currently running, innermost last.
+    ///
+    /// A dynamic `import()` resolves its specifier relative to the module that ran it, and
+    /// this is the only place that knows which module that is.
+    pub module_stack: Vec<String>,
     /// Rejections that no handler has claimed, with the promise they belong to.
     ///
     /// A `then` registered later prunes its entry, which is why the promise is kept: the
@@ -650,6 +671,10 @@ impl<'a> Interp<'a> {
             output: String::new(),
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
+            modules: std::collections::BTreeMap::new(),
+            module_loader: None,
+            main_module_name: None,
+            module_stack: Vec::new(),
             unhandled: Vec::new(),
         };
         crate::builtins::install(&mut interp);
@@ -1072,6 +1097,14 @@ impl<'a> Interp<'a> {
                 kind,
                 value,
             } => self.step_async_generator(&generator, &promise, kind, value),
+            Job::Import {
+                specifier,
+                referrer,
+                promise,
+            } => {
+                self.run_dynamic_import(&specifier, &referrer, &promise);
+                Ok(())
+            }
         }
     }
 
@@ -1831,7 +1864,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Push a frame and run until it returns.
-    fn execute(
+    pub(crate) fn execute(
         &mut self,
         code: Gc<CompiledCode>,
         env: Gc<ClosureEnv>,
@@ -3803,6 +3836,7 @@ impl<'a> Interp<'a> {
                     callback: callback.clone(),
                     fulfilled: *fulfilled,
                 }),
+                Callable::ModuleBinding { cell } => Some(NativeCall::ModuleBinding(cell.clone())),
                 Callable::YieldResult { promise, done } => Some(NativeCall::YieldResult {
                     promise: promise.clone(),
                     done: *done,
@@ -3959,6 +3993,7 @@ impl<'a> Interp<'a> {
                 self.dispose_step(&remaining, &promise, error)?;
                 Ok(Value::Undefined)
             }
+            Some(NativeCall::ModuleBinding(cell)) => Ok(cell.get()),
             Some(NativeCall::YieldResult { promise, done }) => {
                 let value = args.first().cloned().unwrap_or(Value::Undefined);
                 let result = self.iterator_result(value, done)?;
@@ -4072,6 +4107,16 @@ impl<'a> Interp<'a> {
                 .rev()
                 .find_map(|frame| frame.callee.as_object().and_then(|f| f.home_object()))
                 .map_or(Value::Undefined, Value::Object)),
+            // `import.meta`: the innermost module body's meta object. Outside a module
+            // the compiler never emits this, so an empty fallback is unreachable rather
+            // than permissive.
+            6 => {
+                let name = self.module_stack.last().cloned();
+                let meta = name
+                    .and_then(|name| self.modules.get(&name).cloned())
+                    .and_then(|module| module.with(|r| r.import_meta.clone()));
+                Ok(meta.map_or(Value::Undefined, Value::Object))
+            }
             other => Err(Signal::Throw(self.make_error(
                 "InternalError",
                 &format!("special_object {other} is not implemented yet"),
@@ -6193,6 +6238,13 @@ impl<'a> Interp<'a> {
                 self.pop();
                 self.pop();
             }
+            Import => {
+                // `import(specifier)`: the options slot is on top and is not read yet.
+                let _options = self.pop();
+                let specifier = self.pop();
+                let promise = self.dynamic_import(specifier)?;
+                self.push(promise);
+            }
             ForAwaitOfStart => {
                 // Same triple as `for of`, but from `Symbol.asyncIterator` with a
                 // `Symbol.iterator` fallback.
@@ -6420,13 +6472,12 @@ impl<'a> Interp<'a> {
             .closure_vars
             .get(slot)
             .is_some_and(|c| {
+                // A module's declarations and imports are *not* globals: their cells are
+                // the module environment's, filled by the host, so the placeholder routing
+                // must not apply to them.
                 matches!(
                     c.closure_type,
-                    ClosureType::GlobalDecl
-                        | ClosureType::Global
-                        | ClosureType::GlobalRef
-                        | ClosureType::ModuleDecl
-                        | ClosureType::ModuleImport
+                    ClosureType::GlobalDecl | ClosureType::Global | ClosureType::GlobalRef
                 )
             })
     }
@@ -7764,6 +7815,8 @@ enum NativeCall {
         promise: Gc<JsObject>,
         kind: ResumeKind,
     },
+    /// Read a module namespace's binding out of its cell.
+    ModuleBinding(Gc<Cell>),
     /// Answer a pending async-generator method with `{value, done}`.
     YieldResult {
         promise: Gc<JsObject>,

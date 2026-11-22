@@ -164,3 +164,67 @@ fn the_upstream_script_corpus_reports_a_verdict_for_every_case() {
         report.summary()
     );
 }
+
+/// `examples/hello_module.js` is the module system's acceptance test: a JavaScript
+/// module, a JSON module and a text module, all imported from one file.
+///
+/// It is checked here rather than in `script_cases` because it lives under `examples/`,
+/// and it is checked *whole* because the point is the graph — a JSON module is not code,
+/// and `with { type: "text" }` makes the same file a different module. The output is
+/// compared byte for byte, which is the only thing that catches a module returning the
+/// parsed object where the text was asked for.
+#[test]
+fn hello_module_matches_the_reference() {
+    let oracle = require_oracle!();
+    let path = std::path::Path::new("/tmp/quickjs-master/examples/hello_module.js");
+    if !path.is_file() {
+        eprintln!("skipping: {path:?} is not present");
+        return;
+    }
+    let harness = Harness::new(candidate(), oracle);
+    let report = harness.run(&[Case::script(path)]);
+    assert!(
+        report.failures() == 0,
+        "hello_module.js differs from the reference:\n{}",
+        report.summary()
+    );
+}
+
+/// A cyclic import: `a.js` and `b.js` import each other, and `b` calls `a`'s function
+/// from its own top level.
+///
+/// The whole-file case in `script_cases` covers the upstream fixture. This one covers the
+/// ordering that fixture does not: every module in the cycle must have its hoisted
+/// bindings created during *linking*, before any body runs, or `b`'s call into `a` finds
+/// nothing.
+#[test]
+fn a_cycle_between_two_files_matches_the_reference() {
+    let oracle = require_oracle!();
+    let dir = std::env::temp_dir().join("qjs-cycle-conformance");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(
+        dir.join("a.js"),
+        "import { b } from \"./b.js\";\nexport function a(x) { return x + 1 }\n\
+         print(\"a sees b: \" + typeof b);\n",
+    )
+    .expect("write a.js");
+    std::fs::write(
+        dir.join("b.js"),
+        "import { a } from \"./a.js\";\nexport function b(x) { return 2 * a(x) }\n\
+         print(\"b sees a: \" + typeof a);\nprint(\"b calls a: \" + a(1));\n",
+    )
+    .expect("write b.js");
+    let main = dir.join("main.js");
+    std::fs::write(
+        &main,
+        "import { a } from \"./a.js\";\nprint(\"main: \" + a(1));\n",
+    )
+    .expect("write main.js");
+    let harness = Harness::new(candidate(), oracle);
+    let report = harness.run(&[Case::script(&main)]);
+    assert!(
+        report.failures() == 0,
+        "the cyclic import differs from the reference:\n{}",
+        report.summary()
+    );
+}

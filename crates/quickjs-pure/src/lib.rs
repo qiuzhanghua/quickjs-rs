@@ -33,6 +33,7 @@ mod bignum;
 pub mod bigint;
 pub mod builtins;
 pub mod interp;
+pub mod module;
 pub mod object;
 pub mod regexp;
 mod tzif;
@@ -76,6 +77,65 @@ impl std::error::Error for Error {}
 
 /// Convenience alias used throughout the crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Whether `source` should be evaluated as a module, decided the way `qjs` decides.
+///
+/// The rule is deliberately shallow: the **first token** must be `import` or `export`
+/// (an `import` followed by `.` or `(` is `import.meta` or `import()`, both of which are
+/// expressions, so a script may use them). Nothing else makes a file a module.
+///
+/// It has to be this shallow to match the reference, and the difference is observable:
+/// a file that merely *mentions* `import.meta` further down is a script, so it fails with
+/// "import.meta only valid in module code" rather than silently becoming a module.
+pub fn is_module_source(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0;
+    // A shebang line is not code.
+    if bytes.starts_with(b"#!") {
+        while index < bytes.len() && bytes[index] != b'\n' {
+            index += 1;
+        }
+    }
+    loop {
+        // Whitespace.
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if bytes[index..].starts_with(b"//") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            while index < bytes.len() && !bytes[index..].starts_with(b"*/") {
+                index += 1;
+            }
+            index = (index + 2).min(bytes.len());
+            continue;
+        }
+        break;
+    }
+    let rest = &source[index.min(source.len())..];
+    let word = |w: &str| -> Option<&str> { rest.strip_prefix(w) };
+    if let Some(tail) = word("export") {
+        // `exportedThing` is an identifier, not the keyword.
+        return !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$');
+    }
+    if let Some(tail) = word("import") {
+        if tail.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$') {
+            return false;
+        }
+        let tail = tail.trim_start();
+        // `import.meta` and `import(...)` are expressions.
+        if tail.starts_with('.') || tail.starts_with('(') {
+            return false;
+        }
+        return true;
+    }
+    false
+}
 
 /// A JavaScript runtime: one heap, one memory limit, one set of host hooks.
 ///
@@ -140,6 +200,8 @@ pub struct Context<'rt> {
     runtime: &'rt Runtime,
     /// The interpreter, created on first use.
     interp: Option<Interp<'rt>>,
+    /// A loader the host installed, handed to the interpreter when it is built.
+    module_loader: Option<Box<dyn module::ModuleLoader>>,
     /// The value of the last script, as `qjs` reports it.
     last_value: Value,
     /// The name a top-level script is compiled under, which is what `error.stack`
@@ -153,8 +215,23 @@ impl<'rt> Context<'rt> {
         Context {
             runtime,
             interp: None,
+            module_loader: None,
             last_value: Value::Undefined,
             script_name: None,
+        }
+    }
+
+    /// Install how module specifiers are resolved and read.
+    ///
+    /// Without one, importing is a clear error rather than a silent failure: the engine
+    /// cannot guess whether `./x.js` means a file, and the host is what knows.
+    pub fn set_module_loader(&mut self, loader: Box<dyn module::ModuleLoader>) {
+        // A context that has already run something owns a live interpreter, so the loader
+        // goes to whichever exists.
+        if let Some(interp) = self.interp.as_mut() {
+            interp.module_loader = Some(loader);
+        } else {
+            self.module_loader = Some(loader);
         }
     }
 
@@ -180,7 +257,44 @@ impl<'rt> Context<'rt> {
     /// The interpreter, creating it and its realm on first use.
     fn interp(&mut self) -> &mut Interp<'rt> {
         let heap: &'rt Heap = &self.runtime.heap;
-        self.interp.get_or_insert_with(|| Interp::new(heap))
+        let loader = self.module_loader.take();
+        self.interp.get_or_insert_with(|| {
+            let mut interp = Interp::new(heap);
+            interp.module_loader = loader;
+            interp
+        })
+    }
+
+    /// Evaluate `specifier` as the entry module, the way `qjs -m` does.
+    ///
+    /// The microtask queue is drained afterwards, so a module whose top level launched an
+    /// async task has finished it by the time this returns.
+    pub fn eval_module(&mut self, specifier: &str) -> Result<Value> {
+        let loader = self.module_loader.take();
+        let interp = self.interp();
+        if interp.module_loader.is_none() {
+            interp.module_loader = loader;
+        }
+        match interp.run_main_module(specifier) {
+            Ok(value) => {
+                let drained = interp.drain_jobs();
+                let unhandled = interp.take_unhandled_rejections();
+                if let Err(Signal::Throw(reason)) = drained {
+                    let text = interp.describe_exception(&reason);
+                    return Err(Error::Exception(text));
+                }
+                if !unhandled.is_empty() {
+                    return Err(Error::Exception(unhandled.join("\n")));
+                }
+                self.last_value = value.clone();
+                Ok(value)
+            }
+            Err(Signal::Throw(value)) => {
+                let text = interp.describe_exception(&value);
+                Err(Error::Exception(text))
+            }
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
     }
 
     /// Evaluate `source` as a global script and return its completion value.

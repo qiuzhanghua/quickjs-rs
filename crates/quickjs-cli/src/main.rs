@@ -13,6 +13,8 @@
 use std::io::Write;
 use std::process::ExitCode;
 
+mod modules;
+
 /// Exit code used "option parsed, engine not ready yet".
 ///
 /// Note: upstream also exits with 2 for a missing `-e` expression, so the code
@@ -271,6 +273,7 @@ fn main() -> ExitCode {
     }
 
     let mut ctx = quickjs::Context::new(&rt);
+    ctx.set_module_loader(Box::new(modules::FileModuleLoader::new()));
     if let Some(expr) = opts.eval {
         return run(&mut ctx, &expr, "<cmdline>");
     }
@@ -279,12 +282,43 @@ fn main() -> ExitCode {
             Ok(source) => source,
             Err(error) => return die(&format!("qjs: cannot read {path}: {error}"), 1),
         };
+        // `-m` forces module mode, `--script` forces script mode, and the default
+        // autodetects: the reference compiles as a script and falls back to a module only
+        // when the script parse rejects it, which is why a file with no `import`/`export`
+        // runs either way.
+        let as_module = match opts.module {
+            Some(explicit) => explicit,
+            None => quickjs::is_module_source(&source),
+        };
+        if as_module {
+            return run_module(&mut ctx, &path);
+        }
         return run(&mut ctx, &source, &path);
     }
     if opts.interactive || args.is_empty() {
         return pending("interactive REPL", "milestone M9");
     }
     ExitCode::SUCCESS
+}
+
+/// Run `path` as an ES module.
+///
+/// The module is loaded through the same loader the script path uses, so `import`ing it
+/// again from somewhere else finds one record rather than two.
+fn run_module(ctx: &mut quickjs::Context<'_>, path: &str) -> ExitCode {
+    let result = ctx.eval_module(path);
+    let output = ctx.output().to_string();
+    print!("{output}");
+    let _ = std::io::stdout().flush();
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            // The reference reports a module failure through the same "print the value"
+            // path a script uses, with no file prefix.
+            let _ = writeln!(std::io::stderr(), "{error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Parse the SI-suffix sizes accepted by upstream (`k`, `m`, `g`, `t` with an

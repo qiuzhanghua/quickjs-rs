@@ -82,7 +82,10 @@ EXCLUDED_FILES = {
     "test_std.js": "needs the `std`/`os` host modules",
     "test_worker.js": "needs the worker host API",
     "test_worker_module.js": "needs the worker host API and module loading",
-    "test_cyclic_import.js": "needs module loading",
+    # Covered instead by the whole-file harness: it is one module with a cycle in it,
+    # not a set of `test_*` functions, so slicing it would break the imports that are
+    # the whole point. See `quickjs-conformance::script_cases`.
+    "test_cyclic_import.js": "a module, run whole by the conformance harness",
     "fixture_cyclic_import.js": "a module fixture, not a test file",
 }
 

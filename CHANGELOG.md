@@ -2,6 +2,57 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
+## 未发布
+
+### 加：ES 模块（M6）—— 链接、循环导入、`import()`、JSON/text 模块
+
+`qjs` 现在能跑模块：`import`/`export` 的四种形式、`export *`、`export * as ns`、
+`import.meta`、动态 `import()`、`with { type: "json" | "text" | "bytes" }`、
+`-m`/`--script` 与自动检测。三个验收物与参考**逐字节一致**：
+`examples/hello_module.js`、`tests/test_cyclic_import.js`，以及一个 `a.js ↔ b.js`
+互引且 `b` 在顶层调用 `a` 的函数的三文件用例。
+
+实现上最值得记的一条：**模块的顶层绑定就是模块体的闭包变量**
+（`ClosureType::ModuleDecl` / `ModuleImport`），读一个模块变量是普通的 `get_var_ref`，
+所以 `is_global_slot` 里的 `ModuleDecl`/`ModuleImport` 分支必须去掉——它们在
+v0.3.0 之前是"把模块变量当全局"的占位。剩下的全是"谁填这个 cell"：
+
+* 自己的声明分配新 cell；
+* import **直接用导出方的 cell**，不复制 —— live binding 与循环导入都是这一条的推论。
+
+三个坑，都是对照参考才发现、且都会给出**看似合理**的结果：
+
+1. **模块体要执行两次。** 编译出的前缀是 `push_this; if_false <body>`，于是
+   以真值 `this` 调用时只建立提升的绑定、立刻 `return_undef`。这一次调用发生在
+   **链接期**（`js_inner_module_linking` 末尾那次 `JS_Call(func, JS_TRUE)`），
+   而不是求值期——正因如此，循环里任何模块的函数在每个函数体开跑前就已存在。
+   先求值后提升，`b.js` 顶层调用 `a` 的函数就会看到 `undefined`。
+2. **同一个文件作为 JSON 与作为 text 是两个模块。** 缓存键必须带上 attributes，
+   否则 `import m from "./m.json"` 与 `import m from "./m.json" with { type: "text" }`
+   会撞成一条记录，第二次导入静默拿到第一次的值——`hello_module.js` 正是这么写的。
+3. **`declare_module` 恒返回 0**（它的调用者要的是 slot，而模块变量不是 slot），
+   于是 `import * as ns` 的 `var_idx` 也成了 0，把前一个导入覆盖掉。
+
+顺带修掉四个此前没被端到端测出来的解析器 bug：
+* `export { a as b } from "m"` 被当成"导出本地绑定"检查，报 `exported variable 'a' does not exist`；
+* `import("./x")` 在语句位置被当作 import 声明拒绝；
+* `import()` 与 `import.meta` 此前没有编译路径；
+* 自动检测规则换成了参考的规则：**首个 token** 是 `import`（后面不是 `.`/`(`）
+  或 `export`，或后缀 `.mjs`。原先"脚本解析失败就当模块"会让只提到 `import.meta`
+  的文件变成模块，而参考会按脚本处理并报错。
+
+新增覆盖：`crates/quickjs-pure/tests/module.rs`（9 个用例，内存加载器，不碰文件系统）、
+conformance 里整文件跑 `test_cyclic_import.js` + `hello_module.js` + 循环三文件用例。
+
+### 已知差异（记录，不隐藏）
+
+* **通用语法错误的输出格式不同。** 参考是 `SyntaxError: <消息>` 加一行
+  `    at <file>:<line>:<col>`；我们是 `<file>: <line>: <col>: <消息>`，且列号有时偏向
+  词法起点。与模块无关，早就存在，因为差分套件只比 stdout 与退出码所以一直没暴露。
+  要修得让 `Error::Syntax` 带上位置而不是只带字符串。消息**文本**已对齐
+  （例如 `import.meta only valid in module code`、`Could not find export 'x' in module 'm'`、
+  `unsupported module type: 'x'` 都是参考的原文）。
+
 ## v0.3.0 — 2026-11-22
 
 M5（ES6+ 运行期）完成。这一版的边界是：v0.2.0 发布时 M5 还没开始，

@@ -440,6 +440,7 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         column,
         filename: None,
         eval_sites,
+        module: None,
     })
 }
 
@@ -625,6 +626,7 @@ mod tests {
             line: 1,
             column: 1,
             filename: None,
+            module: None,
         }
     }
 
