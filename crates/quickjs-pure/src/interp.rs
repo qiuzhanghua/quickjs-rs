@@ -22,8 +22,8 @@ use js_compile::opcode::{OpFormat, Opcode};
 use js_gc::{Gc, Heap};
 
 use crate::object::{
-    Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, NativeFn, ObjectKind, Property,
-    PropertyKey, array_index, lookup, lookup_key,
+    Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, LocalVars, NativeFn, ObjectKind,
+    Property, PropertyKey, array_index, lookup, lookup_key,
 };
 use crate::value::{Cell, Value, number_to_string};
 
@@ -169,6 +169,9 @@ struct Frame {
     cells: Vec<Gc<Cell>>,
     /// The operand stack.
     stack: Vec<Value>,
+    /// Variables a direct `eval` has declared in this call; see [`LocalVars`].
+    local_vars: Option<Gc<LocalVars>>,
+
     /// Byte offset of the next instruction.
     pc: usize,
     /// Byte offset of the instruction being executed, which is what a stack trace
@@ -205,6 +208,9 @@ impl js_gc::Trace for Frame {
         }
         for cell in &self.cells {
             cell.trace(tracer);
+        }
+        if let Some(local_vars) = &self.local_vars {
+            tracer.visit(local_vars);
         }
         for value in &self.stack {
             value.trace(tracer);
@@ -400,6 +406,13 @@ pub struct Interp<'a> {
     /// during it keeps a handle (see [`ClosureEnv::eval_scope`]), which is what lets
     /// `eval("f = () => i")` work after the eval has returned.
     active_eval_scope: Option<Gc<EvalScope>>,
+    /// The frame that called the direct `eval` currently running, if any.
+    ///
+    /// A sloppy eval declares its `var`s in that frame's variable environment rather than
+    /// on the global object, which is what keeps
+    /// `function f(){ eval("var x=1") } f(); x` from defining a global `x` — and what
+    /// gives each call its own `x`.
+    eval_caller: Option<Option<usize>>,
     /// The caller's `new.target`, while an `eval` runs.
     ///
     /// The eval'd code is a script with no constructor of its own, so it inherits the
@@ -466,6 +479,7 @@ impl<'a> Interp<'a> {
             eval_arguments: None,
             eval_with: None,
             active_eval_scope: None,
+            eval_caller: None,
             pending_new_target: None,
             eval_new_target: None,
             native_frames: Vec::new(),
@@ -618,12 +632,16 @@ impl<'a> Interp<'a> {
         // An arrow has no `this` of its own, so an `eval` inside one inherits the
         // enclosing function's receiver — the lexical `this` the arrow was compiled to
         // read from its closure.
-        let caller = self
+        // `this` and `arguments` come from the innermost *non-arrow* frame, but the
+        // variable environment is the innermost frame of all: an arrow's own body is where
+        // `var`s declared by an `eval` inside it belong.
+        let caller_index = self
             .frames
             .iter()
-            .rev()
-            .find(|frame| !frame.code.code.is_arrow)
-            .or_else(|| self.frames.last());
+            .rposition(|frame| !frame.code.code.is_arrow)
+            .or_else(|| self.frames.len().checked_sub(1));
+        let env_index = self.frames.len().checked_sub(1);
+        let caller = caller_index.and_then(|index| self.frames.get(index));
         let (this, passed) = match caller {
             Some(frame) => (frame.this.clone(), frame.passed.clone()),
             // No frame at all: the eval is running at the top level, so there is
@@ -638,6 +656,11 @@ impl<'a> Interp<'a> {
         // sibling scopes: the flat scan below cannot tell which `i` a `for (let i …)`
         // body means, and guessing by declaration order picks the wrong one as soon as
         // two loops in a row use the same name.
+        // Only a *direct* eval sees the caller's scope. The compiler records a site for
+        // every direct call — a bare `eval(...)` callee — so finding one at the current
+        // position is the test: `(0, eval)(...)` and `f.call(null, ...)` resolve the
+        // callee to a value first and leave no site behind.
+        let mut direct = false;
         let mut resolved_here = false;
         if let Some(frame) = self.frames.last() {
             let (line, column) = frame
@@ -657,6 +680,7 @@ impl<'a> Interp<'a> {
                 .filter(|site| (site.line, site.column) <= (line, column))
                 .max_by_key(|site| (site.line, site.column))
             {
+                direct = true;
                 resolved_here = true;
                 for binding in &site.bindings {
                     // An enclosing function's frame sits `owner` levels below the one
@@ -733,6 +757,13 @@ impl<'a> Interp<'a> {
             .replace(inherited_new_target.unwrap_or(Value::Undefined));
         let eval_cells = self.eval_cells_for(&bindings);
         let previous_bindings = std::mem::replace(&mut self.eval_bindings, bindings);
+        // A sloppy direct eval declares its `var`s in the caller's variable environment;
+        // `declare_eval_local` needs to know which frame that is.
+        // An indirect eval gets the global environment, so nothing of the caller's is
+        // recorded as the place its `var`s belong.
+        let previous_caller = self
+            .eval_caller
+            .replace(if direct { env_index } else { None });
         // The cell-based view of the same bindings, which is what a closure created
         // inside the eval keeps. Only cell-backed bindings can be shared, so a frame
         // whose compiler did not put a binding in a cell simply does not appear here —
@@ -751,6 +782,7 @@ impl<'a> Interp<'a> {
         self.eval_with = previous_with;
         self.eval_new_target = previous_new_target;
         self.eval_bindings = previous_bindings;
+        self.eval_caller = previous_caller;
         self.active_eval_scope = previous_eval_scope;
         result
     }
@@ -869,6 +901,8 @@ impl<'a> Interp<'a> {
             ClosureEnv {
                 cells,
                 eval_scope: None,
+                local_vars: None,
+                local_phase: 1,
             },
         )
     }
@@ -1019,6 +1053,7 @@ impl<'a> Interp<'a> {
             passed: passed_values.drain(..passed).collect(),
             locals,
             cells,
+            local_vars: None,
             stack: Vec::with_capacity(16),
             pc: 0,
             at: 0,
@@ -1027,6 +1062,83 @@ impl<'a> Interp<'a> {
             tail: false,
         });
         Ok(())
+    }
+
+    /// The cell a direct `eval` created for the closure entry at `slot`, if any.
+    ///
+    /// Only names the eval created are here: a name the frame already declared statically
+    /// is written through to its own slot instead, so this cannot shadow a real local.
+    fn eval_created_local(&self, slot: usize) -> Option<Gc<Cell>> {
+        let name = &self.frame().code.code.closure_vars.get(slot)?.name;
+        let (local_vars, phase) = self.visible_local_vars()?;
+        if !local_vars.contains(name) {
+            return None;
+        }
+        local_vars.get(name, phase)
+    }
+
+    /// The variables a direct `eval` declared, as the code currently running sees them.
+    ///
+    /// Inside an eval that is the *caller's* set — the eval's own variable environment
+    /// is the caller's, which is why `eval("var c = 1")` leaves `c` behind. Everywhere
+    /// else it is the current frame's, falling back to the frame the closure was created
+    /// in.
+    fn visible_local_vars(&self) -> Option<(Gc<LocalVars>, u8)> {
+        // While an `eval` runs, its own frame is on top but its variable environment is
+        // the *caller's* — so the caller is what the lookup has to start from.
+        let (index, phase) = match self.eval_caller.flatten() {
+            Some(caller) => (
+                caller,
+                if self.in_parameter_list_at(caller) {
+                    0
+                } else {
+                    1
+                },
+            ),
+            None => (
+                self.frames.len().checked_sub(1)?,
+                if self.in_parameter_list() { 0 } else { 1 },
+            ),
+        };
+        let frame = self.frames.get(index)?;
+        // The frame's own variables, or — for an arrow, which has no variable environment
+        // of its own — the one it was created in, which `ClosureEnv` carries.
+        if let Some(local_vars) = frame.local_vars.clone() {
+            return Some((local_vars, phase));
+        }
+        frame
+            .env
+            .local_vars
+            .clone()
+            .map(|local_vars| (local_vars, frame.env.local_phase))
+    }
+
+    /// Whether the innermost frame is still evaluating its parameter list.
+    ///
+    /// A direct `eval` that runs there declares its `var`s in the parameter environment,
+    /// and a closure created there may only see that much of [`LocalVars`].
+    fn in_parameter_list(&self) -> bool {
+        self.in_parameter_list_at(self.frames.len().saturating_sub(1))
+    }
+
+    /// [`Interp::in_parameter_list`] for a specific frame.
+    fn in_parameter_list_at(&self, frame: usize) -> bool {
+        let Some(frame) = self.frames.get(frame) else {
+            return false;
+        };
+        let code = &frame.code.code;
+        if !code.has_parameter_expressions {
+            return false;
+        }
+        // `(0, 0)` means the compiler did not record a boundary, so treat the whole
+        // function as its body and let a direct `eval` act accordingly.
+        if code.body_start == (0, 0) {
+            return false;
+        }
+        match code.position_at(frame.at as u32) {
+            Some(position) => position < code.body_start,
+            None => false,
+        }
     }
 
     fn frame(&self) -> &Frame {
@@ -1196,6 +1308,14 @@ impl<'a> Interp<'a> {
         if let Some(value) = self.with_lookup(&name)? {
             return Ok(value);
         }
+        // A variable a direct `eval` declared shadows everything the compiler resolved,
+        // including an enclosing function's binding: the eval put it in the caller's own
+        // variable environment, which is nearer than any captured scope.
+        if let Some((local_vars, phase)) = self.visible_local_vars()
+            && let Some(cell) = local_vars.get(&name, phase)
+        {
+            return Ok(cell.get());
+        }
         // The frame that called `eval` is the innermost scope the eval'd code sees, so
         // its local `a` wins over a global `a`.
         if let Some(value) = self.eval_binding_value(&name) {
@@ -1250,10 +1370,22 @@ impl<'a> Interp<'a> {
     /// deleted but is always writable.
     fn put_global(&mut self, slot: usize, value: Value) -> JsResult<()> {
         let (name, lexical, is_const) = self.global_binding(slot);
+
         // An assignment inside a `with` writes through to the object that supplies the
         // name, which for an `eval` means consulting the same chain `get_global` does.
         if let Some(owner) = self.with_owner(&name) {
             self.set_property_with(&owner, &name, value, DeleteFailure::Ignore)?;
+            return Ok(());
+        }
+        // A variable the running eval *declared* takes the write before any caller
+        // binding: `eval("var c = 1")` creates `c` in the eval's own variable
+        // environment even when an enclosing function has a `var c` of its own.
+        if self.eval_caller.flatten().is_some()
+            && let Some((local_vars, phase)) = self.visible_local_vars()
+            && local_vars.contains(&name)
+            && let Some(cell) = local_vars.get(&name, phase)
+        {
+            cell.set(value);
             return Ok(());
         }
         // A binding of the frame that called `eval` takes the write, which is what
@@ -1298,6 +1430,16 @@ impl<'a> Interp<'a> {
             self.realm.globals.insert(name, cell);
             return Ok(());
         }
+        // A variable a direct `eval` declared in this call shadows the global object, even
+        // when the global already has a property of that name — `var c = "global"` at the
+        // top level must not capture `eval("var c = 1")` inside a function.
+        if let Some((local_vars, phase)) = self.visible_local_vars()
+            && local_vars.contains(&name)
+            && let Some(cell) = local_vars.get(&name, phase)
+        {
+            cell.set(value);
+            return Ok(());
+        }
         let global = self.realm.global.clone();
         match global.own_property(&name) {
             // A `var` global is writable, so the store goes straight through — but
@@ -1322,6 +1464,13 @@ impl<'a> Interp<'a> {
             None => {
                 if self.current_strict() {
                     return Err(self.throw_reference(&name));
+                }
+                // A direct eval declares here rather than on the global object: its
+                // `var`s belong to the caller's variable environment. `declare_eval_local`
+                // also covers a plain assignment to a variable an earlier eval made.
+                if let Some(cell) = self.declare_eval_local(&name) {
+                    cell.set(value);
+                    return Ok(());
                 }
                 global.define_data(&name, value);
                 Ok(())
@@ -1427,6 +1576,54 @@ impl<'a> Interp<'a> {
     /// The `TypeError` an assignment to a read-only binding raises.
     fn read_only_local(&self, name: &str) -> Signal {
         Signal::Throw(self.make_error("TypeError", &format!("'{name}' is read-only")))
+    }
+
+    /// Declare `name` as a variable of the frame that called the running `eval`.
+    ///
+    /// `None` when there is no direct eval in progress, or it was called from the top
+    /// level — then the caller's variable environment *is* the global one and the
+    /// existing path is right.
+    fn declare_eval_local(&mut self, name: &str) -> Option<Gc<Cell>> {
+        let caller = self.eval_caller.flatten()?;
+        // The bottom frame is the top-level script, whose variable environment *is* the
+        // global one — so `eval("var x = 1")` at the top level still creates a global.
+        if caller == 0 {
+            return None;
+        }
+        // A name the eval's *own* variable environment already binds is not a new
+        // variable: `eval("var arguments = 1")` inside a parameter list writes that list's
+        // `arguments`, and creating a second binding would leave the first — the one
+        // closures read — untouched. A binding of an *outer* frame does not count: a
+        // declaration shadows it rather than writing through.
+        if self
+            .eval_bindings
+            .iter()
+            .any(|binding| binding.name == name && binding.frame == caller)
+        {
+            return None;
+        }
+        let phase = if self.in_parameter_list_at(caller) {
+            0
+        } else {
+            1
+        };
+        self.frame_local_vars(caller)?;
+        let local_vars = self.frames.get(caller)?.local_vars.clone()?;
+        if let Some(cell) = local_vars.get(name, 1) {
+            return Some(cell);
+        }
+        let cell = self.new_cell(Value::Undefined);
+        Some(local_vars.declare(name, phase, cell))
+    }
+
+    /// Make sure `frame` has a `LocalVars`, creating it on demand.
+    fn frame_local_vars(&mut self, frame: usize) -> Option<Gc<LocalVars>> {
+        if let Some(local_vars) = &self.frames.get(frame)?.local_vars {
+            return Some(local_vars.clone());
+        }
+        let local_vars = Gc::new(self.heap, LocalVars::new());
+        self.frames.get_mut(frame)?.local_vars = Some(local_vars.clone());
+        Some(local_vars)
     }
 
     /// Whether the realm already has a binding for `name`, lexically or as an *own*
@@ -2907,6 +3104,14 @@ impl<'a> Interp<'a> {
             // -- closure variables ------------------------------------------
             GetVarRef | GetVarRef0 | GetVarRef1 | GetVarRef2 | GetVarRef3 => {
                 let slot = self.slot_operand(op, a);
+                // A name a direct `eval` created shadows the binding the compiler chose.
+                // `function t(){ var c = "outer"; function f(a = eval("var c = 1")) { } }`
+                // leaves `t`'s `c` alone but makes every read inside `f` see the eval's,
+                // and only a runtime lookup can know that.
+                if let Some(cell) = self.eval_created_local(slot) {
+                    self.push(cell.get());
+                    return self.step();
+                }
                 let value = self.cell_value(slot)?;
                 self.push(value);
             }
@@ -2921,6 +3126,10 @@ impl<'a> Interp<'a> {
             PutVarRef | PutVarRef0 | PutVarRef1 | PutVarRef2 | PutVarRef3 | PutVarRefCheck => {
                 let slot = self.slot_operand(op, a);
                 let value = self.pop();
+                if let Some(cell) = self.eval_created_local(slot) {
+                    cell.set(value);
+                    return self.step();
+                }
                 // Same rule as `PutLocCheck`: a checked store to a captured binding
                 // refuses a `const` once its initialiser has run.
                 if op == PutVarRefCheck && self.is_read_only(slot, VarSlot::Closure) {
@@ -2931,6 +3140,11 @@ impl<'a> Interp<'a> {
             SetVarRef | SetVarRef0 | SetVarRef1 | SetVarRef2 | SetVarRef3 => {
                 let slot = self.slot_operand(op, a);
                 let value = self.pop();
+                if let Some(cell) = self.eval_created_local(slot) {
+                    cell.set(value.clone());
+                    self.push(value);
+                    return self.step();
+                }
                 self.set_cell(slot, value.clone())?;
                 self.push(value);
             }
@@ -3863,7 +4077,20 @@ impl<'a> Interp<'a> {
             .active_eval_scope
             .clone()
             .or_else(|| self.frame().env.eval_scope.clone());
-        let env = Gc::new(self.heap, ClosureEnv { cells, eval_scope });
+        // A closure sees the variables a direct `eval` declared in the frame it was
+        // created in — the ones declared before *and after* it, so the same object is
+        // shared; only the phase bounds which of them are visible.
+        let local_vars = self.visible_local_vars().map(|(vars, _)| vars);
+        let local_phase = if self.in_parameter_list() { 0 } else { 1 };
+        let env = Gc::new(
+            self.heap,
+            ClosureEnv {
+                cells,
+                eval_scope,
+                local_vars,
+                local_phase,
+            },
+        );
         let object = JsObject::function(
             self.heap,
             Some(self.realm.function_proto.clone()),
@@ -4620,6 +4847,14 @@ impl<'a> Interp<'a> {
         // `eval("var my_var=2")` rules out.
         if let Some(scope) = self.eval_scope.as_mut() {
             scope.entry(name.to_string()).or_insert(Value::Undefined);
+            return;
+        }
+        // A sloppy direct eval declares into its *caller's* variable environment. Doing
+        // this on the global object instead made `eval("var c = 1")` inside a parameter
+        // list overwrite a global `c`, and made two calls to the same function share one
+        // binding.
+        if let Some(cell) = self.declare_eval_local(name) {
+            cell.set(Value::Undefined);
             return;
         }
         let global = self.realm.global.clone();

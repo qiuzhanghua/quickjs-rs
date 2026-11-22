@@ -1523,3 +1523,87 @@ fn eval_respects_a_read_only_binding() {
         "TypeError\n"
     );
 }
+
+#[test]
+fn parameter_expressions_get_their_own_variable_environment() {
+    // A default expression makes the parameter list a scope of its own: the body's `var a`
+    // is a different binding, so the closure still sees the parameter.
+    assert_eq!(
+        eval(
+            "var f = function f(a = 1, p = () => a) { var a = 2; return [a, p()] };\n\
+             print(f().join())"
+        ),
+        "2,1\n"
+    );
+    // A destructured parameter behaves the same way.
+    assert_eq!(
+        eval(
+            "var g = ({x} = {x: 7}, p = () => x) => { var x = 9; return [x, p()] }; print(g().join())"
+        ),
+        "9,7\n"
+    );
+    // …and so does a body that leaves the parameter alone.
+    assert_eq!(
+        eval("var g = ({x} = {x: 7}, p = () => x) => [x, p()]; print(g().join())"),
+        "7,7\n"
+    );
+    // `arguments` exists twice as well, and the parameter list's copy is the one its
+    // closures see: the arrow returns `f`'s arguments, not its own call's.
+    assert_eq!(
+        eval("var f = function f(a, b = () => arguments) { return b()[0] }; print(f(9))"),
+        "9\n"
+    );
+    // A parameter list does not see the body's `var`s, so this `c` is the global one.
+    assert_eq!(
+        eval(
+            "var c = 'global';\n\
+             var f = (a = 1, p = () => c) => { var c = 2; return [c, p()] };\n\
+             print(f().join())"
+        ),
+        "2,global\n"
+    );
+}
+
+#[test]
+fn eval_in_a_parameter_list_belongs_to_the_caller() {
+    // A `var` a sloppy eval declares goes into the caller's variable environment, not onto
+    // the global object — and a direct eval inside a parameter list puts it in the
+    // parameter environment, which its closures and the body both see.
+    assert_eq!(
+        eval(
+            "var c = 'global';\n\
+             var f = function f(a = eval('var c = 1')) { return c };\n\
+             print(f(), c)"
+        ),
+        "1 global\n"
+    );
+    // A closure born in the parameter list sees it…
+    assert_eq!(
+        eval(
+            "var c = 'global';\n\
+             var f = (a = eval('var c = 1'), p = () => c) => { var c = 2; return [c, p()] };\n\
+             print(f().join(), c)"
+        ),
+        "2,1 global\n"
+    );
+    // …including when the variable shadows an enclosing function's own binding.
+    assert_eq!(
+        eval(
+            "function t() {\n\
+                 var c = 'outer';\n\
+                 function f(a = eval('var c = 1'), p = () => c) { return [p(), c] }\n\
+                 return [f().join(), c]\n\
+             }\n\
+             print(t().join(' '))"
+        ),
+        "1,1 outer\n"
+    );
+    // An *indirect* eval has no caller scope at all, so its `var` is a global.
+    assert_eq!(
+        eval(
+            "function t() { (1, eval)('var indirect = 1') }\n\
+             t(); print(typeof indirect)"
+        ),
+        "number\n"
+    );
+}

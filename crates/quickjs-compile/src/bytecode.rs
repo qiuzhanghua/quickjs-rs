@@ -494,6 +494,21 @@ pub struct Function {
     /// to look outward for both — an `eval` inside an arrow sees the enclosing function's
     /// receiver, not the arrow's.
     pub is_arrow: bool,
+    /// Whether the parameter list contains a default expression, and so gets a variable
+    /// environment of its own (`PARAM_SCOPE` in the compiler).
+    ///
+    /// The runtime needs this for two things a direct `eval` can observe: where a `var`
+    /// it declares belongs (the parameter environment, while the defaults are still being
+    /// evaluated), and which bindings a closure created there may see.
+    pub has_parameter_expressions: bool,
+    /// Where the body begins in source order, as `(line, column)`.
+    ///
+    /// A closure whose creation site is before this was created by a default expression,
+    /// so it sees the parameter environment and not the body's. Recorded as a position
+    /// rather than a bytecode offset because the instruction stream is rebuilt (frame
+    /// prologues are prepended) after the point where the compiler knows the boundary.
+    /// `(0, 0)` means "unknown", which is read as "the whole function is its body".
+    pub body_start: (u32, u32),
     /// Parameters.
     pub args: Vec<VarDef>,
     /// How many parameters count towards `Function.prototype.length`.

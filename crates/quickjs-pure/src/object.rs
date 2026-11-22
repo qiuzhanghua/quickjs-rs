@@ -229,6 +229,79 @@ pub struct ClosureEnv {
     /// by then, so the environment carries them by name instead. Ordinary closures leave
     /// this `None` and resolve globals exactly as before.
     pub eval_scope: Option<Gc<EvalScope>>,
+    /// Variables a direct `eval` declared in the frame this closure was created in, and
+    /// how much of that frame it may see.
+    ///
+    /// A closure is created at a *place* in a function, and a direct `eval` can add
+    /// variables after that point. Those variables belong to the variable environment
+    /// that was current at the closure's creation — the parameter list or the body — which
+    /// is what `local_phase` records.
+    pub local_vars: Option<Gc<LocalVars>>,
+    /// `0` for a closure created in a parameter list, `1` for one in a body. A parameter
+    /// list's closure must not see variables a later `eval` in the body declared:
+    /// `function f(a, p = () => c) { eval("var c = 1") }` has `p()` resolve `c` outside
+    /// the function entirely.
+    pub local_phase: u8,
+}
+
+/// Variables a direct `eval` declared in one function call.
+///
+/// A sloppy `eval` declares its `var`s in the caller's variable environment, not on the
+/// global object: `function f() { eval("var x = 1") } f(); x` is a `ReferenceError`, and
+/// two calls to `f` get two `x`s. Each entry therefore records the phase it was declared
+/// in, so a lookup from the parameter list cannot see a body declaration.
+pub struct LocalVars {
+    names: std::cell::RefCell<Vec<(String, Gc<Cell>, u8)>>,
+}
+
+impl Default for LocalVars {
+    fn default() -> LocalVars {
+        LocalVars::new()
+    }
+}
+
+impl LocalVars {
+    /// An empty set.
+    pub fn new() -> LocalVars {
+        LocalVars {
+            names: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The cell `name` resolves to, when it was declared in `phase` or earlier.
+    pub fn get(&self, name: &str, phase: u8) -> Option<Gc<Cell>> {
+        self.names
+            .borrow()
+            .iter()
+            .find(|(bound, _, at)| bound == name && *at <= phase)
+            .map(|(_, cell, _)| cell.clone())
+    }
+
+    /// The cell for `name`, declaring it if this is the first time.
+    pub fn declare(&self, name: &str, phase: u8, cell: Gc<Cell>) -> Gc<Cell> {
+        let mut names = self.names.borrow_mut();
+        if let Some((_, cell, _)) = names.iter().find(|(bound, _, _)| bound == name) {
+            return cell.clone();
+        }
+        names.push((name.to_string(), cell.clone(), phase));
+        cell
+    }
+
+    /// Whether `name` has been declared at all.
+    pub fn contains(&self, name: &str) -> bool {
+        self.names
+            .borrow()
+            .iter()
+            .any(|(bound, _, _)| bound == name)
+    }
+}
+
+impl Trace for LocalVars {
+    fn trace(&self, tracer: &mut Tracer) {
+        for (_, cell, _) in self.names.borrow().iter() {
+            tracer.visit(cell);
+        }
+    }
 }
 
 impl Trace for ClosureEnv {
@@ -238,6 +311,9 @@ impl Trace for ClosureEnv {
         }
         if let Some(scope) = &self.eval_scope {
             tracer.visit(scope);
+        }
+        if let Some(local_vars) = &self.local_vars {
+            tracer.visit(local_vars);
         }
     }
 }

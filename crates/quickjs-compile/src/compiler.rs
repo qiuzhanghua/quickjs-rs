@@ -47,6 +47,20 @@ pub struct Label(u32);
 /// sentinel takes the slot below it.
 const FUNCTION_SCOPE: u64 = u64::MAX - 3;
 
+/// The `var_block` sentinel for a binding of the parameter list.
+///
+/// A function whose parameter list contains a default expression gets *two* variable
+/// environments: one for the parameters and one for the body, so a `var` in the body
+/// that shares a name with a parameter is a different binding. The parameter bindings
+/// therefore need a scope key of their own: reachable while the defaults are
+/// evaluated, invisible to the body, and never merged with a body `var` of the same
+/// name.
+///
+/// Without this, `function f(a = 1, p = () => a) { var a = 2 }` made `p()` return 2:
+/// the closure and the body shared one slot, when only the parameters were in scope
+/// when it was created.
+const PARAM_SCOPE: u64 = u64::MAX - 4;
+
 /// The `blocks` parent sentinel for "this block has no enclosing block".
 ///
 /// Same reasoning as [`FUNCTION_SCOPE`]: `0` is a legal block key, and when it was
@@ -129,6 +143,9 @@ enum Insn {
         action: VarAction,
         name: String,
         block: u64,
+        /// Whether the access was written in the parameter list; see
+        /// [`FnState::in_params`].
+        in_params: bool,
     },
     /// Close a binding *if* it turned out to be captured.
     ///
@@ -436,6 +453,8 @@ struct FnState {
     /// wrapped in another guard.
     emitting_with_guard: bool,
     self_name: Option<String>,
+    /// Where the function body starts, in source order; see [`Function::body_start`].
+    body_start: (u32, u32),
     /// Whether the body contains a *direct* `eval(...)` call.
     ///
     /// A direct eval sees every binding of the function that called it, including ones
@@ -443,6 +462,23 @@ struct FnState {
     /// which can outlive the function. Both need the bindings to live in cells, so this
     /// flag makes the function treat all of them as captured.
     has_direct_eval: bool,
+    /// Whether the parameter list contains a default expression, which is what gives
+    /// the function a second variable environment (see [`PARAM_SCOPE`]).
+    has_parameter_expressions: bool,
+    /// Whether the instructions being emitted belong to the parameter list.
+    ///
+    /// References made here must not see the body's `var`s: the body has not run yet,
+    /// and the reference's own model keeps the two scopes apart.
+    in_params: bool,
+    /// Whether an arrow created in this function's parameter list needs the parameter
+    /// scope's `arguments` binding.
+    needs_param_arguments: bool,
+    /// Whether this function was *created* inside a parameter list.
+    ///
+    /// Inherited, so `f(a = () => () => c)` hides `f`'s body bindings from the inner
+    /// arrow too. The name reference is the arrow's, but the scope it must not see
+    /// belongs to the function the arrow was born in.
+    created_in_params: bool,
     /// What each direct `eval(...)` in this function can see; see [`EvalSite`].
     ///
     /// Only filled in by [`Compiler::materialize_eval_sites`], because the answer is not
@@ -451,7 +487,7 @@ struct FnState {
     /// `eval("myfunc = 1")` has to find.
     eval_sites: Vec<EvalSite>,
     /// Direct `eval` call sites seen so far: where, and the block that was current.
-    pending_eval_sites: Vec<(Span, u64)>,
+    pending_eval_sites: Vec<(Span, u64, bool)>,
     /// Whether the self-name prologue (`special_object 2` then the store) has been
     /// emitted for this function.
     ///
@@ -534,6 +570,11 @@ impl FnState {
             emitting_with_guard: false,
             self_name: None,
             has_direct_eval: false,
+            body_start: (0, 0),
+            has_parameter_expressions: false,
+            in_params: false,
+            needs_param_arguments: false,
+            created_in_params: false,
             eval_sites: Vec::new(),
             pending_eval_sites: Vec::new(),
             self_name_initialized: false,
@@ -815,10 +856,12 @@ impl Compiler {
         let block = self.cur().current_block;
         self.state().label_since_insn = false;
         let pos = self.cur().cur_pos;
+        let in_params = self.cur().in_params;
         self.state().insns.push(Insn::Var {
             action,
             name: name.to_string(),
             block,
+            in_params,
         });
         self.state().insn_pos.push(pos);
     }
@@ -883,10 +926,12 @@ impl Compiler {
                     // goes through `put_var_ref` while reads use `get_var`.
                     let block = self.cur().current_block;
                     let pos = self.cur().cur_pos;
+                    let in_params = self.cur().in_params;
                     self.state().insns.push(Insn::Var {
                         action: VarAction::PutRef,
                         name,
                         block,
+                        in_params,
                     });
                     self.state().insn_pos.push(pos);
                 }
@@ -1504,12 +1549,73 @@ impl Compiler {
             return;
         }
         let state = self.state();
-        if state.vars.iter().any(|v| v.name == name) {
+        // A binding of the *parameter* scope does not count: the body's `var` of the
+        // same name is a different binding and needs a slot of its own.
+        if state.vars.iter().enumerate().any(|(index, v)| {
+            v.name == name && state.var_block.get(index).copied() != Some(PARAM_SCOPE)
+        }) {
             return;
         }
         // A `var` belongs to the function scope, never to the enclosing block.
         state.var_block.push(FUNCTION_SCOPE);
         state.vars.push(def);
+    }
+
+    /// Declare `name` as a binding of the parameter scope, returning its slot.
+    fn declare_param_var(&mut self, name: &str) -> u32 {
+        declare_param_var_at(self.state(), name)
+    }
+
+    /// Give the *parameter* scope an `arguments` binding if the parameter list mentions
+    /// one.
+    ///
+    /// With parameter expressions the reference creates two: an unmapped one in the
+    /// argument scope, for the defaults and anything they close over, and the body's own.
+    /// They are separate bindings, which is what makes
+    /// `(a = eval("var arguments = 1"), p = () => arguments) => { var arguments = 2 }`
+    /// report 1 from `p` and 2 from the body.
+    fn provide_param_arguments(&mut self) {
+        if !self.cur().has_parameter_expressions {
+            return;
+        }
+        let mentioned = self.cur().needs_param_arguments
+            || self
+                .cur()
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Var { name, in_params: true, .. } if name == "arguments"));
+        if !mentioned {
+            return;
+        }
+        let slot = self.declare_param_var("arguments");
+        let magic = if self.cur().strict { 0 } else { 1 };
+        self.prepend_initialiser_to(
+            slot,
+            Insn::Fixed {
+                op: Opcode::SpecialObject,
+                operands: vec![Op::Int(magic)],
+            },
+        );
+    }
+
+    /// [`Compiler::prepend_initialiser`] for a slot rather than a name.
+    fn prepend_initialiser_to(&mut self, slot: u32, producer: Insn) {
+        let current = self.stack.len() - 1;
+        let init = [
+            producer,
+            Insn::Fixed {
+                op: Opcode::PutLoc,
+                operands: vec![Op::Slot(Slot::Loc(slot))],
+            },
+        ];
+        let inserted = init.len();
+        for (index, instruction) in init.into_iter().enumerate() {
+            self.stack[current].insns.insert(index, instruction);
+        }
+        for placed in self.stack[current].labels.iter_mut().flatten() {
+            *placed += inserted;
+        }
+        self.state().label_since_insn = false;
     }
 
     /// Give the function an `arguments` binding if its body mentions one.
@@ -1535,7 +1641,17 @@ impl Compiler {
             }
             return;
         }
-        if !self.mentions("arguments") && !self.stack[current].needs_arguments_local {
+        // Only a *body* mention needs the body's binding: the parameter list has one of
+        // its own (see [`Compiler::provide_param_arguments`]).
+        let mentioned = self.cur().insns.iter().any(|insn| {
+            matches!(insn, Insn::Var { name, in_params, .. } if name == "arguments" && !*in_params)
+        });
+        if !mentioned && !self.cur().needs_arguments_local {
+            return;
+        }
+        // The request may have come only from a parameter-list arrow, in which case the
+        // parameter scope's binding already answers for it and the body needs none.
+        if !mentioned && self.cur().has_parameter_expressions && !self.body_mentions_arguments() {
             return;
         }
         // 0 is strict `arguments`, 1 is sloppy (mapped) `arguments`. The mapping
@@ -1544,10 +1660,28 @@ impl Compiler {
         self.prepend_binding("arguments", magic);
     }
 
+    /// Whether a *body* instruction refers to `arguments`.
+    fn body_mentions_arguments(&self) -> bool {
+        self.cur()
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Var { name, in_params, .. } if name == "arguments" && !*in_params))
+    }
+
     /// Whether the function body's instruction stream refers to `name`.
     fn mentions(&self, name: &str) -> bool {
         let current = self.stack.len() - 1;
-        if self.stack[current].vars.iter().any(|v| v.name == name) {
+        // A binding of the parameter scope does not answer for the body: the body's own
+        // `arguments` (or self-name) still has to be provided for it.
+        if self.stack[current]
+            .vars
+            .iter()
+            .enumerate()
+            .any(|(index, v)| {
+                v.name == name
+                    && self.stack[current].var_block.get(index).copied() != Some(PARAM_SCOPE)
+            })
+        {
             return false;
         }
         self.stack[current]
@@ -1642,6 +1776,7 @@ impl Compiler {
                 },
                 name: name.to_string(),
                 block: 0,
+                in_params: false,
             },
         ];
         let inserted = init.len();
@@ -2609,7 +2744,10 @@ impl Compiler {
                 state.has_direct_eval = true;
             }
             let block = self.cur().current_block;
-            self.state().pending_eval_sites.push((expr.span, block));
+            let in_params = self.cur().in_params;
+            self.state()
+                .pending_eval_sites
+                .push((expr.span, block, in_params));
         }
         let result = self.expr_inner(expr);
         self.state().cur_pos = saved;
@@ -2624,13 +2762,13 @@ impl Compiler {
     /// its block is the current block, an enclosing one, or the function scope.
     fn materialize_eval_sites(&mut self) {
         let pending = std::mem::take(&mut self.state().pending_eval_sites);
-        for (span, site_block) in pending {
-            self.resolve_eval_site(span, site_block);
+        for (span, site_block, in_params) in pending {
+            self.resolve_eval_site(span, site_block, in_params);
         }
     }
 
     /// Resolve the bindings visible at one `eval` call.
-    fn resolve_eval_site(&mut self, span: Span, site_block: u64) {
+    fn resolve_eval_site(&mut self, span: Span, site_block: u64, site_in_params: bool) {
         /// How near a binding is: function distance first, then block depth, then the
         /// later declaration (which shadows the earlier one in the same block).
         type ScopePriority = (usize, usize, std::cmp::Reverse<u32>);
@@ -2687,12 +2825,23 @@ impl Compiler {
                     },
                 ));
             }
+            // A parameter list cannot see the body, so a body `var` is not a binding the
+            // eval can name: `(a = eval("var c = 1"), p = () => c) => { var c = 2 }` must
+            // not let that eval write the body's `c`.
+            let hides_body = if level == deepest {
+                site_in_params
+            } else {
+                state.created_in_params
+            };
             for (index, var) in state.vars.iter().enumerate() {
                 let block = state
                     .var_block
                     .get(index)
                     .copied()
                     .unwrap_or(FUNCTION_SCOPE);
+                if hides_body && block == FUNCTION_SCOPE && !visible_in_params(var) {
+                    continue;
+                }
                 bindings.push((
                     (
                         owner as usize,
@@ -4134,8 +4283,19 @@ impl Compiler {
     /// `arguments` reached from an arrow, which likewise belongs to the enclosing
     /// function.
     fn ensure_enclosing_arguments(&mut self) {
+        // An arrow created in a parameter list needs the *parameter* scope's
+        // `arguments`, not the body's: the two are separate bindings and the arrow was
+        // born before the body existed.
+        let from_params = self.cur().created_in_params;
         if let Some(target) = self.enclosing_function() {
             self.state_at(target).needs_arguments_local = true;
+            if from_params {
+                self.state_at(target).needs_param_arguments = true;
+                // Declare it now, not at the enclosing function's `finish_current`: the
+                // arrow resolves its own `arguments` before that runs, and a binding that
+                // does not exist yet resolves as a global.
+                declare_param_var_at(&mut self.stack[target], "arguments");
+            }
             self.declare_at(target, "arguments");
         }
     }
@@ -4172,6 +4332,9 @@ impl Compiler {
                 action: VarAction::Put,
                 name: name.to_string(),
                 block: 0,
+                // A prologue initialiser runs before the body proper, but it is body
+                // code: `this` and `arguments` are provided for it, not by it.
+                in_params: false,
             },
         ];
         let inserted = init.len();
@@ -4797,6 +4960,18 @@ impl Compiler {
         state.with_names = self.cur().with_names.clone();
         state.is_arrow = func.is_arrow;
         state.created_in_block = self.cur().current_block;
+        // A default anywhere in the parameter list is what gives the function two
+        // variable environments. The reference decides this the same way: it scans the
+        // parenthesis for a top-level `=`, so a destructured name without a default
+        // stays a plain function-scope binding.
+        state.in_params = false;
+        state.has_parameter_expressions = func
+            .params
+            .iter()
+            .any(|param| matches!(param.kind, PatternKind::Assign { .. }));
+        // A function born inside a parameter list inherits the prohibition: it must not
+        // see the body bindings of the function it was created in.
+        state.created_in_params = self.cur().in_params || self.cur().created_in_params;
         // A class constructor knows what it is only because the class told it.
         if let Some((kind, has_fields)) = self.cur().class_ctor_pending {
             state.ctor_kind = kind;
@@ -4861,6 +5036,12 @@ impl Compiler {
         func: &ast::Function,
     ) -> Result<CompiledFunction, SyntaxError> {
         let body_key = func.params_span.end.offset as u64;
+        // Where the body begins, in source order. The runtime needs this to tell a
+        // closure created by a default expression from one the body creates — the two see
+        // different variable environments — and a bytecode offset would not survive the
+        // instruction shuffling that building the frame does. Positions are in source
+        // order, so a comparison answers it.
+        self.state().body_start = (func.params_span.end.line, func.params_span.end.column);
         self.push_block(body_key, NO_PARENT);
         self.state().body_block = body_key;
         // An arrow with an expression body has no statements; the expression is
@@ -4892,6 +5073,20 @@ impl Compiler {
                 self.declare_var(&name.name.clone(), VarDef::var(name.name.clone()));
             }
         }
+        // With parameter expressions, every parameter also gets a binding in the
+        // parameter scope, which is what the defaults and any closure created among them
+        // resolve against. A simple parameter needs both: the argument slot for the body
+        // and the parameter binding for the list.
+        let has_param_scope = self.cur().has_parameter_expressions;
+        if has_param_scope {
+            for param in &func.params {
+                let mut names = Vec::new();
+                param.bound_names(&mut names);
+                for name in names {
+                    self.declare_param_var(&name.name.clone());
+                }
+            }
+        }
         self.hoist(body, body_key)?;
         // A suspending function starts by suspending: the reference's `initial_yield` is
         // the first instruction, so creating a generator runs no body code until the
@@ -4917,19 +5112,44 @@ impl Compiler {
                 self.emit(Opcode::CheckCtor, &[]);
             }
         }
-        for (index, pattern) in &prologue {
-            match &pattern.kind {
-                // `...rest` collects what is left rather than reading one slot.
-                PatternKind::Rest(inner) => {
-                    self.emit(Opcode::Rest, &[Op::Int(*index as i32)]);
-                    self.destructure(inner, Some(VarDeclKind::Var))?;
-                }
-                _ => {
-                    self.emit(Opcode::GetArg, &[Op::Slot(Slot::Arg(*index as u32))]);
-                    self.destructure(pattern, Some(VarDeclKind::Var))?;
+        // The whole parameter list is one scope, and nothing in the body exists yet, so
+        // every name it mentions resolves against the parameter bindings and outward.
+        self.state().in_params = has_param_scope;
+        for (index, param) in func.params.iter().enumerate() {
+            if let Some((_, pattern)) = prologue.iter().find(|(at, _)| *at == index) {
+                match &pattern.kind {
+                    // `...rest` collects what is left rather than reading one slot.
+                    PatternKind::Rest(inner) => {
+                        self.emit(Opcode::Rest, &[Op::Int(index as i32)]);
+                        self.destructure(inner, Some(VarDeclKind::Var))?;
+                    }
+                    _ => {
+                        self.emit(Opcode::GetArg, &[Op::Slot(Slot::Arg(index as u32))]);
+                        self.destructure(pattern, Some(VarDeclKind::Var))?;
+                    }
                 }
             }
+            if !has_param_scope {
+                continue;
+            }
+            // Mirror the value into the parameter scope. For a plain parameter that is
+            // a copy of its argument slot; for a pattern, one copy per name it bound.
+            let mut names = Vec::new();
+            param.bound_names(&mut names);
+            for name in names {
+                let Some(var) = self.cur().vars.iter().enumerate().position(|(index, var)| {
+                    var.name == name.name
+                        && self.cur().var_block.get(index).copied() == Some(FUNCTION_SCOPE)
+                }) else {
+                    continue;
+                };
+                let target = self.declare_param_var(&name.name);
+                self.emit(Opcode::GetLoc, &[Op::Slot(Slot::Loc(var as u32))]);
+                self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(target))]);
+            }
         }
+        // The parameter list is over; from here on a direct `eval` belongs to the body.
+        self.state().in_params = false;
         for stmt in body {
             self.stmt(stmt)?;
             if Self::terminates(stmt) {
@@ -4990,6 +5210,7 @@ impl Compiler {
     /// Resolve and assemble the function on top of the compiler stack, then pop
     /// it.
     fn finish_current(&mut self) -> CompiledFunction {
+        self.provide_param_arguments();
         self.provide_arguments();
         self.provide_this_local();
         self.provide_new_target_local();
@@ -5022,6 +5243,8 @@ impl Compiler {
             kind: state.kind,
             strict: state.strict,
             is_arrow: state.is_arrow,
+            has_parameter_expressions: state.has_parameter_expressions,
+            body_start: state.body_start,
             args: state.args,
             defined_args: state.defined_args,
             vars: state.vars,
@@ -5170,8 +5393,14 @@ fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) 
                 action,
                 name,
                 block,
+                in_params,
             } => {
-                let slot = resolve_slot(stack, current, name, *block);
+                // Only a *read* prefers the parameter scope. A store in the parameter
+                // list is binding its parameter or assigning inside a default; either
+                // way it has to reach the slot the body reads, and the mirror into the
+                // parameter scope is emitted separately (see `compile_function_body`).
+                let reads = matches!(action, VarAction::Get | VarAction::GetUndef);
+                let slot = resolve_slot(stack, current, name, *block, *in_params && reads);
                 // A store to the name of a named function expression is special: the
                 // reference drops it in sloppy mode and throws in strict mode, because
                 // the binding is immutable but only *checked* when the body is strict.
@@ -5216,7 +5445,7 @@ fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) 
                 // The block matters: a loop variable is scoped to the `for` head's own
                 // block, so resolving it against block 0 would miss it entirely and
                 // silently emit nothing.
-                let slot = resolve_slot(stack, current, name, *block);
+                let slot = resolve_slot(stack, current, name, *block, false);
                 // Only a local with a reference cell has anything to close. A global
                 // or a never-captured local resolves to no instruction at all, which
                 // keeps the bytecode identical to the reference's.
@@ -5235,7 +5464,10 @@ fn resolve(stack: &mut [FnState]) -> (Vec<ResolvedInsn>, Vec<Option<Position>>) 
                 // A binding — a local, an argument, or a declared global — cannot be
                 // deleted, and the reference encodes that as a constant `push_false`.
                 // Only an implicit global needs the runtime lookup.
-                if matches!(resolve_slot(stack, current, name, 0), Slot::Global(_)) {
+                if matches!(
+                    resolve_slot(stack, current, name, 0, false),
+                    Slot::Global(_)
+                ) {
                     let atom = intern_atom(&mut stack[current], name);
                     out.push(Some((Opcode::DeleteVar, vec![Op::AtomId(atom)])));
                 } else {
@@ -5355,7 +5587,57 @@ fn local_slot_index(state: &FnState, name: &str, block: u64) -> Option<usize> {
     })
 }
 
-fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -> Slot {
+/// Declare `name` as a binding of `state`'s parameter scope, returning its slot.
+fn declare_param_var_at(state: &mut FnState, name: &str) -> u32 {
+    if let Some(index) = state.vars.iter().enumerate().position(|(index, var)| {
+        var.name == name && state.var_block.get(index).copied() == Some(PARAM_SCOPE)
+    }) {
+        return index as u32;
+    }
+    state.var_block.push(PARAM_SCOPE);
+    state.vars.push(VarDef::var(name));
+    state.vars.len() as u32 - 1
+}
+
+/// Whether a function-scope binding is visible to the parameter list.
+///
+/// The parameter list runs before the body, so the body's `var`s and function
+/// declarations do not exist yet — a name that only the body declares has to resolve
+/// outward instead. What *does* exist by then is the compiler's own prologue: the
+/// self-name of a named function expression (bound by `special_object 2` before anything
+/// else), `this` and `new.target`. Those stay visible, which is what makes
+/// `function f(a = this)` and `var f = function f(a = f)` work.
+///
+/// `arguments` is handled separately, as a binding of the parameter scope itself: with
+/// parameter expressions the reference creates two of them, and the one the parameter
+/// list sees is not the one the body sees (`function f(a = eval("var arguments = 1"))`).
+fn visible_in_params(var: &VarDef) -> bool {
+    var.kind == VarKind::FunctionName || var.name == "this" || var.name == "new.target"
+}
+
+fn resolve_slot(
+    stack: &mut [FnState],
+    current: usize,
+    name: &str,
+    block: u64,
+    in_params: bool,
+) -> Slot {
+    // The parameter list's own bindings. They are consulted first because they shadow
+    // the argument slots they were copied from: `function f(a = 1, p = () => a)` keeps
+    // `a` in the parameter scope, so a closure made there reads the parameter even after
+    // the body assigns to its own `a`.
+    if in_params
+        && let Some(index) = stack[current]
+            .vars
+            .iter()
+            .enumerate()
+            .position(|(index, var)| {
+                var.name == name
+                    && stack[current].var_block.get(index).copied() == Some(PARAM_SCOPE)
+            })
+    {
+        return Slot::Loc(index as u32);
+    }
     if let Some(index) = stack[current].args.iter().position(|a| a.name == name) {
         return Slot::Arg(index as u32);
     }
@@ -5395,6 +5677,7 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
         .find(|(index, var)| {
             var.name == name
                 && stack[current].var_block.get(*index).copied() == Some(FUNCTION_SCOPE)
+                && (!in_params || visible_in_params(var))
         })
         .map(|(index, _)| index);
     if let Some(index) = function_scoped {
@@ -5431,7 +5714,31 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
                     })
                     .map(|(index, _)| index)
             });
-        let found = if let Some(index) = stack[owner].args.iter().position(|a| a.name == name) {
+        // A function born in a parameter list sees that list's bindings, not the body's:
+        // the parameter scope is the environment it was created in.
+        let in_param_scope = stack
+            .get(owner + 1)
+            .is_some_and(|child| child.created_in_params)
+            .then(|| {
+                stack[owner]
+                    .vars
+                    .iter()
+                    .enumerate()
+                    .position(|(index, var)| {
+                        var.name == name
+                            && stack[owner].var_block.get(index).copied() == Some(PARAM_SCOPE)
+                    })
+            })
+            .flatten();
+        let found = if let Some(index) = in_param_scope {
+            let var = &stack[owner].vars[index];
+            Some(Found::Local(
+                ClosureType::Local,
+                index as u32,
+                var.is_const,
+                var.is_lexical,
+            ))
+        } else if let Some(index) = stack[owner].args.iter().position(|a| a.name == name) {
             Some(Found::Local(ClosureType::Arg, index as u32, false, false))
         } else if let Some(index) = lexical {
             let var = &stack[owner].vars[index];
@@ -5441,7 +5748,19 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
                 var.is_const,
                 var.is_lexical,
             ))
-        } else if let Some(index) = stack[owner].vars.iter().position(|v| v.name == name) {
+        } else if let Some(index) = stack[owner]
+            .vars
+            .iter()
+            .enumerate()
+            .find_map(|(index, var)| {
+                // A function created inside a parameter list must not see the body of the
+                // function it was born in; see [`FnState::created_in_params`].
+                let hidden = stack
+                    .get(owner + 1)
+                    .is_some_and(|child| child.created_in_params);
+                (var.name == name && (!hidden || visible_in_params(var))).then_some(index)
+            })
+        {
             let var = &stack[owner].vars[index];
             Some(Found::Local(
                 ClosureType::Local,
@@ -5474,8 +5793,14 @@ fn resolve_slot(stack: &mut [FnState], current: usize, name: &str, block: u64) -
         {
             let closure = &stack[owner].closure_vars[index];
             Some(match closure.closure_type {
+                // `GlobalRef` belongs here too: it is a *global* reached through this
+                // frame's reference table, so treating it as a `Ref` to a local cell makes
+                // the reader look for a cell no frame ever fills. That is how a second
+                // function using `eval` in its parameter list read `undefined` after a
+                // sibling had already made `eval` a closure entry.
                 ClosureType::Global
                 | ClosureType::GlobalDecl
+                | ClosureType::GlobalRef
                 | ClosureType::ModuleDecl
                 | ClosureType::ModuleImport => Found::Global(index as u32),
                 _ => Found::Local(

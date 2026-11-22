@@ -40,7 +40,7 @@ use std::fmt;
 pub const MAGIC: [u8; 4] = *b"QJSB";
 
 /// Format version. Bumped whenever the layout below changes.
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 
 /// Why a blob could not be read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,9 +148,15 @@ fn write_var(out: &mut Vec<u8>, var: &VarDef) {
 fn write_function(out: &mut Vec<u8>, function: &Function) {
     write_string(out, &function.name);
     out.push(kind_tag(function.kind));
-    out.push(u8::from(function.strict) | (u8::from(function.is_arrow) << 1));
+    out.push(
+        u8::from(function.strict)
+            | (u8::from(function.is_arrow) << 1)
+            | (u8::from(function.has_parameter_expressions) << 2),
+    );
     out.extend_from_slice(&function.line.to_be_bytes());
     out.extend_from_slice(&function.column.to_be_bytes());
+    out.extend_from_slice(&function.body_start.0.to_be_bytes());
+    out.extend_from_slice(&function.body_start.1.to_be_bytes());
 
     out.extend_from_slice(&function.defined_args.to_be_bytes());
     out.extend_from_slice(&(function.args.len() as u32).to_be_bytes());
@@ -329,8 +335,10 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
     let flags = reader.u8()?;
     let strict = flags & 1 != 0;
     let is_arrow = flags & 2 != 0;
+    let has_parameter_expressions = flags & 4 != 0;
     let line = reader.u32()?;
     let column = reader.u32()?;
+    let body_start = (reader.u32()?, reader.u32()?);
 
     let defined_args = reader.u32()?;
     let arg_count = reader.u32()? as usize;
@@ -415,6 +423,8 @@ fn read_function(reader: &mut Reader<'_>) -> Result<Function, DecodeError> {
         kind,
         strict,
         is_arrow,
+        has_parameter_expressions,
+        body_start,
         args,
         defined_args,
         vars,
@@ -561,6 +571,8 @@ mod tests {
             kind: FunctionKind::Normal,
             strict: false,
             is_arrow: false,
+            has_parameter_expressions: false,
+            body_start: (1, 12),
             args: vec![],
             defined_args: 0,
             vars: vec![VarDef::var("<ret>"), VarDef::constant("k")],
