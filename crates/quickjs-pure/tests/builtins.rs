@@ -1662,3 +1662,75 @@ fn object_prototype_has_a_proto_accessor() {
         "false\n"
     );
 }
+
+#[test]
+fn regexp_literals_and_exec_match_the_reference() {
+    // A literal is compiled by the `regexp` opcode, not by a call to the constructor.
+    assert_eq!(eval("print(/ab+c/i.source, /ab+c/i.flags)"), "ab+c i\n");
+    // `exec` reports the whole match, the groups, and where it found them.
+    assert_eq!(
+        eval(
+            "var m = /(\\d+)-(\\d+)/.exec('x 12-34 y');\n\
+             print([m[0], m[1], m[2], m.index, m.input].join(' '))"
+        ),
+        "12-34 12 34 2 x 12-34 y\n"
+    );
+    // A group that did not participate is `undefined`, not an empty string.
+    assert_eq!(
+        eval("print(/a(b)?c/.exec('ac')[1] === undefined)"),
+        "true\n"
+    );
+    // `lastIndex` advances for `g` and resets when the match fails.
+    assert_eq!(
+        eval(
+            "var r = /o/g;\n\
+             print([r.test('foo'), r.lastIndex, r.test('foo'), r.lastIndex, r.test('foo'), r.lastIndex].join() )"
+        ),
+        "true,2,true,3,false,0\n"
+    );
+    // A quantified group takes its captures from the *last* iteration.
+    assert_eq!(
+        eval("print(/(z)((a+)?(b+)?(c))*/.exec('zaacbbbcac').join('|'))"),
+        "zaacbbbcac|z|ac|a||c\n"
+    );
+}
+
+#[test]
+fn string_methods_dispatch_to_the_regexp_symbol_methods() {
+    // `replace`, `split`, `search` and `match` reach the pattern through
+    // `Symbol.replace` and friends, so a `RegExp` decides what they mean.
+    assert_eq!(eval("print('a1b2c3'.replace(/\\d/g, '#'))"), "a#b#c#\n");
+    assert_eq!(
+        eval("print('a1b2c3'.replace(/(\\d)/g, '[$1]'))"),
+        "a[1]b[2]c[3]\n"
+    );
+    assert_eq!(
+        eval("print('a1b2'.replace(/\\d/g, function (m) { return '<' + m + '>' }))"),
+        "a<1>b<2>\n"
+    );
+    assert_eq!(eval("print('a,b;c'.split(/[,;]/).join('|'))"), "a|b|c\n");
+    assert_eq!(eval("print('abcabc'.search(/b/))"), "1\n");
+    assert_eq!(eval("print('xabcx'.match(/b/).index)"), "2\n");
+    assert_eq!(eval("print('aXbXc'.match(/X/g).join('-'))"), "X-X\n");
+    // A dollar in the replacement template refers to a group, and `$&` to the match.
+    assert_eq!(eval("print('ab'.replace(/b/, '[$&]'))"), "a[b]\n");
+    assert_eq!(eval("print('ab'.replace(/b/, '$1'))"), "a$1\n");
+}
+
+#[test]
+fn regexp_flags_change_meaning() {
+    assert_eq!(eval("print(/^b/m.test('a\\nb'))"), "true\n");
+    assert_eq!(eval("print(/a.c/s.test('a\\nc'))"), "true\n");
+    assert_eq!(eval("print(/abc/i.test('AbC'))"), "true\n");
+    // `y` refuses to search forward from `lastIndex`.
+    assert_eq!(
+        eval("var r = /b/y; r.lastIndex = 0; print(r.test('abc'))"),
+        "false\n"
+    );
+    // An invalid pattern or flag is a SyntaxError, as it is in the reference.
+    assert_eq!(
+        throws("new RegExp('a', 'bad')"),
+        "SyntaxError: invalid regular expression flags"
+    );
+    assert_eq!(throws("new RegExp('(')"), "SyntaxError: expecting ')'");
+}

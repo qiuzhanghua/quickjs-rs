@@ -121,6 +121,10 @@ pub struct Realm {
     /// Scoped to the realm, which is what makes `Symbol.for("k")` answer the same
     /// symbol every time within one script while a fresh realm starts empty.
     pub symbol_registry: BTreeMap<String, Value>,
+    /// `RegExp.prototype`, filled in by the `RegExp` builtin.
+    pub regexp_proto: Option<Gc<JsObject>>,
+    /// The `RegExp` constructor.
+    pub regexp_ctor: Option<Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
     ///
     /// Held as plain `Value`s rather than looked up on `Symbol` each time: the runtime
@@ -471,6 +475,8 @@ impl<'a> Interp<'a> {
                 generator_proto: JsObject::ordinary(heap, None),
                 symbol_proto: None,
                 symbol_registry: BTreeMap::new(),
+                regexp_proto: None,
+                regexp_ctor: None,
                 well_known_symbols: WellKnownSymbols::default(),
             },
             frames: Vec::new(),
@@ -3592,6 +3598,17 @@ impl<'a> Interp<'a> {
                 if let (Value::Object(function), Value::Object(home)) = (&function, &home) {
                     function.set_home_object(Some(home.clone()));
                 }
+            }
+            Regexp => {
+                // `pattern flags -> regexp`. A literal compiles here rather than through the
+                // constructor, which is both what the reference's dedicated opcode is for
+                // and what keeps `/a/g.source` from being affected by a patched `RegExp`.
+                let flags = self.pop();
+                let pattern = self.pop();
+                let pattern = self.to_js_string(&pattern)?;
+                let flags = self.to_js_string(&flags)?;
+                let object = crate::builtins::regexp::new_regexp(self, &pattern, &flags)?;
+                self.push(Value::Object(object));
             }
             GetSuper => {
                 // `obj -> obj's prototype`: the starting point of a `super` lookup.

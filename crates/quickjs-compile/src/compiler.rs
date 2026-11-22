@@ -2984,6 +2984,15 @@ impl Compiler {
                 self.yield_expression(argument.as_deref(), *delegate)?
             }
             ExprKind::Await(argument) => self.await_expression(argument)?,
+            ExprKind::RegExp { pattern, flags } => {
+                // The pattern and its flags travel as two string constants; `regexp` builds
+                // the object. A dedicated opcode (rather than a call to the constructor) is
+                // what the reference does too, so that a literal never goes through the
+                // public `RegExp` function and its string-coercion rules.
+                self.push_string(pattern);
+                self.push_string(flags);
+                self.emit(Opcode::Regexp, &[]);
+            }
             ExprKind::Arrow(func) => {
                 let function = self.compile_function(func)?;
                 let index = self.push_constant(Constant::Function(Box::new(function)));

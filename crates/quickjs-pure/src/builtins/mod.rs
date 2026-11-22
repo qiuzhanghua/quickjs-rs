@@ -22,6 +22,7 @@ mod math;
 mod number;
 mod object;
 mod reflect;
+pub mod regexp;
 mod string;
 mod symbol;
 
@@ -64,6 +65,14 @@ pub fn install(interp: &mut Interp<'_>) {
     json::install(interp);
     reflect::install(interp);
     date::install(interp);
+    // `RegExp` after `String` (its methods dispatch to `Symbol.replace` and friends) and
+    // after `Symbol`, whose well-known keys it defines its methods under.
+    let regexp = regexp::install(interp, &object_proto);
+    let global = interp.realm.global.clone();
+    global.define(
+        "RegExp",
+        crate::object::Property::with_attributes(Value::Object(regexp), true, false),
+    );
     generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
 }

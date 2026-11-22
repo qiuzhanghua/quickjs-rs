@@ -116,11 +116,13 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::Array { .. } => "Array",
             ObjectKind::Function(_) => "Function",
             ObjectKind::Generator(_) => "Generator",
+            ObjectKind::RegExp(_) => "RegExp",
             ObjectKind::Ordinary => "Object",
         }) {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),
             "Generator" => "Generator".to_string(),
+            "RegExp" => "RegExp".to_string(),
             other => {
                 // An arguments object, a RegExp and so on are distinguished by an
                 // internal tag; `_class` carries it for the classes that have one

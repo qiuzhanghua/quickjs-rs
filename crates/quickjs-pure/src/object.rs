@@ -359,6 +359,8 @@ pub enum ObjectKind {
     },
     /// A function or a class constructor.
     Function(Callable),
+    /// A regular expression: the compiled pattern, plus `lastIndex` as a property.
+    RegExp(crate::builtins::regexp::RegExpData),
     /// A generator object: a detached frame plus how far it got.
     ///
     /// The frame lives here rather than in the interpreter because a suspended generator
@@ -371,6 +373,9 @@ pub enum ObjectKind {
 impl Trace for ObjectKind {
     fn trace(&self, tracer: &mut Tracer) {
         match self {
+            // Nothing in a compiled pattern is a GC value: it holds characters and
+            // integers only.
+            ObjectKind::RegExp(_) => {}
             ObjectKind::Ordinary => {}
             ObjectKind::Array { elements } => {
                 for element in elements {
@@ -613,6 +618,25 @@ impl JsObject {
     }
 
     /// `length` for an array, reading it out of the element vector.
+    /// The compiled pattern, when this object is a `RegExp`.
+    pub fn regexp(&self) -> Option<crate::builtins::regexp::RegExpData> {
+        match &self.data.borrow().kind {
+            ObjectKind::RegExp(data) => Some(data.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make this object a `RegExp` carrying `data`.
+    pub fn set_regexp(&self, data: crate::builtins::regexp::RegExpData) {
+        self.data.borrow_mut().kind = ObjectKind::RegExp(data);
+    }
+
+    /// Whether this object is a `RegExp`.
+    pub fn is_regexp(&self) -> bool {
+        matches!(self.data.borrow().kind, ObjectKind::RegExp(_))
+    }
+
+    /// An array's element count, when this object is an array.
     pub fn array_length(&self) -> Option<usize> {
         match &self.data.borrow().kind {
             ObjectKind::Array { elements } => Some(elements.len()),

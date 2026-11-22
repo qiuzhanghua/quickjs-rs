@@ -7,7 +7,7 @@
 //! `codePointAt`) are called out where they occur.
 
 use crate::builtins::{arg, arg_int_or, define_method, this_string};
-use crate::interp::{Interp, JsResult};
+use crate::interp::{Interp, JsResult, WellKnown};
 use crate::object::{JsObject, Property};
 use crate::value::Value;
 use js_gc::Gc;
@@ -27,6 +27,9 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
         ("substring", 2, substring),
         ("substr", 2, substr),
         ("split", 2, split),
+        ("match", 1, match_method),
+        ("matchAll", 1, match_all),
+        ("search", 1, search),
         ("concat", 1, concat),
         ("toUpperCase", 0, to_upper_case),
         ("toLowerCase", 0, to_lower_case),
@@ -395,6 +398,9 @@ fn substr(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
 
 fn split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let text = text_of(interp, &this)?;
+    if let Some(result) = symbol_dispatch(interp, &this, WellKnown::Split, args)? {
+        return Ok(result);
+    }
     let limit = match args.get(1) {
         None | Some(Value::Undefined) => usize::MAX,
         Some(value) => value.to_number().max(0.0) as usize,
@@ -437,6 +443,9 @@ fn concat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
 
 fn replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let text = text_of(interp, &this)?;
+    if let Some(result) = symbol_dispatch(interp, &this, WellKnown::Replace, args)? {
+        return Ok(result);
+    }
     let pattern = arg(args, 0).to_js_string();
     let replacement = arg(args, 1);
     let Some(offset) = text.find(&pattern) else {
@@ -457,6 +466,75 @@ fn replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Val
         other => other.to_js_string().replace("$&", &pattern),
     };
     Ok(interp.string(format!("{before}{substituted}{after}")))
+}
+
+/// Hand `args` to the pattern's `Symbol.replace`-style method, when it has one.
+///
+/// This is how a `RegExp` (or any object that opts in) gets to define what `replace` and
+/// friends mean, and it is why `String.prototype.split` needs no regexp knowledge of its
+/// own.
+fn symbol_dispatch(
+    interp: &mut Interp<'_>,
+    this: &Value,
+    which: WellKnown,
+    args: &[Value],
+) -> JsResult<Option<Value>> {
+    let pattern = arg(args, 0);
+    let Some(object) = pattern.as_object() else {
+        return Ok(None);
+    };
+    let method = interp.get_property_key(object, &interp.realm.well_known_key(which))?;
+    let Some(method) = method else {
+        return Ok(None);
+    };
+    if matches!(method, Value::Undefined | Value::Null) {
+        return Ok(None);
+    }
+    let mut call_args: Vec<Value> = vec![this.clone()];
+    call_args.extend(args.iter().skip(1).cloned());
+    if call_args.len() < 2 && which == WellKnown::Replace {
+        call_args.push(Value::Undefined);
+    }
+    let result = interp.call_value(method, pattern, call_args)?;
+    Ok(Some(result))
+}
+
+/// `String.prototype.match(pattern)`.
+fn match_method(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    if let Some(result) = symbol_dispatch(interp, &this, WellKnown::Match, args)? {
+        return Ok(result);
+    }
+    // A plain string pattern matches itself once, and reports the index.
+    let text = text_of(interp, &this)?;
+    let pattern = arg(args, 0).to_js_string();
+    let Some(offset) = text.find(&pattern) else {
+        return Ok(Value::Null);
+    };
+    let array = interp.new_array(vec![interp.string(&pattern)]);
+    interp.set_property(&array, "index", Value::Int(offset as i32))?;
+    interp.set_property(&array, "input", interp.string(&text))?;
+    Ok(Value::Object(array))
+}
+
+/// `String.prototype.matchAll(pattern)`.
+fn match_all(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    if let Some(result) = symbol_dispatch(interp, &this, WellKnown::MatchAll, args)? {
+        return Ok(result);
+    }
+    Err(interp.type_error("matchAll needs a global RegExp"))
+}
+
+/// `String.prototype.search(pattern)`.
+fn search(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    if let Some(result) = symbol_dispatch(interp, &this, WellKnown::Search, args)? {
+        return Ok(result);
+    }
+    let text = text_of(interp, &this)?;
+    let pattern = arg(args, 0).to_js_string();
+    Ok(match text.find(&pattern) {
+        Some(offset) => Value::Int(offset as i32),
+        None => Value::Int(-1),
+    })
 }
 
 // ---------------------------------------------------------------------------

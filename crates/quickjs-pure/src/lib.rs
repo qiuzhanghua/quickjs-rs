@@ -33,6 +33,7 @@ mod bignum;
 pub mod builtins;
 pub mod interp;
 pub mod object;
+pub mod regexp;
 mod tzif;
 pub mod value;
 
