@@ -228,7 +228,7 @@ crates/
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | 反汇编输出可读；往返稳定 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型）+ ~60 opcode | ✅ 能跑递归/fib/数组/闭包脚本 |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/栈回溯） | ✅ M4 范围内 `test_builtin.js` 全通过；`Date` 未做 |
-| M5 | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | `test_language.js`、`test_closure.js` 通过 |
+| M5 ✅ | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | 已完成：`test_language.js`、`test_closure.js` 全部通过；`Promise`/async/`for await`/async generator 就位 |
 | M6 | 模块系统 + 动态 import + JSON 模块 | `test_cyclic_import.js`、`hello_module.js` 通过 |
 | M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
 | M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | test262 对应目录达标 |
@@ -289,12 +289,12 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 
 | 缺口 | 影响 | 计划 |
 |---|---|---|
-| `Date` | `Date` 未定义 | M4 剩余部分 |
-| `RegExp` / `Symbol` / `Map` / `Set` | 未定义 | M7 / M8 |
-| TypedArray / ArrayBuffer | 未定义 | M8 |
-| 生成器 / async | 语法接受，运行期未实现 | M5 |
-| spread 调用参数 `f(...a)` | 编译器明确报错 | M5 |
-| 直接 `eval` 的变量作用域 | `eval("var v=1")` 泄漏到全局 | M5 |
+| `Date` | 已实现 | — |
+| `RegExp` / `Symbol` / `Map` / `Set` | 已实现 | — |
+| TypedArray / ArrayBuffer | 已实现 | — |
+| 生成器 / async | 已实现（`Promise`、`await`、`for await`、async generator） | — |
+| spread 调用参数 `f(...a)` | 已实现 | — |
+| 直接 `eval` 的变量作用域 | 已实现（`eval("var v=1")` 留在调用它的函数里） | — |
 | `Function.prototype.toString` | 返回 `[native code]` | 未排期 |
 | 字符串拼接 | O(n²)，大循环慢 | M11 |
 

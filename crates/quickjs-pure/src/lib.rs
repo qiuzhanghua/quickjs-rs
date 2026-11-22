@@ -198,6 +198,13 @@ impl<'rt> Context<'rt> {
         let interp = self.interp();
         match interp.run_script(code) {
             Ok(value) => {
+                // An unhandled rejection is fatal *after* the script finishes, which is
+                // when the reference decides nothing else will claim it. The script's own
+                // output has already been buffered, so it still prints first.
+                let unhandled = interp.take_unhandled_rejections();
+                if !unhandled.is_empty() {
+                    return Err(Error::Exception(unhandled.join("\n")));
+                }
                 self.last_value = value.clone();
                 Ok(value)
             }

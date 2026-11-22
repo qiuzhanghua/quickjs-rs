@@ -128,6 +128,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             }
             ObjectKind::TypedArray { .. } => "Object",
             ObjectKind::Ordinary => "Object",
+            ObjectKind::Promise(_) => "Promise",
             // A proxy reports the tag of what it stands in for, which is what makes
             // `Object.prototype.toString.call(new Proxy([], {}))` say `[object Array]`.
             ObjectKind::Proxy(_) => {

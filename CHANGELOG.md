@@ -4,6 +4,56 @@
 
 ## 未发布
 
+### 加：`Promise`、async/await、`for await`、async generator
+
+前两轮一直把 Promise 排除在外，理由写的是"对现有测试收益为 0"。那个判断错在
+**测量方式**上：`test_language.js` 里有 30 个测试函数，其中一个
+`async function test_await_using()` 是 `async` 声明的，而差分工具的切片正则只认
+`^function `——它从未进入索引，于是"29/29 通过"实际上是 28 个测试的结果。
+修好正则之后真相是 79/85，缺口正是那一个 async 用例。**M5 之前并没有完成，是靠
+漏测通过的。**
+
+这一版补齐了让那个用例真正跑起来所需的全部东西：
+
+1. **`Promise`** —— 构造器、`then`/`catch`/`finally`、`resolve`/`reject`/
+   `all`/`allSettled`/`any`/`race`/`try`/`withResolvers`、`[object Promise]`。
+   状态是 `ObjectKind::Promise`；`resolve`/`reject` 与 `Proxy.revocable` 的
+   `revoke` 一样做成 `Callable` 变体，因为 `NativeFn` 是函数指针、捕获不了它们要
+   记住的那个 promise。
+2. **微任务队列** —— 脚本执行完由 `run_script` 排空。队列里放的是**数据**而不是
+   闭包，否则 GC 看不见；一个挂起的反应恰恰必须让它的事件处理器和 promise 活着。
+3. **async/await** —— 完全复用生成器的协程机制：`await` 就是一次挂起，帧脱离后
+   由微任务恢复。`call_value` 里那句"需要 Promise，尚未实现"的 `InternalError`
+   换成了真正的执行。
+4. **`for await`** —— 编译器不再拒绝；VM 补上 `for_await_of_next` 与
+   `iterator_get_value_done`，因此既能迭代同步可迭代对象（回落到
+   `Symbol.iterator`），也能迭代自定义的 `Symbol.asyncIterator`。
+5. **async generator** —— `%AsyncGeneratorPrototype%`：`next`/`return`/`throw`
+   返回 promise，`Symbol.asyncIterator` 指向自身。`yield v` 和收尾的 `return v`
+   都会先 await，所以 `yield Promise.resolve(3)` 产出的是 `3`。
+6. **未处理拒绝** —— 脚本结束后把没人接的拒绝按参考的格式报到 stderr 并以 1 退出：
+   `Possibly unhandled promise rejection: <error>` + 栈。逐字节与参考一致。
+7. **`AsyncDisposableStack.disposeAsync()`** 真的按顺序 await 每个 disposer（之前
+   因为"没有 Promise"而同步跑完，顺序是错的）。
+
+顺带修掉五处**既有** bug，都是这轮推进时才暴露出来的：
+
+- **`async function` 体被生成了 `initial_yield`**：那是生成器的语义（创建时不跑
+  体）。async 函数必须同步执行到第一个 `await`，否则 `log.push("a"); await 0`
+  里的 `a` 永远不会在调用返回前出现——而且这种挂起与真正的 `await` 在运行期无法
+  区分，只能在编译期就生成对。
+- **`await` 后面多出 `if_false`/`return_async`**：参考实现的 `await` 只发一条
+  指令。这一对是我们 VM 早期"value + magic"设计的补偿，`for await` 复用同一个
+  `await` 时会多压一个值。现在 await 只压它的值，magic 只留给 `yield`。
+- **`drive_async` 用"如何恢复"判断"如何结束"**：被 `throw` 恢复的体，如果
+  `try { await p } catch {}` 之后正常返回，会被判成拒绝，拒绝理由是这个函数的
+  返回值。
+- **`AwaitResume` 多推一个微任务**：恢复被推迟一拍，导致 `f().then(g)` 跑到 `f`
+  自己的下一句前面。现在在反应里直接恢复，顺序与参考逐字一致。
+- **`async` 体的 `return promise` 没有采纳**：用 `fulfill` 而不是 `resolve`，
+  于是 `async function f(){ return Promise.resolve(1) }` 交回的是"promise 的
+  promise"。
+
 ### 加：`Proxy`
 
 `Proxy` 和 `Proxy.revocable` 落地，十一个 trap 全部接线：`get`、`set`、`has`、
@@ -75,17 +125,18 @@
 参考实现没编译时**明确打印 SKIPPED**而不是静默跳过，CI 可用 `--require-oracle`
 把它变成硬要求。
 
-当前账（参考能跑的 79 个测试全过）：
+当前账（参考能跑的 80 个测试全过）：
 
 | 文件 | 结果 |
 |---|---|
-| `test_language.js` | 29/29 |
+| `test_language.js` | 30/30（含 `test_await_using`） |
 | `test_closure.js` | 7/7 |
 | `test_loop.js` | 18/18 |
 | `test_bigint.js` | 5/5 |
 | `test_builtin.js` | 20/20 |
 
-已知缺口清单现在是**空的**。
+已知缺口清单现在是**空的**。上游整文件语料（7 个脚本，含 `test_std.js`）的
+stdout 与退出码也全部与参考一致。
 
 ## v0.2.0 — 2026-11-21
 

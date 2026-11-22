@@ -280,6 +280,94 @@ pub enum Callable {
     /// precisely what this function exists to hold. Keeping them here also means the
     /// collector sees them, so a proxy stays alive while only its `revoke` is reachable.
     Revoker(crate::object::ProxyRef),
+    /// The `resolve` a `Promise` executor receives.
+    ///
+    /// Like [`Callable::Revoker`], this cannot be a plain `Native` with the state in a
+    /// property: a `NativeFn` is a function pointer and cannot capture, and the promise
+    /// it settles is exactly what it has to remember. Both are one-shot per §27.2.1.3.1 —
+    /// the second call is a no-op rather than a second settlement.
+    ///
+    /// The promise object is held directly rather than the state behind its `Rc`, because
+    /// settling has to run *that object's* reactions.
+    PromiseResolve(Gc<JsObject>),
+    /// The `reject` half of that pair.
+    PromiseReject(Gc<JsObject>),
+    /// One of the two continuations an `await` parks on.
+    ///
+    /// Reached through the ordinary reaction machinery, which is why it has to be a
+    /// callable object rather than a queue entry: `await x` is specified as
+    /// `PerformPromiseThen(x, resume, rethrow)`.
+    AwaitResume {
+        /// The body to continue.
+        coroutine: Gc<JsObject>,
+        /// The promise the async function returned.
+        promise: Gc<JsObject>,
+        /// Whether this continuation delivers the value or raises the reason.
+        kind: crate::interp::ResumeKind,
+    },
+    /// One element of `Promise.all`/`allSettled`/`any`/`race` settling.
+    CombinatorSettle {
+        /// The hidden object holding the results array, the remaining count and the
+        /// combinator's own resolve/reject pair.
+        state: Gc<JsObject>,
+        /// Which element this callback belongs to.
+        index: usize,
+        /// Whether the element fulfilled or rejected.
+        fulfilled: bool,
+    },
+    /// Settle a promise with a fixed outcome when called.
+    ///
+    /// `finally` needs "wait for this promise, then re-deliver that value", and a
+    /// `NativeFn` cannot carry the value to re-deliver.
+    SettlePromise {
+        /// The promise to settle.
+        promise: Gc<JsObject>,
+        /// The outcome to settle it with, which is the *original* one.
+        value: Value,
+        /// Whether that outcome is a rejection.
+        rejected: bool,
+    },
+    /// One continuation of an `await` inside an async generator.
+    GeneratorResume {
+        /// The async generator to continue.
+        generator: Gc<JsObject>,
+        /// The promise the pending `next`/`return`/`throw` returned.
+        promise: Gc<JsObject>,
+        /// Whether this delivers the value or raises the reason.
+        kind: crate::interp::ResumeKind,
+    },
+    /// Answer a pending async-generator method with `{value, done: false}`.
+    ///
+    /// `yield v` in an async generator awaits `v` first, so the value can arrive after
+    /// the body has already parked; this is what turns it into the result object.
+    YieldResult {
+        /// The promise the pending method returned.
+        promise: Gc<JsObject>,
+        /// Whether this answers a completed generator rather than a `yield`.
+        done: bool,
+    },
+    /// One step of `AsyncDisposableStack.disposeAsync`.
+    ///
+    /// The remaining resources ride along as a JS array so the collector can see them:
+    /// `disposeAsync` awaits each disposer in turn, which means the list has to survive
+    /// across microtasks rather than living on the Rust stack.
+    DisposeStep {
+        /// Pairs of `[resource, disposeMethod]`, consumed from the end.
+        remaining: Gc<JsObject>,
+        /// The promise `disposeAsync` returned.
+        promise: Gc<JsObject>,
+        /// The `SuppressedError` chain built so far, or `Uninitialized` for none.
+        error: Value,
+        /// Whether this continuation is being called with a rejection reason.
+        rejected: bool,
+    },
+    /// One of the two shims `Promise.prototype.finally` installs.
+    FinallyShim {
+        /// The script's callback, or `None` to pass the outcome straight through.
+        callback: Option<Value>,
+        /// Whether this is the fulfil side.
+        fulfilled: bool,
+    },
 }
 
 impl Trace for Callable {
@@ -298,6 +386,42 @@ impl Trace for Callable {
             }
             Callable::Native { .. } => {}
             Callable::Revoker(slots) => slots.borrow().trace(tracer),
+            Callable::PromiseResolve(promise) | Callable::PromiseReject(promise) => {
+                tracer.visit(promise)
+            }
+            Callable::AwaitResume {
+                coroutine, promise, ..
+            } => {
+                tracer.visit(coroutine);
+                tracer.visit(promise);
+            }
+            Callable::CombinatorSettle { state, .. } => tracer.visit(state),
+            Callable::GeneratorResume {
+                generator, promise, ..
+            } => {
+                tracer.visit(generator);
+                tracer.visit(promise);
+            }
+            Callable::YieldResult { promise, .. } => tracer.visit(promise),
+            Callable::DisposeStep {
+                remaining,
+                promise,
+                error,
+                ..
+            } => {
+                tracer.visit(remaining);
+                tracer.visit(promise);
+                error.trace(tracer);
+            }
+            Callable::SettlePromise { promise, value, .. } => {
+                tracer.visit(promise);
+                value.trace(tracer);
+            }
+            Callable::FinallyShim { callback, .. } => {
+                if let Some(callback) = callback {
+                    callback.trace(tracer);
+                }
+            }
         }
     }
 }
@@ -543,6 +667,12 @@ pub enum ObjectKind {
     /// site that has no pointer to the object. Revoking clears them, which also drops
     /// the collector's references to the target and the handler.
     Proxy(ProxyRef),
+    /// A `Promise`.
+    ///
+    /// The state sits behind an `Rc` for the same reason a proxy's slots do: the
+    /// `resolve`/`reject` pair handed to an executor has to settle *this* promise later,
+    /// and those are function objects with no pointer back to it otherwise.
+    Promise(PromiseRef),
 }
 
 /// The two slots of a proxy, shared with its `revoke` function.
@@ -557,6 +687,91 @@ pub struct ProxyState {
     /// The trap table, or `None` once revoked.
     pub handler: Option<Value>,
 }
+
+/// A `Promise`'s state, shared between the promise object and its resolve/reject
+/// functions.
+///
+/// Behind an `Rc` for the same reason a proxy's slots are: the `resolve` and `reject`
+/// functions handed to an executor have to settle *this* promise later, from a call site
+/// that only has the function.
+pub struct PromiseState {
+    /// Pending, or the value it settled with.
+    pub status: PromiseStatus,
+    /// The `then` reactions waiting on it, in registration order.
+    pub reactions: Vec<PromiseReaction>,
+    /// Whether a rejection has been seen by a handler.
+    ///
+    /// A rejection that never is becomes an unhandled-rejection report, which the
+    /// reference makes fatal at the end of the job queue.
+    pub handled: bool,
+}
+
+impl Default for PromiseState {
+    fn default() -> Self {
+        PromiseState {
+            status: PromiseStatus::Pending,
+            reactions: Vec::new(),
+            handled: false,
+        }
+    }
+}
+
+/// What a `Promise` combinator does when its elements settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombinatorKind {
+    /// The first rejection wins, otherwise an array in input order.
+    All,
+    /// Never rejects; each entry is `{status, value}` or `{status, reason}`.
+    AllSettled,
+    /// The first fulfilment wins, otherwise an `AggregateError`.
+    Any,
+    /// Whichever element settles first.
+    Race,
+}
+
+/// Which of §27.2.1.2's three states a promise is in.
+#[derive(Clone, Default)]
+pub enum PromiseStatus {
+    /// Neither settled: reactions queue up.
+    #[default]
+    Pending,
+    /// Settled with a value, which no further settle may change.
+    Fulfilled(Value),
+    /// Settled with a reason.
+    Rejected(Value),
+}
+
+/// One `then` registration.
+#[derive(Clone)]
+pub struct PromiseReaction {
+    /// Called with the value if the promise fulfils.
+    pub on_fulfilled: Option<Value>,
+    /// Called with the reason if it rejects.
+    pub on_rejected: Option<Value>,
+    /// The promise to settle with whatever the handler returns.
+    pub promise: Gc<JsObject>,
+}
+
+impl Trace for PromiseState {
+    fn trace(&self, tracer: &mut Tracer) {
+        match &self.status {
+            PromiseStatus::Pending => {}
+            PromiseStatus::Fulfilled(value) | PromiseStatus::Rejected(value) => value.trace(tracer),
+        }
+        for reaction in &self.reactions {
+            if let Some(on_fulfilled) = &reaction.on_fulfilled {
+                on_fulfilled.trace(tracer);
+            }
+            if let Some(on_rejected) = &reaction.on_rejected {
+                on_rejected.trace(tracer);
+            }
+            tracer.visit(&reaction.promise);
+        }
+    }
+}
+
+/// A promise's shareable state.
+pub type PromiseRef = std::rc::Rc<std::cell::RefCell<PromiseState>>;
 
 /// A proxy's mutable state, shared between the proxy object and its `revoke`.
 pub type ProxyRef = std::rc::Rc<std::cell::RefCell<ProxyState>>;
@@ -598,6 +813,7 @@ impl Trace for ObjectKind {
             ObjectKind::Function(callable) => callable.trace(tracer),
             ObjectKind::Generator(state) => state.trace(tracer),
             ObjectKind::Proxy(state) => state.borrow().trace(tracer),
+            ObjectKind::Promise(state) => state.borrow().trace(tracer),
         }
     }
 }

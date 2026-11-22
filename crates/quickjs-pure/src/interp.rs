@@ -116,6 +116,10 @@ pub struct Realm {
     pub date_proto: Gc<JsObject>,
     /// `%GeneratorPrototype%`, the prototype of every generator object.
     pub generator_proto: Gc<JsObject>,
+    /// `Promise.prototype`, the prototype of every promise.
+    pub promise_proto: Option<Gc<JsObject>>,
+    /// `%AsyncGeneratorPrototype%`, the prototype of every `async function*` result.
+    pub async_generator_proto: Option<Gc<JsObject>>,
     /// `Symbol.prototype`.
     pub symbol_proto: Option<Gc<JsObject>>,
     /// The `Symbol.for` registry: `key -> symbol`.
@@ -251,6 +255,104 @@ const RESUME_NEXT: i32 = 0;
 /// generator fall into its `return_async`.
 const RESUME_RETURN: i32 = 1;
 
+/// One microtask.
+///
+/// The queue holds *data* rather than closures because its contents are GC values: a
+/// closure would be invisible to the collector, and a pending reaction is exactly the
+/// kind of thing that must keep its handlers and its promise alive.
+pub enum Job {
+    /// A `then` reaction about to run.
+    Reaction {
+        /// The `onFulfilled`/`onRejected` to call, or `None` for the pass-through case.
+        handler: Option<Value>,
+        /// The value or reason to call it with.
+        argument: Value,
+        /// Whether the source promise rejected, which decides the pass-through kind.
+        rejected: bool,
+        /// The promise the answer settles.
+        promise: Gc<JsObject>,
+    },
+    /// Adopt a thenable: call its `then` with the adopting promise's resolve/reject.
+    Thenable {
+        /// The `then` that was found on the value.
+        then: Value,
+        /// The thenable itself, which becomes `then`'s `this`.
+        value: Value,
+        /// The promise being resolved.
+        promise: Gc<JsObject>,
+    },
+    /// An async generator resuming after the value it awaited settled.
+    GeneratorResume {
+        /// The async generator to continue.
+        generator: Gc<JsObject>,
+        /// The promise the pending method returned.
+        promise: Gc<JsObject>,
+        /// Whether this delivers the value or raises the reason.
+        kind: ResumeKind,
+        /// The settled value, or the rejection reason.
+        value: Value,
+    },
+    /// An async function resuming after the value it awaited settled.
+    Resume {
+        /// The body, parked in a coroutine.
+        coroutine: Gc<JsObject>,
+        /// The promise the async function handed its caller.
+        promise: Gc<JsObject>,
+        /// Whether this resumption delivers a value or raises one.
+        kind: ResumeKind,
+        /// The settled value, or the rejection reason.
+        value: Value,
+    },
+}
+
+impl js_gc::Trace for Job {
+    fn trace(&self, tracer: &mut js_gc::Tracer) {
+        match self {
+            Job::Reaction {
+                handler,
+                argument,
+                promise,
+                ..
+            } => {
+                if let Some(handler) = handler {
+                    handler.trace(tracer);
+                }
+                argument.trace(tracer);
+                tracer.visit(promise);
+            }
+            Job::Thenable {
+                then,
+                value,
+                promise,
+            } => {
+                then.trace(tracer);
+                value.trace(tracer);
+                tracer.visit(promise);
+            }
+            Job::Resume {
+                coroutine,
+                promise,
+                value,
+                ..
+            } => {
+                tracer.visit(coroutine);
+                tracer.visit(promise);
+                value.trace(tracer);
+            }
+            Job::GeneratorResume {
+                generator,
+                promise,
+                value,
+                ..
+            } => {
+                tracer.visit(generator);
+                tracer.visit(promise);
+                value.trace(tracer);
+            }
+        }
+    }
+}
+
 /// Which of `%GeneratorPrototype%`'s three methods resumed a generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeKind {
@@ -274,6 +376,14 @@ pub struct GeneratorState {
     frame: Option<Frame>,
     /// How far it got.
     phase: GeneratorPhase,
+    /// Whether the last suspension was an `await` rather than a `yield`.
+    ///
+    /// The two resume with *different stack shapes*: a `yield` is re-entered with the
+    /// value and a magic number, because the emitted code branches on which method
+    /// resumed it, while an `await` simply continues with its value. Getting this wrong
+    /// leaves an extra value on the operand stack that the next instruction then
+    /// consumes — a wrong answer rather than a crash.
+    parked_on_await: bool,
 }
 
 /// Which of §27.5.3.3's states a generator is in.
@@ -467,6 +577,18 @@ pub struct Interp<'a> {
     pub output: String,
     /// The most frames that may be live at once.
     pub max_frames: usize,
+    /// The microtask queue.
+    ///
+    /// Script execution does not return until this has drained, which is what makes
+    /// `Promise.resolve().then(f)` run `f` before the next statement of the *host* rather
+    /// than never. Reactions append to it while it drains, so the loop is a `while` and
+    /// not a `for`.
+    jobs: std::collections::VecDeque<Job>,
+    /// Rejections that no handler has claimed, with the promise they belong to.
+    ///
+    /// A `then` registered later prunes its entry, which is why the promise is kept: the
+    /// reason alone cannot say whether somebody eventually listened.
+    unhandled: Vec<(Gc<JsObject>, Value)>,
 }
 
 impl<'a> Interp<'a> {
@@ -500,6 +622,8 @@ impl<'a> Interp<'a> {
                 error_proto: JsObject::ordinary(heap, None),
                 date_proto: JsObject::ordinary(heap, None),
                 generator_proto: JsObject::ordinary(heap, None),
+                promise_proto: None,
+                async_generator_proto: None,
                 symbol_proto: None,
                 symbol_registry: BTreeMap::new(),
                 regexp_proto: None,
@@ -525,6 +649,8 @@ impl<'a> Interp<'a> {
             native_frames: Vec::new(),
             output: String::new(),
             max_frames: 4096,
+            jobs: std::collections::VecDeque::new(),
+            unhandled: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -593,6 +719,625 @@ impl<'a> Interp<'a> {
         keys.extend(strings);
         keys.extend(symbols);
         Ok(keys)
+    }
+
+    /// The state behind a promise object, or `None` when `object` is not one.
+    pub fn promise_state(&self, object: &Gc<JsObject>) -> Option<crate::object::PromiseRef> {
+        object.with(|data| match &data.kind {
+            ObjectKind::Promise(state) => Some(state.clone()),
+            _ => None,
+        })
+    }
+
+    /// A new pending promise.
+    pub fn new_promise(&mut self) -> Gc<JsObject> {
+        let proto = self.realm.promise_proto.clone();
+        let promise = JsObject::ordinary(self.heap, proto);
+        promise.with_mut(|data| {
+            data.kind = ObjectKind::Promise(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::object::PromiseState::default(),
+            )));
+        });
+        promise
+    }
+
+    /// Fulfil `promise`, unless it has already settled.
+    ///
+    /// Settling is one-shot, and a script can see that: `resolve` called twice, or called
+    /// after `reject`, changes nothing.
+    pub fn fulfill_promise(&mut self, promise: &Gc<JsObject>, value: Value) {
+        let Some(state) = self.promise_state(promise) else {
+            return;
+        };
+        let reactions = {
+            let mut state = state.borrow_mut();
+            if !matches!(state.status, crate::object::PromiseStatus::Pending) {
+                return;
+            }
+            state.status = crate::object::PromiseStatus::Fulfilled(value.clone());
+            std::mem::take(&mut state.reactions)
+        };
+        self.queue_reactions(reactions, value, false);
+    }
+
+    /// Reject `promise`, unless it has already settled.
+    pub fn reject_promise(&mut self, promise: &Gc<JsObject>, reason: Value) {
+        let Some(state) = self.promise_state(promise) else {
+            return;
+        };
+        let reactions = {
+            let mut state = state.borrow_mut();
+            if !matches!(state.status, crate::object::PromiseStatus::Pending) {
+                return;
+            }
+            state.status = crate::object::PromiseStatus::Rejected(reason.clone());
+            std::mem::take(&mut state.reactions)
+        };
+        // Remember it only when nothing is listening *now*; a `then` registered later
+        // prunes the entry in `perform_then`.
+        if reactions.is_empty() {
+            self.unhandled.push((promise.clone(), reason.clone()));
+        }
+        self.queue_reactions(reactions, reason, true);
+    }
+
+    /// Queue one job per reaction.
+    ///
+    /// This is what makes `then` asynchronous even on an already-settled promise:
+    /// `p.then(f); g()` calls `g` first.
+    fn queue_reactions(
+        &mut self,
+        reactions: Vec<crate::object::PromiseReaction>,
+        argument: Value,
+        rejected: bool,
+    ) {
+        for reaction in reactions {
+            let handler = if rejected {
+                reaction.on_rejected.clone()
+            } else {
+                reaction.on_fulfilled.clone()
+            };
+            self.jobs.push_back(Job::Reaction {
+                handler,
+                argument: argument.clone(),
+                rejected,
+                promise: reaction.promise,
+            });
+        }
+    }
+
+    /// `NewPromiseCapability` as the executor receives it: the promise plus its
+    /// resolve/reject pair.
+    ///
+    /// The pair are callable objects rather than Rust closures, because the script gets
+    /// them and may stash them for later.
+    pub fn new_promise_capability(&mut self) -> (Gc<JsObject>, Value, Value) {
+        let promise = self.new_promise();
+        let resolve = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::PromiseResolve(promise.clone()),
+        );
+        let reject = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::PromiseReject(promise.clone()),
+        );
+        (promise, Value::Object(resolve), Value::Object(reject))
+    }
+
+    /// `PromiseResolve(value)`: the value itself when it is already a promise, otherwise a
+    /// new promise resolved with it.
+    pub fn promise_resolve_value(&mut self, value: Value) -> JsResult<Value> {
+        if let Value::Object(object) = &value
+            && self.promise_state(object).is_some()
+        {
+            return Ok(value);
+        }
+        let promise = self.new_promise();
+        self.resolve_promise_with(&promise, value)?;
+        Ok(Value::Object(promise))
+    }
+
+    /// `ResolvePromise`: fulfil, unless the value is a thenable — then follow it.
+    pub fn resolve_promise_with(&mut self, promise: &Gc<JsObject>, value: Value) -> JsResult<()> {
+        // Resolving a promise with itself is a `TypeError`. The check exists because the
+        // alternative is a chain of self-reactions that never settles.
+        if let Value::Object(object) = &value
+            && object.ptr_eq(promise)
+        {
+            // The spec rejects *and* throws, so both the promise and the caller see it.
+            let thrown = self.type_error("cannot resolve a promise with itself");
+            let Signal::Throw(error) = thrown.clone() else {
+                unreachable!("type_error always throws")
+            };
+            self.reject_promise(promise, error);
+            return Err(thrown);
+        }
+        let then = match &value {
+            Value::Object(object) => self.get_property(object, "then")?,
+            _ => None,
+        };
+        let callable_then = matches!(&then, Some(Value::Object(object)) if object.is_callable());
+        if !callable_then {
+            // Not a thenable: a non-callable `then` makes the value fulfil as it is.
+            self.fulfill_promise(promise, value);
+            return Ok(());
+        }
+        // Adopting a thenable is asynchronous — `then` is called from a job, never from
+        // inside `resolve`, so a script cannot make a promise settle synchronously.
+        self.jobs.push_back(Job::Thenable {
+            then: then.expect("checked callable"),
+            value,
+            promise: promise.clone(),
+        });
+        Ok(())
+    }
+
+    /// `Promise.prototype.then`: register a reaction and answer the derived promise.
+    pub fn perform_then(
+        &mut self,
+        promise: &Gc<JsObject>,
+        on_fulfilled: Option<Value>,
+        on_rejected: Option<Value>,
+    ) -> JsResult<Value> {
+        let Some(state) = self.promise_state(promise) else {
+            return Err(self.type_error("not a promise"));
+        };
+        // Whether a rejection handler is being attached decides whether a recorded
+        // rejection stops being unhandled, so it is read before the values are moved.
+        let has_rejection_handler = on_rejected.is_some();
+        let derived = self.new_promise();
+        let reaction = crate::object::PromiseReaction {
+            on_fulfilled,
+            on_rejected,
+            promise: derived.clone(),
+        };
+        let settled = {
+            let mut state = state.borrow_mut();
+            // A rejection somebody reacts to is no longer unhandled.
+            state.handled = true;
+            match &state.status {
+                crate::object::PromiseStatus::Pending => {
+                    state.reactions.push(reaction.clone());
+                    None
+                }
+                crate::object::PromiseStatus::Fulfilled(value) => Some((value.clone(), false)),
+                crate::object::PromiseStatus::Rejected(reason) => Some((reason.clone(), true)),
+            }
+        };
+        // A `catch`/`then` attached to an already-rejected promise, or to one that rejects
+        // later, means somebody is listening after all.
+        if has_rejection_handler {
+            self.unhandled.retain(|(owner, _)| !owner.ptr_eq(promise));
+        }
+        if let Some((argument, rejected)) = settled {
+            let handler = if rejected {
+                reaction.on_rejected
+            } else {
+                reaction.on_fulfilled
+            };
+            self.jobs.push_back(Job::Reaction {
+                handler,
+                argument,
+                rejected,
+                promise: reaction.promise,
+            });
+        }
+        Ok(Value::Object(derived))
+    }
+
+    /// The rejections nobody listened to, formatted the way the reference reports them.
+    ///
+    /// Each line is `Possibly unhandled promise rejection: <value>` followed by the stack
+    /// when there is one. The adjective is the reference's: a rejection is only *possibly*
+    /// unhandled at the point the queue drains, because a `then` may still be attached
+    /// before the host acts on it.
+    pub fn take_unhandled_rejections(&mut self) -> Vec<String> {
+        let entries = std::mem::take(&mut self.unhandled);
+        // Somebody may have attached a handler after the rejection was recorded, so the
+        // promise is the authority rather than the list.
+        let still_unhandled: Vec<Value> = entries
+            .into_iter()
+            .filter_map(|(promise, reason)| {
+                let handled = self
+                    .promise_state(&promise)
+                    .map(|state| state.borrow().handled)
+                    .unwrap_or(true);
+                (!handled).then_some(reason)
+            })
+            .collect();
+        still_unhandled
+            .into_iter()
+            .map(|reason| {
+                let text = self.describe_exception(&reason);
+                let stack = match &reason {
+                    Value::Object(object) => self
+                        .get_property(object, "stack")
+                        .ok()
+                        .flatten()
+                        .map(|value| value.to_js_string())
+                        // `stack` carries a trailing newline of its own, which would leave
+                        // a blank line between two reported rejections.
+                        .map(|text| text.trim_end().to_string())
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+                if stack.is_empty() {
+                    format!("Possibly unhandled promise rejection: {text}")
+                } else {
+                    format!("Possibly unhandled promise rejection: {text}\n{stack}")
+                }
+            })
+            .collect()
+    }
+
+    /// Run the microtask queue to exhaustion.
+    ///
+    /// Jobs queued while draining run in the same drain, FIFO, which is what makes
+    /// `Promise.resolve().then(f).then(g)` call `f` before `g`.
+    pub fn drain_jobs(&mut self) -> JsResult<()> {
+        // A self-perpetuating chain (`function f(){ Promise.resolve().then(f) } f()`)
+        // would spin forever, so the drain is bounded the way the call stack is.
+        let mut budget = 1_000_000usize;
+        while let Some(job) = self.jobs.pop_front() {
+            if budget == 0 {
+                return Err(Signal::Throw(
+                    self.make_error("InternalError", "promise job queue did not drain"),
+                ));
+            }
+            budget -= 1;
+            self.run_job(job)?;
+        }
+        Ok(())
+    }
+
+    /// Run one microtask.
+    fn run_job(&mut self, job: Job) -> JsResult<()> {
+        match job {
+            Job::Reaction {
+                handler: None,
+                argument,
+                rejected,
+                promise,
+            } => {
+                // No handler: the settlement passes straight through to the derived
+                // promise, which is why `p.catch(f)` ignores fulfilments.
+                if rejected {
+                    self.reject_promise(&promise, argument);
+                } else {
+                    self.fulfill_promise(&promise, argument);
+                }
+                Ok(())
+            }
+            Job::Reaction {
+                handler: Some(handler),
+                argument,
+                promise,
+                ..
+            } => match self.call_value(handler, Value::Undefined, vec![argument]) {
+                Ok(answer) => {
+                    if let Err(Signal::Throw(error)) = self.resolve_promise_with(&promise, answer) {
+                        self.reject_promise(&promise, error);
+                    }
+                    Ok(())
+                }
+                Err(Signal::Throw(reason)) => {
+                    self.reject_promise(&promise, reason);
+                    Ok(())
+                }
+                Err(other) => Err(other),
+            },
+            Job::Thenable {
+                then,
+                value,
+                promise,
+            } => {
+                // §27.2.2.2: call the thenable's `then` with this promise's own pair, so
+                // the value it produces settles `promise`.
+                // The thenable's `then` gets this promise's own pair, so whatever it
+                // produces settles `promise`.
+                let resolve = JsObject::function(
+                    self.heap,
+                    Some(self.realm.function_proto.clone()),
+                    Callable::PromiseResolve(promise.clone()),
+                );
+                let reject = JsObject::function(
+                    self.heap,
+                    Some(self.realm.function_proto.clone()),
+                    Callable::PromiseReject(promise.clone()),
+                );
+                match self.call_value(
+                    then,
+                    value,
+                    vec![Value::Object(resolve), Value::Object(reject)],
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(Signal::Throw(reason)) => {
+                        self.reject_promise(&promise, reason);
+                        Ok(())
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+            Job::Resume {
+                coroutine,
+                promise,
+                kind,
+                value,
+            } => self.drive_async(&coroutine, &promise, kind, value),
+            Job::GeneratorResume {
+                generator,
+                promise,
+                kind,
+                value,
+            } => self.step_async_generator(&generator, &promise, kind, value),
+        }
+    }
+
+    /// One element of a `Promise` combinator settled.
+    ///
+    /// The shared state object holds the results array, the number still outstanding, and
+    /// the combinator's own resolve/reject pair. `all` fills by index so the answer keeps
+    /// the input order; `race` settles on the first element and ignores the rest, which a
+    /// one-shot settle gives for free.
+    fn settle_combinator(
+        &mut self,
+        state: &Gc<JsObject>,
+        index: usize,
+        fulfilled: bool,
+        value: Value,
+    ) -> JsResult<()> {
+        let kind = state
+            .own_property("kind")
+            .and_then(|property| property.value)
+            .map(|value| value.to_int32())
+            .unwrap_or(0);
+        let outcome = state
+            .own_property("outcome")
+            .and_then(|property| property.value);
+        let Some(Value::Object(outcome)) = outcome else {
+            return Ok(());
+        };
+        if kind == 3 {
+            // `race`: the first settlement wins; the rest are ignored by the one-shot rule.
+            if fulfilled {
+                self.resolve_promise_with(&outcome, value)?;
+            } else {
+                self.reject_promise(&outcome, value);
+            }
+            return Ok(());
+        }
+        let results = state
+            .own_property("results")
+            .and_then(|property| property.value)
+            .and_then(|value| value.as_object().cloned());
+        let remaining = state
+            .own_property("remaining")
+            .and_then(|property| property.value)
+            .map(|value| value.to_int32())
+            .unwrap_or(0);
+        match kind {
+            0 => {
+                // `all`: the first rejection wins outright.
+                if !fulfilled {
+                    self.reject_promise(&outcome, value);
+                    return Ok(());
+                }
+                let Some(results) = &results else {
+                    return Ok(());
+                };
+                results.array_set(index, value);
+            }
+            1 => {
+                // `allSettled`: never rejects; each slot records what happened.
+                let Some(results) = &results else {
+                    return Ok(());
+                };
+                let record = self.new_object(Some(self.realm.object_proto.clone()));
+                if fulfilled {
+                    record.define_data("status", self.string("fulfilled"));
+                    record.define_data("value", value);
+                } else {
+                    record.define_data("status", self.string("rejected"));
+                    record.define_data("reason", value);
+                }
+                results.array_set(index, Value::Object(record));
+            }
+            2 => {
+                // `any`: the first fulfilment wins; a full sweep of rejections does not
+                // settle here — it is handled by the count below.
+                if fulfilled {
+                    self.resolve_promise_with(&outcome, value)?;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        let left = remaining - 1;
+        state.define_data("remaining", Value::Int(left));
+        if left != 0 {
+            return Ok(());
+        }
+        match kind {
+            0 | 1 => {
+                let Some(results) = results else {
+                    return Ok(());
+                };
+                self.resolve_promise_with(&outcome, Value::Object(results))?;
+            }
+            2 => {
+                let error = self.make_error("AggregateError", "all promises were rejected");
+                self.reject_promise(&outcome, error);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Build an async function's result: a promise whose body runs as a coroutine.
+    pub fn new_async_function(
+        &mut self,
+        function: Value,
+        this: Value,
+        args: Vec<Value>,
+    ) -> JsResult<Value> {
+        let promise = self.new_promise();
+        let coroutine = self.new_coroutine(function, this, args)?;
+        if let Err(Signal::Throw(reason)) =
+            self.drive_async(&coroutine, &promise, ResumeKind::Start, Value::Undefined)
+        {
+            self.reject_promise(&promise, reason);
+        }
+        Ok(Value::Object(promise))
+    }
+
+    /// The coroutine an async body runs in.
+    ///
+    /// Generator-shaped and never exposed to the script: what makes `await` work is the
+    /// same frame-detach-and-resume the generator protocol uses, so this reuses it rather
+    /// than growing a second state machine. The difference is only in the ending — a
+    /// `return` fulfils the caller's promise here instead of producing `{value, done}`.
+    fn new_coroutine(
+        &mut self,
+        function: Value,
+        this: Value,
+        args: Vec<Value>,
+    ) -> JsResult<Gc<JsObject>> {
+        let Some(object) = function.as_object().cloned() else {
+            return Err(self.type_error("not a function"));
+        };
+        let Some((code, env)) = bytecode_of(&object) else {
+            return Err(self.type_error("not a function"));
+        };
+        self.push_frame(code, env, this, args, function)?;
+        let frame = self.frames.pop().expect("push_frame just pushed it");
+        let state = GeneratorState {
+            frame: Some(frame),
+            phase: GeneratorPhase::SuspendedStart,
+            parked_on_await: false,
+        };
+        let coroutine = self.new_object(Some(self.realm.generator_proto.clone()));
+        coroutine.with_mut(|data| {
+            data.kind = ObjectKind::Generator(Box::new(state));
+        });
+        Ok(coroutine)
+    }
+
+    /// Step a coroutine: `(value, done)`, where `done == false` means it parked on an
+    /// `await` and `value` is what it awaited.
+    fn resume_coroutine(
+        &mut self,
+        coroutine: &Gc<JsObject>,
+        kind: ResumeKind,
+        value: Value,
+    ) -> JsResult<(Value, bool)> {
+        let Some(mut state) = coroutine.with_mut(|data| match &mut data.kind {
+            ObjectKind::Generator(state) => Some(std::mem::replace(
+                state.as_mut(),
+                GeneratorState {
+                    frame: None,
+                    phase: GeneratorPhase::Executing,
+                    parked_on_await: false,
+                },
+            )),
+            _ => None,
+        }) else {
+            return Err(self.type_error("not a coroutine"));
+        };
+        let result = self.step_generator(&mut state, kind, value);
+        coroutine.with_mut(|data| {
+            data.kind = ObjectKind::Generator(Box::new(state));
+        });
+        let (value, done, _ready, _reason) = result?;
+        Ok((value, done))
+    }
+
+    /// Advance an async body and settle its promise with the outcome.
+    fn drive_async(
+        &mut self,
+        coroutine: &Gc<JsObject>,
+        promise: &Gc<JsObject>,
+        kind: ResumeKind,
+        value: Value,
+    ) -> JsResult<()> {
+        match self.resume_coroutine(coroutine, kind, value) {
+            Ok((value, true)) => {
+                // `Ok` with `done` means the body finished *normally*, even when it was
+                // resumed by a `throw` — `try { await p } catch {}` completes by
+                // returning. Only the `Err` arm below is a rejection.
+                //
+                // Resolving rather than fulfilling matters: `return promise` in an async
+                // body adopts the inner promise, so `async function f(){ return
+                // Promise.resolve(1) }` answers a promise *of 1*, not a promise of a
+                // promise.
+                if let Err(Signal::Throw(reason)) = self.resolve_promise_with(promise, value) {
+                    self.reject_promise(promise, reason);
+                }
+                Ok(())
+            }
+            Ok((value, false)) => {
+                // Parked on `await`: follow what it awaited and resume with the outcome.
+                let awaited = match self.promise_resolve_value(value) {
+                    Ok(awaited) => awaited,
+                    Err(Signal::Throw(error)) => {
+                        self.reject_promise(promise, error);
+                        return Ok(());
+                    }
+                    Err(other) => return Err(other),
+                };
+                self.hook_await(awaited, coroutine, promise)
+            }
+            Err(Signal::Throw(reason)) => {
+                self.reject_promise(promise, reason);
+                Ok(())
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Arrange for `coroutine` to resume when `awaited` settles.
+    fn hook_await(
+        &mut self,
+        awaited: Value,
+        coroutine: &Gc<JsObject>,
+        promise: &Gc<JsObject>,
+    ) -> JsResult<()> {
+        let resumed = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::AwaitResume {
+                coroutine: coroutine.clone(),
+                promise: promise.clone(),
+                kind: ResumeKind::Next,
+            },
+        );
+        let raised = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::AwaitResume {
+                coroutine: coroutine.clone(),
+                promise: promise.clone(),
+                kind: ResumeKind::Throw,
+            },
+        );
+        // `perform_then` on a non-promise would be wrong, and `promise_resolve_value`
+        // guarantees one; the fallback keeps a mis-shaped value from panicking.
+        let Value::Object(awaited) = &awaited else {
+            self.jobs.push_back(Job::Resume {
+                coroutine: coroutine.clone(),
+                promise: promise.clone(),
+                kind: ResumeKind::Next,
+                value: awaited,
+            });
+            return Ok(());
+        };
+        self.perform_then(
+            awaited,
+            Some(Value::Object(resumed)),
+            Some(Value::Object(raised)),
+        )?;
+        Ok(())
     }
 
     /// `[[GetOwnProperty]]` on an ordinary object: the property table, then the two
@@ -725,7 +1470,12 @@ impl<'a> Interp<'a> {
         let env = self.global_env(&closure_vars);
         let this = Value::Object(self.realm.global.clone());
         let callee = Value::Undefined;
-        self.execute(compiled, env, this, Vec::new(), callee)
+        let result = self.execute(compiled, env, this, Vec::new(), callee)?;
+        // The script is done, so the microtasks it queued run before the host sees the
+        // result. Without this an `async` function's body would never advance past its
+        // first `await`, because nothing else drains the queue.
+        self.drain_jobs()?;
+        Ok(result)
     }
 
     /// Compile and run `source` in global scope, returning its completion value.
@@ -3022,6 +3772,70 @@ impl<'a> Interp<'a> {
                     Some(NativeCall::Bytecode(code.clone(), env.clone()))
                 }
                 Callable::Revoker(slots) => Some(NativeCall::Revoker(slots.clone())),
+                Callable::PromiseResolve(promise) => {
+                    Some(NativeCall::PromiseResolve(promise.clone()))
+                }
+                Callable::PromiseReject(promise) => {
+                    Some(NativeCall::PromiseReject(promise.clone()))
+                }
+                Callable::AwaitResume {
+                    coroutine,
+                    promise,
+                    kind,
+                } => Some(NativeCall::AwaitResume {
+                    coroutine: coroutine.clone(),
+                    promise: promise.clone(),
+                    kind: *kind,
+                }),
+                Callable::CombinatorSettle {
+                    state,
+                    index,
+                    fulfilled,
+                } => Some(NativeCall::CombinatorSettle {
+                    state: state.clone(),
+                    index: *index,
+                    fulfilled: *fulfilled,
+                }),
+                Callable::FinallyShim {
+                    callback,
+                    fulfilled,
+                } => Some(NativeCall::FinallyShim {
+                    callback: callback.clone(),
+                    fulfilled: *fulfilled,
+                }),
+                Callable::YieldResult { promise, done } => Some(NativeCall::YieldResult {
+                    promise: promise.clone(),
+                    done: *done,
+                }),
+                Callable::DisposeStep {
+                    remaining,
+                    promise,
+                    error,
+                    rejected,
+                } => Some(NativeCall::DisposeStep {
+                    remaining: remaining.clone(),
+                    promise: promise.clone(),
+                    error: error.clone(),
+                    rejected: *rejected,
+                }),
+                Callable::GeneratorResume {
+                    generator,
+                    promise,
+                    kind,
+                } => Some(NativeCall::GeneratorResume {
+                    generator: generator.clone(),
+                    promise: promise.clone(),
+                    kind: *kind,
+                }),
+                Callable::SettlePromise {
+                    promise,
+                    value,
+                    rejected,
+                } => Some(NativeCall::SettlePromise {
+                    promise: promise.clone(),
+                    value: value.clone(),
+                    rejected: *rejected,
+                }),
             },
             _ => None,
         });
@@ -3056,6 +3870,128 @@ impl<'a> Interp<'a> {
                 state.handler = None;
                 Ok(Value::Undefined)
             }
+            Some(NativeCall::PromiseResolve(promise)) => {
+                // One-shot: a second call is silently ignored, which
+                // `fulfill_promise`/`reject_promise` enforce by refusing to settle twice.
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                self.resolve_promise_with(&promise, value)?;
+                Ok(Value::Undefined)
+            }
+            Some(NativeCall::PromiseReject(promise)) => {
+                let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                self.reject_promise(&promise, reason);
+                Ok(Value::Undefined)
+            }
+            Some(NativeCall::CombinatorSettle {
+                state,
+                index,
+                fulfilled,
+            }) => {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                self.settle_combinator(&state, index, fulfilled, value)?;
+                Ok(Value::Undefined)
+            }
+            Some(NativeCall::AwaitResume {
+                coroutine,
+                promise,
+                kind,
+            }) => {
+                // Resume *inline*, in the reaction that delivered the value. Deferring it
+                // by another job inserts a tick between every `await` and its
+                // continuation, which reorders `await` against unrelated `then` chains —
+                // `f().then(g)` then runs before `f`'s own next statement.
+                self.drive_async(
+                    &coroutine,
+                    &promise,
+                    kind,
+                    args.first().cloned().unwrap_or(Value::Undefined),
+                )
+                .map(|()| Value::Undefined)
+            }
+            Some(NativeCall::FinallyShim {
+                callback,
+                fulfilled,
+            }) => {
+                // §27.2.5.4.1: run `onFinally` with no arguments, then hand back a promise
+                // that settles with the *original* outcome once the callback's result has
+                // settled. The callback's own value is discarded — that is the whole
+                // difference between `finally` and `then`.
+                let original = args.first().cloned().unwrap_or(Value::Undefined);
+                let result = match &callback {
+                    Some(callback) => {
+                        self.call_value(callback.clone(), Value::Undefined, Vec::new())?
+                    }
+                    None => Value::Undefined,
+                };
+                let resolved = self.promise_resolve_value(result)?;
+                let Value::Object(resolved) = resolved else {
+                    return Ok(original);
+                };
+                // The wait is a chained promise rather than a bare return, so a callback
+                // that returns a slow promise really does delay the continuation.
+                let waiting = self.new_promise();
+                let pass = JsObject::function(
+                    self.heap,
+                    Some(self.realm.function_proto.clone()),
+                    Callable::SettlePromise {
+                        promise: waiting.clone(),
+                        value: original,
+                        rejected: !fulfilled,
+                    },
+                );
+                let pass = Value::Object(pass);
+                // Whichever way the callback's promise settles, the original outcome wins.
+                self.perform_then(&resolved, Some(pass.clone()), Some(pass))?;
+                Ok(Value::Object(waiting))
+            }
+            Some(NativeCall::DisposeStep {
+                remaining,
+                promise,
+                error,
+                rejected,
+            }) => {
+                let error = if rejected {
+                    let reason = args.first().cloned().unwrap_or(Value::Undefined);
+                    self.merge_dispose_error(reason, error)
+                } else {
+                    error
+                };
+                self.dispose_step(&remaining, &promise, error)?;
+                Ok(Value::Undefined)
+            }
+            Some(NativeCall::YieldResult { promise, done }) => {
+                let value = args.first().cloned().unwrap_or(Value::Undefined);
+                let result = self.iterator_result(value, done)?;
+                self.fulfill_promise(&promise, result);
+                Ok(Value::Undefined)
+            }
+            Some(NativeCall::GeneratorResume {
+                generator,
+                promise,
+                kind,
+            }) => {
+                // Inline for the same reason as `AwaitResume`: a deferred resume adds a
+                // tick and reorders the generator against other chains.
+                self.step_async_generator(
+                    &generator,
+                    &promise,
+                    kind,
+                    args.first().cloned().unwrap_or(Value::Undefined),
+                )
+                .map(|()| Value::Undefined)
+            }
+            Some(NativeCall::SettlePromise {
+                promise,
+                value,
+                rejected,
+            }) => {
+                if rejected {
+                    self.reject_promise(&promise, value);
+                } else {
+                    self.fulfill_promise(&promise, value);
+                }
+                Ok(Value::Undefined)
+            }
             Some(NativeCall::Bound {
                 target,
                 this: bound_this,
@@ -3070,10 +4006,9 @@ impl<'a> Interp<'a> {
                     return self.new_generator(callee, this, args);
                 }
                 if code.code.kind.is_async() {
-                    return Err(Signal::Throw(self.make_error(
-                        "InternalError",
-                        "async functions need the Promise builtin, which is not implemented yet",
-                    )));
+                    // Same coroutine machinery as a generator; the difference is only in
+                    // what the completion does — see `new_async_function`.
+                    return self.new_async_function(callee, this, args);
                 }
                 self.execute(code, env, this, args, callee)
             }
@@ -3312,6 +4247,7 @@ impl<'a> Interp<'a> {
         let Some((code, env)) = bytecode_of(&object) else {
             return Err(self.type_error("not a generator function"));
         };
+        let is_async = code.code.kind.is_async();
         self.push_frame(code, env, this, args, function)?;
         let frame = self.frames.pop().expect("push_frame just pushed it");
         // A fresh generator is *suspended at start*: the body has not run, so a
@@ -3319,10 +4255,21 @@ impl<'a> Interp<'a> {
         let mut state = GeneratorState {
             frame: Some(frame),
             phase: GeneratorPhase::SuspendedStart,
+            parked_on_await: false,
         };
         // Run to the first suspension. For a generator that is `initial_yield`, so no
         // body code runs; for a malformed body it would be the first `yield`.
-        let generator = self.new_object(Some(self.realm.generator_proto.clone()));
+        // An `async function*` answers an async generator: same coroutine, but its
+        // methods return promises and `for await` reaches it through `Symbol.asyncIterator`.
+        let proto = if is_async {
+            self.realm
+                .async_generator_proto
+                .clone()
+                .unwrap_or_else(|| self.realm.generator_proto.clone())
+        } else {
+            self.realm.generator_proto.clone()
+        };
+        let generator = self.new_object(Some(proto));
         match self.step_generator(&mut state, ResumeKind::Start, Value::Undefined) {
             Ok(_) => {}
             Err(error) => return Err(error),
@@ -3338,18 +4285,24 @@ impl<'a> Interp<'a> {
     /// Returns the `{value, done}` object itself rather than the pair, because a
     /// `yield*` suspension already has one — the inner iterator's own result — and the
     /// protocol says to hand that straight through rather than nest it.
-    pub fn resume_generator(
+    /// Advance a generator and report *why* it parked.
+    ///
+    /// The sync `next()` does not need the reason — a `yield` and an `await` both mean
+    /// "hand this value to the caller" — but an async generator does: an `await` has to
+    /// settle before it can answer, while a `yield` is the answer.
+    fn resume_generator_detailed(
         &mut self,
         generator: &Gc<JsObject>,
         kind: ResumeKind,
         value: Value,
-    ) -> JsResult<Value> {
+    ) -> JsResult<(Value, bool, bool, Option<SuspendKind>)> {
         let Some(mut state) = generator.with_mut(|data| match &mut data.kind {
             ObjectKind::Generator(state) => Some(std::mem::replace(
                 state.as_mut(),
                 GeneratorState {
                     frame: None,
                     phase: GeneratorPhase::Executing,
+                    parked_on_await: false,
                 },
             )),
             _ => None,
@@ -3360,11 +4313,267 @@ impl<'a> Interp<'a> {
         generator.with_mut(|data| {
             data.kind = ObjectKind::Generator(Box::new(state));
         });
-        let (value, done, ready) = result?;
+        result
+    }
+
+    /// Advance a generator object, as `%GeneratorPrototype%.next` and friends do.
+    ///
+    /// Returns the `{value, done}` object itself rather than the pair, because a
+    /// `yield*` suspension already has one — the inner iterator's own result — and the
+    /// protocol says to hand that straight through rather than nest it.
+    pub fn resume_generator(
+        &mut self,
+        generator: &Gc<JsObject>,
+        kind: ResumeKind,
+        value: Value,
+    ) -> JsResult<Value> {
+        let (value, done, ready, _reason) =
+            self.resume_generator_detailed(generator, kind, value)?;
         if ready {
             return Ok(value);
         }
         self.iterator_result(value, done)
+    }
+
+    /// `next`/`return`/`throw` on an async generator, which answer a promise.
+    ///
+    /// The body is the same coroutine a sync generator runs; what changes is that an
+    /// `await` inside it has to settle before the method can answer, so the step is
+    /// driven off the job queue rather than returning inline.
+    pub fn resume_async_generator(
+        &mut self,
+        generator: &Gc<JsObject>,
+        kind: ResumeKind,
+        value: Value,
+    ) -> JsResult<Value> {
+        let promise = self.new_promise();
+        self.step_async_generator(generator, &promise, kind, value)?;
+        Ok(Value::Object(promise))
+    }
+
+    /// Dispose a list of `(resource, disposeMethod)` pairs, awaiting each disposer.
+    ///
+    /// Returns the promise `AsyncDisposableStack.disposeAsync` hands back. The first
+    /// disposer runs **synchronously** — the reference starts it before returning, which
+    /// a test can observe by logging after the call — and the rest follow once their
+    /// predecessor settles.
+    pub fn dispose_async_all(&mut self, resources: Vec<(Value, Value)>) -> JsResult<Value> {
+        let promise = self.new_promise();
+        let mut pairs = Vec::with_capacity(resources.len());
+        for (value, method) in resources {
+            let pair = self.new_array(vec![value, method]);
+            pairs.push(Value::Object(pair));
+        }
+        let remaining = self.new_array(pairs);
+        self.dispose_step(&remaining, &promise, Value::Uninitialized)?;
+        Ok(Value::Object(promise))
+    }
+
+    /// One link of the `disposeAsync` chain.
+    ///
+    /// Loops while the disposers finish synchronously, and parks on the first thenable it
+    /// meets — pushing itself back in as the continuation, with the accumulated error
+    /// carried along so a later failure can still be folded into the `SuppressedError`.
+    fn dispose_step(
+        &mut self,
+        remaining: &Gc<JsObject>,
+        promise: &Gc<JsObject>,
+        mut error: Value,
+    ) -> JsResult<()> {
+        loop {
+            let length = remaining.array_length().unwrap_or(0);
+            if length == 0 {
+                if matches!(error, Value::Uninitialized) {
+                    self.fulfill_promise(promise, Value::Undefined);
+                } else {
+                    self.reject_promise(promise, error);
+                }
+                return Ok(());
+            }
+            let Some(Value::Object(pair)) = remaining
+                .array_get(length - 1)
+                .filter(|v| !matches!(v, Value::Hole))
+            else {
+                remaining.array_truncate(length - 1);
+                continue;
+            };
+            remaining.array_truncate(length - 1);
+            let value = pair.array_get(0).unwrap_or(Value::Undefined);
+            let Some(Value::Object(method)) = pair.array_get(1) else {
+                continue;
+            };
+            if !method.is_callable() {
+                continue;
+            }
+            match self.call_value(Value::Object(method), value, Vec::new()) {
+                Ok(result) => {
+                    if !self.is_thenable(&result)? {
+                        // Finished synchronously; the next disposer is the next iteration.
+                        continue;
+                    }
+                    let awaited = match self.promise_resolve_value(result) {
+                        Ok(awaited) => awaited,
+                        Err(Signal::Throw(reason)) => {
+                            self.reject_promise(promise, reason);
+                            return Ok(());
+                        }
+                        Err(other) => return Err(other),
+                    };
+                    let Value::Object(awaited) = awaited else {
+                        continue;
+                    };
+                    let ok = JsObject::function(
+                        self.heap,
+                        Some(self.realm.function_proto.clone()),
+                        Callable::DisposeStep {
+                            remaining: remaining.clone(),
+                            promise: promise.clone(),
+                            error: error.clone(),
+                            rejected: false,
+                        },
+                    );
+                    let failed = JsObject::function(
+                        self.heap,
+                        Some(self.realm.function_proto.clone()),
+                        Callable::DisposeStep {
+                            remaining: remaining.clone(),
+                            promise: promise.clone(),
+                            error,
+                            rejected: true,
+                        },
+                    );
+                    self.perform_then(
+                        &awaited,
+                        Some(Value::Object(ok)),
+                        Some(Value::Object(failed)),
+                    )?;
+                    return Ok(());
+                }
+                Err(Signal::Throw(thrown)) => {
+                    error = self.merge_dispose_error(thrown, error);
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    }
+
+    /// Whether `value` would be followed by `ResolvePromise` rather than fulfilled as-is.
+    fn is_thenable(&mut self, value: &Value) -> JsResult<bool> {
+        let Value::Object(object) = value else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.get_property(object, "then")?,
+            Some(Value::Object(then)) if then.is_callable()
+        ))
+    }
+
+    /// One step of an async generator, settling `promise` with an `{value, done}` result.
+    fn step_async_generator(
+        &mut self,
+        generator: &Gc<JsObject>,
+        promise: &Gc<JsObject>,
+        kind: ResumeKind,
+        value: Value,
+    ) -> JsResult<()> {
+        let stepped = self.resume_generator_detailed(generator, kind, value);
+        let (value, done, ready, reason) = match stepped {
+            Ok(stepped) => stepped,
+            Err(Signal::Throw(reason)) => {
+                self.reject_promise(promise, reason);
+                return Ok(());
+            }
+            Err(other) => return Err(other),
+        };
+        // Only an `await` has to wait before the method can answer.
+        if !done && reason == Some(SuspendKind::Await) {
+            let awaited = match self.promise_resolve_value(value) {
+                Ok(awaited) => awaited,
+                Err(Signal::Throw(reason)) => {
+                    self.reject_promise(promise, reason);
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            };
+            let Value::Object(awaited) = awaited else {
+                return Ok(());
+            };
+            let resumed = JsObject::function(
+                self.heap,
+                Some(self.realm.function_proto.clone()),
+                Callable::GeneratorResume {
+                    generator: generator.clone(),
+                    promise: promise.clone(),
+                    kind: ResumeKind::Next,
+                },
+            );
+            let raised = JsObject::function(
+                self.heap,
+                Some(self.realm.function_proto.clone()),
+                Callable::GeneratorResume {
+                    generator: generator.clone(),
+                    promise: promise.clone(),
+                    kind: ResumeKind::Throw,
+                },
+            );
+            self.perform_then(
+                &awaited,
+                Some(Value::Object(resumed)),
+                Some(Value::Object(raised)),
+            )?;
+            return Ok(());
+        }
+        // `yield v` in an *async* generator awaits `v`, and so does the `return v` that
+        // completes it — both arrive as the settled value rather than as the promise
+        // object. A plain value skips the round trip, which is also what keeps `yield 1`
+        // from costing an extra tick.
+        let awaits_value = self.is_thenable(&value)?;
+        if awaits_value {
+            let awaited = match self.promise_resolve_value(value) {
+                Ok(awaited) => awaited,
+                Err(Signal::Throw(reason)) => {
+                    self.reject_promise(promise, reason);
+                    return Ok(());
+                }
+                Err(other) => return Err(other),
+            };
+            let Value::Object(awaited) = awaited else {
+                return Ok(());
+            };
+            // A rejected yield throws *at the yield* inside the body, so the rejection
+            // resumes the generator rather than the method's promise.
+            let answer = JsObject::function(
+                self.heap,
+                Some(self.realm.function_proto.clone()),
+                Callable::YieldResult {
+                    promise: promise.clone(),
+                    done,
+                },
+            );
+            let raise = JsObject::function(
+                self.heap,
+                Some(self.realm.function_proto.clone()),
+                Callable::GeneratorResume {
+                    generator: generator.clone(),
+                    promise: promise.clone(),
+                    kind: ResumeKind::Throw,
+                },
+            );
+            self.perform_then(
+                &awaited,
+                Some(Value::Object(answer)),
+                Some(Value::Object(raise)),
+            )?;
+            return Ok(());
+        }
+        let result = if ready {
+            // `yield*` handed back the inner iterator's own result object.
+            value
+        } else {
+            self.iterator_result(value, done)?
+        };
+        self.fulfill_promise(promise, result);
+        Ok(())
     }
 
     /// The `{value, done}` object an iterator method answers with.
@@ -3381,7 +4590,7 @@ impl<'a> Interp<'a> {
         state: &mut GeneratorState,
         kind: ResumeKind,
         value: Value,
-    ) -> JsResult<(Value, bool, bool)> {
+    ) -> JsResult<(Value, bool, bool, Option<SuspendKind>)> {
         match state.phase {
             GeneratorPhase::Executing => {
                 return Err(self.type_error("cannot invoke a running generator"));
@@ -3390,8 +4599,8 @@ impl<'a> Interp<'a> {
                 // A finished generator answers every resumption without running.
                 return Ok(match kind {
                     ResumeKind::Throw => return Err(Signal::Throw(value)),
-                    ResumeKind::Return => (value, true, false),
-                    ResumeKind::Next | ResumeKind::Start => (Value::Undefined, true, false),
+                    ResumeKind::Return => (value, true, false, None),
+                    ResumeKind::Next | ResumeKind::Start => (Value::Undefined, true, false, None),
                 });
             }
             GeneratorPhase::SuspendedStart => {
@@ -3402,7 +4611,7 @@ impl<'a> Interp<'a> {
                     state.phase = GeneratorPhase::Completed;
                     return Ok(match kind {
                         ResumeKind::Throw => return Err(Signal::Throw(value)),
-                        _ => (value, true, false),
+                        _ => (value, true, false, None),
                     });
                 }
             }
@@ -3410,7 +4619,7 @@ impl<'a> Interp<'a> {
         }
 
         let Some(mut frame) = state.frame.take() else {
-            return Ok((Value::Undefined, true, false));
+            return Ok((Value::Undefined, true, false, None));
         };
         // `next(v)` and `return(v)` re-enter the `yield` with the value *and* the magic
         // number that says which method resumed it; the emitted `if_false` branches on
@@ -3420,7 +4629,11 @@ impl<'a> Interp<'a> {
             ResumeKind::Next | ResumeKind::Start => {
                 if state.phase == GeneratorPhase::SuspendedYield {
                     frame.stack.push(value);
-                    frame.stack.push(Value::Int(RESUME_NEXT));
+                    // An `await` resumes with its value alone; only a `yield` gets the
+                    // magic number that says which of `next`/`return` resumed it.
+                    if !state.parked_on_await {
+                        frame.stack.push(Value::Int(RESUME_NEXT));
+                    }
                 }
             }
             ResumeKind::Return => {
@@ -3463,6 +4676,7 @@ impl<'a> Interp<'a> {
                         frame.stack.pop().unwrap_or(Value::Undefined)
                     };
                     state.frame = Some(frame);
+                    state.parked_on_await = reason == SuspendKind::Await;
                     state.phase = if reason == SuspendKind::Initial {
                         GeneratorPhase::SuspendedStart
                     } else {
@@ -3471,7 +4685,12 @@ impl<'a> Interp<'a> {
                     // `yield*` hands the inner iterator's own result object straight
                     // back, so the caller sees one `{value, done}` rather than a nested
                     // one — which is why the third field says "already a result".
-                    return Ok((yielded, false, reason == SuspendKind::YieldStar));
+                    return Ok((
+                        yielded,
+                        false,
+                        reason == SuspendKind::YieldStar,
+                        Some(reason),
+                    ));
                 }
                 Ok(Step::Suspend(_)) => {
                     // A `yield` in a frame other than the generator's would mean a
@@ -3499,7 +4718,7 @@ impl<'a> Interp<'a> {
                     state.phase = GeneratorPhase::Completed;
                     // The reference closes the generator's closure variables here; ours
                     // live in cells the frame owned, which the drop below releases.
-                    return Ok((value, true, false));
+                    return Ok((value, true, false, None));
                 }
                 Err(Signal::Throw(exception)) => {
                     // The frame that threw gets the first chance to catch, exactly as in
@@ -3541,14 +4760,10 @@ impl<'a> Interp<'a> {
             if code.code.kind.is_generator() {
                 return self.new_generator(callee, this, args).map(Some);
             }
-            // An async function's result is a promise, and this runtime has no `Promise`
-            // builtin yet. Refusing by name beats running the body synchronously and
-            // handing back something that is not a promise.
+            // An async function answers a promise and runs its body as a coroutine, so it
+            // takes the same path as a plain call into it.
             if code.code.kind.is_async() {
-                return Err(Signal::Throw(self.make_error(
-                    "InternalError",
-                    "async functions need the Promise builtin, which is not implemented yet",
-                )));
+                return self.new_async_function(callee, this, args).map(Some);
             }
             self.push_frame(code, env, this, args, callee)?;
             return Ok(None);
@@ -4979,9 +6194,55 @@ impl<'a> Interp<'a> {
                 self.pop();
             }
             ForAwaitOfStart => {
-                return Err(Signal::Throw(
-                    self.make_error("TypeError", "for await is not implemented yet"),
-                ));
+                // Same triple as `for of`, but from `Symbol.asyncIterator` with a
+                // `Symbol.iterator` fallback.
+                let value = self.pop();
+                let iterator = self.get_async_iterator(&value)?;
+                self.push(iterator.object);
+                self.push(iterator.next);
+                self.push(Value::CatchOffset(0));
+            }
+            ForAwaitOfNext => {
+                // `for await` steps the iterator and leaves the *result* wrapped in a
+                // promise, so the `await` the compiler emits right after this can suspend
+                // on it. Unwrapping happens in `iterator_get_value_done`.
+                let extra = a as usize;
+                let iterator_slot = 2 + extra;
+                let result = if matches!(self.peek(iterator_slot), Value::Undefined) {
+                    Value::Undefined
+                } else {
+                    let iterator = Iterator {
+                        object: self.peek(iterator_slot),
+                        next: self.peek(1 + extra),
+                    };
+                    let next = iterator.next.clone();
+                    self.call_value(next, iterator.object, Vec::new())?
+                };
+                let promise = self.promise_resolve_value(result)?;
+                self.push(promise);
+            }
+            IteratorGetValueDone => {
+                // `result -> value done`. A missing result object means the iterator was
+                // already exhausted, which the loop treats as `done`.
+                let result = self.pop();
+                let Value::Object(object) = &result else {
+                    self.push(Value::Undefined);
+                    self.push(Value::Bool(true));
+                    return Ok(Step::Continue);
+                };
+                let done = self
+                    .get_property(object, "done")?
+                    .is_some_and(|value| value.to_boolean());
+                if done {
+                    self.push(Value::Undefined);
+                    self.push(Value::Bool(true));
+                } else {
+                    let value = self
+                        .get_property(object, "value")?
+                        .unwrap_or(Value::Undefined);
+                    self.push(value);
+                    self.push(Value::Bool(false));
+                }
             }
 
             Delete => {
@@ -6181,6 +7442,32 @@ impl<'a> Interp<'a> {
     /// gone: a `for…of` over `null`, over a plain object, or over an object whose
     /// `Symbol.iterator` is not callable all report the same `TypeError` the reference
     /// does, and a user-defined iterable works without a special case.
+    /// `GetIterator(value, async)`: `Symbol.asyncIterator`, falling back to
+    /// `Symbol.iterator`.
+    ///
+    /// The fallback is what makes `for await (x of [1,2])` work: a plain synchronous
+    /// iterable is legal there, and each value it produces is simply already settled by
+    /// the time the `await` around it runs.
+    fn get_async_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
+        let async_key = self.realm.well_known_key(WellKnown::AsyncIterator);
+        let method = self.read_field_key(value, &async_key)?;
+        let has_async = matches!(&method, Value::Object(object) if object.is_callable());
+        if !has_async {
+            return self.get_iterator(value);
+        }
+        let iterator = self.call_value(method, value.clone(), Vec::new())?;
+        if !matches!(iterator, Value::Object(_)) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "iterator is not an object"),
+            ));
+        }
+        let next = self.read_field(&iterator, "next")?;
+        Ok(Iterator {
+            object: iterator,
+            next,
+        })
+    }
+
     fn get_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
         let key = self.realm.well_known_key(WellKnown::Iterator);
         let method = self.read_field_key(value, &key)?;
@@ -6444,6 +7731,51 @@ enum NativeCall {
     },
     /// `Proxy.revocable`'s `revoke`: clear the proxy's slots and answer `undefined`.
     Revoker(crate::object::ProxyRef),
+    /// A promise's `resolve`.
+    PromiseResolve(Gc<JsObject>),
+    /// A promise's `reject`.
+    PromiseReject(Gc<JsObject>),
+    /// One continuation of an `await`.
+    AwaitResume {
+        coroutine: Gc<JsObject>,
+        promise: Gc<JsObject>,
+        kind: ResumeKind,
+    },
+    /// One element of a `Promise` combinator settling.
+    CombinatorSettle {
+        state: Gc<JsObject>,
+        index: usize,
+        fulfilled: bool,
+    },
+    /// One of `Promise.prototype.finally`'s two shims.
+    FinallyShim {
+        callback: Option<Value>,
+        fulfilled: bool,
+    },
+    /// Settle a promise with a fixed outcome.
+    SettlePromise {
+        promise: Gc<JsObject>,
+        value: Value,
+        rejected: bool,
+    },
+    /// Continue an async generator after its `await` settled.
+    GeneratorResume {
+        generator: Gc<JsObject>,
+        promise: Gc<JsObject>,
+        kind: ResumeKind,
+    },
+    /// Answer a pending async-generator method with `{value, done}`.
+    YieldResult {
+        promise: Gc<JsObject>,
+        done: bool,
+    },
+    /// One step of `AsyncDisposableStack.disposeAsync`.
+    DisposeStep {
+        remaining: Gc<JsObject>,
+        promise: Gc<JsObject>,
+        error: Value,
+        rejected: bool,
+    },
 }
 
 /// What a store does when the object refuses the write.

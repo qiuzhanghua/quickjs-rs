@@ -155,8 +155,12 @@ fn the_upstream_script_corpus_reports_a_verdict_for_every_case() {
         "every script case needs a verdict:\n{}",
         report.summary()
     );
-    assert!(
-        report.matched() < cases.len(),
-        "the full upstream corpus cannot pass yet; if it does, delete this assertion"
+    // Once every script case matched, this canary had served its purpose. If it fires
+    // again, the corpus *stopped* fully matching and something regressed.
+    assert_eq!(
+        report.matched(),
+        cases.len(),
+        "the upstream corpus used to match completely; something regressed:\n{}",
+        report.summary()
     );
 }

@@ -24,6 +24,7 @@ pub mod map;
 mod math;
 mod number;
 mod object;
+pub mod promise;
 pub mod proxy;
 mod reflect;
 pub mod regexp;
@@ -71,6 +72,9 @@ pub fn install(interp: &mut Interp<'_>) {
     math::install(interp);
     json::install(interp);
     reflect::install(interp);
+    // `Promise` before `Proxy`: a proxy handler is a plain object, but the reverse is not
+    // true — nothing here reads the other's prototype.
+    promise::install(interp, &object_proto);
     proxy::install(interp);
     date::install(interp);
     // `RegExp` after `String` (its methods dispatch to `Symbol.replace` and friends) and

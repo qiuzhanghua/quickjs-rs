@@ -340,6 +340,8 @@ enum ForLoopKind {
     In,
     /// `for (x of o)` — the values of an iterable.
     Of,
+    /// `for await (x of o)` — the values of an async iterable, or of a sync one.
+    AwaitOf,
 }
 
 /// Which part of a `try` statement a block key refers to.
@@ -1287,13 +1289,12 @@ impl Compiler {
                 body,
                 is_await,
             } => {
-                if *is_await {
-                    return Err(SyntaxError::new(
-                        "for await is not supported by the compiler yet",
-                        stmt.span,
-                    ));
-                }
-                self.for_in_of(stmt, left, right, body, ForLoopKind::Of)?;
+                let kind = if *is_await {
+                    ForLoopKind::AwaitOf
+                } else {
+                    ForLoopKind::Of
+                };
+                self.for_in_of(stmt, left, right, body, kind)?;
             }
             StmtKind::With { object, body } => self.with_stmt(object, body)?,
             StmtKind::ClassDecl(class) => self.class_definition(class, false)?,
@@ -2559,10 +2560,11 @@ impl Compiler {
         let test = self.new_label();
         let break_target = self.new_label();
 
-        let has_iterator = kind == ForLoopKind::Of;
+        let has_iterator = matches!(kind, ForLoopKind::Of | ForLoopKind::AwaitOf);
         match kind {
             ForLoopKind::In => self.emit(Opcode::ForInStart, &[]),
             ForLoopKind::Of => self.emit(Opcode::ForOfStart, &[]),
+            ForLoopKind::AwaitOf => self.emit(Opcode::ForAwaitOfStart, &[]),
         }
         self.emit_jump(Opcode::Goto, test, &[]);
 
@@ -2612,6 +2614,12 @@ impl Compiler {
         match kind {
             ForLoopKind::In => self.emit(Opcode::ForInNext, &[]),
             ForLoopKind::Of => self.emit(Opcode::ForOfNext, &[Op::Int(0)]),
+            ForLoopKind::AwaitOf => {
+                // The reference's shape: step, `await` the result, then unpack it.
+                self.emit(Opcode::ForAwaitOfNext, &[Op::Int(0)]);
+                self.emit(Opcode::Await, &[]);
+                self.emit(Opcode::IteratorGetValueDone, &[]);
+            }
         }
         self.emit_jump(Opcode::IfFalse, next, &[]);
         // The loop is finished; `for_xx_next` left an `undefined` behind.
@@ -4130,14 +4138,16 @@ impl Compiler {
         Ok(())
     }
 
-    /// `await expr`: one instruction, like `yield`, and the same magic-number protocol.
+    /// `await expr`: exactly one instruction.
+    ///
+    /// No resume-magic branch follows it. The reference's `await` leaves a single value
+    /// on the stack and completion is signalled by the `return_async` at the end of the
+    /// body; an `if_false`/`return_async` pair here would be an instruction sequence the
+    /// reference never emits, and a `for await` loop — which reaches `await` through the
+    /// same opcode — would then spill a value the loop's unpacking does not expect.
     fn await_expression(&mut self, argument: &Expr) -> Result<(), SyntaxError> {
         self.expr(argument)?;
         self.emit(Opcode::Await, &[]);
-        let resume = self.new_label();
-        self.emit_jump(Opcode::IfFalse, resume, &[]);
-        self.emit(Opcode::ReturnAsync, &[]);
-        self.place_label(resume);
         Ok(())
     }
 
@@ -5405,11 +5415,17 @@ impl Compiler {
             }
         }
         self.hoist(body, body_key)?;
-        // A suspending function starts by suspending: the reference's `initial_yield` is
-        // the first instruction, so creating a generator runs no body code until the
-        // first `next()`, and an async function has a point to resolve `this` from before
-        // anything else happens.
-        if self.cur().is_suspending() {
+        // A generator starts suspended: `initial_yield` is its first instruction, so
+        // creating one runs no body code until the first `next()`.
+        //
+        // An async function does **not** get one. Its body runs synchronously up to the
+        // first `await` — `async function f(){ log.push("a"); await 0 }` records `a`
+        // before its caller's next statement — so emitting `initial_yield` here would
+        // park the body before it started, which is not fixable at run time: the
+        // suspension looks exactly like a real `await`. The reference's disassembly
+        // confirms the difference (a generator's first opcode is `initial_yield`, an
+        // async function's is its first statement).
+        if self.cur().kind.is_generator() {
             self.emit(Opcode::InitialYield, &[]);
         }
         self.emit_scope_enter(body_key);

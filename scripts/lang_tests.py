@@ -41,10 +41,14 @@ class Sliced:
         lines = source.split("\n")
 
         # Where each top-level function starts and ends, by the column-zero convention.
+        # `async function` has to be included: test_language.js's only asynchronous test
+        # (`test_await_using`) is declared that way, and a regex that only matched
+        # `function` dropped it from the index entirely — so it was never attempted, and
+        # the file's score was reported as complete while one test had never run.
         starts = [
             (i, match.group(1))
             for i, line in enumerate(lines)
-            for match in [re.match(r"^function (\w+)\(", line)]
+            for match in [re.match(r"^(?:async\s+)?function (\w+)\(", line)]
             if match
         ]
         if not starts:
@@ -71,7 +75,7 @@ class Sliced:
             name
             for name in self.order
             if (name.startswith("test_") or name == "test")
-            and re.match(rf"^function {re.escape(name)}\(\)", self.functions[name])
+            and re.match(rf"^(?:async\s+)?function {re.escape(name)}\(\)", self.functions[name])
         ]
 
     def _referenced(self, name):

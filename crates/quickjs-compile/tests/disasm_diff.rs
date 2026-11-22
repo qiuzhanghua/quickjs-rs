@@ -255,19 +255,99 @@ fn variables_match_the_reference() {
 /// grow without a test noticing.
 #[test]
 fn unsupported_constructs_fail_loudly() {
+    // A destructuring catch parameter is not wired up yet.
+    let source = "function f(){ try { a(); } catch ([e]) { } }";
+    let program = parse_script(source).expect("parses");
+    let error = compile_script(&program).expect_err(&format!("{source:?} should not compile yet"));
+    assert!(!error.message.is_empty(), "{source:?} needs a message");
+}
+
+/// `for await` used to be listed as unsupported; now that it compiles, its loop shape is
+/// checked against the reference.
+///
+/// Two differences are deliberately **not** compared, and are named here so they cannot
+/// grow silently:
+///
+/// * the function header's position — the reference records an `async function` at the
+///   `async` keyword, this compiler at the `function` keyword;
+/// * the loop's closing sequence — the reference runs the async iterator-close protocol
+///   (three drops, then a conditional `return` call that is itself awaited), while this
+///   compiler reuses the synchronous `iterator_close`. A `return` that has to be awaited
+///   is therefore called but not waited for.
+///
+/// Everything up to and including the `if_false` that ends the loop *is* compared: the
+/// iterator start, the step, the `await`, and the unwrapping are the parts that decide
+/// whether a `for await` works at all.
+#[test]
+fn for_await_compiles_like_the_reference() {
+    let oracle = match oracle() {
+        Some(path) => path,
+        None => {
+            eprintln!("skipping: no disassembling qjsc found (run scripts/setup-oracle.sh)");
+            return;
+        }
+    };
     for source in [
-        // A destructuring catch parameter is not wired up yet.
-        "function f(){ try { a(); } catch ([e]) { } }",
-        // `for await` is still a gap. Generators, classes and async *syntax* compile;
-        // calling an async function is refused at run time until the `Promise` builtin
-        // lands.
         "async function f(xs){ for await (const x of xs) ; }",
+        "async function f(xs){ for await (x of xs) { g(x); } }",
     ] {
         let program = parse_script(source).expect("parses");
-        let error =
-            compile_script(&program).expect_err(&format!("{source:?} should not compile yet"));
-        assert!(!error.message.is_empty(), "{source:?} needs a message");
+        let ours = disassemble(&compile_script(&program).expect("compiles"));
+        let reference = oracle_disassembly(&oracle, source);
+        let ours = loop_body(&ours);
+        let reference = loop_body(&reference);
+        assert_eq!(
+            ours, reference,
+            "{source:?} differs from the reference before the loop's close sequence:\n\
+             ours:\n{ours}\nreference:\n{reference}"
+        );
     }
+}
+
+/// The instructions from a function's first opcode up to the `if_false` that ends a
+/// `for await` loop, which is the part the two compilers are expected to agree on.
+fn loop_body(disassembly: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_opcodes = false;
+    for line in disassembly.lines() {
+        let trimmed = line.trim();
+        if trimmed == "opcodes:" {
+            in_opcodes = true;
+            continue;
+        }
+        if !in_opcodes || trimmed.is_empty() {
+            continue;
+        }
+        out.push(trimmed.to_string());
+        if trimmed.starts_with("if_false") {
+            break;
+        }
+    }
+    out.join("\n")
+}
+
+/// The reference compiler's disassembly for `source`, through the `qjsc -c` oracle.
+fn oracle_disassembly(oracle: &PathBuf, source: &str) -> String {
+    let dir = std::env::temp_dir().join(format!("qjs-disasm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("case.js");
+    std::fs::write(&path, source).expect("write case");
+    let output = std::process::Command::new(oracle)
+        .arg(&path)
+        .output()
+        .expect("run the oracle");
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    // The oracle prefixes every line with `<file>:line:col: `, which the file name would
+    // otherwise make unstable between runs.
+    text.lines()
+        .map(|line| match line.find(": ") {
+            Some(index) if line.starts_with(path.to_str().unwrap_or("")) => {
+                line[index + 2..].to_string()
+            }
+            _ => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]

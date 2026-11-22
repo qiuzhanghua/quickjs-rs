@@ -322,9 +322,22 @@ fn dispose(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
     Ok(Value::Undefined)
 }
 
-/// `stack.disposeAsync()`. Synchronous here; see the module note.
-fn dispose_async(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    dispose(interp, this, args)
+/// `stack.disposeAsync()` — dispose everything in reverse order, awaiting each disposer.
+///
+/// The resources are handed to the interpreter rather than run here: awaiting a disposer
+/// means parking between two of them, which is the microtask queue's job.
+fn dispose_async(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let Some(object) = this.as_object() else {
+        return Err(interp.type_error("disposeAsync called on a non-object"));
+    };
+    let mut state = state_of(interp, &this)?;
+    if state.disposed {
+        return interp.promise_resolve_value(Value::Undefined);
+    }
+    state.disposed = true;
+    let resources = std::mem::take(&mut state.resources);
+    write_back(object, state);
+    interp.dispose_async_all(resources)
 }
 
 /// Pop and call every resource, folding failures into one `SuppressedError` chain.

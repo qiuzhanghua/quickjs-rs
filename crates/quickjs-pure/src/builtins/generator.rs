@@ -68,6 +68,52 @@ pub fn install(interp: &mut Interp<'_>, proto: &Gc<JsObject>) {
         .well_known_key(crate::interp::WellKnown::Iterator);
     let identity = interp.new_native("[Symbol.iterator]", 0, iterator);
     proto.define_key(&key, Property::data(Value::Object(identity)));
+
+    // `%AsyncGeneratorPrototype%`: same methods, but each answers a promise, and
+    // `Symbol.asyncIterator` is what `for await` looks for.
+    let object_proto = interp.realm.object_proto.clone();
+    let async_proto = interp.new_object(Some(object_proto));
+    interp.realm.async_generator_proto = Some(async_proto.clone());
+    for (name, length, func) in [
+        ("next", 1, async_next as crate::object::NativeFn),
+        ("return", 1, async_generator_return),
+        ("throw", 1, async_generator_throw),
+    ] {
+        super::define_method(&async_proto, name, length, func, interp);
+    }
+    let async_key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::AsyncIterator);
+    let identity = interp.new_native("[Symbol.asyncIterator]", 0, iterator);
+    async_proto.define_key(&async_key, Property::data(Value::Object(identity)));
+}
+
+/// `%AsyncGeneratorPrototype%.next`.
+fn async_next(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let generator = match generator_of(interp, &this) {
+        Ok(generator) => generator,
+        Err(error) => return Err(Signal::Throw(error)),
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    interp.resume_async_generator(&generator, ResumeKind::Next, value)
+}
+
+fn async_generator_return(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let generator = match generator_of(interp, &this) {
+        Ok(generator) => generator,
+        Err(error) => return Err(Signal::Throw(error)),
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    interp.resume_async_generator(&generator, ResumeKind::Return, value)
+}
+
+fn async_generator_throw(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let generator = match generator_of(interp, &this) {
+        Ok(generator) => generator,
+        Err(error) => return Err(Signal::Throw(error)),
+    };
+    let value = args.first().cloned().unwrap_or(Value::Undefined);
+    interp.resume_async_generator(&generator, ResumeKind::Throw, value)
 }
 
 /// `%GeneratorPrototype%[Symbol.iterator]`.
