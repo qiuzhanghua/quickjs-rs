@@ -65,7 +65,18 @@ fn apply(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
 fn construct(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let target = arg(args, 0);
     let rest = array_like(interp, &arg(args, 1))?;
-    interp.construct(target.clone(), target, rest)
+    // `Reflect.construct(target, args, newTarget)`: the third argument decides the
+    // instance's prototype, which is the whole point of the three-argument form — it is how
+    // a subclass is built without calling its constructor. Dropping it made
+    // `Object.getPrototypeOf(Reflect.construct(C, [], D))` answer `C.prototype`.
+    let new_target = match args.get(2) {
+        None | Some(Value::Undefined) => target.clone(),
+        Some(candidate) => candidate.clone(),
+    };
+    if !matches!(&new_target, Value::Object(o) if o.is_callable()) {
+        return Err(interp.type_error("Reflect.construct newTarget is not a constructor"));
+    }
+    interp.construct(target, new_target, rest)
 }
 
 /// Read an array-like argument into a vector.

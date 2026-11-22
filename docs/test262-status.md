@@ -2,8 +2,8 @@
 
 测量时间：2026-02（提交 `4a30079`，v0.4.0 之后）
 
-**已修**：4.1、4.2、4.3、4.4、4.7、4.8，可运行通过率 **42.7% → 58.5%**，
-净修好 2243 例、新引入失败 0 例。见第 7 节。
+**已修**：4.1、4.2、4.3、4.4、4.7、4.8、4.10，可运行通过率 **42.7% → 61.3%**，
+净修好 2739 例、新引入失败 0 例。见第 7 节。
 
 复现：
 
@@ -29,10 +29,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 17665 |
-| **可运行中通过** | **10340（58.5%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 7325 |
+| **可运行中通过** | **10836（61.3%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6829 |
 | ↳ 其中挂起（引擎不终止） | 45 |
-| ↳ 其中答错 | 7280 |
+| ↳ 其中答错 | 6784 |
 | 跳过（引擎完全没这功能） | 6220 |
 
 跳过不是"通过"，所以它单列。按原因：
@@ -225,12 +225,29 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 真正的修法是让 `[[Get]]`/`[[Set]]` 都只认属性表、元素向量退化为缓存，或让 8 个改写
 方法走 `set_property` 而不是 `array_set`。两种都是跨模块改动，单独排期。
 
-### 4.10 `DataView` 完全不存在（0/520）— 未修
+### 4.10 `DataView` 完全不存在（0/520）— ✅ 已修（423/520）
 
 `typeof DataView === "undefined"`，520 条全部以 `ReferenceError` 失败。它与 TypedArray
-共享 `ArrayBuffer`，但方法集独立（`getInt8`/`getFloat64`/`setBigUint64`/`getUint8` 等
-按字节偏移读写）。这一轮没做：TypedArray 的收益已经落袋，DataView 是另一块同规模的工作，
-混在一起会让"这一步做得对不对"无法验证。
+共享 `ArrayBuffer`，但方法集独立：宽度与字节偏移**每次访问时才指定**，所以对齐无关，
+端序也是逐次决定。
+
+复用了 `ElementType::read`/`write`（它们本来就按字节偏移工作），22 个访问器用宏生成——
+`NativeFn` 是裸函数指针，宽度只能烘进函数里而不能捕获。
+
+修的顺序里有三件事超出"补一个类"：
+
+1. **`Reflect.construct` 把第三个参数丢了。** `new.target` 从不生效，
+   `Object.getPrototypeOf(Reflect.construct(C, [], D))` 返回 `C.prototype`。这是预存在
+   的引擎 bug，被 DataView 的 `custom-proto-*` 用例逮到。
+2. **修好它之后又暴露一层：原生构造器先建实例、后校验参数。** 规范要求先校验
+   （`new Promise(非法executor)` 要在读 `new.target.prototype` 之前抛 TypeError）。
+   让所有原生构造器自建实例代价太大（date/number/string 都用"`this` 是对象"判断 `new`），
+   所以只在真正有校验的三个上加 `Callable::Native { own_instance }` 标志：
+   `Promise`、typed array 各构造器、`DataView`。**这一步第一次尝试是全改，数字掉到 50.4%**，
+   靠全量对比才发现代价，改成按需。
+3. **`install_tag` 忽略了自己的 `tag` 参数**，永远返回 `"ArrayBuffer"`，
+   于是 `Object.prototype.toString.call(dataView)` 报错类型。顺带修掉。
+   同时发现 `Symbol.toStringTag` 被装成了访问器，规范是数据属性。
 
 ## 5. 对里程碑结论的修正
 
@@ -244,8 +261,8 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 
 1. ~~`name`/`length` 可配置（4.1）~~——已修，实测 +561 例。
 2. ~~`ToObject` 装箱与数组接收者（4.2）~~——已修，连同 4.4、4.7、4.8 共 +704 例。
-3. ~~`TypedArray` 补全（4.3）~~——已修，实测 +978 例（TypedArray 84→800，
-   TypedArrayConstructors 291→448）。**`DataView` 仍完全缺失（0/520）**，见 4.10。
+3. ~~`TypedArray` 补全（4.3）~~——已修，实测 +978 例。
+4. ~~`DataView`（4.10）~~——已修，实测 +496 例（0→423）。
 4. `Iterator` helpers（664/684 条）——`Iterator` 全局对象整个没有。
 5. `Promise`（真做）——229 条 Promise，另加 `flag:async` 632 条跳过的前置条件。
 6. 正则文法（4.5）——1092 条，受 Unicode 表依赖，和 FR-8 一起做。
@@ -326,3 +343,28 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 - **`DataView`**：0/520，完全缺失（4.10）。
 - **`Iterator` helpers**：664/684 失败，`Iterator` 全局对象整个没有。
 - **`Math` 缺 `ToNumber` 的 BigInt 拒绝**：`Math.max(1n)` 应抛 `TypeError`。
+
+### 4.10 DataView
+
+| | 修前 | 修后 |
+|---|---|---|
+| `DataView` | 0/520 | **423/520** |
+| 全量可运行通过 | 10340（58.5%） | **10836（61.3%）** |
+
+修好 496 例，回归 0 例。
+
+最值得记的一次误判：为了让"先校验参数、再读 `new.target.prototype`"成立，我一开始把
+**所有**原生构造器都改成自建实例（`this = undefined`），整体从 61% 掉到 **50.4%**。
+原因是 date/number/string 等构造器一直用"`this` 是不是对象"来区分 `new C()` 与 `C()`，
+`this` 变成 `undefined` 后它们把两者都当普通调用。全量对比立刻报出 722 条回归，
+才把改动收窄成"只有带参数校验的三个构造器自建实例"。
+
+如果只看那两个 `custom-proto` 用例是否变绿，这个代价完全看不见。
+
+### 仍未做（同一批里明确留下的）
+
+- **`Iterator` helpers**：664/684 失败，`Iterator` 全局对象整个没有。
+- **`RegExp`**：1091 失败，受 Unicode 表依赖，和 FR-8 绑在一起。
+- **`Math` 缺 `ToNumber` 的 BigInt 拒绝**：`Math.max(1n)` 应抛 `TypeError`。
+- **`DataView` 的 resizable ArrayBuffer**：97 条剩余里 22 条是它，需要
+  `ArrayBuffer.prototype.resize` 整套。

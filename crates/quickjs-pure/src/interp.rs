@@ -153,6 +153,8 @@ pub struct Realm {
     /// the result has to carry the per-type prototype — otherwise `r.constructor.name` is
     /// `"Object"` and `r instanceof Int32Array` is false.
     pub typed_array_protos: Vec<Gc<JsObject>>,
+    /// `DataView.prototype`.
+    pub data_view_proto: Option<Gc<JsObject>>,
     /// The `AsyncDisposableStack` prototype.
     pub async_disposable_stack_proto: Option<Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
@@ -587,7 +589,13 @@ pub struct Interp<'a> {
     /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
     /// trace still names it with `(native)` instead of a position, so the names are
     /// tracked separately and stitched into [`Interp::stack_trace`].
-    native_frames: Vec<String>,
+    native_frames: Vec<(String, Gc<JsObject>)>,
+    /// The native function currently executing, for the ones that have to know *which*
+    /// function they are — a typed-array constructor reads its element type off itself.
+    ///
+    /// `current_callee` cannot answer this: a native call pushes no frame of its own, so it
+    /// reports whatever the enclosing bytecode frame was called with.
+    current_native: Option<Gc<JsObject>>,
     /// Text written by `print` and friends, in order.
     ///
     /// Buffered rather than streamed so a test can inspect it; the CLI flushes it
@@ -630,6 +638,7 @@ impl<'a> Interp<'a> {
             Some(object_proto.clone()),
             Callable::Native {
                 func: |_, _, _| Ok(Value::Undefined),
+                own_instance: false,
             },
         );
         let array_proto = JsObject::array(heap, Some(object_proto.clone()), 0);
@@ -665,6 +674,7 @@ impl<'a> Interp<'a> {
                 array_buffer_proto: None,
                 typed_array_proto: None,
                 typed_array_protos: Vec::new(),
+                data_view_proto: None,
                 async_disposable_stack_proto: None,
                 well_known_symbols: WellKnownSymbols::default(),
             },
@@ -679,6 +689,7 @@ impl<'a> Interp<'a> {
             pending_new_target: None,
             eval_new_target: None,
             native_frames: Vec::new(),
+            current_native: None,
             output: String::new(),
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
@@ -1582,11 +1593,41 @@ impl<'a> Interp<'a> {
     /// The observable `name` and `length` are installed as properties here, which is
     /// what `Function.prototype.name` and `.length` read; nothing else stores them,
     /// so `f.name = "x"` behaves like the writable property it is.
+    /// A native constructor that builds its own instance after validating its arguments.
+    ///
+    /// `new` hands it `this = undefined` rather than a pre-made object, so any argument
+    /// check runs before `new.target.prototype` is read.
+    pub fn new_native_ctor(
+        &self,
+        name: impl Into<String>,
+        length: u32,
+        func: NativeFn,
+    ) -> Gc<JsObject> {
+        let function = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::Native {
+                func,
+                own_instance: true,
+            },
+        );
+        function.define(
+            "length",
+            Property::name_or_length(Value::Int(length as i32)),
+        );
+        function.define("name", Property::name_or_length(self.string(name)));
+        function
+    }
+
+    /// A new native function object.
     pub fn new_native(&self, name: impl Into<String>, length: u32, func: NativeFn) -> Gc<JsObject> {
         let function = JsObject::function(
             self.heap,
             Some(self.realm.function_proto.clone()),
-            Callable::Native { func },
+            Callable::Native {
+                func,
+                own_instance: false,
+            },
         );
         // `length` before `name`: `FunctionCreate` sets `[[ParameterCount]]` first, and
         // `Object.getOwnPropertyNames` reports insertion order, so the reference lists
@@ -3972,7 +4013,7 @@ impl<'a> Interp<'a> {
         }
         let callable = function.with(|data| match &data.kind {
             ObjectKind::Function(callable) => match callable {
-                Callable::Native { func } => Some(NativeCall::Native(*func)),
+                Callable::Native { func, .. } => Some(NativeCall::Native(*func)),
                 Callable::Bound {
                     target,
                     this,
@@ -4067,12 +4108,16 @@ impl<'a> Interp<'a> {
                     .and_then(|property| property.value)
                     .map(|value| value.to_js_string())
                     .unwrap_or_default();
-                if !frame_less {
-                    self.native_frames.push(name);
-                }
+                let outer = if frame_less {
+                    None
+                } else {
+                    self.native_frames.push((name, function.clone()));
+                    Some(self.current_native.replace(function.clone()))
+                };
                 let result = func(self, this, &args);
                 if !frame_less {
                     self.native_frames.pop();
+                    self.current_native = outer.flatten();
                 }
                 result
             }
@@ -5105,12 +5150,31 @@ impl<'a> Interp<'a> {
             Some(target) => target.clone(),
             None => function.clone(),
         };
-        let prototype = self.get_property(&prototype_source, "prototype")?;
-        let prototype = match prototype {
-            Some(Value::Object(proto)) => Some(proto),
-            _ => Some(self.realm.object_proto.clone()),
+        // A native constructor builds its own instance, through `new_ctor_instance`, once it
+        // has validated its arguments. Pre-building one here would read
+        // `new.target.prototype` too early: `Reflect.construct(Promise, [], badTarget)` has
+        // to throw `TypeError` for a non-callable executor *before* a throwing `prototype`
+        // getter runs, and `new DataView(detached, …)` likewise for the detached check.
+        let is_native = function.native_creates_own_instance();
+        let this = if is_native {
+            Value::Undefined
+        } else {
+            let prototype = self.get_property(&prototype_source, "prototype")?;
+            let prototype = match prototype {
+                Some(Value::Object(proto)) => Some(proto),
+                // `GetPrototypeFromConstructor`: when the requested `prototype` is not an
+                // object, the answer is the realm's *intrinsic* prototype for this
+                // constructor, not `%Object.prototype%`.
+                _ => {
+                    let fallback = self.get_property(function, "prototype")?;
+                    match fallback {
+                        Some(Value::Object(proto)) => Some(proto),
+                        _ => Some(self.realm.object_proto.clone()),
+                    }
+                }
+            };
+            Value::Object(self.new_object(prototype))
         };
-        let this = Value::Object(self.new_object(prototype));
         // `new.target` inside the body is the constructor that was written, so a bound
         // function's target sees itself rather than the bound wrapper.
         self.pending_new_target = Some(new_target);
@@ -7089,10 +7153,13 @@ impl<'a> Interp<'a> {
         // `NaN` to stay total, and the operators check for the bigint themselves — but
         // `Math.max(1n)`, `new Int32Array(1n)` and every other `ToNumber` caller needs to
         // refuse, and answering `NaN` made them silently wrong instead.
-        if matches!(value, Value::BigInt(_)) {
-            return Err(self.type_error("cannot convert a BigInt to a number"));
+        // Both are checked *after* `ToPrimitive`, so a boxed Symbol or BigInt is refused
+        // too: `ToNumber(Object(Symbol()))` unwraps to the symbol and then fails.
+        match value {
+            Value::BigInt(_) => Err(self.type_error("cannot convert a BigInt to a number")),
+            Value::Symbol(_) => Err(self.type_error("cannot convert a Symbol to a number")),
+            other => Ok(other.to_number()),
         }
-        Ok(value.to_number())
     }
 
     /// `ToPropertyKey`: what a computed member access uses as its key.
@@ -7699,6 +7766,53 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// `OrdinaryCreateFromConstructor(new.target, default_proto)`.
+    ///
+    /// A native constructor calls this once it has validated its arguments, which is the
+    /// order the spec uses for `Promise`, the typed arrays and `DataView`: a bad argument is
+    /// a `TypeError` *before* `new.target.prototype` is read, so a throwing getter there is
+    /// never reached. The prototype comes from `new.target` when it is an object, and from
+    /// `default_proto` otherwise.
+    pub fn new_ctor_instance(&mut self, default_proto: Gc<JsObject>) -> JsResult<Gc<JsObject>> {
+        let Some(target) = self.pending_new_target.clone() else {
+            return Ok(self.new_object(Some(default_proto)));
+        };
+        let Some(target) = target.as_object().cloned() else {
+            return Ok(self.new_object(Some(default_proto)));
+        };
+        let proto = match self.get_property(&target, "prototype")? {
+            Some(Value::Object(proto)) => proto,
+            _ => default_proto,
+        };
+        Ok(self.new_object(Some(proto)))
+    }
+
+    /// Whether this call is a construction, i.e. `new.target` is defined.
+    ///
+    /// A native constructor receives `this = undefined` (it builds its own instance), so it
+    /// cannot use "`this` is not an object" to tell `Ctor()` from `new Ctor()` — this can.
+    /// The native function currently executing, if any.
+    pub fn current_native(&self) -> Option<Gc<JsObject>> {
+        self.current_native.clone()
+    }
+
+    /// Whether this call is a construction, i.e. `new.target` is defined.
+    pub fn is_constructing(&self) -> bool {
+        self.pending_new_target.is_some()
+    }
+
+    /// Whether the pending `new.target` needs its own `prototype` honoured by the constructor.
+    ///
+    /// True whenever `new.target` is not the callee itself, or when it has no usable
+    /// `prototype` — the cases where reading the property is observable at all.
+    pub fn new_target_is_custom(&mut self, callee: &Gc<JsObject>) -> bool {
+        match &self.pending_new_target {
+            Some(Value::Object(target)) => !target.ptr_eq(callee),
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     /// `GetIterator(value)`: the real `Symbol.iterator` protocol.
     ///
     /// The method is looked up on the value (through its prototype), called with no
@@ -7877,7 +7991,7 @@ impl<'a> Interp<'a> {
         // Natives run on the Rust stack, so they sit innermost. They never re-enter
         // JavaScript, which is what makes it correct to emit them all before the
         // bytecode frames rather than interleaved.
-        for name in self.native_frames.iter().rev() {
+        for (name, _) in self.native_frames.iter().rev() {
             if skip > 0 {
                 skip -= 1;
                 continue;

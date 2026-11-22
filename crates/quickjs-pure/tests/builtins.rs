@@ -2802,3 +2802,110 @@ try { a.includes(1, Symbol()); print("no throw"); } catch (e) { print(e.name); }
         )
     );
 }
+
+#[test]
+fn data_view_reads_and_writes_bytes_at_any_offset() {
+    // `DataView` did not exist at all — all 520 conformance cases were `ReferenceError`.
+    // Its distinguishing feature against a typed array is that the width and byte offset are
+    // named per access, so alignment never matters and endianness is per call.
+    assert_eq!(
+        eval(
+            r#"
+var ab = new ArrayBuffer(16);
+var dv = new DataView(ab);
+print(dv.byteOffset, dv.byteLength, dv.buffer === ab);
+print(Object.prototype.toString.call(dv));
+
+var partial = new DataView(ab, 4);
+print(partial.byteOffset, partial.byteLength);
+var sized = new DataView(ab, 4, 8);
+print(sized.byteOffset, sized.byteLength);
+
+// Big-endian by default, little-endian on request.
+var order = new DataView(new ArrayBuffer(4));
+order.setUint32(0, 0x01020304);
+print([...new Uint8Array(order.buffer)].join(","));
+order.setUint32(0, 0x01020304, true);
+print([...new Uint8Array(order.buffer)].join(","));
+
+var nums = new DataView(new ArrayBuffer(8));
+nums.setInt16(0, -2);
+print(nums.getInt16(0, true), nums.getInt16(0, false));
+nums.setFloat64(0, Math.PI);
+print(nums.getFloat64(0));
+nums.setBigInt64(0, -1n);
+print(String(nums.getBigInt64(0)), String(nums.getBigUint64(0)));
+
+// Bounds are enforced per access, not per view.
+var small = new DataView(new ArrayBuffer(2));
+try { small.getInt32(0); print("no throw"); } catch (e) { print(e.name); }
+try { new DataView(ab, 4, 100); print("no throw"); } catch (e) { print(e.name); }
+try { new DataView(new ArrayBuffer(8), Symbol()); print("no throw"); } catch (e) { print(e.name); }
+// A detached buffer makes reads throw but keeps the properties readable.
+var gone = new DataView(new ArrayBuffer(8));
+gone.buffer.transfer();
+print(gone.byteLength);
+try { gone.getInt8(0); print("no throw"); } catch (e) { print(e.name); }
+"#
+        ),
+        concat!(
+            "0 16 true\n",
+            "[object DataView]\n",
+            "4 12\n",
+            "4 8\n",
+            "1,2,3,4\n",
+            "4,3,2,1\n",
+            "-257 -2\n",
+            "3.141592653589793\n",
+            "-1 18446744073709551615\n",
+            "RangeError\n",
+            "RangeError\n",
+            "TypeError\n",
+            "0\n",
+            "TypeError\n",
+        )
+    );
+}
+
+#[test]
+fn reflect_construct_honours_new_target_and_native_constructors_order_their_checks() {
+    // `Reflect.construct`'s third argument was dropped entirely, so `new.target.prototype`
+    // never decided the prototype. Fixing that exposed the next layer: a native constructor
+    // built its instance *before* validating its arguments, so `new Promise(nonCallable)`
+    // and `new DataView(detached, …)` read a `prototype` getter they should not have
+    // reached. Both halves are asserted here because each hid the other.
+    assert_eq!(
+        eval(
+            r#"
+function newTarget() {}
+var proto = {};
+newTarget.prototype = proto;
+
+function C() {}
+print(Object.getPrototypeOf(Reflect.construct(C, [], newTarget)) === proto);
+print(Object.getPrototypeOf(Reflect.construct(C, [])) === C.prototype);
+print(Object.getPrototypeOf(Reflect.construct(ArrayBuffer, [8], newTarget)) === proto);
+
+// A `prototype` that is not an object falls back to the callee's own.
+var bad = function () {};
+bad.prototype = 1;
+print(Object.getPrototypeOf(Reflect.construct(C, [], bad)) === C.prototype);
+
+// A throwing `prototype` getter must not be reached when an argument is already invalid.
+var angry = (function () {}).bind();
+Object.defineProperty(angry, "prototype", {
+  get: function () { throw new Error("prototype read too early"); },
+});
+try { Reflect.construct(Promise, [], angry); print("no throw"); }
+catch (e) { print(e.name); }
+"#
+        ),
+        concat!(
+            "true\n",
+            "true\n",
+            "true\n",
+            "true\n",
+            "TypeError\n",
+        )
+    );
+}

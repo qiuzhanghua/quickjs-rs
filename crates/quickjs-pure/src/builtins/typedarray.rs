@@ -315,6 +315,7 @@ fn f64_to_f16(value: f64) -> u16 {
 pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     install_array_buffer(interp, object_proto);
     install_views(interp, object_proto);
+    install_data_view(interp, object_proto);
 }
 
 fn install_array_buffer(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
@@ -437,7 +438,7 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
             "BYTES_PER_ELEMENT",
             Property::with_attributes(Value::Int(element.size() as i32), false, false),
         );
-        let constructor = interp.new_native(name, 3, view_constructor);
+        let constructor = interp.new_native_ctor(name, 3, view_constructor);
         // `Object.getPrototypeOf(Int8Array)` is `%TypedArray%`, which is where `from` and
         // `of` live; without it the statics were unreachable from every constructor.
         constructor.set_proto(Some(intrinsic.clone()));
@@ -467,14 +468,22 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     }
 }
 
-fn install_tag(proto: &Gc<JsObject>, _tag: &str, interp: &Interp<'_>) {
-    let function = interp.new_native("[Symbol.toStringTag]", 0, buffer_tag);
+/// Give `proto` a `Symbol.toStringTag` answering `tag`.
+///
+/// The tag has to be baked into the function: a native one is a bare pointer and cannot
+/// capture. This used to ignore its `tag` argument and always answer `"ArrayBuffer"`, so
+/// `Object.prototype.toString.call(new DataView(...))` reported the wrong type.
+fn install_tag(proto: &Gc<JsObject>, tag: &str, interp: &Interp<'_>) {
+    // A *data* property: `{value, writable: false, enumerable: false, configurable: true}`.
+    // The tag is a constant, and an accessor here is observable — the conformance check
+    // reads `writable` off the descriptor and a getter has none.
     proto.define_key(
         &interp
             .realm
             .well_known_key(crate::interp::WellKnown::ToStringTag),
         Property {
-            getter: Some(Value::Object(function)),
+            value: Some(interp.string(tag)),
+            writable: false,
             enumerable: false,
             configurable: true,
             ..Property::default()
@@ -483,12 +492,8 @@ fn install_tag(proto: &Gc<JsObject>, _tag: &str, interp: &Interp<'_>) {
 }
 
 /// `ArrayBuffer.prototype[Symbol.toStringTag]`.
-fn buffer_tag(interp: &mut Interp<'_>, _this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string("ArrayBuffer"))
-}
-
 /// `new ArrayBuffer(length)`.
-fn buffer_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+fn buffer_constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let length = arg(args, 0).to_number();
     if length < 0.0 || length.fract() != 0.0 || length > 4294967295.0 {
         return Err(interp.range_error("invalid array buffer length"));
@@ -497,17 +502,12 @@ fn buffer_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> J
         bytes: vec![0; length as usize],
         detached: false,
     }));
-    let object = match this.as_object() {
-        Some(object) => object.clone(),
-        None => {
-            let proto = interp
-                .realm
-                .array_buffer_proto
-                .clone()
-                .unwrap_or_else(|| interp.realm.object_proto.clone());
-            interp.new_object(Some(proto))
-        }
-    };
+    let default_proto = interp
+        .realm
+        .array_buffer_proto
+        .clone()
+        .unwrap_or_else(|| interp.realm.object_proto.clone());
+    let object = interp.new_ctor_instance(default_proto)?;
     object.set_array_buffer(storage);
     Ok(Value::Object(object))
 }
@@ -604,14 +604,9 @@ fn clamp_index(value: f64, length: i64, default: i64) -> i64 {
 /// `Value::to_number` answers `NaN` for both so that it stays total; that made
 /// `copyWithin(0, Symbol())` a silent no-op instead of the `TypeError` the spec requires.
 fn to_integer_or_infinity(interp: &mut Interp<'_>, value: &Value) -> JsResult<f64> {
-    match value {
-        Value::Symbol(_) => Err(interp.type_error("cannot convert a Symbol to a number")),
-        Value::BigInt(_) => Err(interp.type_error("cannot convert a BigInt to a number")),
-        other => {
-            let number = interp.to_js_number(other)?;
-            Ok(if number.is_nan() { 0.0 } else { number.trunc() })
-        }
-    }
+    // `to_js_number` already refuses a Symbol and a BigInt, boxed ones included.
+    let number = interp.to_js_number(value)?;
+    Ok(if number.is_nan() { 0.0 } else { number.trunc() })
 }
 
 /// `ToIndex(value)`: `ToIntegerOrInfinity` and then a range check.
@@ -620,50 +615,45 @@ fn to_integer_or_infinity(interp: &mut Interp<'_>, value: &Value) -> JsResult<f6
 /// a `RangeError`; only a negative or infinite result is refused. `ToNumber` on a BigInt is
 /// a `TypeError`, which is why the conversion goes through the interpreter.
 fn to_index(interp: &mut Interp<'_>, value: &Value, what: &str) -> JsResult<usize> {
-    let number = interp.to_js_number(value)?;
-    if number.is_nan() {
-        return Ok(0);
-    }
-    let truncated = number.trunc();
+    // Through `ToIntegerOrInfinity`, so a Symbol or BigInt is a `TypeError` rather than the
+    // `NaN` that `Value::to_number` answers to stay total.
+    let number = to_integer_or_infinity(interp, value)?;
     // `2^53 - 1` is the largest index the spec allows.
-    if truncated < 0.0 || truncated > 9_007_199_254_740_991.0 {
+    if number < 0.0 || number > 9_007_199_254_740_991.0 {
         return Err(interp.range_error(format!("invalid {what}")));
     }
-    Ok(truncated as usize)
+    Ok(number as usize)
 }
 
-/// The element type this call belongs to, read off the receiver's prototype.
-///
-/// Not off the callee: a native call does not push a frame, so `current_callee` reports
-/// whatever the *enclosing* bytecode frame was called with. The prototype is reliable —
-/// `new` builds the object from `callee.prototype` — and it is what decides the type anyway.
-fn element_of_receiver(interp: &Interp<'_>, this: &Value) -> Option<ElementType> {
-    let object = this.as_object()?;
-    let mut proto = object.proto();
-    // Walk the chain so a subclass of a typed array still finds the type.
-    while let Some(current) = proto {
-        if let Some(raw) = current
-            .own_property("_element")
-            .and_then(|property| property.value)
-        {
-            let raw = raw.to_number() as i32;
-            return ELEMENT_TYPES
-                .into_iter()
-                .map(|(element, _)| element)
-                .find(|element| *element as i32 == raw);
-        }
-        proto = current.proto();
-    }
+/// The element type a typed-array *constructor* stands for, read off its `_element`.
+fn element_of_constructor(interp: &Interp<'_>, callee: &Gc<JsObject>) -> Option<ElementType> {
+    let raw = callee
+        .own_property("_element")
+        .and_then(|property| property.value)?;
+    let raw = raw.to_number() as i32;
+    let found = ELEMENT_TYPES
+        .into_iter()
+        .map(|(element, _)| element)
+        .find(|element| *element as i32 == raw);
     let _ = interp;
-    None
+    found
 }
 
 /// `new Uint8Array(...)`: from a length, from a buffer, or from an array-like.
 fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     // A typed-array constructor cannot be called as a function: there is no receiver to
     // take an element type from, and the spec makes that a `TypeError`.
-    let element = element_of_receiver(interp, &this)
+    // The element type comes from the *callee*, not from a receiver: a native constructor is
+    // handed `this = undefined` and builds its own instance once its arguments are valid.
+    let _ = &this;
+    let callee = interp
+        .current_native()
         .ok_or_else(|| interp.type_error("constructor requires 'new'"))?;
+    let element = element_of_constructor(interp, &callee)
+        .ok_or_else(|| interp.type_error("constructor requires 'new'"))?;
+    if !interp.is_constructing() {
+        return Err(interp.type_error("constructor requires 'new'"));
+    }
     let first = arg(args, 0);
     let (buffer, offset, length) = match &first {
         // `new X(buffer, byteOffset, length)`: a window onto existing bytes.
@@ -749,17 +739,14 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
             (buffer, 0, count)
         }
     };
-    let object = match this.as_object() {
-        Some(object) => object.clone(),
-        None => {
-            let proto = interp
-                .realm
-                .typed_array_proto
-                .clone()
-                .unwrap_or_else(|| interp.realm.object_proto.clone());
-            interp.new_object(Some(proto))
-        }
-    };
+    let default_proto = interp
+        .realm
+        .typed_array_protos
+        .get(element as usize)
+        .cloned()
+        .or_else(|| interp.realm.typed_array_proto.clone())
+        .unwrap_or_else(|| interp.realm.object_proto.clone());
+    let object = interp.new_ctor_instance(default_proto)?;
     object.set_typed_array(buffer, element, offset, length);
     Ok(Value::Object(object))
 }
@@ -1832,4 +1819,285 @@ fn tag_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Val
         Some(name) => interp.string(name),
         None => Value::Undefined,
     })
+}
+
+// ---------------------------------------------------------------------------
+// DataView
+// ---------------------------------------------------------------------------
+
+/// One `get`/`set` pair per width. `NativeFn` is a bare function pointer, so the width has
+/// to be baked into the function rather than captured: the macro below writes one pair of
+/// thin wrappers per row.
+macro_rules! data_view_accessors {
+    ($($get:ident, $set:ident => $element:expr, $width:literal);* $(;)?) => {
+        $(
+            fn $get(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+                data_view_get(interp, &this, args, $element)
+            }
+            fn $set(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+                data_view_set(interp, &this, args, $element)
+            }
+        )*
+
+        /// Every accessor, as `(name, length, body)`.
+        const DATA_VIEW_METHODS: &[(&str, u32, crate::object::NativeFn)] = &[
+            $(
+                (concat!("get", $width), 1, $get as crate::object::NativeFn),
+                (concat!("set", $width), 2, $set as crate::object::NativeFn),
+            )*
+        ];
+    };
+}
+
+data_view_accessors! {
+    get_int8, set_int8 => ElementType::Int8, "Int8";
+    get_uint8, set_uint8 => ElementType::Uint8, "Uint8";
+    get_int16, set_int16 => ElementType::Int16, "Int16";
+    get_uint16, set_uint16 => ElementType::Uint16, "Uint16";
+    get_int32, set_int32 => ElementType::Int32, "Int32";
+    get_uint32, set_uint32 => ElementType::Uint32, "Uint32";
+    get_float16, set_float16 => ElementType::Float16, "Float16";
+    get_float32, set_float32 => ElementType::Float32, "Float32";
+    get_float64, set_float64 => ElementType::Float64, "Float64";
+    get_bigint64, set_bigint64 => ElementType::BigInt64, "BigInt64";
+    get_biguint64, set_biguint64 => ElementType::BigUint64, "BigUint64";
+}
+
+/// Install `DataView` and its prototype.
+pub fn install_data_view(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
+    let proto = interp.new_object(Some(object_proto.clone()));
+    let constructor = interp.new_native_ctor("DataView", 1, data_view_constructor);
+    constructor.define(
+        "prototype",
+        Property::prototype_of(Value::Object(proto.clone()), false),
+    );
+    proto.define(
+        "constructor",
+        Property {
+            value: Some(Value::Object(constructor.clone())),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
+    for (name, getter) in [
+        ("buffer", data_view_buffer as crate::object::NativeFn),
+        ("byteOffset", data_view_byte_offset),
+        ("byteLength", data_view_byte_length),
+    ] {
+        let function = interp.new_native(format!("get {name}"), 0, getter);
+        proto.define(
+            name,
+            Property {
+                getter: Some(Value::Object(function)),
+                enumerable: false,
+                configurable: true,
+                ..Property::default()
+            },
+        );
+    }
+    for (name, length, body) in DATA_VIEW_METHODS {
+        define_method(&proto, name, *length, *body, interp);
+    }
+    interp.realm.data_view_proto = Some(proto.clone());
+    let global = interp.realm.global.clone();
+    global.define(
+        "DataView",
+        Property::with_attributes(Value::Object(constructor), true, false),
+    );
+    install_tag(&proto, "DataView", interp);
+}
+
+/// The receiver as `(buffer, offset, length)`, refusing anything that is not a live view.
+///
+/// A detached buffer is a `TypeError` from every accessor and every property read, which is
+/// what `MakeDataViewWithBufferWitnessRecord`'s `IsDetachedBuffer` check amounts to.
+fn data_view_parts(
+    interp: &mut Interp<'_>,
+    this: &Value,
+) -> JsResult<(Gc<JsObject>, usize, usize)> {
+    let Some(object) = this.as_object() else {
+        return Err(interp.type_error("not a DataView"));
+    };
+    let Some(parts) = object.data_view_parts() else {
+        return Err(interp.type_error("not a DataView"));
+    };
+    Ok(parts)
+}
+
+/// Whether this view's buffer has been detached.
+fn data_view_is_detached(object: &Gc<JsObject>) -> bool {
+    object
+        .data_view_parts()
+        .and_then(|(buffer, _, _)| buffer.array_buffer_storage())
+        .is_some_and(|storage| storage.borrow().detached)
+}
+
+fn data_view_buffer(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let (buffer, _, _) = data_view_parts(interp, &this)?;
+    Ok(Value::Object(buffer))
+}
+
+fn data_view_byte_offset(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let (_, offset, _) = data_view_parts(interp, &this)?;
+    // A detached view is zero-length, so its offset is 0 as well.
+    let detached = this.as_object().is_some_and(data_view_is_detached);
+    Ok(Value::Int(if detached { 0 } else { offset as i32 }))
+}
+
+fn data_view_byte_length(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let (_, _, length) = data_view_parts(interp, &this)?;
+    // A detached buffer has no bytes left, so the view reports 0 rather than throwing.
+    let detached = this.as_object().is_some_and(data_view_is_detached);
+    Ok(Value::Int(if detached { 0 } else { length as i32 }))
+}
+
+/// `dv.getInt32(byteOffset, littleEndian)` and siblings.
+fn data_view_get(
+    interp: &mut Interp<'_>,
+    this: &Value,
+    args: &[Value],
+    element: ElementType,
+) -> JsResult<Value> {
+    let (buffer, offset, length) = data_view_parts(interp, this)?;
+    // `ToIndex(byteOffset)` runs before the detached check, so a `valueOf` that detaches
+    // still runs and an `Infinity` offset is a `RangeError` either way.
+    // `GetViewByteLength` then bounds the access.
+    let byte_offset = to_index(interp, &arg(args, 0), "byte offset")?;
+    if data_view_is_detached(
+        this.as_object()
+            .ok_or_else(|| interp.type_error("not a DataView"))?,
+    ) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    let size = element.size();
+    if byte_offset + size > length {
+        return Err(interp.range_error("byte offset is out of range"));
+    }
+    let little_endian = arg(args, 1).to_boolean();
+    let storage = buffer
+        .array_buffer_storage()
+        .ok_or_else(|| interp.type_error("not a DataView"))?;
+    let storage = storage.borrow();
+    let start = offset + byte_offset;
+    // A `DataView` defaults to *big*-endian while the element types read little-endian, so
+    // the bytes are reversed into a scratch buffer first. One-byte widths are unaffected.
+    let mut scratch = [0u8; 8];
+    let raw = &storage.bytes[start..start + size];
+    if little_endian {
+        scratch[..size].copy_from_slice(raw);
+    } else {
+        for (slot, byte) in scratch[..size].iter_mut().zip(raw.iter().rev()) {
+            *slot = *byte;
+        }
+    }
+    Ok(element.read(buffer.heap(), &scratch, 0))
+}
+
+/// `dv.setInt32(byteOffset, value, littleEndian)` and siblings.
+fn data_view_set(
+    interp: &mut Interp<'_>,
+    this: &Value,
+    args: &[Value],
+    element: ElementType,
+) -> JsResult<Value> {
+    let (buffer, offset, length) = data_view_parts(interp, this)?;
+    // Same order as `data_view_get`: `ToIndex` first, then the detached check.
+    let byte_offset = to_index(interp, &arg(args, 0), "byte offset")?;
+    if data_view_is_detached(
+        this.as_object()
+            .ok_or_else(|| interp.type_error("not a DataView"))?,
+    ) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    let size = element.size();
+    if byte_offset + size > length {
+        return Err(interp.range_error("byte offset is out of range"));
+    }
+    let little_endian = arg(args, 2).to_boolean();
+    // Little-endian first, into scratch, so the conversion (wrap, clamp, or BigInt modulo)
+    // runs before any byte is reversed.
+    let mut scratch = [0u8; 8];
+    element
+        .write(&mut scratch, 0, arg(args, 1))
+        .map_err(|reason| interp.type_error(reason))?;
+    let storage = buffer
+        .array_buffer_storage()
+        .ok_or_else(|| interp.type_error("not a DataView"))?;
+    let mut storage = storage.borrow_mut();
+    let start = offset + byte_offset;
+    let target = &mut storage.bytes[start..start + size];
+    if little_endian {
+        target.copy_from_slice(&scratch[..size]);
+    } else {
+        for (slot, byte) in target.iter_mut().zip(scratch[..size].iter().rev()) {
+            *slot = *byte;
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// `new DataView(buffer, byteOffset, byteLength)`.
+///
+/// The step order is observable and follows 25.3.2.1 exactly: `ToIndex(byteOffset)` runs
+/// *before* the detached-buffer check, so a `valueOf` that detaches is still called, and the
+/// detached check is repeated after the prototype lookup because
+/// `OrdinaryCreateFromConstructor` can run a getter that detaches.
+fn data_view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    // Called as a function rather than with `new`: there is no instance to build.
+    let _ = &this;
+    if !interp.is_constructing() {
+        return Err(interp.type_error("Constructor DataView requires 'new'"));
+    }
+    let Some(buffer) = arg(args, 0).as_object().cloned() else {
+        return Err(interp.type_error("first argument to DataView must be an ArrayBuffer"));
+    };
+    if buffer.array_buffer_storage().is_none() {
+        return Err(interp.type_error("first argument to DataView must be an ArrayBuffer"));
+    }
+    // Step 5 before step 6.
+    let offset = to_index(interp, &arg(args, 1), "byte offset")?;
+    let detached = |buffer: &Gc<JsObject>| {
+        buffer
+            .array_buffer_storage()
+            .is_some_and(|storage| storage.borrow().detached)
+    };
+    if detached(&buffer) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    let total = buffer
+        .array_buffer_storage()
+        .map(|storage| storage.borrow().bytes.len())
+        .unwrap_or(0);
+    if offset > total {
+        return Err(interp.range_error("byte offset is out of range"));
+    }
+    let length = match args.get(2) {
+        // An absent or explicit `undefined` length means "the rest of the buffer".
+        None | Some(Value::Undefined) => total - offset,
+        Some(_) => {
+            let requested = to_index(interp, &arg(args, 2), "byte length")?;
+            if requested > total - offset {
+                return Err(interp.range_error("byte length is out of range"));
+            }
+            requested
+        }
+    };
+    // The prototype lookup already happened — the engine builds `this` from
+    // `new.target.prototype` — but a getter there may have detached the buffer, so the
+    // check is repeated.
+    if detached(&buffer) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    // `OrdinaryCreateFromConstructor` last, so a throwing `new.target.prototype` getter is
+    // never reached for arguments that are already refused.
+    let proto = interp
+        .realm
+        .data_view_proto
+        .clone()
+        .unwrap_or_else(|| interp.realm.object_proto.clone());
+    let instance = interp.new_ctor_instance(proto)?;
+    instance.set_data_view(buffer, offset, length);
+    Ok(Value::Object(instance))
 }

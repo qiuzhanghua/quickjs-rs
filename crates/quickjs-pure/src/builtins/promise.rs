@@ -303,7 +303,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         Property::with_attributes(tag, false, false),
     );
 
-    let constructor = interp.new_native("Promise", 1, constructor);
+    let constructor = interp.new_native_ctor("Promise", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),

@@ -127,7 +127,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
                     "Map"
                 }
             }
-            ObjectKind::TypedArray { .. } => "Object",
+            ObjectKind::TypedArray { .. } | ObjectKind::DataView { .. } => "Object",
             ObjectKind::Ordinary => "Object",
             ObjectKind::Promise(_) => "Promise",
             // A proxy reports the tag of what it stands in for, which is what makes

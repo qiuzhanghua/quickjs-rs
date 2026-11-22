@@ -86,7 +86,50 @@ impl JsObject {
         }
     }
 
-    /// Make this object a typed-array view.
+    /// Whether this callable is a native function rather than compiled JavaScript.
+    ///
+    /// `construct` uses it to decide who builds the instance: a native constructor creates
+    /// its own, after validating its arguments.
+    pub fn is_native_function(&self) -> bool {
+        matches!(
+            &self.data.borrow().kind,
+            ObjectKind::Function(Callable::Native { .. })
+        )
+    }
+
+    /// Whether this native constructor builds its own instance, so `new` must not pass one.
+    pub fn native_creates_own_instance(&self) -> bool {
+        matches!(
+            &self.data.borrow().kind,
+            ObjectKind::Function(Callable::Native {
+                own_instance: true,
+                ..
+            })
+        )
+    }
+
+    /// Make this object a `DataView` over `buffer`.
+    pub fn set_data_view(&self, buffer: Gc<JsObject>, offset: usize, length: usize) {
+        self.data.borrow_mut().kind = ObjectKind::DataView {
+            buffer,
+            offset,
+            length,
+        };
+    }
+
+    /// The `(buffer, offset, length)` of a `DataView`, or `None` when this is not one.
+    pub fn data_view_parts(&self) -> Option<(Gc<JsObject>, usize, usize)> {
+        match &self.data.borrow().kind {
+            ObjectKind::DataView {
+                buffer,
+                offset,
+                length,
+            } => Some((buffer.clone(), *offset, *length)),
+            _ => None,
+        }
+    }
+
+    /// Make this object a typed-array view of `length` elements.
     pub fn set_typed_array(
         &self,
         buffer: Gc<JsObject>,
@@ -325,6 +368,14 @@ pub enum Callable {
     Native {
         /// The implementation.
         func: NativeFn,
+        /// Whether this constructor builds its own instance instead of being handed one.
+        ///
+        /// The spec has a constructor validate its arguments *before*
+        /// `OrdinaryCreateFromConstructor` reads `new.target.prototype`, and only the ones
+        /// with real validation need to: `new Promise(nonCallable)` and `new DataView(…)`
+        /// must refuse the argument before a throwing `prototype` getter can run. The rest
+        /// keep the simpler shape where `new` has already made the object.
+        own_instance: bool,
     },
     /// The `revoke` function `Proxy.revocable` hands back.
     ///
@@ -704,6 +755,20 @@ pub enum ObjectKind {
         /// Whether this is a `Set` rather than a `Map`.
         is_set: bool,
     },
+    /// A `DataView`: a byte-oriented window onto an `ArrayBuffer`.
+    ///
+    /// Separate from `TypedArray` because the two index differently: a typed array has an
+    /// element type and counts *elements*, while a `DataView` is untyped and every accessor
+    /// names its own width and byte offset. Sharing one variant would mean carrying an
+    /// element type that is always "bytes" and a length that means something else.
+    DataView {
+        /// The buffer whose bytes this view reads.
+        buffer: Gc<JsObject>,
+        /// Byte offset of the view's first byte.
+        offset: usize,
+        /// How many bytes the view exposes.
+        length: usize,
+    },
     /// A typed-array view: a window onto an `ArrayBuffer`.
     TypedArray {
         /// The buffer whose bytes this view reads.
@@ -860,7 +925,9 @@ impl Trace for ObjectKind {
             // A buffer's bytes are plain bytes and hold no GC values; a view keeps its
             // buffer alive through the `Gc` it carries.
             ObjectKind::ArrayBuffer(_) => {}
-            ObjectKind::TypedArray { buffer, .. } => tracer.visit(buffer),
+            ObjectKind::TypedArray { buffer, .. } | ObjectKind::DataView { buffer, .. } => {
+                tracer.visit(buffer)
+            }
             ObjectKind::Collection { entries, .. } => {
                 for (key, value) in entries {
                     key.trace(tracer);
