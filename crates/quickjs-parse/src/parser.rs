@@ -843,6 +843,39 @@ impl<'a> Parser<'a> {
             self.semicolon()?;
             return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
         }
+        // `await using x = …` is one declaration; `await` is only a keyword here when the
+        // enclosing code may await at all, which is the same rule `await` expressions use.
+        if self.at_ident("await")
+            && (self.ctx.in_async || self.module)
+            && self.await_using_follows()?
+        {
+            let start = self.current.span.start;
+            if self.top_level && !self.module {
+                return Err(self.error_at(
+                    "using declaration is not allowed at the top level of a script",
+                    self.span_from(start),
+                ));
+            }
+            self.bump()?; // await
+            let decl = self.parse_var_decl_with_keyword(VarDeclKind::AwaitUsing, "using")?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
+        }
+        if self.at_ident("using") && self.using_starts_declaration()? {
+            let start = self.current.span.start;
+            // A script's top level has no block to end, so there would be nowhere to
+            // dispose. The reference rejects it for the same reason; a module, whose
+            // top level *is* a scope, does not.
+            if self.top_level && !self.module {
+                return Err(self.error_at(
+                    "using declaration is not allowed at the top level of a script",
+                    self.span_from(start),
+                ));
+            }
+            let decl = self.parse_var_decl(VarDeclKind::Using, false, true)?;
+            self.semicolon()?;
+            return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
+        }
         if self.module && self.at_keyword(Keyword::Import) {
             let peek = self.peek()?;
             // `import(` and `import.meta` are expressions, not declarations.
@@ -867,6 +900,77 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_)
                 | TokenKind::Punct(Punct::LBracket)
                 | TokenKind::Punct(Punct::LBrace)
+        ))
+    }
+
+    /// The token after a `using` declaration head's binding name, if a head starts here.
+    ///
+    /// `skip` is how many words come before `using` — `1` for `await using`. Returns `None`
+    /// when the shape is not a declaration head at all: the binding must be a plain
+    /// identifier with no line terminator before it.
+    fn using_head_tail(&self, skip: usize) -> Result<Option<Token>> {
+        let mut lexer = self.lexer.clone();
+        // The lexer is already positioned after the current token, so the first
+        // `next_token` yields the token that follows it. `using` itself is `skip` words in,
+        // and the binding is the token after it.
+        let mut binding = None;
+        for _ in 0..=skip {
+            binding = Some(lexer.next_token()?);
+        }
+        let Some(binding) = binding else {
+            return Ok(None);
+        };
+        if binding.newline_before || !matches!(binding.kind, TokenKind::Ident(_)) {
+            return Ok(None);
+        }
+        Ok(Some(lexer.next_token()?))
+    }
+
+    /// Whether `await using` starts a declaration here.
+    ///
+    /// `await` is followed by `using`, which is in turn followed by a binding name and `=`.
+    /// Anything else — `await using(x)` where `using` is a function — is an `await`
+    /// expression over an ordinary call.
+    fn await_using_follows(&self) -> Result<bool> {
+        Ok(matches!(
+            self.using_head_tail(1)?.map(|token| token.kind),
+            Some(TokenKind::Punct(Punct::Eq))
+        ))
+    }
+
+    /// Whether the `using` at the current token begins a declaration.
+    ///
+    /// `using` is a contextual keyword, not a reserved word: `using = 1`, `using(x)` and
+    /// `using.f` are all ordinary expressions over a variable named `using`. The spec's
+    /// rule is `using [no LineTerminator] BindingIdentifier =`, so the binding name has to
+    /// be followed by `=`.
+    ///
+    /// Patterns are excluded on purpose: `using {a} = …` is not a using declaration, and
+    /// the grammar forbids it, so it stays an expression statement that fails to parse as
+    /// one.
+    fn using_starts_declaration(&self) -> Result<bool> {
+        Ok(matches!(
+            self.using_head_tail(0)?.map(|token| token.kind),
+            Some(TokenKind::Punct(Punct::Eq))
+        ))
+    }
+
+    /// Whether `using x of …` starts a `for` head here.
+    ///
+    /// The head has no initialiser, so the token after the binding is `of` (or `in`, which
+    /// the caller then rejects: a `using` may only iterate a `for`-`of`).
+    fn using_starts_for_head(&self) -> Result<bool> {
+        Ok(matches!(
+            self.using_head_tail(0)?.map(|token| token.kind),
+            Some(TokenKind::Ident(name)) if name == "of" || name == "in"
+        ))
+    }
+
+    /// Whether `await using x of …` starts a `for` head here.
+    fn await_using_starts_for_head(&self) -> Result<bool> {
+        Ok(matches!(
+            self.using_head_tail(1)?.map(|token| token.kind),
+            Some(TokenKind::Ident(name)) if name == "of" || name == "in"
         ))
     }
 
@@ -1090,6 +1194,14 @@ impl<'a> Parser<'a> {
             Some(VarDeclKind::Const)
         } else if self.at_ident("let") && self.let_starts_declaration()? {
             Some(VarDeclKind::Let)
+        } else if self.at_ident("using") && self.using_starts_for_head()? {
+            Some(VarDeclKind::Using)
+        } else if self.at_ident("await")
+            && (self.ctx.in_async || self.module)
+            && self.await_using_starts_for_head()?
+        {
+            self.bump()?; // await, leaving `using` as the keyword
+            Some(VarDeclKind::AwaitUsing)
         } else {
             None
         };
@@ -1496,11 +1608,42 @@ impl<'a> Parser<'a> {
         require_init: bool,
     ) -> Result<VarDecl> {
         let start = self.current.span.start;
-        self.bump()?; // var / let / const
+        self.bump()?; // var / let / const / using
+        self.parse_var_declarators(kind, in_for_head, require_init, start)
+    }
+
+    /// A declaration whose leading keyword has already been consumed by the caller.
+    ///
+    /// `await using x = …` is written with two words, so the `await` is read first and only
+    /// the `using` is left here.
+    fn parse_var_decl_with_keyword(&mut self, kind: VarDeclKind, keyword: &str) -> Result<VarDecl> {
+        let start = self.current.span.start;
+        if !self.at_ident(keyword) {
+            return Err(self.error(format!("expected '{keyword}'")));
+        }
+        self.bump()?;
+        self.parse_var_declarators(kind, false, true, start)
+    }
+
+    fn parse_var_declarators(
+        &mut self,
+        kind: VarDeclKind,
+        in_for_head: bool,
+        require_init: bool,
+        start: Position,
+    ) -> Result<VarDecl> {
         let mut declarators = Vec::new();
         loop {
             let declarator_start = self.current.span.start;
             let target = self.parse_binding_target()?;
+            // `using` disposes a value, so it binds a name and nothing else: a pattern has
+            // no single resource to dispose.
+            if kind.is_using() && !matches!(target.unparen_kind(), PatternKind::Ident(_)) {
+                return Err(self.error_at(
+                    "binding patterns are not allowed in using declarations",
+                    target.span,
+                ));
+            }
             let init = if self.eat_punct(Punct::Eq)? {
                 // `for (var x = a in b;;)` must not parse `a in b` as the
                 // initialiser: the head uses AssignmentExpression[~In].
@@ -1511,6 +1654,9 @@ impl<'a> Parser<'a> {
             if init.is_none() && require_init {
                 if kind == VarDeclKind::Const {
                     return Err(self.error("missing initializer in const declaration"));
+                }
+                if kind.is_using() {
+                    return Err(self.error("missing initializer in using declaration"));
                 }
                 if !matches!(target.unparen_kind(), PatternKind::Ident(_)) && !in_for_head {
                     return Err(self.error_at(

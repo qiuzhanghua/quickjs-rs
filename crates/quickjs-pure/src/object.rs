@@ -361,6 +361,8 @@ pub enum ObjectKind {
     Function(Callable),
     /// A regular expression: the compiled pattern, plus `lastIndex` as a property.
     RegExp(crate::builtins::regexp::RegExpData),
+    /// A `DisposableStack` or `AsyncDisposableStack`: the resources it holds.
+    DisposableStack(crate::builtins::disposable::StackState),
     /// A generator object: a detached frame plus how far it got.
     ///
     /// The frame lives here rather than in the interpreter because a suspended generator
@@ -376,6 +378,7 @@ impl Trace for ObjectKind {
             // Nothing in a compiled pattern is a GC value: it holds characters and
             // integers only.
             ObjectKind::RegExp(_) => {}
+            ObjectKind::DisposableStack(state) => state.trace(tracer),
             ObjectKind::Ordinary => {}
             ObjectKind::Array { elements } => {
                 for element in elements {
@@ -624,6 +627,19 @@ impl JsObject {
             ObjectKind::RegExp(data) => Some(data.clone()),
             _ => None,
         }
+    }
+
+    /// The held resources, when this object is a `DisposableStack`.
+    pub fn disposable_stack(&self) -> Option<crate::builtins::disposable::StackState> {
+        match &self.data.borrow().kind {
+            ObjectKind::DisposableStack(state) => Some(state.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make this object a `DisposableStack` holding `state`.
+    pub fn set_disposable_stack(&self, state: crate::builtins::disposable::StackState) {
+        self.data.borrow_mut().kind = ObjectKind::DisposableStack(state);
     }
 
     /// Make this object a `RegExp` carrying `data`.

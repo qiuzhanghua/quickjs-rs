@@ -1734,3 +1734,217 @@ fn regexp_flags_change_meaning() {
     );
     assert_eq!(throws("new RegExp('(')"), "SyntaxError: expecting ')'");
 }
+
+#[test]
+fn using_disposes_in_reverse_order() {
+    // The resources go out in reverse, and the body's own work happens first.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             function f() {\n\
+                 using a = { [Symbol.dispose]() { log.push('a') } };\n\
+                 using b = { [Symbol.dispose]() { log.push('b') } };\n\
+                 log.push('body');\n\
+             }\n\
+             f(); print(log.join())"
+        ),
+        "body,b,a\n"
+    );
+    // A `return` still disposes, because the region is a cleanup on every exit.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             function f() { using a = { [Symbol.dispose]() { log.push('a') } }; return 7 }\n\
+             print(f(), log.join())"
+        ),
+        "7 a\n"
+    );
+    // So does a `break` out of a loop inside the block.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             function f() {\n\
+                 using a = { [Symbol.dispose]() { log.push('a') } };\n\
+                 for (;;) { log.push('loop'); break }\n\
+                 log.push('after');\n\
+             }\n\
+             f(); print(log.join())"
+        ),
+        "loop,after,a\n"
+    );
+    // `null` and `undefined` are legal and dispose to nothing.
+    assert_eq!(
+        eval(
+            "function f() { using a = null; using b = undefined; return 1 }\n\
+             print(f())"
+        ),
+        "1\n"
+    );
+}
+
+#[test]
+fn using_validates_at_the_declaration() {
+    // A value that is not an object, or has no `Symbol.dispose`, fails before the body runs.
+    assert_eq!(
+        eval(
+            "var ran = false;\n\
+             try { (function () { using x = {}; ran = true })() } catch (e) {}\n\
+             print(ran)"
+        ),
+        "false\n"
+    );
+    assert_eq!(
+        eval(
+            "var name;\n\
+             try { (function () { using x = 42 })() } catch (e) { name = e.constructor.name }\n\
+             print(name)"
+        ),
+        "TypeError\n"
+    );
+    // A non-callable disposer is a `TypeError` too.
+    assert_eq!(
+        throws("(function () { using x = { [Symbol.dispose]: 1 } })()"),
+        "TypeError: dispose method is not a function"
+    );
+    // The method is snapshotted once, at the declaration: replacing it afterwards does not
+    // change what runs.
+    assert_eq!(
+        eval(
+            "var reads = 0, disposed = 0, target = {};\n\
+             Object.defineProperty(target, Symbol.dispose, {\n\
+                 get() { reads++; return function () { disposed++ } }\n\
+             });\n\
+             (function () { using x = target })();\n\
+             print(reads, disposed)"
+        ),
+        "1 1\n"
+    );
+}
+
+#[test]
+fn failed_disposals_chain_into_suppressed_errors() {
+    // Each failure is wrapped around the one before it, newest outermost:
+    // LIFO disposes c, then b, then a, so `a` ends up on the outside.
+    assert_eq!(
+        eval(
+            "var caught;\n\
+             try {\n\
+                 (function () {\n\
+                     using a = { [Symbol.dispose]() { throw new Error('a') } };\n\
+                     using b = { [Symbol.dispose]() { throw new Error('b') } };\n\
+                     using c = { [Symbol.dispose]() { throw new Error('c') } };\n\
+                 })();\n\
+             } catch (e) { caught = e }\n\
+             print(caught instanceof SuppressedError, caught.error.message,\n\
+                   caught.suppressed.error.message,\n\
+                   caught.suppressed.suppressed.message)"
+        ),
+        "true a b c\n"
+    );
+    // A body that throws still disposes, and the disposal failure wins over the body's.
+    assert_eq!(
+        eval(
+            "var caught;\n\
+             try {\n\
+                 (function () {\n\
+                     using a = { [Symbol.dispose]() { throw new Error('dispose') } };\n\
+                     throw new Error('body');\n\
+                 })();\n\
+             } catch (e) { caught = e }\n\
+             print(caught instanceof SuppressedError, caught.error.message,\n\
+                   caught.suppressed.message)"
+        ),
+        "true dispose body\n"
+    );
+    // Rewriting `SuppressedError.prototype.constructor` must not hijack the engine's own
+    // wrapping: the aggregate is built from the prototype, not by calling the constructor.
+    assert_eq!(
+        eval(
+            "var saved = SuppressedError.prototype.constructor, hijacked = false;\n\
+             SuppressedError.prototype.constructor = function () { hijacked = true };\n\
+             try {\n\
+                 (function () {\n\
+                     using a = { [Symbol.dispose]() { throw new Error('a') } };\n\
+                     using b = { [Symbol.dispose]() { throw new Error('b') } };\n\
+                 })();\n\
+             } catch (e) {}\n\
+             SuppressedError.prototype.constructor = saved;\n\
+             print(hijacked)"
+        ),
+        "false\n"
+    );
+}
+
+#[test]
+fn for_of_using_disposes_each_iteration() {
+    // The element is validated per iteration, so a bad one fails on its own turn.
+    assert_eq!(
+        eval(
+            "var iters = 0, name;\n\
+             try {\n\
+                 (function () {\n\
+                     for (using x of [{ [Symbol.dispose]() {} }, 42]) { iters++ }\n\
+                 })();\n\
+             } catch (e) { name = e.constructor.name }\n\
+             print(iters, name)"
+        ),
+        "1 TypeError\n"
+    );
+    // …and a good run disposes after each iteration body, not at the end of the loop.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             (function () {\n\
+                 for (using x of [\n\
+                     { tag: 'a', [Symbol.dispose]() { log.push(this.tag) } },\n\
+                     { tag: 'b', [Symbol.dispose]() { log.push(this.tag) } },\n\
+                 ]) { log.push('iter') }\n\
+             })();\n\
+             print(log.join())"
+        ),
+        "iter,a,iter,b\n"
+    );
+}
+
+#[test]
+fn disposable_stack_moves_through_the_intrinsic_prototype() {
+    assert_eq!(
+        eval(
+            "var saved = DisposableStack, disposed = 0;\n\
+             var ds = new saved();\n\
+             ds.use({ [Symbol.dispose]() { disposed++ } });\n\
+             DisposableStack = class Other {};\n\
+             var moved = ds.move();\n\
+             var same = Object.getPrototypeOf(moved) === saved.prototype;\n\
+             moved.dispose();\n\
+             DisposableStack = saved;\n\
+             print(same, disposed, moved.disposed)"
+        ),
+        "true 1 true\n"
+    );
+    // `defer` takes a plain callback, `adopt` gives a resource a disposer.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             var stack = new DisposableStack();\n\
+             stack.defer(function () { log.push('deferred') });\n\
+             stack.adopt({ n: 3 }, function (value) { log.push('adopted' + value.n) });\n\
+             stack.dispose();\n\
+             print(log.join())"
+        ),
+        "adopted3,deferred\n"
+    );
+    // A stack can itself be a `using` resource.
+    assert_eq!(
+        eval(
+            "var log = [];\n\
+             (function () {\n\
+                 using stack = new DisposableStack();\n\
+                 stack.use({ [Symbol.dispose]() { log.push('inner') } });\n\
+                 log.push('body');\n\
+             })();\n\
+             print(log.join())"
+        ),
+        "body,inner\n"
+    );
+}

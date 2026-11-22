@@ -125,6 +125,16 @@ pub struct Realm {
     pub regexp_proto: Option<Gc<JsObject>>,
     /// The `RegExp` constructor.
     pub regexp_ctor: Option<Gc<JsObject>>,
+    /// `SuppressedError.prototype`, which `using` builds its aggregates from.
+    ///
+    /// The prototype rather than the constructor on purpose: a script that replaces
+    /// `SuppressedError.prototype.constructor` must not be able to divert the engine's own
+    /// error wrapping, which the `using` test suite checks explicitly.
+    pub suppressed_error_proto: Option<Gc<JsObject>>,
+    /// The `DisposableStack` prototype, for `move`'s intrinsic construction.
+    pub disposable_stack_proto: Option<Gc<JsObject>>,
+    /// The `AsyncDisposableStack` prototype.
+    pub async_disposable_stack_proto: Option<Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
     ///
     /// Held as plain `Value`s rather than looked up on `Symbol` each time: the runtime
@@ -324,6 +334,10 @@ pub enum WellKnown {
     Unscopables,
     /// `Symbol.asyncIterator`.
     AsyncIterator,
+    /// `Symbol.dispose` — the well-known name of a disposable resource's disposer.
+    Disposable,
+    /// `Symbol.asyncDispose` — the awaited form.
+    AsyncDisposable,
 }
 
 impl WellKnown {
@@ -343,6 +357,8 @@ impl WellKnown {
             WellKnown::Species => 10,
             WellKnown::Unscopables => 11,
             WellKnown::AsyncIterator => 12,
+            WellKnown::Disposable => 13,
+            WellKnown::AsyncDisposable => 14,
         }
     }
 }
@@ -477,6 +493,9 @@ impl<'a> Interp<'a> {
                 symbol_registry: BTreeMap::new(),
                 regexp_proto: None,
                 regexp_ctor: None,
+                suppressed_error_proto: None,
+                disposable_stack_proto: None,
+                async_disposable_stack_proto: None,
                 well_known_symbols: WellKnownSymbols::default(),
             },
             frames: Vec::new(),
@@ -2255,6 +2274,105 @@ impl<'a> Interp<'a> {
             .find_map(|frame| frame.callee.as_object().and_then(|f| f.home_object()))
     }
 
+    /// The dispose method a `using` declaration should snapshot, or an error.
+    ///
+    /// `await`-using prefers `Symbol.asyncDispose` and falls back to `Symbol.dispose`, which
+    /// is what makes a resource that only knows the synchronous protocol usable in both
+    /// forms.
+    pub fn using_method_for(&mut self, value: &Value, await_form: bool) -> JsResult<Value> {
+        // `null` and `undefined` are explicitly allowed and simply dispose to nothing.
+        if value.is_nullish() {
+            return Ok(Value::Undefined);
+        }
+        let Some(object) = value.as_object() else {
+            return Err(self.type_error("value is not disposable: it is not an object"));
+        };
+        let mut method = if await_form {
+            let found = self.get_property_key(
+                object,
+                &self.realm.well_known_key(WellKnown::AsyncDisposable),
+            )?;
+            match found {
+                Some(found) if !found.is_nullish() => Some(found),
+                _ => self
+                    .get_property_key(object, &self.realm.well_known_key(WellKnown::Disposable))?,
+            }
+        } else {
+            self.get_property_key(object, &self.realm.well_known_key(WellKnown::Disposable))?
+        };
+        let Some(found) = method.take() else {
+            return Err(self.type_error("value is not disposable"));
+        };
+        if found.is_nullish() {
+            return Err(self.type_error("value is not disposable"));
+        }
+        let callable = found.as_object().is_some_and(|object| object.is_callable());
+        if !callable {
+            return Err(self.type_error("dispose method is not a function"));
+        }
+        Ok(found)
+    }
+
+    /// Call one resource's disposer, folding a failure into `error_state`.
+    ///
+    /// The value is read through [`Interp::get_loc`] rather than off `locals` directly,
+    /// because a captured `using` binding lives in its reference cell and the local slot is
+    /// stale — a closure over the resource is legal and must not change what is disposed.
+    fn using_dispose_once(&mut self, slot: usize, error_state: Value) -> JsResult<Value> {
+        let value = self.get_loc(slot);
+        let method = self.get_loc(slot + 1);
+        // A resource that was never initialised — its declaration threw — or that is
+        // `null`/`undefined` has nothing to dispose.
+        if value.is_nullish() || matches!(value, Value::Uninitialized) {
+            return Ok(error_state);
+        }
+        if matches!(method, Value::Undefined | Value::Uninitialized) {
+            return Ok(error_state);
+        }
+        match self.call_value(method, value, Vec::new()) {
+            Ok(_) => Ok(error_state),
+            Err(Signal::Throw(thrown)) => Ok(self.merge_dispose_error(thrown, error_state)),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Combine a disposal failure with whatever was already going wrong.
+    pub fn merge_dispose_error(&mut self, new_error: Value, error_state: Value) -> Value {
+        if matches!(error_state, Value::Uninitialized) {
+            return new_error;
+        }
+        self.new_suppressed_error(new_error, error_state)
+    }
+
+    /// A `SuppressedError` instance built straight from its prototype.
+    ///
+    /// Not through the constructor: a script that rewrites
+    /// `SuppressedError.prototype.constructor` must not be able to divert the engine's own
+    /// error wrapping.
+    pub fn new_suppressed_error(&mut self, error: Value, suppressed: Value) -> Value {
+        let proto = self
+            .realm
+            .suppressed_error_proto
+            .clone()
+            .unwrap_or_else(|| self.realm.error_proto.clone());
+        let object = self.new_object(Some(proto));
+        object.define("error", Property::with_attributes(error, true, true));
+        object.define(
+            "suppressed",
+            Property::with_attributes(suppressed, true, true),
+        );
+        object.define(
+            "message",
+            Property::with_attributes(self.string("SuppressedError"), true, true),
+        );
+        object.define(
+            "_class",
+            Property::with_attributes(self.string("Error"), false, false),
+        );
+        self.add_stack(&object);
+        Value::Object(object)
+    }
+
     /// Call `callee`, or push its frame and let the main loop run it.
     ///
     /// This is what keeps deep JavaScript recursion off the Rust stack: a bytecode
@@ -3609,6 +3727,52 @@ impl<'a> Interp<'a> {
                 let flags = self.to_js_string(&flags)?;
                 let object = crate::builtins::regexp::new_regexp(self, &pattern, &flags)?;
                 self.push(Value::Object(object));
+            }
+            UsingDisposeInit => {
+                // The error state a disposal accumulates into. Uninitialised means "no
+                // failure yet"; anything else is the exception being propagated.
+                self.push(Value::Uninitialized);
+            }
+            UsingCheck => {
+                // `value -> value, method`: validate and snapshot the disposer now, so a
+                // later change to `Symbol.dispose` cannot change what gets called, and so a
+                // value that is not disposable fails before the body runs.
+                let value = self.pop();
+                let method = self.using_method_for(&value, a as u8 == 1)?;
+                self.push(value);
+                self.push(method);
+            }
+            UsingDispose => {
+                // `error_state -> error_state'`: dispose the variable at `slot` — its value
+                // is `slot`, its snapshotted method `slot + 1` — folding any failure into
+                // the pending error.
+                let slot = self.slot_operand(op, a);
+                let error_state = self.pop();
+                let merged = self.using_dispose_once(slot, error_state)?;
+                self.push(merged);
+            }
+            UsingDisposeMerge => {
+                let new_error = self.pop();
+                let error_state = self.pop();
+                let merged = self.merge_dispose_error(new_error, error_state);
+                self.push(merged);
+            }
+            UsingDisposeEnd => {
+                // A disposal that failed replaces the block's normal completion, so the
+                // error state becomes a real throw here rather than at the call site.
+                let error_state = self.pop();
+                if !matches!(error_state, Value::Uninitialized) {
+                    return Err(Signal::Throw(error_state));
+                }
+            }
+            UsingDisposeAsync => {
+                // `await using` needs a promise to await and this runtime has no
+                // `Promise` builtin, so the disposer is called synchronously and its result
+                // discarded. That is correct for a disposer that returns nothing and is
+                // reported as a gap rather than silently skipped.
+                let slot = self.slot_operand(op, a);
+                let error_state = self.using_dispose_once(slot, Value::Uninitialized)?;
+                self.push(error_state);
             }
             GetSuper => {
                 // `obj -> obj's prototype`: the starting point of a `super` lookup.

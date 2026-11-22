@@ -61,6 +61,14 @@ const FUNCTION_SCOPE: u64 = u64::MAX - 3;
 /// when it was created.
 const PARAM_SCOPE: u64 = u64::MAX - 4;
 
+/// The name of the hidden local a `using` declaration caches its dispose method in.
+///
+/// It has to be a name no source can produce, because a script may declare anything: the
+/// angle brackets keep it out of the identifier grammar, exactly like `<ret>`.
+fn using_method_name(name: &str) -> String {
+    format!("<using.method {name}>")
+}
+
 /// The `blocks` parent sentinel for "this block has no enclosing block".
 ///
 /// Same reasoning as [`FUNCTION_SCOPE`]: `0` is a legal block key, and when it was
@@ -652,12 +660,9 @@ impl Compiler {
         self.state().body_block = body_key;
         self.hoist(&program.body, body_key)?;
         self.emit_scope_enter(body_key);
-        for stmt in &program.body {
-            self.stmt(stmt)?;
-            if Self::terminates(stmt) {
-                break;
-            }
-        }
+        // Through `stmts` rather than the loop, so a `using` region at the top level of an
+        // eval'd body or a module gets its disposal epilogue like any other block.
+        self.stmts(&program.body)?;
         // The program's value is whatever the last expression statement stored in
         // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common
         // case into a single `set_loc0`.
@@ -1008,6 +1013,30 @@ impl Compiler {
         index
     }
 
+    /// Declare a `using` binding and its cached dispose method, returning both slots.
+    ///
+    /// The two are adjacent by construction, because `using_dispose` addresses the pair as
+    /// `(value, value + 1)` — the reference does the same and documents the constraint.
+    fn declare_using(&mut self, name: &str) -> (u32, u32) {
+        let mut def = VarDef::lexical(name);
+        def.kind = VarKind::Using;
+        let value = self.declare(name, def);
+        let mut method = VarDef::lexical(using_method_name(name));
+        method.kind = VarKind::UsingMethod;
+        let method_slot = self.declare(&using_method_name(name), method);
+        (value, method_slot)
+    }
+
+    /// The slot a `using` binding's dispose method lives in.
+    fn using_method_slot(&self, name: &str) -> Option<u32> {
+        let hidden = using_method_name(name);
+        self.cur()
+            .vars
+            .iter()
+            .position(|var| var.name == hidden)
+            .map(|index| index as u32)
+    }
+
     // -- statements --------------------------------------------------------
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), SyntaxError> {
@@ -1061,12 +1090,9 @@ impl Compiler {
                 let parent = self.cur().current_block;
                 self.push_block(key, parent);
                 self.emit_scope_enter(key);
-                for stmt in body {
-                    self.stmt(stmt)?;
-                    if Self::terminates(stmt) {
-                        break;
-                    }
-                }
+                // A block is where a `using` region lives, so its statements have to go
+                // through `stmts`: that is what emits the disposal epilogue.
+                self.stmts(body)?;
                 self.emit_scope_leave(key);
                 self.state().current_block = parent;
             }
@@ -1340,12 +1366,177 @@ impl Compiler {
     /// Compile a statement list, stopping at the first statement that cannot
     /// fall through.
     fn stmts(&mut self, body: &[Stmt]) -> Result<(), SyntaxError> {
-        for stmt in body {
+        for (index, stmt) in body.iter().enumerate() {
+            // A `using` declaration is not just a binding: everything after it, to the end
+            // of the list, runs inside its disposal region. Compiling the rest of the list
+            // recursively is what gives nested regions their innermost-first order.
+            if Self::using_declaration(stmt).is_some() {
+                return self.using_region(stmt, &body[index + 1..]);
+            }
             self.stmt(stmt)?;
             if Self::terminates(stmt) {
                 break;
             }
         }
+        Ok(())
+    }
+
+    /// The declaration a `using` statement carries, if it is one.
+    fn using_declaration(stmt: &Stmt) -> Option<&VarDecl> {
+        match &stmt.kind {
+            StmtKind::VarDecl(decl) if decl.kind.is_using() => Some(decl),
+            _ => None,
+        }
+    }
+
+    /// Compile `decl` and then the rest of its block, disposing when the block ends.
+    ///
+    /// The shape mirrors a `try`/`finally`, and deliberately so: the disposal has to run on
+    /// every way out of the block — reaching its end, `return`, `break`, `continue`, and an
+    /// exception — and this engine already funnels all of those through `catch` plus
+    /// `gosub`. Registering the region as a jump target with a `finally_label` is what makes
+    /// `return` and `break` dispose without knowing anything about `using`.
+    ///
+    /// ```text
+    ///   <declaration>              value -> x, method -> x+1
+    ///   catch CATCH                <- an exception in the rest lands here
+    /// REST:
+    ///   <the rest of the block>
+    ///   drop                       <- the catch offset, on the fall-through path
+    ///   undefined; gosub DISPOSE; drop
+    ///   goto END
+    /// CATCH:
+    ///   using_dispose x            <- merges the failure into the pending exception
+    ///   throw
+    /// DISPOSE:
+    ///   using_dispose_init
+    ///   using_dispose x
+    ///   using_dispose_end          <- rethrows if a dispose failed
+    ///   ret
+    /// END:
+    /// ```
+    fn using_region(&mut self, stmt: &Stmt, rest: &[Stmt]) -> Result<(), SyntaxError> {
+        let Some(decl) = Self::using_declaration(stmt) else {
+            unreachable!("using_region is only called for a using declaration");
+        };
+        // `using` binds exactly one name and has no pattern form, which the parser
+        // enforces; the region still has to know *which* slot to dispose.
+        let name = decl
+            .declarators
+            .first()
+            .and_then(|declarator| match &declarator.target.kind {
+                PatternKind::Ident(ident) => Some(ident.name.clone()),
+                _ => None,
+            });
+        self.stmt(stmt)?;
+        let Some(name) = name else {
+            // Unreachable for a well-formed `using`, but a bare `using` with no declarator
+            // must not make the compiler panic.
+            return self.stmts(rest);
+        };
+        let Some(value_slot) = self.using_value_slot(&name) else {
+            // Declared globally, which the parser rules out for a script; a module's
+            // top level is a scope, and there the disposal stays a known gap.
+            return self.stmts(rest);
+        };
+        // A block that ends in a `return` or a `throw` never reaches its own epilogue; the
+        // exit path already disposed.
+        let live = !rest.last().is_some_and(Self::terminates);
+        self.using_region_around(value_slot, live, |compiler| compiler.stmts(rest))
+    }
+
+    /// The slot a `using` binding's value lives in.
+    fn using_value_slot(&self, name: &str) -> Option<u32> {
+        self.cur()
+            .vars
+            .iter()
+            .position(|var| var.name == name && var.kind == VarKind::Using)
+            .map(|index| index as u32)
+    }
+
+    /// Wrap `inside` in a disposal region for the resource in `value_slot`.
+    ///
+    /// Shared between a `using` statement — which owns the rest of its block — and a
+    /// `for (using x of …)` body, which owns only one iteration. The shape mirrors a
+    /// `try`/`finally`, deliberately: the disposal has to run on every way out — reaching
+    /// the end, `return`, `break`, `continue`, and an exception — and this engine already
+    /// funnels all of those through `catch` plus `gosub`. Registering the region as a jump
+    /// target with a `finally_label` is what makes `return` and `break` dispose without
+    /// knowing anything about `using`.
+    ///
+    /// ```text
+    ///   catch CATCH                <- an exception inside lands here
+    ///   <inside>
+    ///   drop                       <- the catch offset, on the fall-through path
+    ///   undefined; gosub DISPOSE; drop
+    ///   goto END
+    /// CATCH:
+    ///   using_dispose slot         <- merges the failure into the pending exception
+    ///   throw
+    /// DISPOSE:
+    ///   using_dispose_init
+    ///   using_dispose slot
+    ///   using_dispose_end          <- rethrows if a dispose failed
+    ///   ret
+    /// END:
+    /// ```
+    fn using_region_around(
+        &mut self,
+        value_slot: u32,
+        live: bool,
+        inside: impl FnOnce(&mut Self) -> Result<(), SyntaxError>,
+    ) -> Result<(), SyntaxError> {
+        let catch_label = self.new_label();
+        let end_label = self.new_label();
+        let dispose_label = self.new_label();
+
+        self.emit_jump(Opcode::Catch, catch_label, &[]);
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label: None,
+            continue_label: None,
+            // The catch offset is the one thing on the stack that leaving has to remove.
+            drop_count: 1,
+            finally_label: Some(dispose_label),
+            is_regular_stmt: false,
+            has_iterator: false,
+        });
+        inside(self)?;
+        self.pop_jump_target();
+
+        if live {
+            self.emit(Opcode::Drop, &[]);
+            self.emit(Opcode::Undefined, &[]);
+            self.emit_jump(Opcode::Gosub, dispose_label, &[]);
+            self.emit(Opcode::Drop, &[]);
+            self.emit_jump(Opcode::Goto, end_label, &[]);
+        }
+
+        // An exception unwinds to here with the thrown value on the stack, which is exactly
+        // the shape `using_dispose` expects as its error state.
+        self.place_label(catch_label);
+        self.emit(Opcode::UsingDispose, &[Op::Slot(Slot::Loc(value_slot))]);
+        self.emit(Opcode::Throw, &[]);
+
+        self.place_label(dispose_label);
+        // Inside the subroutine the return value and the `gosub` return address are both
+        // live, and neither an outer finalizer nor another region may run before this one
+        // has finished.
+        self.push_jump_target(JumpTarget {
+            names: Vec::new(),
+            break_label: None,
+            continue_label: None,
+            drop_count: 2,
+            finally_label: None,
+            is_regular_stmt: false,
+            has_iterator: false,
+        });
+        self.emit(Opcode::UsingDisposeInit, &[]);
+        self.emit(Opcode::UsingDispose, &[Op::Slot(Slot::Loc(value_slot))]);
+        self.emit(Opcode::UsingDisposeEnd, &[]);
+        self.pop_jump_target();
+        self.emit(Opcode::Ret, &[]);
+        self.place_label(end_label);
         Ok(())
     }
 
@@ -1398,6 +1589,13 @@ impl Compiler {
                         if decl.kind == VarDeclKind::Var {
                             let def = VarDef::var(text.clone());
                             self.declare_var(&text, def);
+                        } else if decl.kind.is_using() {
+                            // Two adjacent slots: the resource, then the dispose method
+                            // snapshotted at declaration. `using_dispose` reads them as a
+                            // pair `(slot, slot + 1)`, so nothing may be declared between
+                            // them — which is why both are declared here, in one step,
+                            // rather than the method being added at emission time.
+                            self.declare_using(&text);
                         } else {
                             let def = if decl.kind == VarDeclKind::Const {
                                 VarDef::constant(text.clone())
@@ -2357,7 +2555,27 @@ impl Compiler {
         // `set_loc v` when the body starts by reading the loop variable.
         let body_label = self.new_label();
         self.place_label(body_label);
-        self.stmt(body)?;
+        // `for (using x of …)` disposes once per iteration, so the body is a disposal
+        // region rather than the whole loop: the resource is the element that this
+        // iteration produced.
+        let using_slot = match left {
+            ForHead::VarDecl(decl) if decl.kind.is_using() => {
+                decl.declarators
+                    .first()
+                    .and_then(|declarator| match &declarator.target.kind {
+                        PatternKind::Ident(ident) => self.using_value_slot(&ident.name),
+                        _ => None,
+                    })
+            }
+            _ => None,
+        };
+        match using_slot {
+            Some(slot) => {
+                let live = !Self::terminates(body);
+                self.using_region_around(slot, live, |compiler| compiler.stmt(body))?;
+            }
+            None => self.stmt(body)?,
+        }
 
         self.place_label(test);
         match kind {
@@ -2392,6 +2610,21 @@ impl Compiler {
         };
         match &pattern.kind {
             PatternKind::Ident(name) => {
+                // `for (using x of …)` validates and snapshots each iteration's value
+                // before the body runs, which is what makes a non-disposable element fail
+                // on the iteration that produced it rather than at the end of the loop.
+                if let ForHead::VarDecl(decl) = left
+                    && decl.kind.is_using()
+                {
+                    let method_slot = self
+                        .using_method_slot(&name.name)
+                        .expect("a using binding was declared during hoisting");
+                    self.emit(
+                        Opcode::UsingCheck,
+                        &[Op::Int(if decl.kind.is_await_using() { 1 } else { 0 })],
+                    );
+                    self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(method_slot))]);
+                }
                 self.emit_var(action, &name.name);
                 Ok(())
             }
@@ -2423,6 +2656,23 @@ impl Compiler {
                 PatternKind::Ident(name) => {
                     self.expr(init)?;
                     self.set_name_if_anonymous(init, &name.name);
+                    if decl.kind.is_using() {
+                        // `using_check` validates the value and snapshots its dispose
+                        // method: `value -> value, method`. The snapshot is what makes a
+                        // later change to `Symbol.dispose` irrelevant, and validating here
+                        // is what keeps the body from running at all when the value is not
+                        // disposable.
+                        let method_slot = self
+                            .using_method_slot(&name.name)
+                            .expect("a using binding was declared during hoisting");
+                        self.emit(
+                            Opcode::UsingCheck,
+                            &[Op::Int(if decl.kind.is_await_using() { 1 } else { 0 })],
+                        );
+                        self.emit(Opcode::PutLoc, &[Op::Slot(Slot::Loc(method_slot))]);
+                        self.emit_var(VarAction::PutInit, &name.name);
+                        continue;
+                    }
                     // A declaration statement produces no value, so nothing is
                     // duplicated onto the stack.
                     match decl.kind {
@@ -5159,12 +5409,9 @@ impl Compiler {
         }
         // The parameter list is over; from here on a direct `eval` belongs to the body.
         self.state().in_params = false;
-        for stmt in body {
-            self.stmt(stmt)?;
-            if Self::terminates(stmt) {
-                break;
-            }
-        }
+        // Through `stmts`: the body is a block, and a `using` declaration in it is a
+        // disposal region.
+        self.stmts(body)?;
         // The implicit return only exists if control can actually get here: an
         // infinite loop never falls off the end.
         if self.end_is_reachable() {

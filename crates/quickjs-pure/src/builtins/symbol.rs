@@ -30,7 +30,7 @@ use js_gc::Gc;
 /// The name is both the `Symbol` property name and the symbol's description: the
 /// reference registers them as `Symbol.iterator` and so on, which is why
 /// `Symbol.iterator.description` reads `"Symbol.iterator"` and `String` of it matches.
-const WELL_KNOWN: [&str; 13] = [
+const WELL_KNOWN: [&str; 15] = [
     "toPrimitive",
     "iterator",
     "match",
@@ -44,6 +44,8 @@ const WELL_KNOWN: [&str; 13] = [
     "species",
     "unscopables",
     "asyncIterator",
+    "dispose",
+    "asyncDispose",
 ];
 
 /// Install `Symbol` and create the realm's well-known symbols.

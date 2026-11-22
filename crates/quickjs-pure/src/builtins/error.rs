@@ -8,8 +8,9 @@
 
 use crate::builtins::arg;
 use crate::interp::{Interp, JsResult};
-use crate::object::Property;
+use crate::object::{JsObject, Property};
 use crate::value::Value;
+use js_gc::Gc;
 
 /// The classes to install, in the order their prototypes have to be chained.
 ///
@@ -83,6 +84,87 @@ pub fn install(interp: &mut Interp<'_>) {
             Property::with_attributes(Value::Object(constructor), true, false),
         );
     }
+
+    install_suppressed_error(interp, &error_proto);
+}
+
+/// `SuppressedError`, the aggregate a failed disposal reports.
+///
+/// It cannot go through the loop above: every other error class takes `(message)`, while
+/// this one takes `(error, suppressed, message)`. Its whole purpose is to carry the two
+/// errors `using` has to keep when one disposal throws while another error is already
+/// propagating.
+fn install_suppressed_error(interp: &mut Interp<'_>, error_proto: &Gc<JsObject>) {
+    let proto = interp.new_object(Some(error_proto.clone()));
+    proto.define(
+        "name",
+        Property::with_attributes(interp.string("SuppressedError"), true, false),
+    );
+    proto.define(
+        "message",
+        Property::with_attributes(interp.string(""), true, false),
+    );
+    let constructor = interp.new_native("SuppressedError", 3, suppressed_error_constructor);
+    constructor.define(
+        "prototype",
+        Property::with_attributes(Value::Object(proto.clone()), false, false),
+    );
+    proto.define(
+        "constructor",
+        Property::with_attributes(Value::Object(constructor.clone()), true, false),
+    );
+    interp.realm.suppressed_error_proto = Some(proto);
+    interp
+        .realm
+        .errors
+        .insert("SuppressedError", constructor.clone());
+    let global = interp.realm.global.clone();
+    global.define(
+        "SuppressedError",
+        Property::with_attributes(Value::Object(constructor), true, false),
+    );
+}
+
+/// `new SuppressedError(error, suppressed, message)`.
+fn suppressed_error_constructor(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+) -> JsResult<Value> {
+    let error = arg(args, 0);
+    let suppressed = arg(args, 1);
+    let message = arg(args, 2);
+    // `new` has already made the object and passes it as `this`; a plain call behaves like
+    // `new`, which is what the reference does for every error class.
+    let object = match &this {
+        Value::Object(object) => object.clone(),
+        _ => {
+            let proto = interp
+                .realm
+                .suppressed_error_proto
+                .clone()
+                .unwrap_or_else(|| interp.realm.error_proto.clone());
+            interp.new_object(Some(proto))
+        }
+    };
+    object.define("error", Property::with_attributes(error, true, true));
+    object.define(
+        "suppressed",
+        Property::with_attributes(suppressed, true, true),
+    );
+    if !matches!(message, Value::Undefined) {
+        let text = interp.to_js_string(&message)?;
+        object.define(
+            "message",
+            Property::with_attributes(interp.string(text), true, true),
+        );
+    }
+    object.define(
+        "_class",
+        Property::with_attributes(interp.string("Error"), false, false),
+    );
+    interp.add_stack(&object);
+    Ok(Value::Object(object))
 }
 
 /// The `&'static str` keys the realm's error table uses.

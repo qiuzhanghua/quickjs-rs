@@ -252,6 +252,14 @@ pub enum VarDeclKind {
     Let,
     /// `const`
     Const,
+    /// `using`
+    ///
+    /// A lexical binding whose value is disposed at the end of the enclosing block. The
+    /// await form is a separate variant so that the await-ness travels with the
+    /// declaration the way the other keywords do.
+    Using,
+    /// `await using`
+    AwaitUsing,
 }
 
 impl VarDeclKind {
@@ -261,12 +269,25 @@ impl VarDeclKind {
             VarDeclKind::Var => "var",
             VarDeclKind::Let => "let",
             VarDeclKind::Const => "const",
+            // A message that uses this only names the binding kind, and `await using` is
+            // still a `using`.
+            VarDeclKind::Using | VarDeclKind::AwaitUsing => "using",
         }
     }
 
     /// Whether the declaration is block-scoped.
     pub fn is_lexical(self) -> bool {
         !matches!(self, VarDeclKind::Var)
+    }
+
+    /// Whether this declaration disposes its binding at the end of the block.
+    pub fn is_using(self) -> bool {
+        matches!(self, VarDeclKind::Using | VarDeclKind::AwaitUsing)
+    }
+
+    /// Whether the disposal is awaited.
+    pub fn is_await_using(self) -> bool {
+        matches!(self, VarDeclKind::AwaitUsing)
     }
 }
 

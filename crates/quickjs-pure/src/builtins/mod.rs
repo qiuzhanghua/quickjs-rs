@@ -13,6 +13,7 @@
 
 mod array;
 pub(crate) mod date;
+pub mod disposable;
 mod error;
 mod function;
 mod generator;
@@ -73,6 +74,9 @@ pub fn install(interp: &mut Interp<'_>) {
         "RegExp",
         crate::object::Property::with_attributes(Value::Object(regexp), true, false),
     );
+    // The stacks need `Symbol.dispose` (installed by `symbol`) and the error prototypes,
+    // and nothing else depends on them.
+    disposable::install(interp, &object_proto);
     generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
 }

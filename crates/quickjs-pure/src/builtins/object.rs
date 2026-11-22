@@ -117,6 +117,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::Function(_) => "Function",
             ObjectKind::Generator(_) => "Generator",
             ObjectKind::RegExp(_) => "RegExp",
+            ObjectKind::DisposableStack(_) => "Object",
             ObjectKind::Ordinary => "Object",
         }) {
             "Array" => "Array".to_string(),
