@@ -16,6 +16,9 @@ pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
     define_method(number_proto, "toExponential", 1, to_exponential, interp);
     define_method(number_proto, "toPrecision", 1, to_precision, interp);
     define_method(number_proto, "valueOf", 0, value_of, interp);
+    // Without this, `Number.prototype.toLocaleString` was `Object.prototype`'s, which runs
+    // `this.toString()` on the *wrapper* and answers `"[object Number]"`.
+    define_method(number_proto, "toLocaleString", 0, to_locale_string, interp);
 
     let constructor = interp.new_native("Number", 1, constructor);
     constructor.define(
@@ -87,6 +90,12 @@ fn number_of(interp: &Interp<'_>, this: &Value) -> Result<f64, crate::interp::Si
             .ok_or_else(|| interp.type_error("Number method on a non-number")),
         _ => Err(interp.type_error("Number method on a non-number")),
     }
+}
+
+/// `Number.prototype.toLocaleString`, which is `toString` when there is no `Intl`.
+fn to_locale_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let value = number_of(interp, &this)?;
+    Ok(interp.string(number_to_string(value)))
 }
 
 fn to_string(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -492,6 +501,13 @@ fn is_safe_integer(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> Js
 /// Install `Boolean`.
 pub fn install_boolean(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
     define_method(boolean_proto, "toString", 0, boolean_to_string, interp);
+    define_method(
+        boolean_proto,
+        "toLocaleString",
+        0,
+        boolean_to_string,
+        interp,
+    );
     define_method(boolean_proto, "valueOf", 0, boolean_value_of, interp);
     let constructor = interp.new_native("Boolean", 1, boolean_constructor);
     constructor.define(

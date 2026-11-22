@@ -147,6 +147,12 @@ pub struct Realm {
     pub array_buffer_proto: Option<Gc<JsObject>>,
     /// `%TypedArray%.prototype`, the prototype every view type inherits from.
     pub typed_array_proto: Option<Gc<JsObject>>,
+    /// One prototype per view type, in [`builtins::typedarray::ELEMENT_TYPES`] order.
+    ///
+    /// A typed array answers `map`/`filter`/`slice` with a *new view of the same type*, and
+    /// the result has to carry the per-type prototype — otherwise `r.constructor.name` is
+    /// `"Object"` and `r instanceof Int32Array` is false.
+    pub typed_array_protos: Vec<Gc<JsObject>>,
     /// The `AsyncDisposableStack` prototype.
     pub async_disposable_stack_proto: Option<Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
@@ -658,6 +664,7 @@ impl<'a> Interp<'a> {
                 set_proto: None,
                 array_buffer_proto: None,
                 typed_array_proto: None,
+                typed_array_protos: Vec::new(),
                 async_disposable_stack_proto: None,
                 well_known_symbols: WellKnownSymbols::default(),
             },
@@ -1581,11 +1588,15 @@ impl<'a> Interp<'a> {
             Some(self.realm.function_proto.clone()),
             Callable::Native { func },
         );
-        function.define("name", Property::name_or_length(self.string(name)));
+        // `length` before `name`: `FunctionCreate` sets `[[ParameterCount]]` first, and
+        // `Object.getOwnPropertyNames` reports insertion order, so the reference lists
+        // `length,name` and this listed `name,length`. A bytecode function already gets it
+        // the right way round; only native ones were built backwards.
         function.define(
             "length",
             Property::name_or_length(Value::Int(length as i32)),
         );
+        function.define("name", Property::name_or_length(self.string(name)));
         function
     }
 
@@ -3084,7 +3095,11 @@ impl<'a> Interp<'a> {
             && let Some(index) = array_index(text)
             && object.typed_array_parts().is_some()
         {
-            object.typed_array_set(index as usize, value);
+            // A BigInt view refuses a Number; the spec makes that a `TypeError` rather
+            // than a silent skip, in strict mode and sloppy alike.
+            if let Some(Err(reason)) = object.typed_array_set(index as usize, value) {
+                return Err(self.type_error(reason));
+            }
             return Ok(());
         }
         if let Some(text) = text
@@ -7064,9 +7079,18 @@ impl<'a> Interp<'a> {
 
     /// `ToNumber` with the object case going through `ToPrimitive`.
     pub fn to_js_number(&mut self, value: &Value) -> JsResult<f64> {
-        if matches!(value, Value::Object(_)) {
-            let primitive = self.to_primitive(value.clone(), Hint::Number)?;
-            return Ok(primitive.to_number());
+        let value = if matches!(value, Value::Object(_)) {
+            self.to_primitive(value.clone(), Hint::Number)?
+        } else {
+            value.clone()
+        };
+        // `ToNumber` refuses a BigInt: there is no lossless number for a 2^70 integer, so
+        // the spec makes this a `TypeError` rather than `NaN`. `Value::to_number` answers
+        // `NaN` to stay total, and the operators check for the bigint themselves — but
+        // `Math.max(1n)`, `new Int32Array(1n)` and every other `ToNumber` caller needs to
+        // refuse, and answering `NaN` made them silently wrong instead.
+        if matches!(value, Value::BigInt(_)) {
+            return Err(self.type_error("cannot convert a BigInt to a number"));
         }
         Ok(value.to_number())
     }
@@ -7637,6 +7661,44 @@ impl<'a> Interp<'a> {
     /// An object that already carries a `next` method is used as it is — that is what
     /// `arr.values()` returns — and only arrays and strings get the built-in
     /// sequence iterator.
+    /// Whether `value` has a callable `Symbol.iterator`, i.e. `GetMethod` succeeds.
+    ///
+    /// Callers that must choose between the iterable and the array-like protocol — the
+    /// typed-array constructor is the main one — need to ask *before* committing to one.
+    pub fn has_iterator(&mut self, value: &Value) -> JsResult<bool> {
+        let key = self.realm.well_known_key(WellKnown::Iterator);
+        let method = self.read_field_key(value, &key)?;
+        if matches!(method, Value::Undefined | Value::Null) {
+            return Ok(false);
+        }
+        if !matches!(&method, Value::Object(object) if object.is_callable()) {
+            return Err(Signal::Throw(
+                self.make_error("TypeError", "Symbol.iterator is not callable"),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Collect everything an iterable yields, closing it if the walk is abandoned.
+    ///
+    /// The cap is a guard against a generator that never ends: an unbounded collect would
+    /// be an out-of-memory abort rather than a catchable error.
+    pub fn collect_iterable(&mut self, value: &Value) -> JsResult<Vec<Value>> {
+        const MAX_ITEMS: usize = 1 << 24;
+        let iterator = self.get_iterator(value)?;
+        let mut out = Vec::new();
+        loop {
+            let (element, done) = self.iterator_step(&iterator)?;
+            if done {
+                return Ok(out);
+            }
+            out.push(element);
+            if out.len() > MAX_ITEMS {
+                return Err(self.range_error("iterable is too long to collect"));
+            }
+        }
+    }
+
     /// `GetIterator(value)`: the real `Symbol.iterator` protocol.
     ///
     /// The method is looked up on the value (through its prototype), called with no

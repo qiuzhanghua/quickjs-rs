@@ -11,7 +11,7 @@
 //! * Argument checks throw the same error *class* the reference does, because the
 //!   test suite asserts on `instanceof` and on `e.name`.
 
-mod array;
+pub(crate) mod array;
 pub mod bigint;
 pub(crate) mod date;
 pub mod disposable;

@@ -142,6 +142,32 @@ impl BigInt {
         }
     }
 
+    /// The value of a `u64`.
+    pub fn from_u64(value: u64) -> BigInt {
+        BigInt::from_u64_magnitude(value)
+    }
+
+    /// The low 64 bits, as the two's-complement bit pattern.
+    ///
+    /// `BigInt::asIntN(64, v)` / `asUintN(64, v)`: a typed array stores the value modulo
+    /// `2^64`, so `new BigUint64Array(1)[0] = -1n` reads back `2^64-1` and a value that
+    /// needs more than 64 bits keeps only its low ones.
+    pub fn to_u64_wrapping(&self) -> u64 {
+        let low = self.mag.first().copied().unwrap_or(0) as u64;
+        let high = self.mag.get(1).copied().unwrap_or(0) as u64;
+        let magnitude = low | (high << 32);
+        if self.negative {
+            magnitude.wrapping_neg()
+        } else {
+            magnitude
+        }
+    }
+
+    /// `to_u64_wrapping` reinterpreted as signed.
+    pub fn to_i64_wrapping(&self) -> i64 {
+        self.to_u64_wrapping() as i64
+    }
+
     /// Parse `text` in `radix`, which is what a literal and `BigInt("…")` both need.
     ///
     /// Surrounding whitespace is not accepted here; the caller trims it, because the literal

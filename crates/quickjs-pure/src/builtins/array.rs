@@ -130,14 +130,22 @@ fn from(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
             out.push(interp.string_wtf8(point));
         }
     } else if let Some(object) = source.as_object() {
+        // `ToLength(Get(src, "length"))`, so a fractional or negative length behaves and an
+        // absurd one is not an allocation.
         let length = interp
             .get_property(object, "length")?
-            .map(|value| value.to_number() as usize)
-            .unwrap_or(0);
+            .map(|value| value.to_number())
+            .unwrap_or(0.0);
+        let length = to_length(length).min(MAX_FROM_LENGTH);
         for index in 0..length {
-            if let Some(value) = interp.get_property(object, &index.to_string())? {
-                out.push(value);
-            }
+            // A missing index contributes `undefined`; the result is as long as the source
+            // said, not as long as the indices that happen to exist. Skipping absent ones
+            // made `Array.from({length: 2})` an empty array.
+            out.push(
+                interp
+                    .get_property(object, &index.to_string())?
+                    .unwrap_or(Value::Undefined),
+            );
         }
     }
     // A mapping function turns it into `Array.from(src, fn)`, i.e. `map`.
@@ -146,11 +154,13 @@ fn from(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
         .cloned()
         .filter(|v| !matches!(v, Value::Undefined))
     {
+        // The mapper's `this` is the third argument, which used to be dropped.
+        let this_arg = arg(args, 2);
         let mut mapped = Vec::with_capacity(out.len());
         for (index, value) in out.into_iter().enumerate() {
             mapped.push(interp.call_value(
                 mapper.clone(),
-                Value::Undefined,
+                this_arg.clone(),
                 vec![value, Value::Int(index as i32)],
             )?);
         }
@@ -661,6 +671,12 @@ fn length_of(interp: &mut Interp<'_>, source: &Value) -> JsResult<usize> {
         .unwrap_or(0.0);
     Ok(to_length(length))
 }
+
+/// How long a source `Array.from` will read.
+///
+/// A real array of this size would already be out of memory, so the bound turns a hostile
+/// `{length: 2**53-1}` into a catchable `RangeError` instead of an abort.
+const MAX_FROM_LENGTH: usize = 1 << 26;
 
 /// `ToLength`: `NaN` and negatives are zero, fractions truncate, and the result saturates
 /// at `2^53-1` rather than staying infinite.

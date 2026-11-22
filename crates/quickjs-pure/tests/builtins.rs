@@ -2691,3 +2691,114 @@ print(b.hasOwnProperty("3"));
         )
     );
 }
+
+#[test]
+fn typed_arrays_are_complete_enough_to_iterate_and_transform() {
+    // Every one of these was `TypeError: undefined is not a function`: `%TypedArray%` and
+    // its whole method family did not exist. `map`/`filter`/`slice` answer a *view of the
+    // same type* rather than an array, and `map` over `BigInt64Array` must answer BigInts.
+    assert_eq!(
+        eval(
+            r#"
+print(new Int32Array([1,2,3]).map(function (x) { return x * 2; }).join(","));
+print(new Int32Array([1,2,3]).map(function (x) { return x; }).constructor.name);
+print(new Int32Array([1,2,3,4]).filter(function (x) { return x % 2 === 0; }).join(","));
+print([...new Int32Array([1,2,3])].join(","));
+print(JSON.stringify([...new Int32Array([9,8]).keys()]));
+print(new Int32Array([10,9,1]).sort().join(","));
+print(new Int32Array([1,2,3]).reduce(function (a, b) { return a + b; }));
+print(new Int32Array([5,6,7]).at(-1), new Int32Array([5,6,7]).findLast(function (x) { return x > 5; }));
+
+// A BigInt view reads and writes BigInts, refuses numbers, and wraps modulo 2^64.
+print(typeof new BigInt64Array(1)[0]);
+var wrapped = new BigUint64Array(1);
+wrapped[0] = -1n;
+print(wrapped[0]);
+try { new BigInt64Array([1]); print("no throw"); } catch (e) { print(e.name); }
+print(new BigInt64Array([1n,-2n]).sort().join(","));
+
+// `%TypedArray%` is the shared parent of every view constructor.
+var TA = Object.getPrototypeOf(Int8Array);
+print(TA.name, Object.getOwnPropertyNames(TA).join(","));
+print(Int8Array.from([1,2]).join(","), Int32Array.of(3,4).join(","));
+try { TA(); print("no throw"); } catch (e) { print(e.name); }
+
+// `Symbol.iterator` wins over `length` when constructing from a source.
+var iterable = {};
+iterable[Symbol.iterator] = function () {
+  var i = 0;
+  return { next: function () { return i < 2 ? { value: ++i, done: false } : { done: true }; } };
+};
+print(new Int32Array(iterable).join(","));
+
+// A derived view that is too short is refused rather than written past its end.
+var s = new Int8Array(2);
+s.constructor = {};
+s.constructor[Symbol.species] = function () { return new Int8Array(); };
+try { s.map(function () { return 0; }); print("no throw"); } catch (e) { print(e.name); }
+
+// A detached buffer makes every method throw.
+var ab = new ArrayBuffer(8);
+var detached = new Int32Array(ab);
+ab.transfer();
+try { detached.map(function () { return 0; }); print("no throw"); } catch (e) { print(e.name); }
+"#
+        ),
+        concat!(
+            "2,4,6\n",
+            "Int32Array\n",
+            "2,4\n",
+            "1,2,3\n",
+            "[0,1]\n",
+            "1,9,10\n",
+            "6\n",
+            "7 7\n",
+            "bigint\n",
+            "18446744073709551615n\n",
+            "TypeError\n",
+            "-2,1\n",
+            "TypedArray length,name,from,of,prototype\n",
+            "1,2 3,4\n",
+            "TypeError\n",
+            "1,2\n",
+            "TypeError\n",
+            "TypeError\n",
+        )
+    );
+}
+
+#[test]
+fn array_from_and_array_index_search_honour_their_arguments() {
+    // `Array.from({length: 2})` was an *empty* array — a missing index was skipped instead
+    // of contributing `undefined` — which quietly shortened every source a test built with
+    // `Array.from({length: n}, …)`. And the typed-array searches ignored `fromIndex`
+    // entirely, so a Symbol there returned cleanly instead of throwing.
+    assert_eq!(
+        eval(
+            r#"
+print(Array.from({length: 2}).length);
+print(JSON.stringify(Array.from({length: 2, 0: "x"})));
+print(JSON.stringify(Array.from([1], function () { return this.v; }, {v: 9})));
+print(JSON.stringify(Array.from(new Set([1,2]))));
+
+var a = new Int32Array([1,2,3,2,1]);
+print(a.indexOf(2), a.indexOf(2, 2), a.indexOf(2, -2));
+print(a.lastIndexOf(2), a.lastIndexOf(2, 2), a.lastIndexOf(2, -2));
+print(a.includes(1, 2), a.includes(1, -1), a.includes(1, Infinity));
+print(a.indexOf(1, Infinity), a.lastIndexOf(1, -Infinity));
+try { a.includes(1, Symbol()); print("no throw"); } catch (e) { print(e.name); }
+"#
+        ),
+        concat!(
+            "2\n",
+            "[\"x\",null]\n",
+            "[9]\n",
+            "[1,2]\n",
+            "1 3 3\n",
+            "3 1 3\n",
+            "true true false\n",
+            "-1 -1\n",
+            "TypeError\n",
+        )
+    );
+}

@@ -63,10 +63,14 @@ pub enum ElementType {
     Float32,
     /// `Float64Array`
     Float64,
+    /// `BigInt64Array`
+    BigInt64,
+    /// `BigUint64Array`
+    BigUint64,
 }
 
 /// The view types, in the order their prototypes are installed.
-pub const ELEMENT_TYPES: [(ElementType, &str); 10] = [
+pub const ELEMENT_TYPES: [(ElementType, &str); 12] = [
     (ElementType::Int8, "Int8Array"),
     (ElementType::Uint8, "Uint8Array"),
     (ElementType::Uint8Clamped, "Uint8ClampedArray"),
@@ -77,6 +81,8 @@ pub const ELEMENT_TYPES: [(ElementType, &str); 10] = [
     (ElementType::Float16, "Float16Array"),
     (ElementType::Float32, "Float32Array"),
     (ElementType::Float64, "Float64Array"),
+    (ElementType::BigInt64, "BigInt64Array"),
+    (ElementType::BigUint64, "BigUint64Array"),
 ];
 
 impl ElementType {
@@ -86,8 +92,16 @@ impl ElementType {
             ElementType::Int8 | ElementType::Uint8 | ElementType::Uint8Clamped => 1,
             ElementType::Int16 | ElementType::Uint16 | ElementType::Float16 => 2,
             ElementType::Int32 | ElementType::Uint32 | ElementType::Float32 => 4,
-            ElementType::Float64 => 8,
+            ElementType::Float64 | ElementType::BigInt64 | ElementType::BigUint64 => 8,
         }
+    }
+
+    /// Whether elements are `BigInt`s rather than numbers.
+    ///
+    /// The two behave differently in ways that reach most methods: the sort order, what a
+    /// literal element converts to, and whether a Number is a `TypeError`.
+    pub fn is_bigint(self) -> bool {
+        matches!(self, ElementType::BigInt64 | ElementType::BigUint64)
     }
 
     /// The name, as `Symbol.toStringTag` and the class tag report it.
@@ -103,10 +117,16 @@ impl ElementType {
     ///
     /// A short buffer — only reachable if a view was built over a truncated one — reads as
     /// `0` rather than panicking, because a script must not be able to make the engine abort.
-    pub fn read(self, bytes: &[u8], offset: usize) -> Value {
+    pub fn read(self, heap: &js_gc::Heap, bytes: &[u8], offset: usize) -> Value {
         let slice = bytes.get(offset..offset + self.size());
         let Some(slice) = slice else {
-            return Value::Int(0);
+            // A short buffer reads as the type's zero, which for a BigInt type is `0n`.
+            return match self {
+                ElementType::BigInt64 | ElementType::BigUint64 => {
+                    Value::BigInt(js_gc::Gc::new(heap, crate::bigint::BigInt::zero()))
+                }
+                _ => Value::Int(0),
+            };
         };
         match self {
             ElementType::Int8 => Value::Int(slice[0] as i8 as i32),
@@ -130,14 +150,48 @@ impl ElementType {
             ElementType::Float64 => Value::Float(f64::from_le_bytes([
                 slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
             ])),
+            // A BigInt element reads back as a `BigInt`, never as a number: `typeof
+            // new BigInt64Array(1)[0]` is `"bigint"` and `0n`, not `0`.
+            ElementType::BigInt64 => Value::BigInt(js_gc::Gc::new(
+                heap,
+                crate::bigint::BigInt::from_i64(i64::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+                ])),
+            )),
+            ElementType::BigUint64 => Value::BigInt(js_gc::Gc::new(
+                heap,
+                crate::bigint::BigInt::from_u64(u64::from_le_bytes([
+                    slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+                ])),
+            )),
         }
     }
 
     /// Store `value` into the element at `offset`.
-    pub fn write(self, bytes: &mut [u8], offset: usize, value: Value) {
+    /// The `Err` carries the reason, which the caller turns into a `TypeError`.
+    pub fn write(self, bytes: &mut [u8], offset: usize, value: Value) -> Result<(), &'static str> {
         let size = self.size();
         if offset + size > bytes.len() {
-            return;
+            return Ok(());
+        }
+        // `ToNumber` refuses a Symbol and a BigInt; `Value::to_number` answers `NaN` so
+        // that it stays total, which here would store a wrong element instead of throwing.
+        if !self.is_bigint() && matches!(value, Value::Symbol(_) | Value::BigInt(_)) {
+            return Err(NOT_A_NUMBER);
+        }
+        // A BigInt element type runs `ToBigInt`, not `ToNumber`: a Number is a TypeError,
+        // and a BigInt is stored modulo `2^64`. That is why this can fail at all.
+        if matches!(self, ElementType::BigInt64 | ElementType::BigUint64) {
+            let Value::BigInt(big) = &value else {
+                return Err(NOT_A_BIGINT);
+            };
+            let slice = &mut bytes[offset..offset + size];
+            let bits = match self {
+                ElementType::BigInt64 => big.to_i64_wrapping() as u64,
+                _ => big.to_u64_wrapping(),
+            };
+            slice.copy_from_slice(&bits.to_le_bytes());
+            return Ok(());
         }
         let number = value.to_number();
         let slice = &mut bytes[offset..offset + size];
@@ -156,9 +210,18 @@ impl ElementType {
             ElementType::Float16 => slice.copy_from_slice(&f64_to_f16(number).to_le_bytes()),
             ElementType::Float32 => slice.copy_from_slice(&(number as f32).to_le_bytes()),
             ElementType::Float64 => slice.copy_from_slice(&number.to_le_bytes()),
+            // Handled above; unreachable, but the match has to be exhaustive.
+            ElementType::BigInt64 | ElementType::BigUint64 => {}
         }
+        Ok(())
     }
 }
+
+/// Why an element write was refused: the target is a BigInt type and the value is not one.
+pub const NOT_A_BIGINT: &str = "cannot convert a Number to a BigInt";
+
+/// Why an element write was refused: the target is numeric and the value has no number form.
+pub const NOT_A_NUMBER: &str = "cannot convert a Symbol or BigInt to a number";
 
 /// `ToIntegerOrInfinity`, truncated toward zero, as the integer element types need it.
 ///
@@ -296,8 +359,42 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     define_method(&shared, "fill", 1, fill, interp);
     define_method(&shared, "join", 1, join, interp);
     define_method(&shared, "toString", 0, join, interp);
+    define_method(&shared, "toLocaleString", 0, to_locale_string, interp);
     define_method(&shared, "slice", 2, slice, interp);
     define_method(&shared, "subarray", 2, subarray, interp);
+    // The whole `%TypedArray%.prototype` iteration family, which was absent: every
+    // `[].map.call(typedArray, f)` reached `undefined is not a function`.
+    define_method(&shared, "at", 1, at as crate::object::NativeFn, interp);
+    define_method(&shared, "every", 1, every, interp);
+    define_method(&shared, "some", 1, some, interp);
+    define_method(&shared, "forEach", 1, for_each, interp);
+    define_method(&shared, "map", 1, map, interp);
+    define_method(&shared, "filter", 1, filter, interp);
+    define_method(&shared, "reduce", 1, reduce, interp);
+    define_method(&shared, "reduceRight", 1, reduce_right, interp);
+    define_method(&shared, "find", 1, find, interp);
+    define_method(&shared, "findIndex", 1, find_index, interp);
+    define_method(&shared, "findLast", 1, find_last, interp);
+    define_method(&shared, "findLastIndex", 1, find_last_index, interp);
+    define_method(&shared, "indexOf", 1, index_of, interp);
+    define_method(&shared, "lastIndexOf", 1, last_index_of, interp);
+    define_method(&shared, "includes", 1, includes, interp);
+    define_method(&shared, "reverse", 0, reverse, interp);
+    define_method(&shared, "sort", 1, sort, interp);
+    define_method(&shared, "copyWithin", 2, copy_within, interp);
+    define_method(&shared, "with", 2, with, interp);
+    define_method(&shared, "toReversed", 0, to_reversed, interp);
+    define_method(&shared, "toSorted", 1, to_sorted, interp);
+    define_method(&shared, "values", 0, values, interp);
+    define_method(&shared, "keys", 0, keys, interp);
+    define_method(&shared, "entries", 0, entries, interp);
+    // `%TypedArray%.prototype[Symbol.iterator]` *is* `values`, not a wrapper around it.
+    if let Some(values_fn) = shared.own_property("values").and_then(|p| p.value) {
+        let key = interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::Iterator);
+        shared.define_key(&key, Property::with_attributes(values_fn, true, false));
+    }
     for (name, getter) in [
         ("buffer", buffer_of as crate::object::NativeFn),
         ("byteOffset", byte_offset_of),
@@ -324,6 +421,9 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         );
     }
     interp.realm.typed_array_proto = Some(shared.clone());
+    // Built after the shared prototype exists, because `%TypedArray%.prototype` *is* that
+    // object and `constructor` has to point back at the intrinsic.
+    let intrinsic = install_typed_array_intrinsic(interp, &shared);
 
     let global = interp.realm.global.clone();
     for (element, name) in ELEMENT_TYPES {
@@ -338,6 +438,9 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
             Property::with_attributes(Value::Int(element.size() as i32), false, false),
         );
         let constructor = interp.new_native(name, 3, view_constructor);
+        // `Object.getPrototypeOf(Int8Array)` is `%TypedArray%`, which is where `from` and
+        // `of` live; without it the statics were unreachable from every constructor.
+        constructor.set_proto(Some(intrinsic.clone()));
         constructor.define(
             "_element",
             Property::with_attributes(Value::Int(element as i32), false, false),
@@ -354,6 +457,9 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
             "constructor",
             Property::with_attributes(Value::Object(constructor.clone()), true, false),
         );
+        // Remembered so a method that answers with a fresh view can give it the right
+        // prototype; `new_view` looks the type up in this vector.
+        interp.realm.typed_array_protos.push(proto.clone());
         global.define(
             name,
             Property::with_attributes(Value::Object(constructor), true, false),
@@ -493,15 +599,37 @@ fn clamp_index(value: f64, length: i64, default: i64) -> i64 {
 ///
 /// This is what makes `new Uint8Array(buffer)` mean "from byte 0, to the end": the missing
 /// second argument is `undefined`, which is `0`, and a `NaN` offset must not be a failure.
-fn to_index(interp: &Interp<'_>, value: &Value, what: &str) -> JsResult<usize> {
-    let number = value.to_number();
+/// `ToIntegerOrInfinity(value)`, which refuses a Symbol and a BigInt.
+///
+/// `Value::to_number` answers `NaN` for both so that it stays total; that made
+/// `copyWithin(0, Symbol())` a silent no-op instead of the `TypeError` the spec requires.
+fn to_integer_or_infinity(interp: &mut Interp<'_>, value: &Value) -> JsResult<f64> {
+    match value {
+        Value::Symbol(_) => Err(interp.type_error("cannot convert a Symbol to a number")),
+        Value::BigInt(_) => Err(interp.type_error("cannot convert a BigInt to a number")),
+        other => {
+            let number = interp.to_js_number(other)?;
+            Ok(if number.is_nan() { 0.0 } else { number.trunc() })
+        }
+    }
+}
+
+/// `ToIndex(value)`: `ToIntegerOrInfinity` and then a range check.
+///
+/// `ToIntegerOrInfinity` *truncates*, so `new Int32Array(2.7)` is two elements rather than
+/// a `RangeError`; only a negative or infinite result is refused. `ToNumber` on a BigInt is
+/// a `TypeError`, which is why the conversion goes through the interpreter.
+fn to_index(interp: &mut Interp<'_>, value: &Value, what: &str) -> JsResult<usize> {
+    let number = interp.to_js_number(value)?;
     if number.is_nan() {
         return Ok(0);
     }
-    if number < 0.0 || number.is_infinite() || number.fract() != 0.0 {
+    let truncated = number.trunc();
+    // `2^53 - 1` is the largest index the spec allows.
+    if truncated < 0.0 || truncated > 9_007_199_254_740_991.0 {
         return Err(interp.range_error(format!("invalid {what}")));
     }
-    Ok(number as usize)
+    Ok(truncated as usize)
 }
 
 /// The element type this call belongs to, read off the receiver's prototype.
@@ -565,8 +693,16 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
             };
             (object.clone(), byte_offset, length)
         }
-        // `new X(length)`
-        Value::Int(_) | Value::Float(_) => {
+        // `new X(length)` for any *primitive* argument: the spec goes to `ToIndex` before
+        // it ever looks for `Symbol.iterator`, so `new Int32Array("3")` is three zeroes
+        // rather than the three characters. Only an object is treated as a source.
+        Value::Int(_)
+        | Value::Float(_)
+        | Value::String(_)
+        | Value::Bool(_)
+        | Value::BigInt(_)
+        | Value::Null
+        | Value::Undefined => {
             let count = to_index(interp, &first, "typed array length")?;
             let proto = interp
                 .realm
@@ -582,7 +718,15 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
         }
         // `new X(iterable)`: a buffer sized by the source, filled from it.
         _ => {
-            let values = interp.array_like_to_args(&first)?;
+            // `Symbol.iterator` wins over `length`: an object that is both iterable and
+            // array-like is read through the iterator. That is what the harness's
+            // `makeIterable` — a plain object carrying only `Symbol.iterator` — needs, and
+            // without it every such source constructed an *empty* view.
+            let values = if interp.has_iterator(&first)? {
+                interp.collect_iterable(&first)?
+            } else {
+                interp.array_like_to_args(&first)?
+            };
             let proto = interp
                 .realm
                 .array_buffer_proto
@@ -596,7 +740,11 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
             buffer.set_array_buffer(storage);
             let count = values.len();
             for (index, value) in values.into_iter().enumerate() {
-                write_element(&buffer, element, 0, index, value);
+                // `new BigInt64Array([1])` is a TypeError: the initialiser runs
+                // `ToBigInt` on each value, and a Number is not convertible.
+                if write_element(&buffer, element, 0, index, value).is_err() {
+                    return Err(interp.type_error("cannot convert a Number to a BigInt"));
+                }
             }
             (buffer, 0, count)
         }
@@ -623,15 +771,15 @@ fn write_element(
     offset: usize,
     index: usize,
     value: Value,
-) {
+) -> Result<(), &'static str> {
     let Some(storage) = buffer.array_buffer_storage() else {
-        return;
+        return Ok(());
     };
     let mut storage = storage.borrow_mut();
     if storage.detached {
-        return;
+        return Ok(());
     }
-    element.write(&mut storage.bytes, offset + index * element.size(), value);
+    element.write(&mut storage.bytes, offset + index * element.size(), value)
 }
 
 /// Read the elements of a typed array, which `join`/`set`/`slice` all need.
@@ -689,7 +837,9 @@ fn set_from(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
                 .typed_array_parts()
                 .map(|(buffer, _, base, _)| (buffer, base))
                 .expect("a typed array has parts");
-            write_element(&buffer, element, base, offset + index, value);
+            if write_element(&buffer, element, base, offset + index, value).is_err() {
+                return Err(interp.type_error("cannot convert a Number to a BigInt"));
+            }
         }
     }
     Ok(Value::Undefined)
@@ -730,33 +880,160 @@ fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         .map(|(buffer, _, base, _)| (buffer, base))
         .expect("a typed array has parts");
     for index in start as usize..end.max(start) as usize {
-        write_element(&buffer, element, base, index, value.clone());
+        if write_element(&buffer, element, base, index, value.clone()).is_err() {
+            return Err(interp.type_error("cannot convert a Number to a BigInt"));
+        }
     }
     Ok(Value::Object(object))
 }
 
-/// `a.slice(begin, end)`: a new view with a buffer of its own.
-fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let object = this
-        .as_object()
-        .ok_or_else(|| interp.type_error("not a typed array"))?;
-    let Some(length) = object.typed_array_length() else {
-        return Err(interp.type_error("not a typed array"));
+/// `%TypedArray%`: the intrinsic every view constructor inherits from.
+///
+/// Absent until now, which is why `Object.getPrototypeOf(Int8Array)` answered
+/// `Function.prototype` and `Object.getPrototypeOf(Int8Array).from` was `undefined`. It is
+/// not a constructor — calling or `new`-ing it is a `TypeError` — it exists to hold the
+/// shared statics and `Symbol.species`.
+fn install_typed_array_intrinsic(interp: &mut Interp<'_>, shared: &Gc<JsObject>) -> Gc<JsObject> {
+    let intrinsic = interp.new_native("TypedArray", 0, typed_array_intrinsic_call);
+    // `from` and `of` go on before `prototype`, because `Object.getOwnPropertyNames` reports
+    // insertion order and the reference lists them in this order.
+    define_method(
+        &intrinsic,
+        "from",
+        1,
+        from as crate::object::NativeFn,
+        interp,
+    );
+    define_method(&intrinsic, "of", 0, of, interp);
+    // `%TypedArray%.prototype` is the shared prototype, and it is read-only.
+    intrinsic.define(
+        "prototype",
+        Property::prototype_of(Value::Object(shared.clone()), false),
+    );
+    // The constructor property points back, which is what `TA.prototype.constructor === TA`
+    // and a species lookup both rely on.
+    shared.define(
+        "constructor",
+        Property {
+            value: Some(Value::Object(intrinsic.clone())),
+            writable: true,
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
+    // `get %TypedArray%[Symbol.species]` answers `this`, so a subclass that does not
+    // override it still produces instances of itself.
+    let species = interp.new_native("[Symbol.species]", 0, species_getter);
+    let key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::Species);
+    intrinsic.define_key(
+        &key,
+        Property {
+            getter: Some(Value::Object(species)),
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
+    intrinsic
+}
+
+/// `%TypedArray%` is abstract: both forms of construction are refused.
+fn typed_array_intrinsic_call(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    _args: &[Value],
+) -> JsResult<Value> {
+    Err(interp.type_error("Abstract class TypedArray not directly constructable"))
+}
+
+fn species_getter(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(this)
+}
+
+/// `%TypedArray%.from(source, mapfn, thisArg)`.
+///
+/// The result is built by calling `this` as a constructor, which is what makes
+/// `MyArray.from(...)` answer a `MyArray` rather than an `Int8Array`.
+fn from(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let source = arg(args, 0);
+    let mapper = match args.get(1) {
+        None | Some(Value::Undefined) => None,
+        Some(candidate) if matches!(candidate, Value::Object(o) if o.is_callable()) => {
+            Some(candidate.clone())
+        }
+        Some(_) => return Err(interp.type_error("mapfn is not a function")),
+    };
+    let this_arg = arg(args, 2);
+    // The source is read either through `Symbol.iterator` or as an array-like, the same
+    // choice the constructor makes.
+    let values = if interp.has_iterator(&source)? {
+        interp.collect_iterable(&source)?
+    } else {
+        interp.array_like_to_args(&source)?
+    };
+    let mut mapped = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        match &mapper {
+            Some(mapper) => mapped.push(interp.call_value(
+                mapper.clone(),
+                this_arg.clone(),
+                vec![value, Value::Int(index as i32)],
+            )?),
+            None => mapped.push(value),
+        }
+    }
+    typed_array_from_values(interp, &this, &mapped)
+}
+
+/// `%TypedArray%.of(...items)`.
+fn of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    typed_array_from_values(interp, &this, args)
+}
+
+/// Build a view by calling `constructor` with a length, then filling it.
+fn typed_array_from_values(
+    interp: &mut Interp<'_>,
+    constructor: &Value,
+    values: &[Value],
+) -> JsResult<Value> {
+    if !matches!(constructor, Value::Object(o) if o.is_callable()) {
+        return Err(interp.type_error("not a constructor"));
+    }
+    let created = interp.construct(
+        constructor.clone(),
+        constructor.clone(),
+        vec![Value::Int(values.len() as i32)],
+    )?;
+    let Some(object) = created.as_object().cloned() else {
+        return Err(interp.type_error("constructor did not answer an object"));
     };
     let Some(element) = object.typed_array_element_type() else {
-        return Err(interp.type_error("not a typed array"));
+        return Err(interp.type_error("constructor did not answer a typed array"));
     };
-    let length_i = length as i64;
-    let begin = clamp_index(arg(args, 0).to_number(), length_i, 0);
-    let end = clamp_index(
-        match args.get(1) {
-            None => length as f64,
-            Some(value) => value.to_number(),
-        },
-        length_i,
-        length_i,
-    );
-    let count = (end - begin).max(0) as usize;
+    // The constructor is arbitrary script: it may answer a shorter view than asked for,
+    // which the spec refuses rather than writing past the end.
+    let available = object.typed_array_length().unwrap_or(0);
+    if values.len() > available {
+        return Err(interp.type_error("derived typed array has an insufficient length"));
+    }
+    write_back(interp, &object, element, values)?;
+    Ok(created)
+}
+
+/// A new view of `element` type holding `values`, which is what `map`/`filter`/`slice`
+/// and friends answer with.
+///
+/// `%TypedArray%.prototype.map` is *not* `Array.prototype.map`: the result is a typed array
+/// of the same element type, not an ordinary array, which is why the spec goes through
+/// `TypedArraySpeciesCreate` rather than `ArraySpeciesCreate`.
+fn new_view(
+    interp: &mut Interp<'_>,
+    element: ElementType,
+    values: &[Value],
+) -> JsResult<Gc<JsObject>> {
     let proto = interp
         .realm
         .array_buffer_proto
@@ -764,23 +1041,704 @@ fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
         .unwrap_or_else(|| interp.realm.object_proto.clone());
     let buffer = interp.new_object(Some(proto));
     buffer.set_array_buffer(Rc::new(RefCell::new(BufferStorage {
-        bytes: vec![0; count * element.size()],
+        bytes: vec![0; values.len() * element.size()],
         detached: false,
     })));
-    for index in 0..count {
-        if let Some(value) = object.typed_array_element(begin as usize + index) {
-            write_element(&buffer, element, 0, index, value);
+    for (index, value) in values.iter().enumerate() {
+        if write_element(&buffer, element, 0, index, value.clone()).is_err() {
+            return Err(interp.type_error("cannot convert a Number to a BigInt"));
         }
     }
-    let fresh = interp.new_object(Some(
-        interp
-            .realm
-            .typed_array_proto
-            .clone()
-            .unwrap_or_else(|| interp.realm.object_proto.clone()),
-    ));
-    fresh.set_typed_array(buffer, element, 0, count);
-    Ok(Value::Object(fresh))
+    let proto = interp
+        .realm
+        .typed_array_protos
+        .get(element as usize)
+        .cloned()
+        .or_else(|| interp.realm.typed_array_proto.clone())
+        .unwrap_or_else(|| interp.realm.object_proto.clone());
+    let fresh = interp.new_object(Some(proto));
+    fresh.set_typed_array(buffer, element, 0, values.len());
+    Ok(fresh)
+}
+
+/// `TypedArraySpeciesCreate(receiver, len)`: the view a method answers with.
+///
+/// The spec does not simply build a view of the same type. It reads `receiver.constructor`,
+/// then that function's `Symbol.species`, and calls it with the length — so a subclass can
+/// redirect the result and a test can assert the override was honoured, or that a throwing
+/// species propagates. Falling straight through to `new_view` made every `speciesctor` case
+/// fail even though the elements were right.
+fn species_create(
+    interp: &mut Interp<'_>,
+    receiver: &Gc<JsObject>,
+    element: ElementType,
+    values: &[Value],
+) -> JsResult<Gc<JsObject>> {
+    let constructor = interp.get_property(receiver, "constructor")?;
+    let species = match &constructor {
+        // `undefined` — or no `constructor` at all — means "use the default".
+        None | Some(Value::Undefined) => None,
+        Some(Value::Object(constructor)) => {
+            let key = interp
+                .realm
+                .well_known_key(crate::interp::WellKnown::Species);
+            interp.get_property_key(constructor, &key)?
+        }
+        // Anything else is neither absent nor an object, and `SpeciesConstructor` refuses
+        // it outright: `sample.constructor = 42` makes `sample.map(f)` a `TypeError`.
+        Some(_) => return Err(interp.type_error("constructor is not an object")),
+    };
+    let species = match species {
+        Some(Value::Null) | None | Some(Value::Undefined) => {
+            return new_view(interp, element, values);
+        }
+        Some(other) => other,
+    };
+    if !matches!(&species, Value::Object(o) if o.is_callable()) {
+        return Err(interp.type_error("species is not a constructor"));
+    }
+    let created = interp.construct(
+        species.clone(),
+        species,
+        vec![Value::Int(values.len() as i32)],
+    )?;
+    let Some(object) = created.as_object().cloned() else {
+        return Err(interp.type_error("species constructor did not answer an object"));
+    };
+    let Some(actual_element) = object.typed_array_element_type() else {
+        return Err(interp.type_error("species constructor did not answer a typed array"));
+    };
+    // A species is allowed to answer a *longer* view but not a shorter one: the spec
+    // checks `srcLength <= targetLength`.
+    let available = object.typed_array_length().unwrap_or(0);
+    if values.len() > available {
+        return Err(interp.type_error("derived typed array has an insufficient length"));
+    }
+    write_back(interp, &object, actual_element, values)?;
+    Ok(object)
+}
+
+/// The receiver as `(elements, element type)`, the shape every method here starts from.
+///
+/// A typed array is never a plain object: unlike `Array.prototype`'s methods, these do not
+/// run `ToObject` on anything, they refuse a receiver that is not a view.
+fn view_parts(interp: &mut Interp<'_>, this: &Value) -> JsResult<(Vec<Value>, ElementType)> {
+    let Some(object) = this.as_object() else {
+        return Err(interp.type_error("not a typed array"));
+    };
+    let Some(element) = object.typed_array_element_type() else {
+        return Err(interp.type_error("not a typed array"));
+    };
+    // `ValidateTypedArray` runs `IsDetachedBuffer` and refuses. Without this a detached
+    // view silently behaved like an empty one, so every `detached-buffer` test — which
+    // expects a `TypeError` — saw a clean return instead.
+    if is_detached(object) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    Ok((elements_of(interp, this)?, element))
+}
+
+/// Whether this view's buffer has been detached.
+fn is_detached(object: &Gc<JsObject>) -> bool {
+    let Some((buffer, _, _, _)) = object.typed_array_parts() else {
+        return false;
+    };
+    buffer
+        .array_buffer_storage()
+        .is_some_and(|storage| storage.borrow().detached)
+}
+
+/// The callback a typed-array method requires, or a `TypeError`.
+fn typed_callback(interp: &mut Interp<'_>, args: &[Value]) -> JsResult<Value> {
+    let callback = arg(args, 0);
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    Ok(callback)
+}
+
+/// Call `callback(element, index, receiver)` for every element.
+fn call_typed(
+    interp: &mut Interp<'_>,
+    callback: &Value,
+    value: Value,
+    index: usize,
+    receiver: &Gc<JsObject>,
+) -> JsResult<Value> {
+    interp.call_value(
+        callback.clone(),
+        Value::Undefined,
+        vec![
+            value,
+            Value::Int(index as i32),
+            Value::Object(receiver.clone()),
+        ],
+    )
+}
+
+/// `a.at(index)`: negative counts from the end, out of range is `undefined`.
+fn at(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (elements, _) = view_parts(interp, &this)?;
+    let length = elements.len() as f64;
+    let raw = arg(args, 0).to_number().trunc();
+    let index = if raw < 0.0 { length + raw } else { raw };
+    if index < 0.0 || index >= length {
+        return Ok(Value::Undefined);
+    }
+    Ok(elements[index as usize].clone())
+}
+
+/// `a.every(f)` / `a.some(f)`.
+fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    quantify(interp, this, args, false)
+}
+
+fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    quantify(interp, this, args, true)
+}
+
+fn quantify(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    want_any: bool,
+) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, _) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    for (index, value) in elements.into_iter().enumerate() {
+        let answer = call_typed(interp, &callback, value, index, &receiver)?;
+        // `every` stops on the first falsy answer, `some` on the first truthy one.
+        if answer.to_boolean() == want_any {
+            return Ok(Value::Bool(want_any));
+        }
+    }
+    Ok(Value::Bool(!want_any))
+}
+
+fn for_each(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, _) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    for (index, value) in elements.into_iter().enumerate() {
+        call_typed(interp, &callback, value, index, &receiver)?;
+    }
+    Ok(Value::Undefined)
+}
+
+fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, element_type) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    let mut out = Vec::with_capacity(elements.len());
+    for (index, value) in elements.into_iter().enumerate() {
+        out.push(call_typed(interp, &callback, value, index, &receiver)?);
+    }
+    Ok(Value::Object(species_create(
+        interp,
+        &receiver,
+        element_type,
+        &out,
+    )?))
+}
+
+fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, element_type) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    let mut out = Vec::new();
+    for (index, value) in elements.into_iter().enumerate() {
+        let keep = call_typed(interp, &callback, value.clone(), index, &receiver)?;
+        if keep.to_boolean() {
+            out.push(value);
+        }
+    }
+    Ok(Value::Object(species_create(
+        interp,
+        &receiver,
+        element_type,
+        &out,
+    )?))
+}
+
+fn reduce(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    reduce_with(interp, this, args, false)
+}
+
+fn reduce_right(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    reduce_with(interp, this, args, true)
+}
+
+fn reduce_with(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    right_to_left: bool,
+) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, _) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    let mut indices: Vec<usize> = (0..elements.len()).collect();
+    if right_to_left {
+        indices.reverse();
+    }
+    let mut ordered = indices.into_iter();
+    let mut accumulator = match args.get(1) {
+        Some(value) if !matches!(value, Value::Undefined) => value.clone(),
+        _ => match ordered.next() {
+            Some(index) => elements[index].clone(),
+            None => {
+                return Err(interp.type_error("Reduce of empty array with no initial value"));
+            }
+        },
+    };
+    for index in ordered {
+        accumulator = interp.call_value(
+            callback.clone(),
+            Value::Undefined,
+            vec![
+                accumulator,
+                elements[index].clone(),
+                Value::Int(index as i32),
+                Value::Object(receiver.clone()),
+            ],
+        )?;
+    }
+    Ok(accumulator)
+}
+
+fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    find_with(interp, this, args, FindKind::Value, false)
+}
+
+fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    find_with(interp, this, args, FindKind::Index, false)
+}
+
+fn find_last(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    find_with(interp, this, args, FindKind::Value, true)
+}
+
+fn find_last_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    find_with(interp, this, args, FindKind::Index, true)
+}
+
+#[derive(Clone, Copy)]
+enum FindKind {
+    Value,
+    Index,
+}
+
+fn find_with(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    kind: FindKind,
+    from_end: bool,
+) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (elements, _) = view_parts(interp, &this)?;
+    let callback = typed_callback(interp, args)?;
+    let mut indices: Vec<usize> = (0..elements.len()).collect();
+    if from_end {
+        indices.reverse();
+    }
+    for index in indices {
+        let value = elements[index].clone();
+        let answer = call_typed(interp, &callback, value.clone(), index, &receiver)?;
+        if answer.to_boolean() {
+            return Ok(match kind {
+                FindKind::Value => value,
+                FindKind::Index => Value::Int(index as i32),
+            });
+        }
+    }
+    Ok(match kind {
+        FindKind::Value => Value::Undefined,
+        FindKind::Index => Value::Int(-1),
+    })
+}
+
+fn index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    search(interp, this, args, SearchKind::IndexOf, false)
+}
+
+fn last_index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    search(interp, this, args, SearchKind::IndexOf, true)
+}
+
+fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    search(interp, this, args, SearchKind::Includes, false)
+}
+
+#[derive(Clone, Copy)]
+enum SearchKind {
+    /// `===`-style, so `NaN` is never found.
+    IndexOf,
+    /// `SameValueZero`, so `NaN` is found, and the answer is a boolean.
+    Includes,
+}
+
+fn search(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    kind: SearchKind,
+    from_end: bool,
+) -> JsResult<Value> {
+    let (elements, _) = view_parts(interp, &this)?;
+    let needle = arg(args, 0);
+    let length = elements.len();
+    // `fromIndex` is `ToIntegerOrInfinity`, so a Symbol here is a `TypeError` — which is
+    // why the conversion has to happen even when the answer is already decided. Ignoring
+    // the argument made `includes(7, Symbol())` return cleanly instead of throwing.
+    let missing = match args.get(1) {
+        None | Some(Value::Undefined) => true,
+        Some(_) => false,
+    };
+    let start = if from_end {
+        // `lastIndexOf`: the default is the last index, and a negative offset counts back
+        // from the end; anything below zero means "not found".
+        let raw = if missing {
+            length as f64
+        } else {
+            to_integer_or_infinity(interp, &arg(args, 1))?
+        };
+        if raw < 0.0 {
+            match (length as f64 + raw) as i64 {
+                n if n < 0 => None,
+                n => Some(n as usize),
+            }
+        } else {
+            Some((raw.min(length as f64) as usize).min(length.saturating_sub(1)))
+        }
+    } else {
+        // `indexOf`/`includes`: the default is the first index, and a negative offset
+        // counts back from the end but clamps to zero.
+        let raw = if missing {
+            0.0
+        } else {
+            to_integer_or_infinity(interp, &arg(args, 1))?
+        };
+        if raw >= 0.0 {
+            Some(raw.min(length as f64) as usize)
+        } else {
+            Some(((length as f64 + raw).max(0.0)) as usize)
+        }
+    };
+    let mut order: Vec<usize> = match start {
+        None => Vec::new(),
+        Some(start) if from_end => (0..=start.min(length.saturating_sub(1))).rev().collect(),
+        Some(start) => (start..length).collect(),
+    };
+    if length == 0 {
+        order.clear();
+    }
+    for index in order {
+        let value = &elements[index];
+        let found = match kind {
+            SearchKind::IndexOf => value.strict_equals(&needle),
+            // `includes` uses SameValueZero, which finds a `NaN` that `indexOf` cannot.
+            SearchKind::Includes => value.same_value_zero(&needle),
+        };
+        if found {
+            return Ok(match kind {
+                SearchKind::IndexOf => Value::Int(index as i32),
+                SearchKind::Includes => Value::Bool(true),
+            });
+        }
+    }
+    Ok(match kind {
+        SearchKind::IndexOf => Value::Int(-1),
+        SearchKind::Includes => Value::Bool(false),
+    })
+}
+
+/// `a.reverse()`: in place, and it answers the receiver.
+fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let object = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (mut elements, element_type) = view_parts(interp, &this)?;
+    elements.reverse();
+    write_back(interp, &object, element_type, &elements)?;
+    Ok(Value::Object(object))
+}
+
+fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (mut elements, element_type) = view_parts(interp, &this)?;
+    match args.first() {
+        // The default order is numeric for a typed array, unlike `Array.prototype.sort`'s
+        // string order — `new Int32Array([10, 9]).sort()` is `[9, 10]`.
+        None | Some(Value::Undefined) => {
+            if element_type.is_bigint() {
+                elements.sort_by(compare_bigints);
+            } else {
+                elements.sort_by(|a, b| {
+                    a.to_number()
+                        .partial_cmp(&b.to_number())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        }
+        Some(comparator) if matches!(comparator, Value::Object(o) if o.is_callable()) => {
+            // A comparator is arbitrary script, so Rust's sort cannot be told it is a
+            // total order; this merge sort keeps the comparison count deterministic.
+            merge_sort_typed(interp, &mut elements, comparator)?;
+        }
+        Some(_) => return Err(interp.type_error("comparator is not a function")),
+    }
+    write_back(interp, &object, element_type, &elements)?;
+    Ok(Value::Object(object))
+}
+
+fn compare_bigints(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::BigInt(a), Value::BigInt(b)) => a.cmp(b),
+        _ => std::cmp::Ordering::Equal,
+    }
+}
+
+fn merge_sort_typed(
+    interp: &mut Interp<'_>,
+    items: &mut Vec<Value>,
+    comparator: &Value,
+) -> JsResult<()> {
+    if items.len() <= 1 {
+        return Ok(());
+    }
+    let mid = items.len() / 2;
+    let mut right = items.split_off(mid);
+    merge_sort_typed(interp, items, comparator)?;
+    merge_sort_typed(interp, &mut right, comparator)?;
+    let mut merged = Vec::with_capacity(items.len() + right.len());
+    let mut left_iter = std::mem::take(items).into_iter().peekable();
+    let mut right_iter = right.into_iter().peekable();
+    loop {
+        match (left_iter.peek(), right_iter.peek()) {
+            (Some(left), Some(right_value)) => {
+                let answer = interp.call_value(
+                    comparator.clone(),
+                    Value::Undefined,
+                    vec![left.clone(), right_value.clone()],
+                )?;
+                if answer.to_number() > 0.0 {
+                    merged.push(right_iter.next().expect("peeked"));
+                } else {
+                    merged.push(left_iter.next().expect("peeked"));
+                }
+            }
+            (Some(_), None) => merged.push(left_iter.next().expect("peeked")),
+            (None, Some(_)) => merged.push(right_iter.next().expect("peeked")),
+            (None, None) => break,
+        }
+    }
+    *items = merged;
+    Ok(())
+}
+
+/// Store `values` back into the receiver's view, which is how the in-place methods answer.
+fn write_back(
+    interp: &mut Interp<'_>,
+    object: &Gc<JsObject>,
+    element_type: ElementType,
+    values: &[Value],
+) -> JsResult<()> {
+    let Some((buffer, _, base, _)) = object.typed_array_parts() else {
+        return Err(interp.type_error("not a typed array"));
+    };
+    for (index, value) in values.iter().enumerate() {
+        if write_element(&buffer, element_type, base, index, value.clone()).is_err() {
+            return Err(interp.type_error("cannot convert a Number to a BigInt"));
+        }
+    }
+    Ok(())
+}
+
+/// `a.copyWithin(target, start, end)`: copies a run of elements over an earlier one.
+fn copy_within(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (mut elements, element_type) = view_parts(interp, &this)?;
+    let length_i = elements.len() as i64;
+    let target = clamp_index(to_integer_or_infinity(interp, &arg(args, 0))?, length_i, 0);
+    let start = clamp_index(to_integer_or_infinity(interp, &arg(args, 1))?, length_i, 0);
+    let end = match args.get(2) {
+        None | Some(Value::Undefined) => length_i,
+        Some(value) => clamp_index(to_integer_or_infinity(interp, value)?, length_i, length_i),
+    };
+    // The index arguments are arbitrary script through `valueOf`, and one of them may
+    // detach the buffer: `copyWithin(0, {valueOf(){ detach() }})` must throw, not copy from
+    // storage that is gone. `ValidateTypedArray` therefore runs again here.
+    if is_detached(&object) {
+        return Err(interp.type_error("the buffer is detached"));
+    }
+    let count = (end - start).min(length_i - target).max(0) as usize;
+    // A temporary, because the ranges may overlap: `copyWithin(0, 1)` would otherwise read
+    // values it had already overwritten.
+    let source: Vec<Value> = (0..count)
+        .map(|offset| elements[start as usize + offset].clone())
+        .collect();
+    for (offset, value) in source.into_iter().enumerate() {
+        elements[target as usize + offset] = value;
+    }
+    write_back(interp, &object, element_type, &elements)?;
+    Ok(Value::Object(object))
+}
+
+/// `a.toLocaleString()`: each element through its own `toLocaleString`, joined by `,`.
+fn to_locale_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let elements = elements_of(interp, &this)?;
+    let mut parts = Vec::with_capacity(elements.len());
+    for element in elements {
+        // `undefined` and `null` contribute an empty field, exactly as `join` does.
+        if matches!(element, Value::Undefined | Value::Null) {
+            parts.push(String::new());
+            continue;
+        }
+        // Read `toLocaleString` off the element's own chain, so a Number reaches
+        // `Number.prototype.toLocaleString` and a BigInt reaches `BigInt.prototype`'s.
+        let method = match &element {
+            Value::Object(object) => interp.get_property(object, "toLocaleString")?,
+            primitive => {
+                let boxed = interp.object_from(primitive)?;
+                interp.get_property(&boxed, "toLocaleString")?
+            }
+        };
+        let text = match method {
+            Some(method) => {
+                let result = interp.call_value(method, element.clone(), Vec::new())?;
+                interp.to_js_string(&result)?
+            }
+            None => interp.to_js_string(&element)?,
+        };
+        parts.push(text);
+    }
+    Ok(interp.string(parts.join(",")))
+}
+
+/// `a.with(index, value)`: a copy with one element replaced.
+fn with(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (mut elements, element_type) = view_parts(interp, &this)?;
+    let length = elements.len() as f64;
+    let raw = arg(args, 0).to_number().trunc();
+    let index = if raw < 0.0 { length + raw } else { raw };
+    if index < 0.0 || index >= length {
+        return Err(interp.range_error("index is out of range"));
+    }
+    elements[index as usize] = arg(args, 1);
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    Ok(Value::Object(species_create(
+        interp,
+        &receiver,
+        element_type,
+        &elements,
+    )?))
+}
+
+fn to_reversed(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let (mut elements, element_type) = view_parts(interp, &this)?;
+    elements.reverse();
+    Ok(Value::Object(species_create(
+        interp,
+        &receiver,
+        element_type,
+        &elements,
+    )?))
+}
+
+fn to_sorted(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (elements, element_type) = view_parts(interp, &this)?;
+    // Reuse `sort` by handing it a fresh view of the same contents.
+    let copy = new_view(interp, element_type, &elements)?;
+    sort(interp, Value::Object(copy.clone()), args)?;
+    Ok(Value::Object(copy))
+}
+
+/// `a.values()` / `a.keys()` / `a.entries()`.
+///
+/// The iterator machinery is shared with `Array.prototype`: `length_of` and `element_at`
+/// reach a typed array through its exotic `length` and index properties, so the same
+/// `next` walks it correctly and the laziness carries over.
+fn values(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    // `%TypedArray%.prototype.values` runs `ValidateTypedArray` before building the
+    // iterator, so a detached view throws here rather than on the first `next`.
+    view_parts(interp, &this)?;
+    crate::builtins::array::iterator(interp, this, crate::builtins::array::IteratorKind::Value)
+}
+
+fn keys(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    view_parts(interp, &this)?;
+    crate::builtins::array::iterator(interp, this, crate::builtins::array::IteratorKind::Key)
+}
+
+fn entries(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    view_parts(interp, &this)?;
+    crate::builtins::array::iterator(interp, this, crate::builtins::array::IteratorKind::Entry)
+}
+
+/// `a.slice(begin, end)`: a new view with a buffer of its own.
+fn slice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (elements, element_type) = view_parts(interp, &this)?;
+    let receiver = this
+        .as_object()
+        .cloned()
+        .ok_or_else(|| interp.type_error("not a typed array"))?;
+    let length_i = elements.len() as i64;
+    let begin = clamp_index(arg(args, 0).to_number(), length_i, 0);
+    let end = clamp_index(
+        match args.get(1) {
+            None | Some(Value::Undefined) => length_i as f64,
+            Some(value) => value.to_number(),
+        },
+        length_i,
+        length_i,
+    );
+    let count = (end - begin).max(0) as usize;
+    // Copied into a temporary first: `slice` reads the source through `[[Get]]` and builds
+    // the result through `TypedArraySpeciesCreate`, and a species override may resize the
+    // source, so the two must not be interleaved.
+    let taken: Vec<Value> = (0..count)
+        .map(|index| elements[begin as usize + index].clone())
+        .collect();
+    Ok(Value::Object(species_create(
+        interp,
+        &receiver,
+        element_type,
+        &taken,
+    )?))
 }
 
 /// `a.subarray(begin, end)`: a view over the *same* buffer.

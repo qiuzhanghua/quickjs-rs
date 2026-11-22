@@ -130,22 +130,32 @@ impl JsObject {
         if storage.detached || index >= length {
             return Some(Value::Undefined);
         }
-        Some(element.read(&storage.bytes, offset + index * element.size()))
+        // The buffer's own handle is where the heap comes from, so a BigInt element can be
+        // allocated without every caller having to thread one through.
+        Some(element.read(
+            buffer.heap(),
+            &storage.bytes,
+            offset + index * element.size(),
+        ))
     }
 
     /// Store one view element, applying the type's wrap or clamp.
-    pub fn typed_array_set(&self, index: usize, value: Value) -> Option<()> {
+    ///
+    /// `Some(Ok(()))` stored, `Some(Err(()))` refused the *value* — a Number into a BigInt
+    /// view, which the caller turns into a `TypeError` — and `None` when this is not a
+    /// view at all or the index is out of range, which is a silent no-op.
+    pub fn typed_array_set(&self, index: usize, value: Value) -> Option<Result<(), &'static str>> {
         let (buffer, element, offset, length) = self.typed_array_parts()?;
         if index >= length {
-            return Some(());
+            return Some(Ok(()));
         }
         let storage = buffer.array_buffer_storage()?;
         let mut storage = storage.borrow_mut();
         if storage.detached {
-            return Some(());
+            return Some(Ok(()));
         }
-        element.write(&mut storage.bytes, offset + index * element.size(), value);
-        Some(())
+        let stored = element.write(&mut storage.bytes, offset + index * element.size(), value);
+        Some(stored)
     }
 }
 

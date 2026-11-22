@@ -2,8 +2,8 @@
 
 测量时间：2026-02（提交 `4a30079`，v0.4.0 之后）
 
-**已修**：4.1、4.2、4.4、4.7、4.8，可运行通过率 **42.7% → 53.0%**，
-净修好 1265 例、新引入失败 0 例。见第 7 节。
+**已修**：4.1、4.2、4.3、4.4、4.7、4.8，可运行通过率 **42.7% → 58.5%**，
+净修好 2243 例、新引入失败 0 例。见第 7 节。
 
 复现：
 
@@ -29,10 +29,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 17665 |
-| **可运行中通过** | **7536（42.7%）** |
-| 可运行中失败 | 8303 |
+| **可运行中通过** | **10340（58.5%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 7325 |
 | ↳ 其中挂起（引擎不终止） | 45 |
-| ↳ 其中答错 | 8258 |
+| ↳ 其中答错 | 7280 |
 | 跳过（引擎完全没这功能） | 6220 |
 
 跳过不是"通过"，所以它单列。按原因：
@@ -149,7 +149,7 @@ Object.assign(1, {a: 1})   // TypeError: Object.assign target is not an object�
 
 `a.length` 上限（4.4）随之修好：`ArrayCreate` 的 `2^32-1` 校验补上，44 条挂起消失。
 
-### 4.3 TypedArray 只是骨架（1365/1453 条）— 未修
+### 4.3 TypedArray 只是骨架（1365/1453 条）— ✅ 已修（仍失败 643）
 
 ```js
 var t = new Uint8Array([1,2,3]);
@@ -159,6 +159,26 @@ t.map, t.filter         // undefined
 typeof BigInt64Array    // undefined
 typeof DataView         // undefined
 ```
+
+**实际缺的比"骨架"更多**，按修的顺序：
+
+1. `BigInt64Array`／`BigUint64Array` 整个不存在（490 条只是 `ReferenceError`）。
+   元素读写要按 BigInt 语义：读回 `0n` 且 `typeof` 是 `"bigint"`，写 Number 是
+   `TypeError`，写入值按 `2^64` 取模环绕（`BigUint64Array(1)[0] = -1n` 得 `2^64-1n`）。
+   这逼出两处架构变动：`ElementType::write` 变成可失败，`read` 需要堆来分配 BigInt
+   （从缓冲区自己的 `Gc` 取 `heap()`，不必给每个调用者加参数）。
+2. 迭代族（`map`/`filter`/`forEach`/`some`/`every`/`reduce`/`find*`/`indexOf`/
+   `lastIndexOf`/`includes`/`at`/`reverse`/`sort`/`copyWithin`/`with`/`toReversed`/
+   `toSorted`/`values`/`keys`/`entries`）一个都没有。注意 `map`/`filter`/`slice` 要返回
+   **同类型视图**而不是数组。
+3. `%TypedArray%` 这个内建本身不存在——`Object.getPrototypeOf(Int8Array)` 是
+   `Function.prototype`，所以 `from`/`of`/`Symbol.species` 无处安放。
+4. 构造函数只走 array-like 路径，不消费 `Symbol.iterator`；而原始值应该走 `ToIndex`
+   而不是迭代（`new Int32Array("3")` 是三个 0，不是三个字符）。
+5. `TypedArraySpeciesCreate` 缺失：`map`/`filter`/`slice`/`with`/`toReversed` 必须读
+   `constructor[Symbol.species]`，否则子类重定向和抛错都无法观察。
+6. 分离缓冲区（detached buffer）的视图没在方法入口 `ValidateTypedArray`，于是静默
+   当成空视图而不是抛 `TypeError`。
 
 `length`/`byteLength`/`byteOffset`/`set`/`subarray`/`slice`/`join` 有，其余大面积缺失。这直接推翻了"FR-3 的 TypedArray 部分已完成"的说法。
 
@@ -205,6 +225,13 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 真正的修法是让 `[[Get]]`/`[[Set]]` 都只认属性表、元素向量退化为缓存，或让 8 个改写
 方法走 `set_property` 而不是 `array_set`。两种都是跨模块改动，单独排期。
 
+### 4.10 `DataView` 完全不存在（0/520）— 未修
+
+`typeof DataView === "undefined"`，520 条全部以 `ReferenceError` 失败。它与 TypedArray
+共享 `ArrayBuffer`，但方法集独立（`getInt8`/`getFloat64`/`setBigUint64`/`getUint8` 等
+按字节偏移读写）。这一轮没做：TypedArray 的收益已经落袋，DataView 是另一块同规模的工作，
+混在一起会让"这一步做得对不对"无法验证。
+
 ## 5. 对里程碑结论的修正
 
 - FR-3 中 `TypedArray`／`DataView`／`BigInt64Array` 不能记为完成（4.3）。
@@ -217,8 +244,8 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 
 1. ~~`name`/`length` 可配置（4.1）~~——已修，实测 +561 例。
 2. ~~`ToObject` 装箱与数组接收者（4.2）~~——已修，连同 4.4、4.7、4.8 共 +704 例。
-3. `TypedArray` 补全（4.3）——1365/1453 条，**当前最大单块**。先补迭代器、
-   `at`/`map`/`filter`，再补 `BigInt64Array`（806 条）与 `DataView`（465 条）。
+3. ~~`TypedArray` 补全（4.3）~~——已修，实测 +978 例（TypedArray 84→800，
+   TypedArrayConstructors 291→448）。**`DataView` 仍完全缺失（0/520）**，见 4.10。
 4. `Iterator` helpers（664/684 条）——`Iterator` 全局对象整个没有。
 5. `Promise`（真做）——229 条 Promise，另加 `flag:async` 632 条跳过的前置条件。
 6. 正则文法（4.5）——1092 条，受 Unicode 表依赖，和 FR-8 一起做。
@@ -269,3 +296,33 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 回归保护：`crates/quickjs-pure/tests/builtins.rs` 的
 `array_methods_are_generic_over_array_likes_and_read_the_receiver_lazily` 与
 `define_property_follows_validate_and_apply`。已验证两者在修复前都失败。
+
+### 4.3 TypedArray：从骨架到可用
+
+| | 修前 | 修后 |
+|---|---|---|
+| `TypedArray` | 84/1446 | **800/1446** |
+| `TypedArrayConstructors` | 291/666 | **448/666** |
+| 全量可运行通过 | 9362（53.0%） | **10340（58.5%）** |
+
+修好 978 例，回归 0 例（逐用例名字求差集）。
+
+过程中的两次自我修正，都是全量对比报出来的：
+
+1. **`Array.from({length: 2})` 返回空数组。** 这是预存在的 bug（改动前后都是空），
+   但它是 typed-array 用例构造源数据的必经之路：`makeArray` 用它建数组，于是所有
+   `new TA(Array.from({length: n}, …))` 拿到的视图长度都是 0。根因是缺失的索引被
+   *跳过* 而不是填 `undefined`。不修它，TypedArray 的修法看起来对、数字上不去。
+2. **`ToNumber` 对 BigInt 静默返回 `NaN`。** `new Int32Array(1n)` 因此得到长度 0 而不是
+   `TypeError`。修在 `Interp::to_js_number`（12 处调用点全是规范要求抛错的地方）。
+   `Math.max(1n)` 仍答 `NaN`——`Math` 走的是自己的 `to_number()`，记为已知缺口。
+
+回归保护：`crates/quickjs-pure/tests/builtins.rs` 的
+`typed_arrays_are_complete_enough_to_iterate_and_transform` 与
+`array_from_and_array_index_search_honour_their_arguments`，已验证在修复前都失败。
+
+### 仍未做（同一批里明确留下的）
+
+- **`DataView`**：0/520，完全缺失（4.10）。
+- **`Iterator` helpers**：664/684 失败，`Iterator` 全局对象整个没有。
+- **`Math` 缺 `ToNumber` 的 BigInt 拒绝**：`Math.max(1n)` 应抛 `TypeError`。
