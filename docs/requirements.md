@@ -172,7 +172,7 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 | NFR-7 | 依赖最小化：runtime 零第三方 crate（`libc` 也避免，用 `std` + 少量 `sys` 封装）；dev-deps 不限 | `cargo tree` 审计 |
 | NFR-8 | 平台：macOS(arm64/x64)、Linux(x64/arm64)、Windows(msvc)；WASM 列为可选 | CI 矩阵 |
 | NFR-9 | 可调试：`--dump`、字节码反汇编、`trace` 分配跟踪、错误栈含行列与函数名 | 手工验收 |
-| NFR-10 | 可测试：差分 oracle 框架（跑 C 版 `qjs` vs Rust `qjs`）+ test262 harness + fuzz 目标 | `cargo test` 一键运行 |
+| NFR-10 | 可测试：差分 oracle 框架（跑 C 版 `qjs` vs Rust `qjs`）+ test262 harness + fuzz 目标 | `cargo test` 一键运行；test262 见 `docs/test262-status.md`（`scripts/test262.sh`，因需外部 checkout 与一分钟墙钟，不进 `check.sh`） |
 | NFR-11 | 可嵌入：`no_std` 不支持（明确），但 `std` 访问集中在 `sys` 层，便于后续移植 | 架构评审 |
 | NFR-12 | MSRV：edition 2024（rustc ≥ 1.85） | CI |
 

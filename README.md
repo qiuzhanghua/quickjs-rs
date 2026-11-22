@@ -137,3 +137,14 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 每个里程碑（M0、M1、…）单独提交，提交前必须 `./scripts/check.sh` 全绿；
 提交信息用 `feat(module): 中文摘要 (Mx)`，正文写清验收证据（测试数、与 C 版对比结论）。
+
+## 一致性测量
+
+`cargo test` 里的差分套件只覆盖上游 `tests/*.js`（七个文件），样本窄；语言覆盖面的真实数字由 test262 给出：
+
+```sh
+./scripts/test262.sh                 # 全部 test/built-ins
+TEST262_GROUP=1 ./scripts/test262.sh # 按部件看失败分布
+```
+
+当前基线与已知缺陷见 [`docs/test262-status.md`](docs/test262-status.md)。
