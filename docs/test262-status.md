@@ -371,6 +371,55 @@ qjs --memory-limit 64M -e '...'        # 限额完全不生效
 现在三个都以退出码 2 + `qjs: not implemented yet: … (milestone M9)` 结束，
 与 `interactive REPL` 的处理一致。`qjs --help` 的文本不变，仍与参考逐字节一致。
 
+### 4.15 私有类字段 `#x`：已勘明协议，未实施
+
+这是本项目唯一一处"编译器明确报错"的语言特性，也是真实代码的硬阻断：
+`class A { #x = 1 }` 至今报 `private class fields are not supported by the compiler yet`。
+
+**为什么本轮没做。** 它的实测收益极小：`test/built-ins` 里只有 **7 个**用例使用私有名
+（私有字段的用例主要在 `test/language/class/`，而当前基线只跑 `test/built-ins`）。
+真正的价值在真实代码，不在这个数字上。而它的成本是跨编译器与 VM 的一整套改动，
+半途而废会产出"能编译但语义不对"的结果——正是本项目最不该有的东西。
+
+**已勘明的部分**（用 `qjsc-dump` 反汇编参考实现得到，可直接照做）：
+
+解析器与 AST 侧**已经齐备**：`PropName::Private`、`MemberProp::Private`、
+`Expr::PrivateIn` 都在，私有名重复声明的 early error 也已实现。
+缺的是编译器与 VM。
+
+参考实现的栈纪律与 opcode 序列：
+
+| opcode | 栈 | 用途 |
+|---|---|---|
+| `private_symbol "#x"` | `-> sym` | 每次类求值产生**全新** symbol，存入类作用域的局部变量 `#x` |
+| `define_private_field` | `obj sym value -> obj` | 实例字段初始化 |
+| `get_private_field` | `obj sym -> value` | 读，缺品牌时 `TypeError` |
+| `put_private_field` | `obj value sym ->` | 写（编译器用 `insert2` 重排到 `[obj value sym]`） |
+| `private_in` | `obj sym -> bool` | `#x in o` |
+| `add_brand` | `obj brand ->` | 类求值时给原型加方法品牌；静态侧是 `dup; null; swap; add_brand` |
+| `check_brand` | `obj sym -> obj sym` | 私有**方法**调用前校验品牌 |
+
+类定义的完整序列（`class A { #x; #m(){} }`）：
+
+```
+define_class A,0
+private_symbol "#x"      ; put_loc2            — 私有字段名
+fclosure8 0 ; set_home_object ; set_name "#m" ; put_loc3   — 私有方法
+… define_method 各公开成员 …
+dup ; null ; swap ; add_brand                              — 静态品牌
+fclosure8 <class_fields_init> ; set_home_object ; put_loc4
+```
+
+构造函数里是 `get_loc0 this ; get_loc1 <home_object> ; add_brand`，
+即把**方法品牌**加到原型上；字段初始化走 `define_private_field`。
+构造函数的 `check_ctor` 之后调 `<class_fields_init>`。
+
+实现要点：`private_symbol` 可以复用已有的 `Value::Symbol`（符号已是真正的属性键），
+但要保证**每次类求值一个新 symbol**，否则两个类各自的 `#x` 会撞成同一个键 ——
+这正是"看起来对、结果是错答案"的那类陷阱。
+
+同一批里另一个未做的：`static { }` 静态块，编译器同样明确报错。
+
 ## 5. 对里程碑结论的修正
 
 - FR-3 中 `TypedArray`／`DataView`／`BigInt64Array` 不能记为完成（4.3）。
