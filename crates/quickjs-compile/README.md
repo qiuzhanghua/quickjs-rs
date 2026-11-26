@@ -11,7 +11,7 @@ behaviour matches.
 
 ```toml
 [dependencies]
-quickjs-compile = "0.2"
+quickjs-compile = "0.4"
 ```
 
 The package is `quickjs-compile` but the library is `js_compile`:

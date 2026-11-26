@@ -5,7 +5,7 @@
 //! tracked is the upstream release whose version string is
 //! [`COMPAT_VERSION`].
 //!
-//! # Current state (M3)
+//! # Current state (v0.4.0 — milestones M0–M6)
 //!
 //! Source is parsed, compiled to bytecode and executed: [`Context::eval`] runs a
 //! script and returns its completion value, and [`Context::output`] holds whatever
@@ -18,8 +18,28 @@
 //! assert_eq!(ctx.output(), "2\n");
 //! ```
 //!
-//! Not there yet: the standard library beyond `print`, classes and generators, and
-//! modules. Those are later milestones (see `docs/requirements.md`).
+//! The standard library covers `Object`, `Function`, `Array`, `String`, `Number`,
+//! `Math`, `JSON`, `Reflect`, `Date`, `RegExp`, `Symbol`, `Map`/`Set`, `BigInt`,
+//! TypedArray, `DataView` and the error classes; the ES6+ runtime is in place
+//! (class, destructuring, generators, `Proxy`, `Promise`/async, `for await`); and
+//! ES modules run through [`Context::eval_module`].
+//!
+//! # Not there yet
+//!
+//! Every gap below is a loud failure rather than a wrong answer:
+//!
+//! * private class fields (`#x`) are rejected by the compiler with a
+//!   `SyntaxError`;
+//! * the `std`/`os` host modules and the event loop are absent, so `setTimeout`
+//!   is undefined and a script cannot touch the filesystem;
+//! * `Iterator` helpers and `RegExp.escape` are missing, and `RegExp` lookbehind
+//!   does not parse;
+//! * the host API is still small: a script can be evaluated, but Rust cannot yet
+//!   register a native function on the global object or call a JavaScript
+//!   function back.
+//!
+//! See `docs/requirements.md` in the repository for the milestone plan and
+//! `docs/test262-status.md` for the measured language coverage.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]

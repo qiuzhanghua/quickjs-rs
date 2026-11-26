@@ -29,7 +29,13 @@
 | M2 | 字节码编译器 + 作用域解析 + 序列化 | ✅ 逐 opcode 差分通过 |
 | M3 | VM 核心（调用/对象/异常/闭包/原型） | ✅ `qjs` 能执行 JS |
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Reflect） | ✅ `test_builtin.js` 的 M4 部分 229/237 语句通过 |
-| M5–M11 | ES6+ 运行期、模块、正则/Unicode、BigInt/TypedArray、std/os/Worker、AOT、性能 | ⬜ |
+| M5 | ES6+ 运行期（class/generator/async/迭代/解构/模板/Proxy） | ✅ 残留：私有类字段 `#x` 编译器报错 |
+| M6 | 模块系统 + 动态 `import()` + JSON/text 模块 | ✅ `hello_module.js` 与参考逐字节一致 |
+| M7 | 正则引擎 + Unicode 表 | ⬜ `RegExp` 已可用；缺 `RegExp.escape`、lookbehind、Unicode 表 |
+| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | ⬜ 前三项已可用；`Atomics`/`WeakRef` 未开始 |
+| M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | ⬜ |
+| M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
+| M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
 | M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
 
 ## 已交付的结构

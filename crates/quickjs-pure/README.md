@@ -10,7 +10,7 @@ cannot do.
 
 ```toml
 [dependencies]
-quickjs-pure = "0.2"
+quickjs-pure = "0.4"
 ```
 
 The package is `quickjs-pure` but the library is `quickjs` (the plain name is taken on

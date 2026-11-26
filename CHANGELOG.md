@@ -2,6 +2,72 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
+## 未发布（在 v0.4.0 之后）
+
+**可用性边界未变**：`qjs` 能做的事与 v0.4.0 完全相同——这一节里没有一行逻辑代码被改过，
+记录的全是代码之外的东西：门禁本身，以及它周围那些还在说旧事实的文档。
+
+按 v0.1.1 立下的同一条尺子，扩大的不是可用性就不抬版本号。抬版本的时刻是
+M7（正则引擎 + Unicode 表）或者 M9（`std`/`os`/事件循环）真正落地。
+
+### 修：门禁在 HEAD 上是红的，两处
+
+发现时 `./scripts/check.sh` 两步都过不去，而 README 第 87、144 行与脚本自己的
+header 都写着它"提交前必跑"。两条都以"没人真的跑过"收尾，值得记下来：
+
+1. **`cargo fmt --check` 失败** —— `crates/quickjs-pure/tests/builtins.rs` 里一处
+   5 个片段的 `concat!` 是 rustfmt 要收成一行、而代码写成多行的形态。这是
+   `check.sh` 的**第一道**关卡，也就是说"提交前必须全绿"这条约定在最后一个提交上
+   并不成立。改成单个字符串字面量，内容逐字节不变。
+2. **`scripts/check.sh` 在 git 里是 `100644`** —— 四个脚本里只有它漏了可执行位
+   （`publish.sh`/`setup-oracle.sh`/`test262.sh`/`slice-builtin-test.py` 都是 `100755`），
+   于是文档里那条命令执行时直接 `权限不够`。用 `git update-index --chmod=+x` 修，
+   不留一个只有本地才对的 `chmod`。
+
+第 2 条正好解释了第 1 条为什么能一直藏着：门禁自己跑不起来，红绿就没人看见。
+
+### 修：五处文档与事实不符
+
+| 位置 | 原状 | 现状 |
+|---|---|---|
+| `quickjs-pure/src/lib.rs` 模块文档 | `# Current state (M3)`，并写"Not there yet: classes and generators, and modules" | 改成 v0.4.0 / M0–M6，列出实际标准库与 ES6+ 运行期；新增 `# Not there yet` 段记录四个真实缺口 |
+| `README.md` 里程碑表 | `M5–M11` 一整行 ⬜ | 拆成 M5 ✅（残留私有字段）、M6 ✅、M7–M11 各自 ⬜ 并标注"已可用 / 未开始" |
+| 四个 crate 的 `README.md` | 依赖示例写 `"0.2"` | `"0.4"`，与 `[workspace.dependencies]` 的宽版本写法一致，patch 升级不必再动 |
+| `docs/test262-status.md` 首行 | `测量时间：2026-02` | `2026-11-22`，并写明基线 `4a30079`、末轮 `93ecc32` |
+| `docs/test262-status.md` 4.3 末 | "仍未做：`DataView` 0/520，完全缺失" | 与 4.10 已修（423/520）矛盾，改为指向 4.10 |
+
+第一条最要紧：那是 `cargo doc` 的首屏，也是唯一一处会把"类、生成器、模块都没有"
+当成当前状态告诉使用者的地方——而 `quickjs-pure` 已经发布到 crates.io 了。
+
+### 验证
+
+`./scripts/check.sh` 退出码 0，四步全跑：fmt 干净、`clippy -D warnings` 干净、
+`cargo test` **395 passed / 0 failed / 1 ignored**（ignored 仍是那 15 条
+"语义对但字节码不同"的优化层差分）。改动过的 `builtins.rs` 断言单独跑过：
+`-p quickjs-pure --test builtins` 113 passed。
+
+`scripts/lang-diff.py` 依旧打印 `SKIPPED`：本机没有 `/tmp/quickjs-master`
+参考实现，所以上面这些数字**没有一条是差分结论**，一致性回归这一轮没被测。
+
+### 顺带记录：仍未处理
+
+以下都是这一轮读代码与实跑时确认的、**不属于本次改动范围**的事，写在这里是为了
+不让它们留在对话里：
+
+- **README 的「已知缺口」表已过期。** 表里说 TypedArray 只有 7/29 个数组方法且没有
+  `Symbol.iterator`，实测 `map` 与 `[...new Uint8Array([1,2])]` 都已正确。现在的真实
+  缺口是 `Iterator` helpers（664 例）、`RegExp.escape` + lookbehind（1091 例）、
+  `Math.max(1n)` 返回 `NaN` 而不是抛 `TypeError`、resizable ArrayBuffer。
+- **`--std` 下 `typeof std === "undefined"`。** 文档说"模块不存在"，实际是对
+  `--std` 的全局注入静默给了 `undefined`——这与本项目"响亮失败、不给错答案"的
+  原则相左，应当抛错。
+- **FR-12 的 Rust 宿主 API 基本没做。** `Context` 只暴露 `eval`/`eval_module`/
+  `output`/`last_value`；注册原生函数与回调 JS 函数的入口在 `Interp` 上，而
+  `Context.interp` 是私有字段。作为门面 crate 发布出去之后，这是"可嵌入"这个定位上
+  最实际的障碍。
+- **数组下标两个真相源**（`test262-status.md` 4.9）：8 个改写方法仍写快照副本，
+  `Array.prototype.push.call(1, 2)` 抛 `TypeError: '0' is read-only` 而不是返回 1。
+
 ## v0.4.0 — 2026-11-22
 
 M6（ES 模块）完成，并修掉三处**给错答案而不报错**的缺陷——三处都在 v0.3.0 里，
