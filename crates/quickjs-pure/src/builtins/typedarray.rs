@@ -32,7 +32,7 @@
 //! length of `0`, which is what the reference does; the storage stays behind the `Rc` so all
 //! the views see the transition at once.
 
-use crate::builtins::{arg, define_method};
+use crate::builtins::{arg, define_method, install_tag};
 use crate::interp::{Interp, JsResult};
 use crate::object::{BufferStorage, JsObject, Property};
 use crate::value::Value;
@@ -466,29 +466,6 @@ fn install_views(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
             Property::with_attributes(Value::Object(constructor), true, false),
         );
     }
-}
-
-/// Give `proto` a `Symbol.toStringTag` answering `tag`.
-///
-/// The tag has to be baked into the function: a native one is a bare pointer and cannot
-/// capture. This used to ignore its `tag` argument and always answer `"ArrayBuffer"`, so
-/// `Object.prototype.toString.call(new DataView(...))` reported the wrong type.
-fn install_tag(proto: &Gc<JsObject>, tag: &str, interp: &Interp<'_>) {
-    // A *data* property: `{value, writable: false, enumerable: false, configurable: true}`.
-    // The tag is a constant, and an accessor here is observable — the conformance check
-    // reads `writable` off the descriptor and a getter has none.
-    proto.define_key(
-        &interp
-            .realm
-            .well_known_key(crate::interp::WellKnown::ToStringTag),
-        Property {
-            value: Some(interp.string(tag)),
-            writable: false,
-            enumerable: false,
-            configurable: true,
-            ..Property::default()
-        },
-    );
 }
 
 /// `ArrayBuffer.prototype[Symbol.toStringTag]`.

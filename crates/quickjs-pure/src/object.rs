@@ -728,10 +728,22 @@ impl Trace for EvalScope {
 pub enum ObjectKind {
     /// An ordinary object: only its property table.
     Ordinary,
-    /// An array: dense elements plus a property table for everything else.
+    /// An array: a dense element vector plus a property table for everything else.
+    ///
+    /// `length` is stored **separately** rather than derived from `elements.len()`, so a
+    /// sparse array costs nothing to poke at a far index: the reference answers
+    /// `a = []; a.length = 4294967295` instantly, while deriving the length from a dense
+    /// vector meant allocating one `Value` per slot — 62 GB and 24 seconds for that one
+    /// statement. An index past the vector is a hole, and `length` alone records how many
+    /// holes there are at the end.
+    ///
+    /// Invariant: `elements.len() <= length`. A truncation drops both, so the reverse
+    /// (`length < elements.len()`) never holds.
     Array {
-        /// The dense prefix of the array.
+        /// The dense prefix: everything before the first trailing hole.
         elements: Vec<Value>,
+        /// The logical length, which may exceed `elements.len()`.
+        length: usize,
     },
     /// A function or a class constructor.
     Function(Callable),
@@ -947,7 +959,7 @@ impl Trace for ObjectKind {
                 }
             }
             ObjectKind::Ordinary => {}
-            ObjectKind::Array { elements } => {
+            ObjectKind::Array { elements, .. } => {
                 for element in elements {
                     element.trace(tracer);
                 }
@@ -1144,12 +1156,17 @@ impl JsObject {
     }
 
     /// An array with the given prototype and initial capacity.
+    /// An empty array with room for `capacity` elements.
+    ///
+    /// The length starts at 0: `capacity` is a `Vec` hint, not a length. Callers that want
+    /// holes use [`Self::array_set_length`], which no longer allocates them.
     pub fn array(heap: &js_gc::Heap, proto: Option<Gc<JsObject>>, capacity: usize) -> Gc<JsObject> {
         Gc::new(
             heap,
             JsObject::new(
                 ObjectKind::Array {
                     elements: Vec::with_capacity(capacity),
+                    length: 0,
                 },
                 proto,
             ),
@@ -1290,7 +1307,7 @@ impl JsObject {
     /// The elements of an array object, if this is one.
     pub fn array_elements(&self) -> Option<Vec<Value>> {
         match &self.data.borrow().kind {
-            ObjectKind::Array { elements } => Some(elements.clone()),
+            ObjectKind::Array { elements, .. } => Some(elements.clone()),
             _ => None,
         }
     }
@@ -1305,7 +1322,7 @@ impl JsObject {
         let mut out: Vec<(PropertyKey, Property)> = data.props.to_vec();
         // An array's elements live in their own vector rather than the property table, so
         // they have to be synthesized — with the attributes an ordinary element has.
-        if let ObjectKind::Array { elements } = &data.kind {
+        if let ObjectKind::Array { elements, .. } = &data.kind {
             for (index, element) in elements.iter().enumerate() {
                 if matches!(element, Value::Hole) {
                     continue;
@@ -1327,7 +1344,7 @@ impl JsObject {
                 out.push((
                     key,
                     Property {
-                        value: Some(Value::Int(length as i32)),
+                        value: Some(length_value(length)),
                         writable: self.length_writable(),
                         enumerable: false,
                         configurable: false,
@@ -1391,7 +1408,7 @@ impl JsObject {
     /// An array's element count, when this object is an array.
     pub fn array_length(&self) -> Option<usize> {
         match &self.data.borrow().kind {
-            ObjectKind::Array { elements } => Some(elements.len()),
+            ObjectKind::Array { length, .. } => Some(*length),
             _ => None,
         }
     }
@@ -1399,7 +1416,7 @@ impl JsObject {
     /// Read one array element.
     pub fn array_get(&self, index: usize) -> Option<Value> {
         match &self.data.borrow().kind {
-            ObjectKind::Array { elements } => elements.get(index).cloned(),
+            ObjectKind::Array { elements, .. } => elements.get(index).cloned(),
             _ => None,
         }
     }
@@ -1407,9 +1424,10 @@ impl JsObject {
     /// Append to an array and return the new length.
     pub fn array_push(&self, value: Value) -> usize {
         match &mut self.data.borrow_mut().kind {
-            ObjectKind::Array { elements } => {
+            ObjectKind::Array { elements, length } => {
                 elements.push(value);
-                elements.len()
+                *length = elements.len();
+                *length
             }
             _ => 0,
         }
@@ -1422,8 +1440,21 @@ impl JsObject {
     /// and the debug printer reports. A store *of* `undefined` is a real element.
     pub fn array_set(&self, index: usize, value: Value) -> bool {
         match &mut self.data.borrow_mut().kind {
-            ObjectKind::Array { elements } => {
-                if index >= elements.len() {
+            ObjectKind::Array { elements, length } => {
+                if index >= *length {
+                    // Growing has to fill the gap, and filling it means the vector really
+                    // does hold `index + 1` slots — a store at `2^32-2` is 68 GB whatever
+                    // the length field says. Refuse instead of aborting the process: the
+                    // reference throws `RangeError` from the allocation. A caller that
+                    // cares converts this `false` into the spec's answer.
+                    if index + 1 > ARRAY_ELEMENT_LIMIT {
+                        return false;
+                    }
+                    elements.resize(index + 1, Value::Hole);
+                    *length = elements.len();
+                } else if index >= elements.len() {
+                    // Inside the logical length but past the dense prefix: a hole that is
+                    // being filled, so the vector has to catch up first.
                     elements.resize(index + 1, Value::Hole);
                 }
                 elements[index] = value;
@@ -1452,8 +1483,9 @@ impl JsObject {
     /// Store `value` as a plain element without creating holes, used by `push`.
     pub fn array_push_hole(&self) -> bool {
         match &mut self.data.borrow_mut().kind {
-            ObjectKind::Array { elements } => {
+            ObjectKind::Array { elements, length } => {
                 elements.push(Value::Hole);
+                *length = elements.len();
                 true
             }
             _ => false,
@@ -1464,10 +1496,17 @@ impl JsObject {
     ///
     /// `a.length = 5` on a two-element array leaves three holes, so the fill value is
     /// [`Value::Hole`] rather than `undefined`.
-    pub fn array_set_length(&self, length: usize) -> bool {
+    /// Growing only records the new length: the extra slots are holes, and a hole needs
+    /// no storage. That is what makes `a = []; a.length = 4294967295` an O(1) operation
+    /// instead of a 62 GB allocation.
+    pub fn array_set_length(&self, new_length: usize) -> bool {
         match &mut self.data.borrow_mut().kind {
-            ObjectKind::Array { elements } => {
-                elements.resize(length, Value::Hole);
+            ObjectKind::Array { elements, length } => {
+                if new_length < *length {
+                    // Shrinking really does drop the trailing elements.
+                    elements.truncate(new_length);
+                }
+                *length = new_length;
                 true
             }
             _ => false,
@@ -1480,11 +1519,14 @@ impl JsObject {
     /// it is separate from [`Self::array_set_length`] because growing an array by
     /// assignment produces holes, which are indistinguishable from `undefined`
     /// here.
-    pub fn array_truncate(&self, length: usize) -> bool {
+    pub fn array_truncate(&self, new_length: usize) -> bool {
         match &mut self.data.borrow_mut().kind {
-            ObjectKind::Array { elements } => {
-                if length < elements.len() {
-                    elements.truncate(length);
+            ObjectKind::Array { elements, length } => {
+                if new_length < elements.len() {
+                    elements.truncate(new_length);
+                }
+                if new_length < *length {
+                    *length = new_length;
                 }
                 true
             }
@@ -1766,7 +1808,7 @@ pub fn own_property_including_array(object: &Gc<JsObject>, key: &PropertyKey) ->
     // turned it off.
     if text == "length" {
         return Some(Property {
-            value: Some(Value::Int(object.array_length()? as i32)),
+            value: Some(length_value(object.array_length()?)),
             writable: object.length_writable(),
             enumerable: false,
             configurable: false,
@@ -1807,6 +1849,40 @@ pub fn lookup_key(object: &Gc<JsObject>, key: &PropertyKey) -> Option<(Gc<JsObje
 /// [`lookup_key`] for a string key.
 pub fn lookup(object: &Gc<JsObject>, name: &str) -> Option<(Gc<JsObject>, Property)> {
     lookup_key(object, &PropertyKey::from(name))
+}
+
+/// The largest array index that may be *stored*, i.e. the largest dense vector this engine
+/// will grow to an index for.
+///
+/// The spec's `length` limit is `2^32-1`, but the elements are a dense `Vec<Value>` here,
+/// so a store at index `2^32-2` is a 68 GB reservation. The reference (which keeps
+/// elements in a hash map) answers instantly. Refusing past this bound keeps the process
+/// alive; the conformance tests that really do store near `2^32` are recorded in
+/// `docs/test262-status.md` as a limitation rather than quietly answered wrong.
+pub const ARRAY_ELEMENT_LIMIT: usize = 1 << 26;
+
+/// An array's `length` as a JavaScript number.
+///
+/// `Value::Int` only holds an `i32`, and an array's length may legitimately reach
+/// `2^32-1`, so a plain cast is not enough: `a[2**32-2] = 1; a.length` came back as `-1`,
+/// and `Object.getOwnPropertyDescriptor(a, "length").value` with it. Every
+/// `LengthOfArrayLike` over such an array then ran to `-1`, and the paths without their
+/// own `RangeError` check turned into `memory allocation of 68719476720 bytes failed`.
+pub fn length_value(length: usize) -> Value {
+    if length <= i32::MAX as usize {
+        Value::Int(length as i32)
+    } else {
+        Value::Float(length as f64)
+    }
+}
+
+/// An array *index* as a JavaScript number.
+///
+/// Same problem as [`length_value`] and the same fix: an index may be as large as
+/// `2^32-2`, which `Value::Int` cannot hold. `a[2**32-2] = 1; a.indexOf(1)` was answering
+/// `-2` because the index was truncated on the way out.
+pub fn index_value(index: usize) -> Value {
+    length_value(index)
 }
 
 /// The array index a property key names, if it names one.

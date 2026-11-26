@@ -1524,7 +1524,7 @@ impl<'a> Interp<'a> {
             && let Some(length) = object.array_length()
         {
             return Some(Property {
-                value: Some(Value::Int(length as i32)),
+                value: Some(crate::object::length_value(length)),
                 writable: object.length_writable(),
                 enumerable: false,
                 configurable: false,
@@ -2987,7 +2987,8 @@ impl<'a> Interp<'a> {
             if let Some(length) = object.array_length()
                 && text == "length"
             {
-                return Ok(Some(Value::Int(length as i32)));
+                // Not `Value::Int(length as i32)`: see [`length_value`].
+                return Ok(Some(crate::object::length_value(length)));
             }
         }
         match lookup_key(object, key) {
@@ -6252,7 +6253,7 @@ impl<'a> Interp<'a> {
                 let target = self.pop();
                 let value = match &target {
                     Value::Object(object) => match object.array_length() {
-                        Some(length) => Value::Int(length as i32),
+                        Some(length) => crate::object::length_value(length),
                         None => self.read_field(&target, "length")?,
                     },
                     Value::String(text) => Value::Int(text.utf16_len() as i32),
@@ -7553,6 +7554,40 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// Fill in a String exotic object: `_value`, `length` and the index properties.
+    ///
+    /// `new String("ab")` used to get only `_value`, so `new String("ab").length` was
+    /// `undefined`, `new String("ab")[0]` was `undefined`, and every `Array.prototype`
+    /// method called on a box saw an array-like of length 0 — 36 test262 files exercise
+    /// exactly that. `ToObject` on a *primitive* string built the indices correctly, so
+    /// the two paths had drifted; this is the one both now use.
+    ///
+    /// The indices are *code units*, so an astral character occupies two of them — the
+    /// same rule `s.length` and `s[i]` follow.
+    pub(crate) fn init_string_wrapper(
+        &self,
+        object: &Gc<JsObject>,
+        text: &Gc<crate::value::JsString>,
+    ) {
+        object.define(
+            "length",
+            Property::with_attributes(Value::Int(text.utf16_len() as i32), false, false),
+        );
+        for index in 0..text.utf16_len() {
+            if let Some(unit) = text.wtf8().unit_at(index) {
+                object.define(
+                    &index.to_string(),
+                    // Own, non-writable, enumerable, non-configurable — §10.4.3.4.
+                    Property::with_attributes(self.string_wtf8(unit), false, true),
+                );
+            }
+        }
+        object.define(
+            "_value",
+            Property::with_attributes(Value::String(text.clone()), false, false),
+        );
+    }
+
     /// `ToObject`: box a primitive, refuse `undefined` and `null`.
     ///
     /// A destructuring *object* pattern starts with this, which is why `var {} = null`
@@ -7564,27 +7599,7 @@ impl<'a> Interp<'a> {
             Value::Object(object) => return Ok(object.clone()),
             Value::String(text) => {
                 let object = self.new_object(self.realm.string_proto.clone());
-                // `length` and the index properties are own and enumerable on a String
-                // object, which is what makes `Object.keys(new String("ab"))` list
-                // `0` and `1`.
-                object.define(
-                    "length",
-                    Property::with_attributes(Value::Int(text.utf16_len() as i32), false, false),
-                );
-                // The indices are *code units*, so an astral character occupies two of
-                // them — the same rule `s.length` and `s[i]` follow.
-                for index in 0..text.utf16_len() {
-                    if let Some(unit) = text.wtf8().unit_at(index) {
-                        object.define(
-                            &index.to_string(),
-                            Property::with_attributes(self.string_wtf8(unit), false, true),
-                        );
-                    }
-                }
-                object.define(
-                    "_value",
-                    Property::with_attributes(Value::String(text.clone()), false, false),
-                );
+                self.init_string_wrapper(&object, text);
                 return Ok(object);
             }
             Value::Int(_) | Value::Float(_) => (self.realm.number_proto.clone(), value.clone()),

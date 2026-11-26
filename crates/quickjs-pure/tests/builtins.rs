@@ -2804,6 +2804,184 @@ try { a.includes(1, Symbol()); print("no throw"); } catch (e) { print(e.name); }
 }
 
 #[test]
+fn array_callbacks_receive_their_this_arg_and_wrapped_strings_have_length() {
+    // Two independent root causes behind one batch of failures:
+    //
+    // * Every callback-taking `Array.prototype` method passed `undefined` to `[[Call]]`
+    //   instead of the second argument. Invisible in `arr.map(f)`, wrong in `arr.map(f, x)`
+    //   — and 159 test262 files do nothing but `assert(this === thisArg)` inside one.
+    //   `reduce`/`reduceRight` are the exception: their second argument is the initial
+    //   accumulator, so they keep passing `undefined`.
+    // * `new String(x)` filled only `_value`, never `length` or the index properties, so
+    //   the box was an array-like of length 0. `ToObject` on a *primitive* had the right
+    //   shape, so the two paths had drifted apart.
+    assert_eq!(
+        eval(
+            r#"
+var arg = {tag: "arg"};
+var seen = [];
+[1].forEach(function () { seen.push(this); }, arg);
+[1].map(function () { seen.push(this); }, arg);
+[1].filter(function () { seen.push(this); }, arg);
+[1].some(function () { seen.push(this); }, arg);
+[1].every(function () { seen.push(this); }, arg);
+[1].find(function () { seen.push(this); }, arg);
+[1].findIndex(function () { seen.push(this); }, arg);
+[1].findLast(function () { seen.push(this); }, arg);
+[1].findLastIndex(function () { seen.push(this); }, arg);
+[1].flatMap(function () { seen.push(this); return []; }, arg);
+print(seen.length, seen.every(function (value) { return value === arg; }));
+// `reduce`'s second argument is the accumulator, not a `thisArg`, so the callback's
+// `this` stays `undefined` — which sloppy mode then coerces to the global object.
+print([1].reduce(function () { return this === this; }, 0, arg));
+
+var boxed = new String("ab");
+print(boxed.length, boxed[0], JSON.stringify(Object.keys(boxed)));
+print(Array.prototype.every.call(boxed, function (v, i, o) {
+  return o instanceof String && !(o[Symbol.iterator] === undefined);
+}));
+print(new String("\u{1D11E}").length);
+"#
+        ),
+        concat!(
+            "10 true\n",
+            "true\n",
+            "2 a [\"0\",\"1\"]\n",
+            "true\n",
+            "2\n",
+        )
+    );
+}
+
+#[test]
+fn array_search_and_change_by_copy_follow_their_index_rules() {
+    // `lastIndexOf` ignored `fromIndex` outright, so `[1,2,3].lastIndexOf(3, 1)` answered
+    // `2` instead of `-1`; an explicit `undefined` is `ToIntegerOrInfinity(undefined)` = 0,
+    // which is *not* the same as the argument being absent. The missing methods
+    // (`copyWithin`, `with`, `toReversed`, `toSorted`, `toSpliced`) then had to write to
+    // the receiver rather than a copy, and `copyWithin` turns a copied hole into a
+    // *deleted* property.
+    assert_eq!(
+        eval(
+            r#"
+var target = {};
+print([0, target, true].lastIndexOf(target, 1.5));
+print([0, true, target].lastIndexOf(target, 1.5));
+print([1, 2, 3].lastIndexOf(3, 1), [1, 2, 3].lastIndexOf(1, 2));
+print([1, 2, 1].lastIndexOf(2, undefined), [1, 2, 1].lastIndexOf(1));
+print([0, 1, 1].lastIndexOf(1, "1"), [0, 1, 1].lastIndexOf(1, "one"));
+
+var holes = [0, 1, , , 1];
+holes.copyWithin(0, 1, 4);
+print(holes.length, holes[0], holes[4], holes.hasOwnProperty(1), holes.hasOwnProperty(2));
+
+print([0, 1, 2, 3].copyWithin(1, undefined).join(","));
+print(Array.prototype.copyWithin.call(true) instanceof Boolean);
+
+print([0,,2,,4].with(2, 6).join("|"));
+print([1, 2, 3].toReversed().join(","));
+print([1, 2, 3].toSpliced(0, 1).join(","));
+print([3,,1].toSorted().join("|"));
+print([1, 2, 3].with(-1, 9).join(","));
+try { [1, 2, 3].with(3, 9); } catch (e) { print(e.name); }
+print([1,2,3].findLast(function (v) { return v < 3; }), [1,2,3].findLastIndex(function (v) { return v < 3; }));
+
+print(Array.prototype[Symbol.unscopables].with, Array.prototype[Symbol.unscopables].at);
+print(Object.getPrototypeOf(Array.prototype[Symbol.unscopables]));
+"#
+        ),
+        concat!(
+            "1\n",
+            "-1\n",
+            "-1 0\n",
+            "-1 2\n",
+            "1 -1\n",
+            "5 1 1 false false\n",
+            "0,0,1,2\n",
+            "true\n",
+            "0||6||4\n",
+            "3,2,1\n",
+            "2,3\n",
+            "1|3|\n",
+            "1,2,9\n",
+            "RangeError\n",
+            "2 1\n",
+            "undefined true\n",
+            "null\n",
+        )
+    );
+}
+
+#[test]
+fn namespaced_builtins_carry_their_tostring_tag() {
+    // `Object.prototype.toString.call(Math)` was `[object Object]`: none of `Math`, `JSON`
+    // or `Reflect` had a `@@toStringTag`. That single omission is what a run of
+    // `Array.prototype` tests check from *inside* a callback applied to `Math` and `JSON`,
+    // so it showed up as a dozen `map`/`filter`/`every` failures with no array bug at all.
+    // The tag is a *data* property — an accessor reports `writable: undefined` and fails
+    // `verifyProperty`.
+    assert_eq!(
+        eval(
+            r#"
+print(Object.prototype.toString.call(Math), Object.prototype.toString.call(JSON));
+print(Object.prototype.toString.call(Reflect));
+print(Math[Symbol.toStringTag], typeof Math[Symbol.toStringTag]);
+print(Object.getOwnPropertyDescriptor(Math, Symbol.toStringTag).writable);
+Math.length = 1; Math[0] = 1;
+print(JSON.stringify(Array.prototype.map.call(Math, function (v, i, o) {
+  return Object.prototype.toString.call(o) === "[object Math]";
+})));
+"#
+        ),
+        concat!(
+            "[object Math] [object JSON]\n",
+            "[object Reflect]\n",
+            "Math string\n",
+            "false\n",
+            "[true]\n",
+        )
+    );
+}
+
+#[test]
+fn array_length_and_index_beyond_i32_survive_the_trip_out() {
+    // `Value::Int` is an `i32`, and an array's `length` may legitimately reach `2^32-1`,
+    // so every place that cast was wrong: `Object.defineProperty(a, "length", …)` reported
+    // `-1`, `a.length` reported `-1`, and — worst — an array *index* came back truncated,
+    // so `a.indexOf(x)` at index `2^32-2` answered `-2`.
+    //
+    // The index half is only reachable through an array-like, because a real array stores a
+    // dense `Vec<Value>` and an index that large would need 68 GB. That is a separate,
+    // recorded limitation; what this pins down is the arithmetic on the way out.
+    //
+    // `findIndex` is deliberately absent: it scans forward from 0, so a length of `2^32` is
+    // 4 billion `[[Get]]`s — spec-mandated, and the reason the conformance tests that care
+    // about huge lengths all use `findLast`/`lastIndexOf`, which search downwards.
+    assert_eq!(
+        eval(
+            r#"
+var like = {length: 4294967296, 4294967294: "x", 4294967295: "y"};
+print(like.length);
+print(Array.prototype.lastIndexOf.call(like, "x", 4294967295));
+print(Array.prototype.indexOf.call(like, "y", 4294967294));
+
+var big = [];
+big.length = 4294967295;
+print(big.length, Object.getOwnPropertyDescriptor(big, "length").value);
+print([1, 2, 3].length, [1, 2, 3].indexOf(2), [1, 2, 3].lastIndexOf(1));
+"#
+        ),
+        concat!(
+            "4294967296\n",
+            "4294967294\n",
+            "4294967295\n",
+            "4294967295 4294967295\n",
+            "3 1 0\n",
+        )
+    );
+}
+
+#[test]
 fn data_view_reads_and_writes_bytes_at_any_offset() {
     // `DataView` did not exist at all — all 520 conformance cases were `ReferenceError`.
     // Its distinguishing feature against a typed array is that the width and byte offset are

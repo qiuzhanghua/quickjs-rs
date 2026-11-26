@@ -5,7 +5,7 @@
 //! `Math.round(-0.5)` is `-0` and not `-1`; and `Math.min`/`max` return `NaN` if any
 //! argument is `NaN`, even though `Math.min(1, NaN)` could be read as `1`.
 
-use crate::builtins::{arg, define_method};
+use crate::builtins::{arg, define_method, install_tag};
 use crate::interp::{Interp, JsResult};
 use crate::object::Property;
 use crate::value::{Value, to_int32};
@@ -14,6 +14,8 @@ use crate::value::{Value, to_int32};
 pub fn install(interp: &mut Interp<'_>) {
     let object_proto = interp.realm.object_proto.clone();
     let math = interp.new_object(Some(object_proto));
+    // §21.3: `Object.prototype.toString.call(Math)` is `[object Math]`.
+    install_tag(&math, "Math", interp);
 
     for (name, value) in [
         ("PI", std::f64::consts::PI),

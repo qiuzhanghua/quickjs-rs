@@ -41,10 +41,20 @@ pub fn install(interp: &mut Interp<'_>, array_proto: &Gc<JsObject>) {
         ("find", 1, find),
         ("findIndex", 1, find_index),
         ("fill", 1, fill),
+        ("copyWithin", 2, copy_within),
         ("sort", 1, sort),
         ("flat", 0, flat),
         ("flatMap", 1, flat_map),
+        ("findLast", 1, find_last),
+        ("findLastIndex", 1, find_last_index),
+        // The "change array by copy" family: each returns a new array and leaves the
+        // receiver alone, so a frozen array can be transformed.
+        ("toReversed", 0, to_reversed),
+        ("toSorted", 1, to_sorted),
+        ("toSpliced", 2, to_spliced),
+        ("with", 2, array_with),
         ("toString", 0, to_string),
+        ("toLocaleString", 0, to_locale_string),
         ("at", 1, at),
         ("values", 0, values),
         ("keys", 0, keys),
@@ -65,6 +75,22 @@ pub fn install(interp: &mut Interp<'_>, array_proto: &Gc<JsObject>) {
             .well_known_key(crate::interp::WellKnown::Iterator);
         array_proto.define_key(&key, Property::data(values_fn));
     }
+
+    // `Array.prototype[@@unscopables]` lists the methods that must not shadow a `with`
+    // binding. The object has a **null** prototype, and each entry is a data property
+    // with all three attributes true — `verifyProperty` checks exactly that.
+    array_proto.define_key(
+        &interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::Unscopables),
+        Property {
+            value: Some(unscopables(interp)),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
 
     let constructor = interp.new_native_constructor("Array", 1, constructor);
     constructor.define(
@@ -161,7 +187,7 @@ fn from(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
             mapped.push(interp.call_value(
                 mapper.clone(),
                 this_arg.clone(),
-                vec![value, Value::Int(index as i32)],
+                vec![value, crate::object::index_value(index)],
             )?);
         }
         out = mapped;
@@ -303,7 +329,25 @@ fn elements(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Valu
         }
         return Ok(out);
     }
+    // The dense vector is only the *prefix*: an array's `length` may exceed it, and the
+    // difference is trailing holes. `new Array(3).fill(1)` has an empty vector and
+    // `length: 3`, so returning the vector alone made `fill` write nothing at all. The
+    // vector is not padded here — that would allocate the holes this change exists to
+    // avoid — so the caller has to compare against `array_length`.
     Ok(object.array_elements().unwrap_or_default())
+}
+
+/// The `thisArg` of a callback-taking method: the **second** argument, or `undefined`.
+///
+/// Every one of `forEach`/`map`/`filter`/`some`/`every`/`find`/`findIndex`/`flatMap`
+/// reads it from here. They used to pass `Value::Undefined` to `[[Call]]` outright, which
+/// is invisible in the common `arr.map(f)` case but wrong for `arr.map(f, x)` — 159
+/// test262 cases are nothing but `assert(this === thisArg)` inside the callback.
+///
+/// `reduce`/`reduceRight` are the exception: their second argument is the *initial
+/// accumulator*, so they have no `thisArg` at all.
+fn callback_this(args: &[Value]) -> Value {
+    args.get(1).cloned().unwrap_or(Value::Undefined)
 }
 
 /// Normalise a possibly negative index the way every array method does.
@@ -335,20 +379,33 @@ fn push(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         }
         store_or_throw(interp, &array, index, value.clone())?;
     }
-    Ok(Value::Int(array.array_length().unwrap_or(0) as i32))
+    Ok(crate::object::length_value(
+        array.array_length().unwrap_or(0),
+    ))
 }
 
 fn pop(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let mut current = elements(interp, &array)?;
-    let value = current.pop().unwrap_or(Value::Undefined);
-    array.array_set_length(current.len());
-    Ok(value)
+    // The *logical* length: `new Array(2)` has two holes and no storage, so popping it
+    // has to shorten `length` to 1 and answer `undefined`. Reading the dense vector
+    // instead saw an empty array and left the length alone.
+    let length = receiver_length(interp, &array)?;
+    if length == 0 {
+        return Ok(Value::Undefined);
+    }
+    let value = receiver_element(interp, &array, length - 1)?.unwrap_or(Value::Hole);
+    array.array_set_length(length - 1);
+    Ok(match value {
+        Value::Hole => Value::Undefined,
+        value => value,
+    })
 }
 
 fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let mut current = elements(interp, &array)?;
+    // Again the logical length, padded: `new Array(3).shift()` answers `undefined` and
+    // leaves two holes.
+    let mut current = padded_elements(interp, &array)?;
     if current.is_empty() {
         return Ok(Value::Undefined);
     }
@@ -357,19 +414,22 @@ fn shift(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Valu
     for (index, element) in current.into_iter().enumerate() {
         store_or_throw(interp, &array, index, element)?;
     }
-    Ok(value)
+    Ok(match value {
+        Value::Hole => Value::Undefined,
+        value => value,
+    })
 }
 
 fn unshift(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let current = elements(interp, &array)?;
+    let current = padded_elements(interp, &array)?;
     let mut combined: Vec<Value> = args.to_vec();
     combined.extend(current);
     let length = combined.len();
     for (index, element) in combined.into_iter().enumerate() {
         store_or_throw(interp, &array, index, element)?;
     }
-    Ok(Value::Int(length as i32))
+    Ok(crate::object::length_value(length))
 }
 
 // ---------------------------------------------------------------------------
@@ -477,14 +537,19 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
 fn index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver(interp, &this)?;
     let length = receiver_length(interp, &array)?;
+    // §23.1.3.14 step 3: an empty receiver answers -1 *before* `fromIndex` is coerced,
+    // so a poisoned `valueOf` on it must not run.
+    if length == 0 {
+        return Ok(Value::Int(-1));
+    }
     let needle = arg(args, 0);
-    let start = normalise(arg_int_or(args, 1, 0) as f64, length);
+    let start = relative_index(interp, args.get(1), length)?;
     // A hole is skipped, which is why `[1,,3].indexOf(undefined)` is -1.
     for index in start..length {
         if let Some(value) = receiver_element(interp, &array, index)?
             && value.strict_equals(&needle)
         {
-            return Ok(Value::Int(index as i32));
+            return Ok(crate::object::index_value(index));
         }
     }
     Ok(Value::Int(-1))
@@ -494,14 +559,46 @@ fn last_index_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResu
     let array = receiver(interp, &this)?;
     let length = receiver_length(interp, &array)?;
     let needle = arg(args, 0);
-    for index in (0..length).rev() {
+    if length == 0 {
+        return Ok(Value::Int(-1));
+    }
+    // `fromIndex` defaults to `len - 1` **only when the argument is absent**: an explicit
+    // `undefined` is `ToIntegerOrInfinity(undefined)`, which is 0, so
+    // `[1,2,1].lastIndexOf(2, undefined)` is -1 rather than 1. The start used to be
+    // hardwired to the last element, so every explicit `fromIndex` was ignored —
+    // `[1,2,3].lastIndexOf(3, 1)` answered `2`.
+    let from = match args.get(1) {
+        None => length as f64 - 1.0,
+        Some(value) => to_integer_or_infinity(interp, value)?,
+    };
+    // Negative counts from the end, and `fromIndex` past the end clamps to the last
+    // element (unlike `indexOf`, where it clamps to one past the end).
+    let start = if from >= 0.0 {
+        (from.min(length as f64 - 1.0)) as usize
+    } else {
+        let behind = length as f64 + from;
+        if behind < 0.0 {
+            return Ok(Value::Int(-1));
+        }
+        behind as usize
+    };
+    for index in (0..=start).rev() {
         if let Some(value) = receiver_element(interp, &array, index)?
             && value.strict_equals(&needle)
         {
-            return Ok(Value::Int(index as i32));
+            return Ok(crate::object::index_value(index));
         }
     }
     Ok(Value::Int(-1))
+}
+
+/// `ToIntegerOrInfinity`: truncate toward zero, keep `±Infinity`, `NaN` becomes 0.
+fn to_integer_or_infinity(interp: &mut Interp<'_>, value: &Value) -> JsResult<f64> {
+    let number = interp.to_js_number(value)?;
+    if number.is_nan() {
+        return Ok(0.0);
+    }
+    Ok(number.trunc())
 }
 
 fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -625,8 +722,8 @@ fn array_iterator_next(interp: &mut Interp<'_>, this: Value, _args: &[Value]) ->
     interp.set_property(&object, "_index", Value::Int(index as i32 + 1))?;
     let element = element_at(interp, &source, index)?;
     let value = match kind {
-        1 => Value::Int(index as i32),
-        2 => Value::Object(interp.new_array(vec![Value::Int(index as i32), element])),
+        1 => crate::object::index_value(index),
+        2 => Value::Object(interp.new_array(vec![crate::object::index_value(index), element])),
         _ => element,
     };
     result.define_data("value", value);
@@ -653,7 +750,8 @@ fn length_of(interp: &mut Interp<'_>, source: &Value) -> JsResult<usize> {
     };
     let length = interp
         .get_property(&object, "length")?
-        .map(|value| value.to_number())
+        .map(|value| interp.to_js_number(&value))
+        .transpose()?
         .unwrap_or(0.0);
     Ok(to_length(length))
 }
@@ -726,6 +824,7 @@ fn iterate(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Vec
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     let mut out = Vec::new();
     for index in 0..length {
         // A hole is not an element: the iteration methods skip it entirely, so
@@ -736,10 +835,10 @@ fn iterate(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Vec
         };
         interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value.clone(),
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -764,6 +863,7 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     // Held to the receiver's length from the start, with `Hole` where the source had
     // one: `[1,,3].map(f)` is `[f(1), <hole>, f(3)]`, not the two-element `[f(1), f(3)]`
     // that dropping holes produced.
@@ -774,10 +874,10 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
         };
         *slot = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value,
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -796,6 +896,7 @@ fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     let mut out = Vec::new();
     for index in 0..length {
         let Some(value) = receiver_element(interp, &array, index)? else {
@@ -803,10 +904,10 @@ fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
         };
         let keep = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value.clone(),
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -841,6 +942,8 @@ fn reduce_with(
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    // No `thisArg`: `reduce`'s second argument is the initial accumulator, so the
+    // callback always runs with `this === undefined`.
     let indices: Vec<usize> = if right_to_left {
         (0..length).rev().collect()
     } else {
@@ -872,7 +975,7 @@ fn reduce_with(
             vec![
                 accumulator,
                 value,
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -890,16 +993,17 @@ fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     for index in 0..length {
         let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
         };
         let answer = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value,
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -920,16 +1024,17 @@ fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     for index in 0..length {
         let Some(value) = receiver_element(interp, &array, index)? else {
             continue;
         };
         let answer = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value,
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -950,14 +1055,15 @@ fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     for index in 0..length {
         let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
         let answer = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value.clone(),
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
@@ -978,19 +1084,20 @@ fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<
     if !matches!(&callback, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("callback is not a function"));
     }
+    let this_arg = callback_this(args);
     for index in 0..length {
         let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
         let answer = interp.call_value(
             callback.clone(),
-            Value::Undefined,
+            this_arg.clone(),
             vec![
                 value,
-                Value::Int(index as i32),
+                crate::object::index_value(index),
                 Value::Object(array.clone()),
             ],
         )?;
         if answer.to_boolean() {
-            return Ok(Value::Int(index as i32));
+            return Ok(crate::object::index_value(index));
         }
     }
     Ok(Value::Int(-1))
@@ -998,7 +1105,9 @@ fn find_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<
 
 fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let current_len = elements(interp, &array)?.len();
+    // The *logical* length, not the dense vector's: `new Array(3).fill(1)` has three
+    // holes and no storage at all, and filling them has to reach index 2.
+    let current_len = receiver_length(interp, &array)?;
     let value = arg(args, 0);
     let start = normalise(arg_int_or(args, 1, 0) as f64, current_len);
     let end = normalise(
@@ -1020,8 +1129,10 @@ fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 
 fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let mut current = elements(interp, &array)?;
-    let length = current.len();
+    // Padded: `new Array(3).splice(0, 1)` removes one of the three holes and leaves two,
+    // so the logical length has to be what the range arithmetic sees.
+    let mut current = padded_elements(interp, &array)?;
+    let length = receiver_length(interp, &array)?.max(current.len());
     let start = normalise(arg_int_or(args, 0, 0) as f64, length);
     let remove = if args.len() > 1 {
         (arg_int_or(args, 1, 0).max(0) as usize).min(length - start)
@@ -1038,13 +1149,17 @@ fn splice(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
     for (index, value) in current.into_iter().enumerate() {
         store_or_throw(interp, &array, index, value)?;
     }
+    // `removed` keeps its holes: `new Array(3).splice(0,1)` is one hole, not `undefined`.
     let result = interp.new_array(removed);
+    result.array_set_length(remove);
     Ok(Value::Object(result))
 }
 
 fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let mut current = elements(interp, &array)?;
+    // The *logical* length, padded with holes: `new Array(3).reverse()` is still
+    // `[<3 empty items>]`, and reading only the dense vector made it a zero-length array.
+    let mut current = padded_elements(interp, &array)?;
     current.reverse();
     for (index, value) in current.into_iter().enumerate() {
         store_or_throw(interp, &array, index, value)?;
@@ -1058,7 +1173,8 @@ fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
 /// because `"10" < "9"`. Kept as-is because the reference does the same.
 fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
-    let mut current = elements(interp, &array)?;
+    // See `reverse`: the trailing holes are part of the array.
+    let mut current = padded_elements(interp, &array)?;
     let comparator = args
         .first()
         .cloned()
@@ -1080,6 +1196,22 @@ fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         store_or_throw(interp, &array, index, value)?;
     }
     Ok(Value::Object(array))
+}
+
+/// The receiver's elements with the holes between the dense vector and the logical length
+/// materialised.
+///
+/// An array's storage is only the prefix before its first trailing hole, so
+/// `new Array(3)` has an empty vector and `length: 3`. A method that reorders *in place*
+/// (`reverse`, `sort`) still has to see all three positions, and it may allocate them: it
+/// is about to write them back anyway.
+fn padded_elements(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Value>> {
+    let mut items = elements(interp, object)?;
+    let length = receiver_length(interp, object)?;
+    if length > items.len() {
+        items.resize(length, Value::Hole);
+    }
+    Ok(items)
 }
 
 /// Store one element of a write-back, raising when the array refuses.
@@ -1214,4 +1346,319 @@ fn flat_map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
     flatten(interp, &items, 1, &mut out)?;
     let result = interp.new_array(out);
     Ok(Value::Object(result))
+}
+
+// ---------------------------------------------------------------------------
+// findLast, copyWithin, change array by copy
+// ---------------------------------------------------------------------------
+
+/// `a.findLast(predicate, thisArg)`: the last element the predicate accepts.
+///
+/// The search runs *downwards* from `len - 1` and stops at the first hit, so it is not
+/// `find` over a reversed copy: a predicate that mutates the array has to observe each
+/// index in descending order.
+fn find_last(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let array = receiver(interp, &this)?;
+    // The length is read before the predicate is validated, which is observable.
+    let length = receiver_length(interp, &array)?;
+    let callback = arg(args, 0);
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    let this_arg = callback_this(args);
+    for index in (0..length).rev() {
+        // A hole reads as `undefined`: `find`/`findLast` use `Get`, so unlike `forEach`
+        // they do visit holes.
+        let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
+        let answer = interp.call_value(
+            callback.clone(),
+            this_arg.clone(),
+            vec![
+                value.clone(),
+                crate::object::index_value(index),
+                Value::Object(array.clone()),
+            ],
+        )?;
+        if answer.to_boolean() {
+            return Ok(value);
+        }
+    }
+    Ok(Value::Undefined)
+}
+
+/// `a.findLastIndex(predicate, thisArg)`: where `findLast` would have found it.
+fn find_last_index(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let array = receiver(interp, &this)?;
+    let length = receiver_length(interp, &array)?;
+    let callback = arg(args, 0);
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("callback is not a function"));
+    }
+    let this_arg = callback_this(args);
+    for index in (0..length).rev() {
+        let value = receiver_element(interp, &array, index)?.unwrap_or(Value::Undefined);
+        let answer = interp.call_value(
+            callback.clone(),
+            this_arg.clone(),
+            vec![
+                value,
+                crate::object::index_value(index),
+                Value::Object(array.clone()),
+            ],
+        )?;
+        if answer.to_boolean() {
+            return Ok(crate::object::index_value(index));
+        }
+    }
+    Ok(Value::Int(-1))
+}
+
+/// `a.copyWithin(target, start, end)`: copy a range over another range, in place.
+///
+/// This method **writes to the receiver**, so it cannot go through `receiver_copy` —
+/// `Array.prototype.copyWithin.call(true)` has to answer the boxed Boolean and
+/// `copyWithin.call({length: 4, …})` has to write the argument object. The writes go
+/// through `[[Set]]` and a copied hole becomes a *deleted* property, which is what
+/// `fill-holes` checks (`hasOwnProperty(1) === false` after the copy).
+fn copy_within(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = receiver(interp, &this)?;
+    let length = receiver_length(interp, &object)?;
+    let target = relative_index(interp, args.first(), length)?;
+    let start = relative_index(interp, args.get(1), length)?;
+    // `end` defaults to `len`, and an explicit `undefined` is also `len` — unlike
+    // `start`, where `undefined` is `0`.
+    let end = match args.get(2) {
+        None | Some(Value::Undefined) => length,
+        Some(value) => relative_index(interp, Some(value), length)?,
+    };
+    let count = end.saturating_sub(start).min(length.saturating_sub(target));
+    // Direction matters when the ranges overlap: copying forwards would overwrite
+    // elements it has not read yet, so a target inside the source goes backwards.
+    let backwards = start < target && target < start + count;
+    for step in 0..count {
+        let offset = if backwards { count - 1 - step } else { step };
+        let from = start + offset;
+        let to = target + offset;
+        match receiver_element(interp, &object, from)? {
+            Some(value) => write_element(interp, &object, to, value)?,
+            None => {
+                // §23.1.3.4 step 15.f.i is `DeletePropertyOrThrow`, so a non-configurable
+                // destination index is a `TypeError`, not a silent skip.
+                if !interp.delete_property(&object, &to.to_string())? {
+                    return Err(interp.type_error(format!("cannot delete property '{to}'")));
+                }
+            }
+        }
+    }
+    // §23.1.3.4 answers the receiver itself, so `copyWithin.call(true)` is the box.
+    Ok(Value::Object(object))
+}
+
+/// `ToIntegerOrInfinity` with the negative-from-the-end rule, clamped to `[0, length]`.
+fn relative_index(
+    interp: &mut Interp<'_>,
+    value: Option<&Value>,
+    length: usize,
+) -> JsResult<usize> {
+    let raw = match value {
+        None => return Ok(0),
+        Some(value) => to_integer_or_infinity(interp, value)?,
+    };
+    if raw < 0.0 {
+        let from_end = length as f64 + raw;
+        return Ok(if from_end < 0.0 { 0 } else { from_end as usize });
+    }
+    Ok((raw.min(length as f64)) as usize)
+}
+
+/// Store one element on a receiver that may be an array, an array-like or a box.
+///
+/// `[[Set]]` rather than the element vector, so an accessor on the index runs, a
+/// read-only index refuses, and a non-array receiver actually changes.
+fn write_element(
+    interp: &mut Interp<'_>,
+    object: &Gc<JsObject>,
+    index: usize,
+    value: Value,
+) -> JsResult<()> {
+    interp.set_property(object, &index.to_string(), value)
+}
+
+/// The elements of the receiver with holes flattened to `undefined`.
+///
+/// The change-array-by-copy family does *not* preserve holes: §23.1.3.24 step 5.a.i is
+/// `CreateDataProperty`, so `[0,,2,,4].with(2, 6)` is a five-element
+/// `[0, undefined, 6, undefined, 4]` with every index present. An element inherited from
+/// `Array.prototype` is read too, which is why this cannot come from the element vector.
+fn dense_elements(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Value>> {
+    let length = receiver_length(interp, object)?;
+    // The result is an `ArrayCreate(len)`, so an absurd length is refused before
+    // anything is allocated instead of looping over `2^32` empty slots.
+    array_create_length(interp, length)?;
+    let mut out = Vec::with_capacity(length.min(1024));
+    for index in 0..length {
+        out.push(receiver_element(interp, object, index)?.unwrap_or(Value::Undefined));
+    }
+    Ok(out)
+}
+
+/// `a.toReversed()`: a reversed copy, receiver untouched.
+fn to_reversed(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let object = receiver(interp, &this)?;
+    let mut items = dense_elements(interp, &object)?;
+    items.reverse();
+    Ok(Value::Object(interp.new_array(items)))
+}
+
+/// `a.with(index, value)`: a copy with one element replaced.
+///
+/// `index` may be negative, counting from the end; anything outside the array is a
+/// `RangeError`, not a silent no-op. The receiver is never read at the replaced index, so
+/// a getter there does not run — `no-get-replaced-index`.
+fn array_with(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = receiver(interp, &this)?;
+    let length = receiver_length(interp, &object)?;
+    array_create_length(interp, length)?;
+    let raw = to_integer_or_infinity(interp, &arg(args, 0))?;
+    let index = if raw < 0.0 { length as f64 + raw } else { raw };
+    if index < 0.0 || index >= length as f64 {
+        return Err(interp.range_error("index is out of range"));
+    }
+    let index = index as usize;
+    let mut items = Vec::with_capacity(length.min(1024));
+    for position in 0..length {
+        if position == index {
+            items.push(arg(args, 1));
+        } else {
+            items.push(receiver_element(interp, &object, position)?.unwrap_or(Value::Undefined));
+        }
+    }
+    Ok(Value::Object(interp.new_array(items)))
+}
+
+/// `a.toSorted(compareFn)`: a sorted copy, receiver untouched.
+fn to_sorted(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    // §23.1.3.29 step 1 validates the comparator **before** `ToObject(this)` and before
+    // `LengthOfArrayLike`, so a `get length` that throws must not run when the comparator
+    // is not callable.
+    let comparator = args
+        .first()
+        .filter(|value| !matches!(value, Value::Undefined));
+    if let Some(function) = comparator
+        && !matches!(function, Value::Object(object) if object.is_callable())
+    {
+        return Err(interp.type_error("comparator is not a function"));
+    }
+    let object = receiver(interp, &this)?;
+    // Every element is read *before* the comparator is called, which is observable:
+    // `comparefn-called-after-get-elements` turns on exactly that order.
+    let mut items = dense_elements(interp, &object)?;
+    match comparator {
+        Some(comparator) => merge_sort(interp, &mut items, &comparator.clone())?,
+        None => items.sort_by_key(|value| SortKey(value.to_js_string())),
+    }
+    Ok(Value::Object(interp.new_array(items)))
+}
+
+/// `a.toSpliced(start, deleteCount, ...items)`: a spliced copy, receiver untouched.
+fn to_spliced(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = receiver(interp, &this)?;
+    let length = receiver_length(interp, &object)?;
+    let actual_start = match args.first() {
+        None => 0,
+        Some(value) => relative_index(interp, Some(value), length)?,
+    };
+    let delete_count = match args.get(1) {
+        // `toSpliced(start)` removes everything from `start` on.
+        None => length - actual_start,
+        Some(value) => {
+            let count = to_integer_or_infinity(interp, value)?;
+            (count.max(0.0) as usize).min(length - actual_start)
+        }
+    };
+    let items: Vec<Value> = args.iter().skip(2).cloned().collect();
+    let new_length = length + items.len() - delete_count;
+    array_create_length(interp, new_length)?;
+    let mut out = Vec::with_capacity(new_length.min(1024));
+    for index in 0..actual_start {
+        out.push(receiver_element(interp, &object, index)?.unwrap_or(Value::Undefined));
+    }
+    out.extend(items);
+    // The discarded range is never read, which is the point of
+    // `discarded-element-not-read`: a getter on a deleted index must not run.
+    for index in (actual_start + delete_count)..length {
+        out.push(receiver_element(interp, &object, index)?.unwrap_or(Value::Undefined));
+    }
+    Ok(Value::Object(interp.new_array(out)))
+}
+
+/// `a.toLocaleString()`: each element through its own `toLocaleString`, joined by `,`.
+///
+/// Distinct from `toString` because the *elements* are asked, not the array: `Number`
+/// reaches `Number.prototype.toLocaleString`, `BigInt` reaches `BigInt.prototype`'s, and
+/// an element that overrides the method is honoured.
+fn to_locale_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    let object = receiver(interp, &this)?;
+    let length = receiver_length(interp, &object)?;
+    let mut parts = Vec::with_capacity(length.min(1024));
+    for index in 0..length {
+        let element = receiver_element(interp, &object, index)?.unwrap_or(Value::Undefined);
+        // `undefined` and `null` contribute an empty field, exactly as `join` does.
+        if matches!(element, Value::Undefined | Value::Null) {
+            parts.push(String::new());
+            continue;
+        }
+        // Read `toLocaleString` off the element's own chain, boxing a primitive first so
+        // that the prototype method is reachable.
+        let method = match &element {
+            Value::Object(element) => interp.get_property(element, "toLocaleString")?,
+            primitive => {
+                let boxed = interp.object_from(primitive)?;
+                interp.get_property(&boxed, "toLocaleString")?
+            }
+        };
+        let text = match method {
+            Some(method) if matches!(&method, Value::Object(o) if o.is_callable()) => {
+                let result = interp.call_value(method, element.clone(), Vec::new())?;
+                interp.to_js_string(&result)?
+            }
+            // §23.1.3.26 step 6.b.ii invokes unconditionally and a missing method is a
+            // `TypeError`, but the reference answers with `ToString` for the primitives
+            // whose prototype method is absent, so this keeps that behaviour.
+            _ => interp.to_js_string(&element)?,
+        };
+        parts.push(text);
+    }
+    Ok(interp.string(parts.join(",")))
+}
+
+/// The `@@unscopables` list: `Object.create(null)` with `true` at each method name.
+///
+/// `with (obj) { entries }` must resolve to `obj.entries`, not to
+/// `Array.prototype.entries`, when `obj` is an array — that is the whole point of the
+/// list. `with` is deliberately **absent**: it would otherwise hide the binding named
+/// `obj.with`, and the spec leaves it off.
+fn unscopables(interp: &Interp<'_>) -> Value {
+    let list = interp.new_object(None);
+    for name in [
+        "at",
+        "copyWithin",
+        "entries",
+        "fill",
+        "find",
+        "findIndex",
+        "findLast",
+        "findLastIndex",
+        "flat",
+        "flatMap",
+        "includes",
+        "keys",
+        "toReversed",
+        "toSorted",
+        "toSpliced",
+        "values",
+    ] {
+        list.define(name, Property::data(Value::Bool(true)));
+    }
+    Value::Object(list)
 }

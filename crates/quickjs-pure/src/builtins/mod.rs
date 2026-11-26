@@ -157,6 +157,33 @@ pub fn has_arg(args: &[Value], index: usize) -> bool {
     args.len() > index
 }
 
+/// Give `object` a `Symbol.toStringTag` data property answering `tag`.
+///
+/// A *data* property, not an accessor: `{value, writable: false, enumerable: false,
+/// configurable: true}`, which is what §17 requires of every `@@toStringTag` and what
+/// `verifyProperty` reads off the descriptor. An accessor reports `writable: undefined`
+/// and fails.
+///
+/// Namespaced objects (`Math`, `JSON`, `Reflect`, `Intl`, `Atomics`) all need one:
+/// without it `Object.prototype.toString.call(Math)` answers `[object Object]` instead of
+/// `[object Math]`, and a run of `Array.prototype` tests — `map`/`filter`/`forEach`/
+/// `some`/`every`/`reduce`/`reduceRight` applied to `Math` and `JSON` — check exactly
+/// that tag from inside the callback.
+pub fn install_tag(object: &Gc<JsObject>, tag: &str, interp: &Interp<'_>) {
+    object.define_key(
+        &interp
+            .realm
+            .well_known_key(crate::interp::WellKnown::ToStringTag),
+        Property {
+            value: Some(interp.string(tag)),
+            writable: false,
+            enumerable: false,
+            configurable: true,
+            ..Property::default()
+        },
+    );
+}
+
 /// The `this` of a method call, as an object.
 ///
 /// A primitive receiver is boxed: `"abc".indexOf(…)` reaches a method on

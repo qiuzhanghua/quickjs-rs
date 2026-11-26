@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **12678（68.6%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 5809 |
-| ↳ 其中挂起（引擎不终止） | 10 |
-| ↳ 其中答错 | 5799 |
+| **可运行中通过** | **13152（71.1%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 5335 |
+| ↳ 其中挂起（引擎不终止） | 9 |
+| ↳ 其中答错 | 5326 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -54,7 +54,8 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 在那之后再修掉可构造性（4.12）又得 +332 例、再修 `Math`/`Number` 的 `ToNumber`（4.13）
 得 +7 例，两次回归都是 0，通过率回到 62.5%。补上 Iterator helpers（4.16）再得 +523 例，
 再把 helper 的关闭语义与 `zip`/`zipKeyed` 对齐（4.17）得 +405 例，两次回归都是 0，
-到 67.5%。
+到 67.5%。再补 `Array` 的缺件与两处语义（4.21）得 +475 例，回归 1 例——那 1 例经查是
+**此前的假通过**，见 4.21 末尾，所以真回归是 0，通过率到 71.1%。
 
 **基线绑定了 test262 的提交。** `docs/test262-baseline.txt.gz` 首行现在是
 `# test262 <commit>`。没有这一行时，检出被清掉后重新克隆会落到新的 HEAD，
@@ -89,35 +90,42 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 
 ## 3. 失败面在哪
 
-按部件（仅可运行）：
+按部件（仅可运行，本轮全量跑的实测值）：
 
 | 部件 | 失败数 |
 |---|---|
-| Object | 1567 |
-| Array | 1383 |
-| TypedArray | 1365 |
-| RegExp | 1115 |
-| Iterator | 664 |
-| String | 568 |
-| DataView | 520 |
-| TypedArrayConstructors | 472 |
-| Promise | 251 |
-| Set | 213 |
+| RegExp | 1082 |
+| TypedArray | 575 |
+| Array | 465 |
+| Promise | 465 |
+| String | 462 |
+| TypedArrayConstructors | 187 |
+| Set | 187 |
+| Object | 176 |
+| ArrayBuffer | 155 |
+| WeakMap | 140 |
+| Function | 122 |
+| Iterator | 101 |
+
+`Array` 从 912 条降到 476 条（见 4.21）；`Object` 从 1567 降到 180、`Iterator` 从 664
+降到 101，是此前几轮（4.16–4.20）的结果，本表已随之更新。
 
 按失败形态（同一缺陷会聚成一类）：
 
 | 数量 | 形态 | 等价于 |
 |---|---|---|
-| 1086 | `TypeError: undefined is not a function` | 缺失方法（`RegExp.escape`、`TypedArray.prototype.at/map/filter` 等） |
-| 806 | `ReferenceError: BigInt64Array is not defined` | BigInt 类型化数组完全没有 |
-| 465 | `ReferenceError: DataView is not defined` | `DataView` 完全没有 |
-| 441 | `ReferenceError: Iterator is not defined` | Iterator helpers 没有 |
-| 435 | 期望抛 `TypeError` 却没抛 | 缺参数/类型校验 |
-| 520 | `name`/`length` 描述符应可配置 | **一个系统性缺陷，见 4.1** |
-| 192 | `TypeError: target is not an object` | **原始值未装箱，见 4.2** |
+| 463 | `TypeError: undefined is not a function` | 缺失方法（`RegExp.escape`、`Array.fromAsync`、部分 TypedArray 方法） |
+| 360 | `SameValue` 不符 | 逐条语义 |
+| 252 | 期望抛 `TypeError` 却没抛 | 缺参数/类型校验 |
 | 192 | 期望 parse 期 `SyntaxError` 却执行了 | 早期错误检查缺失 |
-| 57 | `ShadowRealm is not defined` | 未实现（非目标） |
+| 134 | `cannot convert a Number to a BigInt` | harness 的 `makeArray` 路径 |
+| 107 | `String method on a non-string` | 字符串方法对接收者的校验过松 |
+| 102 | 期望 `TypeError` 得到 `ReferenceError` | 缺失全局（`WeakMap`/`WeakSet`/`ShadowRealm`） |
+| 89+47+42 | `WeakMap`/`WeakSet`/`FinalizationRegistry is not defined` | 未实现 |
+| 76 | `implements ArrayBuffer.prototype.resize` | **resizable ArrayBuffer 未实现** |
 | 70+58 | 正则 `invalid group`／lookbehind 不支持 | 正则文法不完整 |
+| 54 | `ShadowRealm is not defined` | 未实现（非目标） |
+| 31 | `unsupported property name 'ASCII_Hex_Digit'` | 缺 Unicode 属性表 |
 
 ## 4. 已确认的引擎缺陷（有最小复现）
 
@@ -563,6 +571,127 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 把它去掉再断言 tag 变回 `Function`。我一开始写成不可配置，`delete` 静默返回 `false`，
 测试才暴露出来。
 
+### 4.21 `Array` 的两个根因与七个缺件（✅ 已修，+460 例）
+
+`test/built-ins/Array` 从 2155/3067（70.3%）到 **2577/3067（84.0%）**，全量从 68.6% 到
+**71.1%**（+460 例）。失败按形态聚成六类，前两类是**一个缺陷各自散在十几个方法里**：
+
+| 数量 | 形态 | 根因 |
+|---|---|---|
+| 159 | 回调里 `this !== thisArg` | **所有**回调方法把 `undefined` 传给 `[[Call]]` |
+| 157 | `undefined is not a function` | 七个方法整个不存在 |
+| 95 | `Array.fromAsync is not a function` | 整块没做 |
+| 54 | `resizable ArrayBuffer` | 未实现（见下） |
+| 16 | `memory allocation of … failed` | 数组上限校验只在部分路径上 |
+| 其余 | 逐条语义 | — |
+
+**第一个根因：`thisArg` 被静默丢弃。** `forEach`/`map`/`filter`/`some`/`every`/`find`/
+`findIndex`/`flatMap` 都写死了 `interp.call_value(callback, Value::Undefined, …)`。
+在 `arr.map(f)` 这个最常见形状里看不出差别，在 `arr.map(f, x)` 里就全错——而 test262 里
+有 159 个文件除了 `assert(this === thisArg)` 什么都不做。修法是加一个 `callback_this(args)`
+读**第二个**参数，八个方法统一走它。
+
+`reduce`/`reduceRight` 是例外且必须保持例外：它们的第二个参数是**初始累加值**，规范里
+没有 `thisArg`，所以回调的 `this` 就该是 `undefined`。这类"看起来同族、其实不是"的
+地方是批量修改最容易批量改错的地方。
+
+**第二个根因：`new String(x)` 只填了 `_value`。** 盒装字符串应当是 String exotic
+object，`length` 与索引属性都在它自己身上（§10.4.3.4）。`ToObject` 对**原语**字符串
+建得是对的，构造器却另有一套、只写 `_value`，于是 `new String("ab").length` 是
+`undefined`、`[0]` 是 `undefined`，而一切 `Array.prototype` 方法对这个盒子看到的
+array-like 长度是 0。两条路径合流成 `Interp::init_string_wrapper` 一处。
+
+**七个缺件**：`copyWithin`、`toReversed`、`toSorted`、`toSpliced`、`with`、`findLast`、
+`findLastIndex`，外加 `Array.prototype[@@unscopables]`（一个原型为 `null` 的对象，
+每个条目三个属性全 `true`，`with` 故意**不在**列表里）。
+
+`copyWithin` 与其余六个不同，它**写回接收者**，所以不能走 `receiver_copy`：
+`Array.prototype.copyWithin.call(true)` 必须答那个盒装 Boolean，
+`copyWithin.call({length: 4, …})` 必须真的改参数对象。写入走 `[[Set]]`，而被复制的
+**空洞要变成删除**而不是 `undefined`——`[0,1,,,1].copyWithin(0,1,4)` 之后
+`hasOwnProperty(1)` 是 `false`。反过来，"change array by copy" 家族**不保留空洞**
+（§23.1.3.24 用的是 `CreateDataProperty`），所以它们各自把空洞填成 `undefined`。
+
+`toSorted` 还有一个顺序细节：§23.1.3.29 第 1 步先校验 comparator 再读 `length`，
+所以 comparator 不可调用时，`get length` 那个会抛的 getter **不得运行**。
+
+**`lastIndexOf` 的 `fromIndex` 从来没被读过。** 它把起点写死成最后一个元素，于是
+`[1,2,3].lastIndexOf(3, 1)` 答 `2`（应 `-1`）。同时 `indexOf`/`lastIndexOf` 走的是
+`arg_int_or`，对对象参数直接 `NaN`，而规范要 `ToNumber`（经 `ToPrimitive`）——
+`[0,1,1].lastIndexOf(1, "1")` 是 `1`，`"one"` 是 `-1`。另外显式传 `undefined` 与
+**不传**是两件事：`ToIntegerOrInfinity(undefined)` 是 0，不是 `len-1`。
+还有一处顺序：长度为 0 时 `indexOf` 要在**强制转换 `fromIndex` 之前**答 `-1`。
+
+**为什么 `Math`/`JSON`/`Reflect` 的 `@@toStringTag` 算在这里。** 14 条
+`map`/`filter`/`every`/`some`/`reduce`/`reduceRight` 失败，是回调里断言
+`Object.prototype.toString.call(o) === "[object Math]"`——`Array` 一个 bug 都没有，
+错的是那三个命名空间对象没有 tag。顺手把 `install_tag` 从 `typedarray.rs` 提到
+`builtins/mod.rs`，四处共用，并记下它必须是**数据**属性（访问器没有 `writable`，
+`verifyProperty` 会失败）。
+
+**那 1 条"回归"是此前的假通过。**
+`Array/prototype/indexOf/coerced-searchelement-fromindex-grow.js` 在基线里是 `PASS`，
+现在 `FAIL`。查下去：它要 `resizable-arraybuffer` 的 `rab.resize()`，而我们的
+`ArrayBuffer` 没有 `resize`，harness 里的 `evil.valueOf` 一调用就抛——**旧代码之所以
+"通过"，是因为 `indexOf` 根本没把 `fromIndex` 交给 `ToNumber`**，那个会抛的
+`valueOf` 因此从未运行。修正 `ToNumber` 之后它开始真的抛错，用例才终于诚实。
+这正是"报错被当成通过"的同一类：`assert` 通过不是因为行为对，而是因为路上少走了一步。
+残留的 202 条 `resizable-arraybuffer` 失败（TypedArray 85、Array 54、ArrayBuffer 28、
+DataView 26 等）是**真缺口**，登记在 `docs/requirements.md` 的 FR-8 里，不列进跳过表——
+跳过表只该装"没打算做"，不该装"做了但坏了"。
+
+**`Array.fromAsync`（95 条）本轮没做。** 它不是"再补一个方法"：规范要求它在
+同步迭代器上 `Await` 每个值，中途出错要 `AsyncIteratorClose`，还要支持
+`@@asyncIterator`。用现有原语拼一个近似实现会在异步与错误路径上**静默错答案**，
+而错答案比缺失更贵。按本项目的尺子，它现在响亮地报 `undefined is not a function`，
+这是可接受的状态；下一轮单独排期。
+
+回归保护：`crates/quickjs-pure/tests/builtins.rs` 的三条新测试
+`array_callbacks_receive_their_this_arg_and_wrapped_strings_have_length`、
+`array_search_and_change_by_copy_follow_their_index_rules`、
+`namespaced_builtins_carry_their_tostring_tag`。已验证三条在修复前**全部失败**。
+
+### 4.22 数组的 `length` 与存储解耦（✅ 已修，内存事故的根因）
+
+追查 4.21 里那 16 条 `memory allocation of 68719476720 bytes failed` 时挖出来的：
+
+**`a.length` 曾被截断成 `i32`。** `Value::Int` 只装得下 `i32`，而数组的 `length`
+合法上限是 `2^32-1`，于是 `a[2**32-2] = 1; a.length` 答 `-1`。更糟的是**索引**也这么
+截断：`Array.prototype.indexOf.call(arrayLike, x)` 在 `2^32-2` 处命中时答 `-2`。
+三处独立的地方各写了一遍 `length as i32`（`ordinary_own_property`、
+`own_property_including_array`、`GetLength` 指令），现在统一走
+`object::length_value` / `object::index_value`。
+
+**然后发现 `length` 本身是存储的派生量。** 修好截断之后
+`a = []; a.length = 4294967295` 变成了真事——而元素是稠密 `Vec<Value>`，
+`resize(4294967295)` 就是 **62 GB / 24 秒**；参考实现是 0.00 秒 / 3.6 MB。这是
+panics-and-OOM 级的缺陷，不是覆盖率问题。
+
+修法是把 `length` 从 `elements.len()` 里**拿出来**，成为 `ObjectKind::Array` 的独立字段：
+
+- 不变式只剩 `elements.len() <= length`，差额是**尾部空洞**，不占存储；
+- `array_set_length` 变大是 O(1)（原来会 `resize` 出一整片 `Hole`）；
+- `array_set` 越过 `length` 时仍要真的填出中间的空洞（那是稠密存储的代价），所以
+  加了 `ARRAY_ELEMENT_LIMIT`（`2^26`）兜底，拒绝而不是 abort 整个进程。
+
+代价是**每个"用稠密向量当元素列表"的方法都得改成用逻辑长度**。这一批漏掉就会静默
+丢数据，实测抓到的三个：
+
+| 表达式 | 修前 | 修后 |
+|---|---|---|
+| `new Array(3).reverse()` | 长度 0 | 长度 3（三个空洞） |
+| `new Array(3).splice(0,1)` | 长度 0/0 | 返回 1 个空洞、接收者剩 2 |
+| `new Array(2).pop()` | `undefined`，长度仍是 2 | `undefined`，长度 1 |
+| `new Array(3).fill(1)` | 一个元素都没写 | `[1,1,1]` |
+
+`fill` 那条是 `scripts/lang-diff.py` 抓到的（`Math.sumPrecise(new Array(300).fill(…))`
+答 `-0`）；`reverse`/`splice`/`pop`/`shift` 是照着同一模式手查出来的。这类"改了底层表示、
+上层还有 N 处假设"的收尾，靠的就是差分套件——它当场从 80/85 掉到 79/85。
+
+`reverse`/`sort`/`splice`/`shift`/`unshift` 用 `padded_elements`（逻辑长度补齐空洞），
+因为它们本来就要写回、允许分配；`fill` 用 `receiver_length` 但要逐格 `[[Set]]`；
+`pop`/`shift` 的返回值要把 `Hole` 折成 `undefined`。
+
 ## 5. 对里程碑结论的修正
 
 - FR-3 中 `TypedArray`／`DataView`／`BigInt64Array` 不能记为完成（4.3）。
@@ -720,6 +849,12 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 - **分配失败应走 `Error::OutOfMemory`**，而不是让 Rust 的分配器 abort。
   没有 `set_error_hook` 式的兜底，任何 OOM 都会变成核心转储。这需要把
   `Vec` 的分配点收进一个可控的分配器，属于跨模块改动。
+- **稠密数组仍有一个 O(index) 的存储代价。** 4.22 把 `length` 解耦之后，
+  `a.length = 2**32-1` 是 O(1)，但 `a[2**32-2] = 1` 仍然要真的填出 68 GB 的空洞——
+  参考实现用哈希表，所以那里也是 O(1)。现在至少不会拖垮整机：越过
+  `ARRAY_ELEMENT_LIMIT`（`2^26`）的 `array_set` 返回 `false`，由调用方转成 `RangeError`。
+  残留的 202 条 `resizable-arraybuffer` 与少数"在 `2^32` 附近存一个元素"的用例
+  仍会失败，这是已登记的表示层缺口，不是静默错答案。
 
 ### 4.11 代理的可调用性在撤销后被丢掉（+9 例）
 

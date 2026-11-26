@@ -6,7 +6,7 @@
 //! install a property and why the test suite reaches for `Reflect.apply` when it
 //! wants to call a function without spreading the arguments.
 
-use crate::builtins::{arg, define_method};
+use crate::builtins::{arg, define_method, install_tag};
 use crate::interp::{Interp, JsResult};
 
 use crate::value::Value;
@@ -15,6 +15,8 @@ use crate::value::Value;
 pub fn install(interp: &mut Interp<'_>) {
     let object_proto = interp.realm.object_proto.clone();
     let reflect = interp.new_object(Some(object_proto));
+    // §28.1: `Object.prototype.toString.call(Reflect)` is `[object Reflect]`.
+    install_tag(&reflect, "Reflect", interp);
     for (name, length, func) in [
         ("apply", 3, apply as crate::object::NativeFn),
         ("construct", 2, construct),

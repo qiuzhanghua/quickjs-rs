@@ -98,10 +98,12 @@ fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult
         None => String::new(),
     };
     let value = interp.string(text);
-    // `new String(x)` boxes, so the text is stored on the receiver for
-    // `String.prototype.valueOf` and the boxing path in `this_object` to find.
-    if let Value::Object(object) = &this {
-        object.define("_value", Property::with_attributes(value, false, false));
+    // `new String(x)` boxes: the receiver is a String *exotic* object, so it needs the
+    // text itself plus the `length` and index properties described in §10.4.3.4.
+    // Filling only `_value` left `new String("ab").length` `undefined` and made every
+    // `Array.prototype` method called on a box see an array-like of length 0.
+    if let (Value::Object(object), Value::String(text)) = (&this, &value) {
+        interp.init_string_wrapper(object, text);
         return Ok(this);
     }
     Ok(value)

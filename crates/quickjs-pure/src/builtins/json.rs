@@ -9,7 +9,7 @@
 //! `JSON.parse` accepts the strict JSON grammar; the reference also accepts a few
 //! extensions, but nothing here depends on them.
 
-use crate::builtins::{arg, define_method};
+use crate::builtins::{arg, define_method, install_tag};
 use crate::interp::{Interp, JsResult};
 use crate::object::{JsObject, Property, PropertyKey};
 use crate::value::{Value, number_to_string};
@@ -19,6 +19,8 @@ use js_gc::Gc;
 pub fn install(interp: &mut Interp<'_>) {
     let object_proto = interp.realm.object_proto.clone();
     let json = interp.new_object(Some(object_proto));
+    // §21.3: `Object.prototype.toString.call(JSON)` is `[object JSON]`.
+    install_tag(&json, "JSON", interp);
     define_method(&json, "stringify", 3, stringify, interp);
     define_method(&json, "parse", 2, parse, interp);
     let global = interp.realm.global.clone();
