@@ -268,6 +268,30 @@ fn main() -> ExitCode {
     rt.set_memory_limit(opts.memory_limit);
     rt.set_stack_size(opts.stack_size);
 
+    // Three options are parsed, advertised in `--help`, and then do nothing. Accepting
+    // them silently is the one thing this project does not do on purpose: a user who
+    // passes `--memory-limit 64M` believes a runaway script will be stopped, and a user
+    // who passes `--std` believes `os`/`std` are importable. Both beliefs are false, and
+    // the second one is how `--memory-limit` stopped being decorative and started being
+    // dangerous — an unbounded test run took the whole session down.
+    //
+    // So they fail loudly instead, the way an unimplemented feature is meant to.
+    if opts.load_std {
+        return pending("std/os host modules", "milestone M9");
+    }
+    if opts.memory_limit.is_some() {
+        return pending(
+            "--memory-limit",
+            "milestone M9; the limit is not enforced yet",
+        );
+    }
+    if opts.stack_size.is_some() {
+        return pending(
+            "--stack-size",
+            "milestone M9; the limit is not enforced yet",
+        );
+    }
+
     if opts.quit_only {
         return ExitCode::SUCCESS;
     }

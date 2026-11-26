@@ -62,10 +62,14 @@ pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
 fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let number = match args.first() {
         None => Value::Int(0),
-        // A bigint converts to the nearest double, so a bigint wider than 53 bits loses
-        // precision exactly as `ToNumber` says it should.
+        // The one place a BigInt is accepted: `Number(1n)` is `1`, unlike `Math.max(1n)`
+        // which is a `TypeError`. §21.1.1.1 says so explicitly, so it cannot share the
+        // `ToNumber` refusal below.
         Some(Value::BigInt(big)) => Value::Float(big.to_f64()),
-        Some(value) => Value::Float(value.to_number()),
+        // Everything else is `ToNumber`, which refuses a Symbol and unwraps an object
+        // through `ToPrimitive` first — so `Number(Symbol())` is a `TypeError` rather
+        // than `NaN`, and `Number(Object(Symbol()))` is too.
+        Some(value) => Value::Float(interp.to_js_number(value)?),
     };
     // `new Number(1)` is a wrapper object, so the number has to be stored on the
     // receiver: without it `Number.prototype.valueOf` finds no `_value` and every

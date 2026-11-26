@@ -438,14 +438,13 @@ impl Runner {
         let mut command = Command::new("sh");
         // Each test gets a hard address-space limit. Without it a single test that
         // allocates in a loop takes the whole machine down: test262 has tests that build
-        // huge arrays on purpose, and this engine does not enforce `--memory-limit`
-        // (`Runtime::set_memory_limit` stores the value and nothing reads it), so the
-        // allocation goes to the real allocator. Measured consequence: running the suite
-        // with the default job count logged the user out of the machine.
+        // huge arrays on purpose. Measured consequence: running the suite with the default
+        // job count logged the user out of the machine.
         //
-        // The limit is applied by `sh` rather than by the engine, so it holds even while
-        // the engine's own limit is decorative. 512 MiB is far above what any single
-        // test262 test needs and far below what it takes to starve the host.
+        // `qjs` is not asked to enforce this itself. It now refuses `--memory-limit`
+        // outright rather than accepting a limit it does not honour, and this harness has
+        // no business depending on a limit the engine cannot deliver. `ulimit` in the
+        // child shell holds regardless of what the engine implements.
         command
             .arg("-c")
             .arg(format!(

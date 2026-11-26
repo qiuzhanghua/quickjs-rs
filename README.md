@@ -72,9 +72,10 @@ quickjs = { package = "quickjs-pure", version = "0.4" }
 
 | 缺口 | 行为 |
 |---|---|
-| `std`/`os` 宿主模块、事件循环、Worker（M9） | 模块不存在；`setTimeout` 未定义 |
+| `std`/`os` 宿主模块、事件循环、Worker（M9） | `--std` 报 `not implemented yet`；`setTimeout` 未定义 |
+| `--memory-limit` / `--stack-size` | 报 `not implemented yet`（此前接受即忽略，等于假的安全） |
 | 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported` |
-| TypedArray 的数组方法（`map`/`reduce`/`forEach`… 只有 7/29）与 `Symbol.iterator` | 方法为 `undefined` |
+| `Iterator` helpers、`RegExp.escape`、lookbehind | `Iterator` 未定义；`RegExp.escape` 为 `undefined`；lookbehind 报 `invalid group` |
 | 通用语法错误的输出格式 | 我们 `<file>: <line>: <col>: <msg>`，参考 `SyntaxError: <msg>` + `at` 行 |
 
 完整清单（含每条的排期）见 `docs/requirements.md` 的「已知缺口」与

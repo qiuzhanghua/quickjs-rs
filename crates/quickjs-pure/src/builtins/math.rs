@@ -8,7 +8,7 @@
 use crate::builtins::{arg, define_method};
 use crate::interp::{Interp, JsResult};
 use crate::object::Property;
-use crate::value::Value;
+use crate::value::{Value, to_int32};
 
 /// Install `Math`.
 pub fn install(interp: &mut Interp<'_>) {
@@ -70,16 +70,37 @@ pub fn install(interp: &mut Interp<'_>) {
     );
 }
 
-fn unary(interp: &mut Interp<'_>, args: &[Value], f: impl Fn(f64) -> f64) -> JsResult<Value> {
-    let _ = interp;
-    Ok(Value::Float(f(arg(args, 0).to_number())))
+/// `ToNumber` for a `Math` argument.
+///
+/// `Value::to_number` is total and answers `NaN` for a BigInt, which left the engine
+/// silently wrong here: `Math.max(1n)` is a `TypeError`, not `NaN`, because there is no
+/// lossless number for a 2^70 integer. Every other `ToNumber` caller was moved onto
+/// [`Interp::to_js_number`] when this was found; `Math` was missed because it does its own
+/// coercion, so it kept answering `NaN` long after the rest of the engine refused.
+/// `ToUint32`, which is `ToInt32` reinterpreted.
+fn to_uint32(value: f64) -> u32 {
+    to_int32(value) as u32
 }
 
-fn abs(_interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+fn to_number(interp: &mut Interp<'_>, value: &Value) -> JsResult<f64> {
+    interp.to_js_number(value)
+}
+
+/// [`to_number`] for the common case where the argument is already owned.
+fn number_of(interp: &mut Interp<'_>, value: Value) -> JsResult<f64> {
+    to_number(interp, &value)
+}
+
+fn unary(interp: &mut Interp<'_>, args: &[Value], f: impl Fn(f64) -> f64) -> JsResult<Value> {
+    let value = number_of(interp, arg(args, 0))?;
+    Ok(Value::Float(f(value)))
+}
+
+fn abs(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     // `abs(-0)` is `+0`, and `abs` of an integer stays an integer.
     Ok(match arg(args, 0) {
         Value::Int(value) => Value::Int(value.saturating_abs()),
-        other => Value::Float(other.to_number().abs()),
+        other => Value::Float(number_of(interp, other)?.abs()),
     })
 }
 
@@ -96,7 +117,7 @@ fn ceil(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
 /// `(x + 0.5).floor()` would be wrong for negatives (`-0.5` would become `-1`), so
 /// the half is added and the result clamped back for zero to keep `-0`.
 fn round(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let value = arg(args, 0).to_number();
+    let value = number_of(interp, arg(args, 0))?;
     if !value.is_finite() {
         return Ok(Value::Float(value));
     }
@@ -116,8 +137,7 @@ fn trunc(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
 }
 
 fn sign(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let value = arg(args, 0).to_number();
-    let _ = interp;
+    let value = number_of(interp, arg(args, 0))?;
     Ok(Value::Float(if value.is_nan() {
         f64::NAN
     } else if value > 0.0 {
@@ -139,9 +159,8 @@ fn cbrt(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
 }
 
 fn pow(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let base = arg(args, 0).to_number();
-    let exponent = arg(args, 1).to_number();
-    let _ = interp;
+    let base = number_of(interp, arg(args, 0))?;
+    let exponent = number_of(interp, arg(args, 1))?;
     Ok(Value::Float(base.powf(exponent)))
 }
 
@@ -186,8 +205,8 @@ fn atan(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
 }
 
 fn atan2(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let y = arg(args, 0).to_number();
-    let x = arg(args, 1).to_number();
+    let y = number_of(interp, arg(args, 0))?;
+    let x = number_of(interp, arg(args, 1))?;
     let _ = interp;
     Ok(Value::Float(y.atan2(x)))
 }
@@ -199,7 +218,7 @@ fn min(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     }
     let mut best = f64::INFINITY;
     for value in args {
-        let number = value.to_number();
+        let number = to_number(interp, value)?;
         if number.is_nan() {
             return Ok(Value::Float(f64::NAN));
         }
@@ -218,7 +237,7 @@ fn max(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     }
     let mut best = f64::NEG_INFINITY;
     for value in args {
-        let number = value.to_number();
+        let number = to_number(interp, value)?;
         if number.is_nan() {
             return Ok(Value::Float(f64::NAN));
         }
@@ -232,9 +251,9 @@ fn max(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
 
 /// `Math.imul`, the 32-bit wrapping multiply.
 fn imul(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let a = arg(args, 0).to_int32();
-    let b = arg(args, 1).to_int32();
-    let _ = interp;
+    // `ToInt32` runs `ToNumber` first, so a BigInt argument is refused here too.
+    let a = to_int32(number_of(interp, arg(args, 0))?);
+    let b = to_int32(number_of(interp, arg(args, 1))?);
     Ok(Value::Int(a.wrapping_mul(b)))
 }
 
@@ -243,7 +262,13 @@ fn hypot(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
     let mut max = 0.0f64;
     let mut found_infinite = false;
     let mut found_nan = false;
-    let numbers: Vec<f64> = args.iter().map(|value| value.to_number()).collect();
+    let numbers: Vec<f64> = {
+        let mut numbers = Vec::with_capacity(args.len());
+        for value in args {
+            numbers.push(to_number(interp, value)?);
+        }
+        numbers
+    };
     for number in &numbers {
         if number.is_infinite() {
             found_infinite = true;
@@ -269,15 +294,14 @@ fn hypot(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
 
 /// `Math.fround`, rounding to the nearest `f32`.
 fn fround(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let value = arg(args, 0).to_number();
+    let value = number_of(interp, arg(args, 0))?;
     let _ = interp;
     Ok(Value::Float(value as f32 as f64))
 }
 
 /// `Math.clz32`, the count of leading zero bits.
 fn clz32(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let value = arg(args, 0).to_uint32();
-    let _ = interp;
+    let value = to_uint32(number_of(interp, arg(args, 0))?);
     Ok(Value::Int(value.leading_zeros() as i32))
 }
 
@@ -307,7 +331,7 @@ fn sum_precise(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
             return Err(interp.type_error("Math.sumPrecise element is not a number"));
         }
         seen = true;
-        accumulator.add(element.to_number());
+        accumulator.add(number_of(interp, element.clone())?);
     }
     // The empty sum is `-0`, which is what the reference returns and what the
     // addition identity for this operation is defined as.

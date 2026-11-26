@@ -5858,7 +5858,7 @@ impl<'a> Interp<'a> {
                 // unary plus is defined to produce a *number*, which a bigint cannot
                 // become without loss. It used to fall through to `NaN`.
                 if matches!(value, Value::BigInt(_)) {
-                    return Err(self.type_error("cannot convert a BigInt to a number"));
+                    return Err(self.type_error("cannot convert bigint to number"));
                 }
                 let numeric = self.numeric_of(value)?;
                 self.push(numeric);
@@ -7205,8 +7205,8 @@ impl<'a> Interp<'a> {
         // Both are checked *after* `ToPrimitive`, so a boxed Symbol or BigInt is refused
         // too: `ToNumber(Object(Symbol()))` unwraps to the symbol and then fails.
         match value {
-            Value::BigInt(_) => Err(self.type_error("cannot convert a BigInt to a number")),
-            Value::Symbol(_) => Err(self.type_error("cannot convert a Symbol to a number")),
+            Value::BigInt(_) => Err(self.type_error("cannot convert bigint to number")),
+            Value::Symbol(_) => Err(self.type_error("cannot convert symbol to number")),
             other => Ok(other.to_number()),
         }
     }

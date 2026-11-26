@@ -2962,3 +2962,46 @@ print(kind(() => new named()));
          no throw\n"
     );
 }
+
+#[test]
+fn math_refuses_a_bigint_instead_of_answering_nan() {
+    // `Value::to_number` is total and answers `NaN`, which is fine for the operators (they
+    // check the bigint themselves) and wrong for every `ToNumber` caller: `Math.max(1n)`
+    // is a `TypeError`, and answering `NaN` made it silently wrong for a whole milestone.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { f(); return "no throw" } catch (e) { return e.constructor.name } }
+print(kind(() => Math.max(1n)), kind(() => Math.min(1n)), kind(() => Math.abs(1n)));
+print(kind(() => Math.sqrt(1n)), kind(() => Math.pow(1n, 2)), kind(() => Math.hypot(1n)));
+print(kind(() => Math.sign(1n)), kind(() => Math.imul(1n, 2)), kind(() => Math.clz32(1n)));
+print(kind(() => Math.fround(1n)), kind(() => Math.sumPrecise([1n])));
+print(kind(() => Math.max(Symbol())));
+print(Math.max(1, 2), Math.max(), 1 / Math.min(0, -0));
+"#
+        ),
+        "TypeError TypeError TypeError\n\
+         TypeError TypeError TypeError\n\
+         TypeError TypeError TypeError\n\
+         TypeError TypeError\n\
+         TypeError\n\
+         2 -Infinity -Infinity\n"
+    );
+}
+
+#[test]
+fn number_refuses_a_symbol_but_accepts_a_bigint() {
+    // The one asymmetry in `ToNumber`: §21.1.1.1 makes `Number(1n)` return `1`, while
+    // `Number(Symbol())` is a `TypeError` — so the BigInt special case cannot be dropped
+    // in favour of `ToNumber`, and the Symbol case cannot be left to `to_number`'s `NaN`.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { return String(f()) } catch (e) { return e.constructor.name } }
+print(kind(() => Number(1n)), kind(() => Number()), kind(() => Number(true)));
+print(kind(() => Number(Symbol())), kind(() => Number(Object(Symbol()))));
+"#
+        ),
+        "1 0 1\nTypeError TypeError\n"
+    );
+}

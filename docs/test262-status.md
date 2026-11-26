@@ -41,17 +41,18 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **11548（62.5%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6939 |
+| **可运行中通过** | **11555（62.5%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6932 |
 | ↳ 其中挂起（引擎不终止） | 8 |
-| ↳ 其中答错 | 6931 |
+| ↳ 其中答错 | 6926 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
 是被过期的跳过表挡住的（`flag:async` 与 `explicit-resource-management`），解锁后分母
 变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立。
 
-在那之后再修掉可构造性（4.12）又得 +332 例、回归 0 例，通过率回到 62.5%。
+在那之后再修掉可构造性（4.12）又得 +332 例、再修 `Math`/`Number` 的 `ToNumber`（4.13）
+得 +7 例，两次回归都是 0，通过率回到 62.5%。
 
 跳过不是"通过"，所以它单列。按原因：
 
@@ -329,6 +330,46 @@ isCtor(Math.max)                   // 应为 false，实为 true
   `name` 属性本身存在且为 `""`，缺的是赋值时的名字推导。
 - `new String("ab").length` 应为 `2`，实为 `undefined`（包装器对象没有 `length`
   与索引属性）。
+
+### 4.13 `Math` 与 `Number` 绕过了 `ToNumber`（✅ 已修，+7 例）
+
+`Math.max(1n)` 答 `NaN`，应为 `TypeError`。同一根因下还有两处：
+
+```js
+Number(Symbol())          // 应为 TypeError，实为 NaN（静默）
+Number(Object(Symbol()))  // 同上
+Math.imul(1n, 2)          // 应为 TypeError，实为 0
+```
+
+`Interp::to_js_number` 早就拒绝 BigInt 与 Symbol —— 之前修 `new Int32Array(1n)` 时
+改的 12 处调用点都走它。`Math` 漏掉是因为它有自己的一套 coercion（直接
+`Value::to_number()`，而后者为了"总是有答案"对 BigInt 返回 `NaN`）；
+`Number` 漏掉是因为它的构造器显式特判了 BigInt（这是对的，§21.1.1.1 要求
+`Number(1n) === 1`），于是顺手把 Symbol 也放过去了。
+
+修法是 `Math` 里加一个 `to_number` 包装转调 `to_js_number`，13 处 coercion 全部改走它；
+`Number` 的构造器只保留 BigInt 特判，其余交给 `to_js_number`。
+
+顺带把两条错误消息的文本对齐参考实现（`cannot convert bigint to number`、
+`cannot convert symbol to number`，此前是 `cannot convert a BigInt to a number`）。
+文本差异本身不影响判定，但这是本项目"以 C 版实测输出为准"的一部分。
+
+### 4.14 三个"接受即忽略"的命令行选项（✅ 已改成响亮失败）
+
+`--std`、`--memory-limit`、`--stack-size` 三个选项此前**解析、写进 `--help`、存进
+`Runtime` 字段，然后什么都不做**：
+
+```sh
+qjs --std -e 'typeof std'              # undefined，应为 object
+qjs --memory-limit 64M -e '...'        # 限额完全不生效
+```
+
+`--memory-limit` 是最危险的一个：用户以为脚本会被拦住，实际一路吃到内核 OOM
+（第 8 节那次把会话跑掉，直接原因就是它）。按本项目"响亮失败、不给错答案"的尺子，
+这三个都应该报错而不是假装。
+
+现在三个都以退出码 2 + `qjs: not implemented yet: … (milestone M9)` 结束，
+与 `interactive REPL` 的处理一致。`qjs --help` 的文本不变，仍与参考逐字节一致。
 
 ## 5. 对里程碑结论的修正
 
