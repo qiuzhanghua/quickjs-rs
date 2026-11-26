@@ -820,6 +820,12 @@ pub struct ProxyState {
     /// re-derived from `target` being `Some`: `typeof p.proxy` has to stay `"function"`
     /// after `Proxy.revocable(function(){}, {}).revoke()`, and the reference agrees.
     pub callable: bool,
+    /// Whether this proxy has a `[[Construct]]`, decided once when it is created.
+    ///
+    /// Same reasoning as [`ProxyState::callable`], and the two are genuinely independent:
+    /// `Proxy.revocable(function(){}, {})` is both callable and constructible, while a
+    /// proxy over an arrow function is callable and not constructible.
+    pub constructible: bool,
 }
 
 /// A `Promise`'s state, shared between the promise object and its resolve/reject
@@ -1080,6 +1086,15 @@ pub struct ObjectData {
     /// Whether this function is a class constructor, which may not be called without
     /// `new`.
     pub class_constructor: bool,
+    /// Whether this function has a `[[Construct]]`, i.e. may appear as the target of
+    /// `new` or `Reflect.construct`.
+    ///
+    /// Not derivable from being callable, and that is the whole point: an ordinary
+    /// method, an arrow function, a generator, an async function and most built-in
+    /// methods are all callable and none of them may be constructed (§10.2.1,
+    /// §15.3.1). Deriving it from `is_callable` made `new (Array.prototype.map)` succeed,
+    /// which test262 checks for every built-in (`not-a-constructor.js`, 515 files).
+    pub constructible: bool,
 }
 
 impl Trace for ObjectData {
@@ -1118,6 +1133,7 @@ impl JsObject {
                 length_writable: true,
                 home_object: None,
                 class_constructor: false,
+                constructible: false,
             }),
         }
     }
@@ -1176,17 +1192,28 @@ impl JsObject {
         }
     }
 
-    /// Whether the target of this proxy can be constructed.
+    /// Whether this object has a `[[Construct]]`, i.e. may be the target of `new` or
+    /// `Reflect.construct`.
     pub fn is_constructor(&self) -> bool {
-        match &self.data.borrow().kind {
-            ObjectKind::Function(_) => true,
-            ObjectKind::Proxy(state) => state
-                .borrow()
-                .target
-                .as_ref()
-                .is_some_and(|target| target.is_callable()),
+        let data = self.data.borrow();
+        match &data.kind {
+            // The flag, not "is a function": a plain method is a function and is not a
+            // constructor. Set at creation by whoever knows what was built.
+            ObjectKind::Function(_) => data.constructible,
+            // Recorded at creation for the same reason as callability: revoking drops the
+            // target without taking `[[Construct]]` away.
+            ObjectKind::Proxy(state) => state.borrow().constructible,
             _ => false,
         }
+    }
+
+    /// Give this function a `[[Construct]]`.
+    ///
+    /// Only for callables that are constructors by definition: ordinary functions, class
+    /// constructors, and the built-in constructors. Everything else — methods, arrows,
+    /// generators, async functions — keeps the default `false`.
+    pub fn set_constructible(&self, yes: bool) {
+        self.data.borrow_mut().constructible = yes;
     }
 
     /// This object's proxy slots, when it is one (revoked or not).
@@ -1206,11 +1233,13 @@ impl JsObject {
         // Read callability from the target *now*: it is the one moment the answer is
         // available, and it outlives revocation.
         let callable = target.is_callable();
+        let constructible = target.is_constructor();
         Gc::new(
             heap,
             JsObject::new(
                 ObjectKind::Proxy(std::rc::Rc::new(std::cell::RefCell::new(ProxyState {
                     callable,
+                    constructible,
                     target: Some(target),
                     handler: Some(handler),
                 }))),
@@ -1235,8 +1264,17 @@ impl JsObject {
     }
 
     /// Record the object a method was defined on.
+    ///
+    /// A method has no `[[Construct]]` (§10.2.1): `new (o.m)` is a `TypeError` even
+    /// though `o.m` is a function. Acquiring a home object is exactly the moment a
+    /// function becomes a method, so the flag is cleared here rather than left to every
+    /// method-defining call site to remember.
     pub fn set_home_object(&self, home: Option<Gc<JsObject>>) {
-        self.data.borrow_mut().home_object = home;
+        let mut data = self.data.borrow_mut();
+        data.home_object = home.clone();
+        if home.is_some() {
+            data.constructible = false;
+        }
     }
 
     /// Whether this is a class constructor.

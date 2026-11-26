@@ -2903,3 +2903,62 @@ catch (e) { print(e.name); }
         "true\ntrue\ntrue\ntrue\nTypeError\n"
     );
 }
+
+#[test]
+fn only_constructors_have_a_construct_method() {
+    // §7.2.4 `IsConstructor`. Being callable is not the same property: an arrow function,
+    // a generator, an async function, a class method and a plain object method are all
+    // callable and none of them may be used with `new`. Deriving `[[Construct]]` from
+    // `is_callable` made `new (Array.prototype.map)` build an object out of nothing.
+    assert_eq!(
+        eval(
+            r#"
+function isCtor(f) { try { Reflect.construct(function () {}, [], f); return true } catch (e) { return false } }
+print(isCtor(Array.prototype.map), isCtor(Object.keys), isCtor(JSON.stringify), isCtor(Math.max));
+print(isCtor(Object), isCtor(Array), isCtor(Map), isCtor(Error), isCtor(Proxy));
+print(isCtor(1), isCtor({}), isCtor(null));
+function plain() {}
+print(isCtor(plain), isCtor(class {}), isCtor(() => 1), isCtor(function* () {}), isCtor(async function () {}));
+var object = { method() {} };
+class Klass { method() {} }
+print(isCtor(object.method), isCtor(Klass.prototype.method), isCtor(Klass));
+print(isCtor(plain.bind(null)), isCtor((() => 1).bind(null)));
+print(isCtor(Symbol), isCtor(BigInt));
+"#
+        ),
+        "false false false false\n\
+         true true true true true\n\
+         false false false\n\
+         true true false false false\n\
+         false false true\n\
+         true false\n\
+         true true\n"
+    );
+}
+
+#[test]
+fn new_on_a_non_constructor_names_it() {
+    // The message matters: test262 asserts on the class, and users read the name.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { f(); return "no throw" } catch (e) { return e.constructor.name + ": " + e.message } }
+function named() {}
+print(kind(() => new named()));
+print(kind(() => new (() => 1)()));
+print(kind(() => new (function* G() {})()));
+print(kind(() => new (async function A() {})()));
+print(kind(() => new Symbol()));
+print(kind(() => new BigInt(1)));
+print(kind(() => new named()));
+"#
+        ),
+        "no throw\n\
+         TypeError:  is not a constructor\n\
+         TypeError: G is not a constructor\n\
+         TypeError: A is not a constructor\n\
+         TypeError: Symbol is not a constructor\n\
+         TypeError: BigInt is not a constructor\n\
+         no throw\n"
+    );
+}

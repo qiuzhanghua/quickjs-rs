@@ -1384,7 +1384,7 @@ pub fn install(interp: &mut Interp<'_>) {
         }
     }
 
-    let constructor = interp.new_native("Date", 7, constructor);
+    let constructor = interp.new_native_constructor("Date", 7, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(date_proto.clone()), false, false),

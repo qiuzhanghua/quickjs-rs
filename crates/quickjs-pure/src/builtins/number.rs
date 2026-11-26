@@ -20,7 +20,7 @@ pub fn install(interp: &mut Interp<'_>, number_proto: &Gc<JsObject>) {
     // `this.toString()` on the *wrapper* and answers `"[object Number]"`.
     define_method(number_proto, "toLocaleString", 0, to_locale_string, interp);
 
-    let constructor = interp.new_native("Number", 1, constructor);
+    let constructor = interp.new_native_constructor("Number", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(number_proto.clone()), false, false),
@@ -509,7 +509,7 @@ pub fn install_boolean(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
         interp,
     );
     define_method(boolean_proto, "valueOf", 0, boolean_value_of, interp);
-    let constructor = interp.new_native("Boolean", 1, boolean_constructor);
+    let constructor = interp.new_native_constructor("Boolean", 1, boolean_constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(boolean_proto.clone()), false, false),

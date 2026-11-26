@@ -1611,11 +1611,29 @@ impl<'a> Interp<'a> {
                 own_instance: true,
             },
         );
+        function.set_constructible(true);
         function.define(
             "length",
             Property::name_or_length(Value::Int(length as i32)),
         );
         function.define("name", Property::name_or_length(self.string(name)));
+        function
+    }
+
+    /// A native constructor that lets `new` build the instance first.
+    ///
+    /// The ordinary case for a built-in constructor: `new Array(3)` has no argument
+    /// validation that must precede reading `new.target.prototype`, so the object can be
+    /// created before the implementation runs. Distinct from [`Interp::new_native`],
+    /// which makes a *method* and therefore not a constructor at all.
+    pub fn new_native_constructor(
+        &self,
+        name: impl Into<String>,
+        length: u32,
+        func: NativeFn,
+    ) -> Gc<JsObject> {
+        let function = self.new_native(name, length, func);
+        function.set_constructible(true);
         function
     }
 
@@ -1643,11 +1661,19 @@ impl<'a> Interp<'a> {
 
     /// A new bound function.
     pub fn new_bound(&self, target: Value, this: Value, args: Vec<Value>) -> Gc<JsObject> {
-        JsObject::function(
+        // §10.4.1.3 BoundFunctionCreate: a bound function has `[[Call]]` because it was
+        // made by calling `bind`, and `[[Construct]]` exactly when its target has one.
+        // `new (function(){}.bind(null))()` works; `new (()=>{}).bind(null)()` does not.
+        let constructible = target
+            .as_object()
+            .is_some_and(|target| target.is_constructor());
+        let bound = JsObject::function(
             self.heap,
             Some(self.realm.function_proto.clone()),
             Callable::Bound { target, this, args },
-        )
+        );
+        bound.set_constructible(constructible);
+        bound
     }
 
     /// A new reference cell.
@@ -5122,6 +5148,22 @@ impl<'a> Interp<'a> {
                 _ => None,
             });
             let Some((target, leading)) = bound else {
+                // Not a bound function, so this object is the callee. §7.2.4
+                // `IsConstructor` decides whether `new` may proceed, and the two ad-hoc
+                // refusals above cover only the built-ins the reference also refuses by
+                // name. Everything else — a method, an arrow, an async function — has no
+                // `[[Construct]]` either, and answering "yes" here made
+                // `new (Array.prototype.map)` build an object instead of throwing.
+                if !object.is_constructor() {
+                    let name = object
+                        .own_property("name")
+                        .and_then(|property| property.value)
+                        .map(|value| value.to_js_string())
+                        .unwrap_or_default();
+                    return Err(Signal::Throw(
+                        self.make_error("TypeError", &format!("{name} is not a constructor")),
+                    ));
+                }
                 break;
             };
             let mut all = leading;
@@ -6809,6 +6851,12 @@ impl<'a> Interp<'a> {
         // `.length` is the arity before any default or rest parameter, not the number
         // of slots a pattern parameter needs.
         let length = function.defined_args;
+        // `[[Construct]]` per §10.2.1: an ordinary function has it, a generator, an async
+        // function and an arrow function do not. A *method* also does not, but that is not
+        // known here — the method is marked when the `[[HomeObject]]` is attached (see
+        // `set_home_object`), which is the moment it becomes a method.
+        let constructible =
+            !function.is_arrow && function.kind == js_compile::bytecode::FunctionKind::Normal;
         let code = Gc::new(self.heap, CompiledCode::new(*function));
         // A closure built inside an `eval` inherits the eval's view of the enclosing
         // bindings, so it can still read them once the eval has returned.
@@ -6835,6 +6883,7 @@ impl<'a> Interp<'a> {
             Some(self.realm.function_proto.clone()),
             Callable::Bytecode { code, env },
         );
+        object.set_constructible(constructible);
         object.define(
             "length",
             Property::name_or_length(Value::Int(length as i32)),

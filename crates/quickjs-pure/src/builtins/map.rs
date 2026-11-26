@@ -33,7 +33,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
 
 fn install_map(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     let proto = interp.new_object(Some(object_proto.clone()));
-    let constructor = interp.new_native("Map", 0, map_constructor);
+    let constructor = interp.new_native_constructor("Map", 0, map_constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),
@@ -67,7 +67,7 @@ fn install_map(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
 
 fn install_set(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     let proto = interp.new_object(Some(object_proto.clone()));
-    let constructor = interp.new_native("Set", 0, set_constructor);
+    let constructor = interp.new_native_constructor("Set", 0, set_constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),

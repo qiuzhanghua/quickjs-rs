@@ -34,7 +34,7 @@ pub fn install(interp: &mut Interp<'_>, function_proto: &Gc<JsObject>) {
         function_proto.define(name, Property::accessor(Some(Value::Object(getter)), None));
     }
 
-    let constructor = interp.new_native("Function", 1, constructor);
+    let constructor = interp.new_native_constructor("Function", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(function_proto.clone()), false, false),

@@ -14,7 +14,7 @@ use js_gc::Gc;
 
 /// Install `Proxy` on the realm's global object.
 pub fn install(interp: &mut Interp<'_>) {
-    let constructor = interp.new_native("Proxy", 2, constructor);
+    let constructor = interp.new_native_constructor("Proxy", 2, constructor);
     // `Proxy` is a function you call with `new`, but it has no `prototype` property:
     // proxies inherit from their *target's* prototype, so there is nothing for one to
     // sit on.

@@ -31,7 +31,7 @@ pub struct RegExpData {
 /// Install `RegExp` and its prototype methods.
 pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) -> Gc<JsObject> {
     let prototype = interp.new_object(Some(object_proto.clone()));
-    let constructor = interp.new_native("RegExp", 2, constructor);
+    let constructor = interp.new_native_constructor("RegExp", 2, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(prototype.clone()), false, false),

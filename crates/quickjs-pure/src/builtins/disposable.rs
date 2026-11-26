@@ -84,7 +84,7 @@ fn install_one(
     name: &str,
     async_form: bool,
 ) -> Gc<JsObject> {
-    let constructor = interp.new_native(name, 0, constructor);
+    let constructor = interp.new_native_constructor(name, 0, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(prototype.clone()), false, false),

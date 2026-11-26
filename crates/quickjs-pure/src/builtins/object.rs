@@ -48,7 +48,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         },
     );
 
-    let constructor = interp.new_native("Object", 1, constructor);
+    let constructor = interp.new_native_constructor("Object", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(object_proto.clone()), false, false),

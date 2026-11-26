@@ -63,7 +63,7 @@ pub fn install(interp: &mut Interp<'_>, string_proto: &Gc<JsObject>) {
         string_proto.define_key(&key, Property::data(values_fn));
     }
 
-    let constructor = interp.new_native("String", 1, constructor);
+    let constructor = interp.new_native_constructor("String", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(string_proto.clone()), false, false),

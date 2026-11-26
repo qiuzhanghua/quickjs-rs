@@ -73,7 +73,7 @@ fn construct(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
         None | Some(Value::Undefined) => target.clone(),
         Some(candidate) => candidate.clone(),
     };
-    if !matches!(&new_target, Value::Object(o) if o.is_callable()) {
+    if !matches!(&new_target, Value::Object(o) if o.is_constructor()) {
         return Err(interp.type_error("Reflect.construct newTarget is not a constructor"));
     }
     interp.construct(target, new_target, rest)

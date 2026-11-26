@@ -16,7 +16,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     let proto = interp.new_object(Some(object_proto.clone()));
     interp.realm.bigint_proto = Some(proto.clone());
 
-    let constructor = interp.new_native("BigInt", 1, constructor);
+    let constructor = interp.new_native_constructor("BigInt", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),

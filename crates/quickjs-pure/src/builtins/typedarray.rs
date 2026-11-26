@@ -320,7 +320,7 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
 
 fn install_array_buffer(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     let proto = interp.new_object(Some(object_proto.clone()));
-    let constructor = interp.new_native("ArrayBuffer", 1, buffer_constructor);
+    let constructor = interp.new_native_constructor("ArrayBuffer", 1, buffer_constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),

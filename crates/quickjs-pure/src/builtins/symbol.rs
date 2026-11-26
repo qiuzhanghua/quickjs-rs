@@ -53,7 +53,7 @@ pub fn install(interp: &mut Interp<'_>) {
     let object_proto = interp.realm.object_proto.clone();
     let function_proto = interp.realm.function_proto.clone();
 
-    let constructor = interp.new_native("Symbol", 0, constructor);
+    let constructor = interp.new_native_constructor("Symbol", 0, constructor);
     // `Symbol` has no `[[Construct]]`, and `construct` reads this flag to say so.
     constructor.define("_not_a_constructor", Property::data(Value::Bool(true)));
     constructor.set_proto(Some(function_proto));

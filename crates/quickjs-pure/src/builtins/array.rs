@@ -66,7 +66,7 @@ pub fn install(interp: &mut Interp<'_>, array_proto: &Gc<JsObject>) {
         array_proto.define_key(&key, Property::data(values_fn));
     }
 
-    let constructor = interp.new_native("Array", 1, constructor);
+    let constructor = interp.new_native_constructor("Array", 1, constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(array_proto.clone()), false, false),

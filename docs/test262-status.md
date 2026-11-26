@@ -41,15 +41,17 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **11216（60.7%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 7271 |
+| **可运行中通过** | **11548（62.5%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6939 |
 | ↳ 其中挂起（引擎不终止） | 8 |
-| ↳ 其中答错 | 7263 |
+| ↳ 其中答错 | 6931 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
 是被过期的跳过表挡住的（`flag:async` 与 `explicit-resource-management`），解锁后分母
-变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立，见第 2 节末尾。
+变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立。
+
+在那之后再修掉可构造性（4.12）又得 +332 例、回归 0 例，通过率回到 62.5%。
 
 跳过不是"通过"，所以它单列。按原因：
 
@@ -277,7 +279,7 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
    于是 `Object.prototype.toString.call(dataView)` 报错类型。顺带修掉。
    同时发现 `Symbol.toStringTag` 被装成了访问器，规范是数据属性。
 
-### 4.12 每个原生方法都能被 `new`（新发现，未修）
+### 4.12 可构造性被写成了可调用（✅ 已修，+332 例）
 
 解锁 `$DONE` 之后浮出来的，影响面比 ERM 本身大得多：
 
@@ -291,26 +293,42 @@ isCtor(Math.max)                   // 应为 false，实为 true
 ```
 
 参考实现全部返回 `false`。根因是**可构造性被写成了"可调用"**：
+`Reflect.construct` 读 `is_callable()`，而 `JsObject::is_constructor()` 虽然存在，
+却**没有任何调用点**，并且它自己的判据（`ObjectKind::Function(_) => true`）
+与 `is_callable` 一样宽松。
 
-- `Reflect.construct` 读的是 `is_callable()`，于是任何可调用对象都是合法 `newTarget`；
-- `JsObject::is_constructor()` 存在，但**没有任何一处调用它**，而且它自己的判据
-  （`ObjectKind::Function(_) => true`）与 `is_callable` 一样宽松。
+修法是给对象加一个真正的 `[[Construct]]` 标志（`ObjectData::constructible`），
+在三个地方落位：
 
-按规范可构造的是：普通函数、类构造器、原生构造器；**不可构造**的是箭头函数、
-生成器与 async 函数、类方法、对象字面量方法、以及绝大多数原生方法。当前表示里
-`Callable::Bytecode` 同时装着这两类，`CompiledFunction` 只有 `kind`（Normal/Generator/
-Async/AsyncGenerator）与 `is_arrow`，没有任何"这是方法"的位。
+| 什么 | 何时定 | 依据 |
+|---|---|---|
+| 字节码函数 | 建闭包时 | §10.2.1：普通函数有，生成器/async/箭头函数没有 |
+| 方法 | 挂 `[[HomeObject]]` 时 | 成为方法的那一刻就失去 `[[Construct]]`，所以清标志放在 `set_home_object` 里，而不是让每个 `define_method` 调用点自己记得 |
+| 内建 | 安装时 | `new_native` 造方法（不可构造），新增的 `new_native_constructor` 造构造器；`new_native_ctor` 三个"自建实例"的照旧 |
 
-所以修法不是改一行判断，而是要**新增一个可构造性标志并在两处落位**：
+过程里三次自我纠正，都是全量对比报出来的：
 
-1. 编译器：方法（类体、对象字面量、getter/setter）与箭头/生成器/async 标记为不可构造，
-   普通函数与类构造器标记为可构造，随 `CompiledFunction` 序列化；
-2. 内建安装：`Callable::Native` 需要区分构造器与方法
-   （现有 `own_instance` 只表达"谁建实例"，不表达"能不能被 new"）。
+1. **第一次 +332 / −23。** 23 条回归全是 `prototype-from-newtarget` 一族。原因是
+   绑定函数（`function(){}.bind(null)`）从未被标成可构造，而它作为 `newTarget` 必须
+   是。按 §10.4.1.3，绑定函数的 `[[Construct]]` 跟随其目标：`new (f.bind())()` 可以，
+   `new (()=>{}.bind())()` 不行。修好后 −23 → −2。
+2. **剩下 2 条是 `Symbol/is-constructor` 与 `BigInt/is-constructor`。** 它们断言
+   `isConstructor(Symbol) === true` —— 规范里 Symbol 与 BigInt **有** `[[Construct]]`，
+   只是真的去构造时抛 `TypeError`。引擎把"有 [[Construct]]"与"构造会抛错"混成了一件
+   事（`_not_a_constructor` 属性）。现在两者都标成可构造，`_not_a_constructor` 继续
+   负责在那之后抛错，报错文本与参考逐字节一致。
+3. 最终 **+332 / −0**，通过率 60.7% → 62.5%。
 
-test262 里 `not-a-constructor.js` 是一整族用例，每个内建都有，这也是
-`DisposableStack` 那 22 条失败里最密集的一类。价值上它比 ERM 本身大，因为它横跨
-所有部件。
+`not-a-constructor.js` 在 test262 里是 515 个文件，每个内建都有，所以这一条比 ERM
+本身值钱。两个新回归测试（`only_constructors_have_a_construct_method`、
+`new_on_a_non_constructor_names_it`）已验证在旧判据下失败。
+
+顺带记两处**与本条无关的既有缺陷**（查证过改动前后都错，故不在本轮处理）：
+
+- `var a = () => 1; a.name` 应为 `"a"`（NamedEvaluation），实为 `""`。匿名箭头函数的
+  `name` 属性本身存在且为 `""`，缺的是赋值时的名字推导。
+- `new String("ab").length` 应为 `2`，实为 `undefined`（包装器对象没有 `length`
+  与索引属性）。
 
 ## 5. 对里程碑结论的修正
 

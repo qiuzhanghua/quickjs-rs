@@ -61,7 +61,7 @@ pub fn install(interp: &mut Interp<'_>) {
         // The constructor is a native function whose identity is what `new` uses;
         // which class it belongs to is carried in `_class`, because a `NativeFn` is
         // a plain function pointer and cannot capture.
-        let constructor = interp.new_native(class, 1, error_constructor);
+        let constructor = interp.new_native_constructor(class, 1, error_constructor);
         constructor.define(
             "_class",
             Property::with_attributes(interp.string(class), false, false),
@@ -104,7 +104,8 @@ fn install_suppressed_error(interp: &mut Interp<'_>, error_proto: &Gc<JsObject>)
         "message",
         Property::with_attributes(interp.string(""), true, false),
     );
-    let constructor = interp.new_native("SuppressedError", 3, suppressed_error_constructor);
+    let constructor =
+        interp.new_native_constructor("SuppressedError", 3, suppressed_error_constructor);
     constructor.define(
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),
