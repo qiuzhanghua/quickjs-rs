@@ -2900,12 +2900,6 @@ try { Reflect.construct(Promise, [], angry); print("no throw"); }
 catch (e) { print(e.name); }
 "#
         ),
-        concat!(
-            "true\n",
-            "true\n",
-            "true\n",
-            "true\n",
-            "TypeError\n",
-        )
+        "true\ntrue\ntrue\ntrue\nTypeError\n"
     );
 }
