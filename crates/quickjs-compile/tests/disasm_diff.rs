@@ -104,19 +104,35 @@ fn set_filename(function: &mut js_compile::Function, name: &str) {
     }
 }
 
-fn compare(cases: &[&str]) -> Vec<String> {
+fn compare(cases: &[&str]) -> (Vec<String>, usize) {
     let Some(oracle) = oracle() else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
     let scratch = Scratch::new("diff");
     let mut failures = Vec::new();
+    let mut compared = 0;
     for source in cases {
         let Some(reference) = reference_disassembly(&oracle, &scratch, source) else {
+            // The reference refuses to compile it, so there is no bytecode to compare.
+            // That used to be a silent `continue`, which meant "do we also refuse it?"
+            // was never asked — a case could flip from rejected to accepted by us and the
+            // suite would stay green. Three cases sit on this path (`[1,...,,]`,
+            // `continue` to a non-iteration label, `??` mixed with `||`); all three are
+            // early errors we also reject. Check that, so the skip is a test and not a
+            // hole.
+            let path = scratch.0.join("case.js");
+            let path = path.to_str().expect("utf-8 path");
+            if ours(source, path).is_ok() {
+                failures.push(format!(
+                    "  {source:?}\n    the reference rejects this, but we compile it"
+                ));
+            }
             continue;
         };
         let path = scratch.0.join("case.js");
         let path = path.to_str().expect("utf-8 path");
         let reference = normalise(&reference, path);
+        compared += 1;
         match ours(source, path) {
             Err(err) => failures.push(format!("  {source:?}\n    we failed: {err}")),
             Ok(actual) => {
@@ -126,7 +142,7 @@ fn compare(cases: &[&str]) -> Vec<String> {
             }
         }
     }
-    failures
+    (failures, compared)
 }
 
 /// A side-by-side diff, so a failure names the instruction that differs.
@@ -180,7 +196,7 @@ fn literals_match_the_reference() {
         "\"two words\";",
         "undefined;",
     ];
-    assert_cases(&cases);
+    assert_cases("literals_match_the_reference", &cases);
 }
 
 #[test]
@@ -221,7 +237,7 @@ fn operators_match_the_reference() {
         "a, b;",
         "(a, b, c);",
     ];
-    assert_cases(&cases);
+    assert_cases("operators_match_the_reference", &cases);
 }
 
 #[test]
@@ -247,7 +263,7 @@ fn variables_match_the_reference() {
         "function f(a, b) { return a + b; }",
         "function f() { return 1; } f();",
     ];
-    assert_cases(&cases);
+    assert_cases("variables_match_the_reference", &cases);
 }
 
 /// Constructs the compiler rejects with a clear error rather than compiling them
@@ -368,7 +384,7 @@ fn statements_match_the_reference() {
         "f(1, 2);",
         "f(1, 2, 3);",
     ];
-    assert_cases(&cases);
+    assert_cases("statements_match_the_reference", &cases);
 }
 
 /// The temporal dead zone and the scope chain.
@@ -444,7 +460,7 @@ fn tdz_and_scopes_match_the_reference() {
         "function f(){ { { let c; } let b; } let a; }",
         "function f(){ let a; { let b; } let c; }",
     ];
-    assert_cases(&cases);
+    assert_cases("tdz_and_scopes_match_the_reference", &cases);
 }
 
 /// Function name inference and closure plumbing, which the TDZ work touches.
@@ -470,7 +486,7 @@ fn named_functions_and_captures_match_the_reference() {
         "function k(a, b, c, d){ return d; }",
         "function k(a, b, c, d, e){ return e; }",
     ];
-    assert_cases(&cases);
+    assert_cases("named_functions_and_captures_match_the_reference", &cases);
 }
 
 /// `break`, `continue` and labelled statements.
@@ -508,7 +524,7 @@ fn loops_and_labels_match_the_reference() {
         "function f(c){ for(;;){ for(;;){ break; } a(); } }",
         "function f(c){ for(;;){ for(;;){ continue; } a(); } }",
     ];
-    assert_cases(&cases);
+    assert_cases("loops_and_labels_match_the_reference", &cases);
 }
 
 /// Known gaps: jump and constant-folding optimisations the reference applies but
@@ -556,7 +572,10 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
         "function f(a){ return a.length; }",
         "function f(){ return [1,2].length; }",
     ];
-    assert_cases(&cases);
+    assert_cases(
+        "constant_conditions_and_dead_jumps_match_the_reference",
+        &cases,
+    );
 }
 
 /// Assignments, in statement *and* value position.
@@ -614,7 +633,7 @@ fn assignments_match_the_reference() {
         "function f(o,k,b){ o[k] ??= b; c(); }",
         "function f(o,k,b){ var x = (o[k] ||= b); }",
     ];
-    assert_cases(&cases);
+    assert_cases("assignments_match_the_reference", &cases);
 }
 
 /// Calls, which have to pass their receiver.
@@ -647,7 +666,7 @@ fn calls_pass_their_receiver() {
         "function f(a,c){ a?.b(c); }",
         "function f(a,c){ a?.[k](c); }",
     ];
-    assert_cases(&cases);
+    assert_cases("calls_pass_their_receiver", &cases);
 }
 
 /// `??` and optional chaining.
@@ -681,7 +700,7 @@ fn nullish_and_optional_chains_match_the_reference() {
         "function f(a){ return a?.b + 1; }",
         "function f(a){ if (a?.b) c(); }",
     ];
-    assert_cases(&cases);
+    assert_cases("nullish_and_optional_chains_match_the_reference", &cases);
 }
 
 /// `switch`.
@@ -717,7 +736,7 @@ fn switch_matches_the_reference() {
         "function f(x){ switch(x.y){ case 1: return 1; } }",
         "function f(x){ switch(x){ case 1: return; default: b(); } }",
     ];
-    assert_cases(&cases);
+    assert_cases("switch_matches_the_reference", &cases);
 }
 
 /// `try`/`catch`/`finally`.
@@ -768,7 +787,7 @@ fn try_catch_finally_matches_the_reference() {
         // `return` inside a `finally`.
         "function f(){ try { a(); } finally { return 1; } }",
     ];
-    assert_cases(&cases);
+    assert_cases("try_catch_finally_matches_the_reference", &cases);
 }
 
 /// `for`/`in` and `for`/`of`.
@@ -816,7 +835,7 @@ fn for_in_of_matches_the_reference() {
         "function f(o, t){ for (t[0] in o) a(t); }",
         "function f(o, t){ for (t.k of o) a(t); }",
     ];
-    assert_cases(&cases);
+    assert_cases("for_in_of_matches_the_reference", &cases);
 }
 
 /// Object and array literals.
@@ -895,11 +914,23 @@ fn literals_build_in_place() {
         "function f(){ g({a:1}, [2]); }",
         "function f(){ return typeof {}; }",
     ];
-    assert_cases(&cases);
+    assert_cases("literals_build_in_place", &cases);
 }
 
-fn assert_cases(cases: &[&str]) {
-    let failures = compare(cases);
+fn assert_cases(name: &str, cases: &[&str]) {
+    let (failures, compared) = compare(cases);
+    // Report the runtime counts so `scripts/verify-claims.py` can check the numbers
+    // `README.md` publishes. They used to be maintained by hand and six of them had
+    // drifted; a count in a table is a claim, so it gets measured rather than remembered.
+    if let Some(dir) = std::env::var_os("QUICKJS_CASE_COUNTS") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(std::path::Path::new(&dir).join("disasm-cases.txt"))
+            .expect("open the case-count file");
+        writeln!(file, "{name}\t{}\t{compared}", cases.len()).expect("write the case count");
+    }
     assert!(
         failures.is_empty(),
         "{} of {} cases differ from the reference:\n{}",

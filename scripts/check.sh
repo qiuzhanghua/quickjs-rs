@@ -29,3 +29,10 @@ python3 ./scripts/lang-diff.py
 # like this and by nothing else. Skips loudly when the reference is not built.
 echo "== scripts/realworld.sh (real-world corpus)"
 ./scripts/realworld.sh
+
+# Every count README.md publishes, checked against what the suites measure. Six of them
+# had drifted while they were maintained by hand (35 vs 36 literals, 41 vs 59
+# declaration-conflict cases, 365 vs 366 bytecode cases); a number in a table is a claim,
+# so it gets a test.
+echo "== scripts/verify-claims.py (numbers README.md publishes)"
+python3 ./scripts/verify-claims.py

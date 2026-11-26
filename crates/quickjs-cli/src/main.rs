@@ -231,15 +231,16 @@ fn parse_args(args: &[String]) -> Result<Options, ExitCode> {
             i += 1;
             continue;
         }
-        // First non-option argument: the script. Everything after it is
-        // `scriptArgs`.
+        // First non-option argument: the script. Everything from here on is positional,
+        // which is exactly what `scriptArgs` holds — element 0 is the script itself when
+        // there is one, and with `-e` the whole list is just the trailing arguments.
         opts.file = Some(arg.to_string());
-        opts.script_args = args[i + 1..].to_vec();
+        opts.script_args = args[i..].to_vec();
         i = args.len();
     }
     if opts.file.is_none() && i < args.len() {
         opts.file = Some(args[i].clone());
-        opts.script_args = args[i + 1..].to_vec();
+        opts.script_args = args[i..].to_vec();
     }
     Ok(opts)
 }
@@ -298,6 +299,9 @@ fn main() -> ExitCode {
 
     let mut ctx = quickjs::Context::new(&rt);
     ctx.set_module_loader(Box::new(modules::FileModuleLoader::new()));
+    // `scriptArgs` is the positional list as `qjs` defines it: element 0 is the script
+    // when a script was named, and the trailing arguments when `-e` supplied the source.
+    ctx.set_script_args(opts.script_args.clone());
     if let Some(expr) = opts.eval {
         return run(&mut ctx, &expr, "<cmdline>");
     }

@@ -49,10 +49,15 @@ fn reference_verdict(oracle: &Engine, dir: &Path, source: &str) -> Option<bool> 
 fn declaration_conflicts_match_the_reference() {
     let oracle = require_oracle!();
     let dir = scratch();
-    // A mix of programs QuickJS accepts and rejects. Each one is a real early
-    // error from ES2025 §13.2.1 (VarDeclaredNames / LexicallyDeclaredNames).
-    let corpus = [
-        // -- rejected by the reference --
+    // Two lists, and the label is now a *checked claim* rather than a comment. It used to
+    // be one array with `// -- rejected --` section comments, and four sources drifted into
+    // both halves: three that the reference actually accepts were listed as rejected, and
+    // one that it rejects was listed as accepted. Nothing noticed, because the loop only
+    // compared "ours vs the reference" and never looked at the label.
+    //
+    // Every case is an early error from §13.2.1 (VarDeclaredNames /
+    // LexicallyDeclaredNames) or a legal shape that looks like one.
+    let rejected_by_reference = [
         "var a = 1; let a = 2;",
         "let a; var a;",
         "let a; let a;",
@@ -60,23 +65,22 @@ fn declaration_conflicts_match_the_reference() {
         "const a = 1; class a {}",
         "function f() { let a; var a; }",
         "function f(a) { let a; }",
-        "function f(a) { var a; }",
-        "function f({a}) { let a; }",
-        "function f([a]) { const a = 1; }",
         "var f = (a) => { let a; };",
-        "var f = (a) => { var a; };",
         "try {} catch (e) { let e; }",
         "try {} catch ({e}) { var e; }",
         "switch (x) { case 1: let a; break; case 2: let a; }",
-        "for (let a of xs) { let a; }",
         "for (let a of xs) { var a; }",
         "for (let a = 0, a = 1; ; ) ;",
         "{ let a; { var a; } }",
-        "{ let a; function g() { var a; } }",
-        "let a; function a() {}",
         "class A {} class A {}",
         "import {a} from 'm'; let a;",
-        // -- accepted by the reference --
+        "{ function a() {} let a; }",
+        "{ var a; let a; }",
+        "{ let a; for (;;) { var a; } }",
+        "let a; { let a; { var a; } }",
+        "class A { static { let a; var a; } }",
+    ];
+    let accepted_by_reference = [
         "var a; var a;",
         "var a; { let a; }",
         "let a; { let a; }",
@@ -105,28 +109,40 @@ fn declaration_conflicts_match_the_reference() {
         "function f([a]) { var a; }",
         "class A { m() { let a; } }",
         "let a; { var b; }",
-        // -- rejected: more conflict shapes --
-        "{ function a() {} let a; }",
-        "{ var a; let a; }",
-        "for (let a of xs) { function a() {} }",
-        "{ let a; for (;;) { var a; } }",
-        "let a; { let a; { var a; } }",
-        "try {} catch ({e}) { var e; }",
+        "function f([a]) { const a = 1; }",
+        "var f = (a) => { var a; };",
         "try {} catch ([e]) { let e; }",
-        "class A { static { let a; var a; } }",
+        "for (let a of xs) { let a; }",
+        "{ let a; function g() { var a; } }",
+        "for (let a of xs) { function a() {} }",
     ];
     let mut mismatches = Vec::new();
-    for source in corpus {
-        let Some(reference) = reference_verdict(&oracle, &dir, source) else {
-            continue;
-        };
-        let ours = js_parse::parse_script(source).is_ok();
-        if ours != reference {
-            mismatches.push(format!(
-                "  {source:?}\n    reference: {}, ours: {}",
-                if reference { "accept" } else { "reject" },
-                if ours { "accept" } else { "reject" }
-            ));
+    for (expected, cases) in [
+        (false, &rejected_by_reference[..]),
+        (true, &accepted_by_reference[..]),
+    ] {
+        for source in cases {
+            let Some(reference) = reference_verdict(&oracle, &dir, source) else {
+                continue;
+            };
+            // The label has to be right about the reference before our agreement with the
+            // reference means anything.
+            if reference != expected {
+                mismatches.push(format!(
+                    "  {source:?}\n    listed as {}, but the reference {}",
+                    if expected { "accepted" } else { "rejected" },
+                    if reference { "accepts" } else { "rejects" }
+                ));
+                continue;
+            }
+            let ours = js_parse::parse_script(source).is_ok();
+            if ours != reference {
+                mismatches.push(format!(
+                    "  {source:?}\n    reference: {}, ours: {}",
+                    if reference { "accept" } else { "reject" },
+                    if ours { "accept" } else { "reject" }
+                ));
+            }
         }
     }
     let _ = std::fs::remove_dir_all(&dir);

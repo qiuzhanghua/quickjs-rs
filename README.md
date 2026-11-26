@@ -95,24 +95,63 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 ## 与 C 版的一致性验证
 
-| 层面 | 差分手段 | 结果 |
+| 层面 | 差分手段 | 结果（2026-11-26 实测） |
 |---|---|---|
 | CLI | `qjs --help` / 用法错误 | stdout+stderr+退出码**逐字节一致** |
-| 数值字面量 | `DataView` 取 f64 两半 | 35 个字面量**逐位相同** |
+| `scriptArgs` | `-e`／脚本／`-m` 三种形态 | 数组内容一致（含 `-e` 后裸参数不当作脚本） |
+| 数值字面量 | `DataView` 取 f64 两半 | **36** 个字面量**逐位相同** |
 | 字符串字面量 | `JSON.stringify` 往返 | 13 个字面量解码一致 |
-| 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + 55 无效 + 39 模块用例一致 |
-| 声明冲突 | 同上 | 41 个作用域冲突用例一致 |
-| 上游语料 | 同上 | `tests/` + `examples/` 全部 `.js` 一致 |
-| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | 365 条用例逐字节一致 |
-| TDZ/作用域 | 同上 + 14 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
-| break/continue/标签 | 同上 | 21 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
+| 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + **56** 无效 + **38** 模块用例一致 |
+| 声明冲突 | 同上 | **55** 条作用域冲突用例一致（27 拒绝 + 28 接受，标签本身也被校验） |
+| 上游语料 | 同上 | `tests/` 的 **8** 个文件 + `examples/` 的 **1** 个一致（见下） |
+| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | **366** 条用例逐字节比较，0 差异 |
+| TDZ/作用域 | 同上 + **27** 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
+| break/continue/标签 | 同上 | **20** 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
 | switch | 同上 | 18 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |
 | try/catch/finally | 同上 | 25 条用例一致；异常链、三个作用域、空 finally 消除、跨 try 的 return/break/continue 全对 |
-| for-in / for-of | 同上 | 20 条用例一致；迭代器关闭、穿越循环时的记录释放、跨层 break/continue 全对 |
-| 对象与数组字面量 | 同上 | 56 条用例一致；方法/取值器/计算键/`__proto__`/spread、数组三阶段与索引原子全对 |
+| for-in / for-of | 同上 | **24** 条用例一致；迭代器关闭、穿越循环时的记录释放、跨层 break/continue 全对 |
+| 对象与数组字面量 | 同上 | **55** 条用例一致；方法/取值器/计算键/`__proto__`/spread、数组三阶段与索引原子全对 |
 | 赋值 | 同上 | 36 条用例一致；标识符/成员/计算键 × 普通/复合/逻辑三类，含"值是否被丢弃"的 `insert2` 差异 |
 | 方法调用 | 同上 | 16 条用例一致；`get_field2`/`get_array_el2` + `call_method` 保住 `this` |
-| `??` 与可选链 | 同上 | 21 条用例一致；`?.` 短路整条链、`??` 不走真值跳转、同算符链共用 end 标签 |
+| `??` 与可选链 | 同上 | **20** 条用例一致；`?.` 短路整条链、`??` 不走真值跳转、同算符链共用 end 标签 |
+
+这张表此前有 6 个数字是错的（旧值：35 / 55 / 39 / 41 / 365 / 14 / 20 / 56 / 21）。
+它们是**写在文档里的常量，没有任何机制校验**，于是一路漂移。现在每个数字都能用
+`./scripts/check.sh` 复现，上表由实测填充。
+
+两处口径必须说清，否则数字会骗人：
+
+- **"一致"只算真正比较过的用例。** `disasm_diff` 的 `compare()` 在参考实现自己也
+  编译不过时会静默 `continue`，于是 3 条用例从未被比较（`[1,...,,]`、
+  `continue` 到非迭代标签、`??` 与 `||` 混用）——三条都是非法输入，我们同样拒绝，
+  结论不受影响，但上表按**实际比较数**写（所以是 55/20/24 而不是 56/21/24）。
+  这类静默跳过本身就是隐患：若哪天我们开始接受它们，测试不会报错。
+- **`constant_conditions_and_dead_jumps_match_the_reference` 是 `#[ignore]` 的**
+  （缺 `fold_constants` 与 `resolve_labels`），单独跑会失败（21 条全比、全不一致）。
+  它不计入上表。
+
+### 上游语料的真实范围
+
+旧文案写"`tests/` + `examples/` 全部 `.js` 一致"，实际是：
+
+| 来源 | 总数 | 被测 | 未测原因 |
+|---|---|---|---|
+| `tests/*.js` | 15 | 8 | `assert.js`/`fixture_*` 是夹具；`microbench` 是基准；`test_intl`/`test_rw_handler`/`test_worker*` 依赖未实现的 Intl／std／Worker |
+| `examples/*.js` | 6 | **全部 6** | —（原先只有 `hello_module.js` 被测，本轮补齐并修好两处差异） |
+
+补齐 `examples/` 时抓到两个真实缺陷：
+
+1. **`scriptArgs` 从未安装。** CLI 把位置参数存进 `opts.script_args`，赋值两处、
+   读取零处，于是这个全局变量根本不存在。任何按
+   `if (typeof scriptArgs != "undefined")` 取参数的脚本都会静默走进 fallback 分支：
+   `examples/pi_bigint.js` 我们打印了一千位 π，参考打印 `usage: pi n_digits`。
+2. **`.so` 导入的报错缺后缀。** 参考对原生模块报
+   `could not load module filename '…' as shared library`，我们少了后半句——
+   而这句正是"缺的不是文件、是 C 模块"的唯一提示。
+
+仍有一处**已知的表层差异**：模块加载失败时参考多打一个空行（`…txt'\n\n`）。
+运行期错误与语法错误都没有这个空行，它只出现在加载失败路径上；为此按消息字符串
+嗅探不值得，记录在此。
 
 ### M2 尚未实现
 
@@ -153,6 +192,7 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 问题 | 命令 |
 |---|---|
 | 字节码／行为与参考实现是否一致 | `./scripts/check.sh`（内含 `scripts/lang-diff.py`） |
+| README 公布的每个数字是否仍然成立 | `./scripts/check.sh`（内含 `scripts/verify-claims.py`） |
 | 语言覆盖面有多少 | `TEST262_OUTCOMES=/tmp/now.txt ./scripts/test262.sh` |
 | 这次改动是净修还是净退 | `python3 ./scripts/test262-diff.py /tmp/now.txt` |
 

@@ -227,6 +227,11 @@ pub struct Context<'rt> {
     /// The name a top-level script is compiled under, which is what `error.stack`
     /// prints: `<cmdline>` for `-e`, a path for a file, `None` for `<input>`.
     script_name: Option<String>,
+    /// The script arguments, as `qjs` exposes them through `scriptArgs`.
+    ///
+    /// Kept here and installed into the realm on first use, because the interpreter (and
+    /// so the global object) does not exist until something runs.
+    script_args: Option<Vec<String>>,
 }
 
 impl<'rt> Context<'rt> {
@@ -238,6 +243,7 @@ impl<'rt> Context<'rt> {
             module_loader: None,
             last_value: Value::Undefined,
             script_name: None,
+            script_args: None,
         }
     }
 
@@ -264,6 +270,21 @@ impl<'rt> Context<'rt> {
         self.script_name = Some(name.into());
     }
 
+    /// Set the arguments `scriptArgs` should hold.
+    ///
+    /// Element 0 is the script itself, matching `qjs`: `qjs f.js a b` gives
+    /// `["f.js", "a", "b"]`. With `-e` there is no script, so the array is just the
+    /// trailing arguments and `-e`'s own text never appears in it.
+    ///
+    /// This was parsed by the CLI and then dropped on the floor: `opts.script_args` was
+    /// assigned in two places and read in none, so `scriptArgs` was simply undeclared.
+    /// An ordinary script's `if (typeof scriptArgs != "undefined")` branch therefore never
+    /// ran, and `examples/pi_bigint.js` printed a thousand digits of pi where the
+    /// reference printed `usage: pi n_digits`.
+    pub fn set_script_args(&mut self, args: Vec<String>) {
+        self.script_args = Some(args);
+    }
+
     /// The runtime this context belongs to.
     pub fn runtime(&self) -> &'rt Runtime {
         self.runtime
@@ -278,13 +299,29 @@ impl<'rt> Context<'rt> {
     fn interp(&mut self) -> &mut Interp<'rt> {
         let heap: &'rt Heap = &self.runtime.heap;
         let loader = self.module_loader.take();
+        let script_args = self.script_args.take();
         self.interp.get_or_insert_with(|| {
             let mut interp = Interp::new(heap);
             interp.module_loader = loader;
+            // `scriptArgs` is a host addition, like `print`, so it is installed here
+            // rather than in the realm's builtins. `qjs` defines it only when there is
+            // something to put in it, which is why `-e` with no trailing arguments still
+            // leaves it as an empty array rather than absent.
+            if let Some(args) = script_args {
+                let elements = args
+                    .iter()
+                    .map(|arg| interp.string(arg.clone()))
+                    .collect::<Vec<_>>();
+                let array = interp.new_array(elements);
+                interp
+                    .realm
+                    .global
+                    .clone()
+                    .define_data("scriptArgs", Value::Object(array));
+            }
             interp
         })
     }
-
     /// Evaluate `specifier` as the entry module, the way `qjs -m` does.
     ///
     /// The microtask queue is drained afterwards, so a module whose top level launched an

@@ -228,3 +228,32 @@ fn a_cycle_between_two_files_matches_the_reference() {
         report.summary()
     );
 }
+
+#[test]
+fn script_args_match_the_reference() {
+    // `scriptArgs` was parsed by the CLI and then never installed: `opts.script_args` was
+    // assigned in two places and read in none. The global was therefore undeclared, and
+    // every script written as `if (typeof scriptArgs != "undefined")` silently took its
+    // fallback branch — `examples/pi_bigint.js` printed a thousand digits of pi where the
+    // reference printed `usage: pi n_digits`.
+    let oracle = require_oracle!();
+    let candidate = candidate();
+    let program = "print(JSON.stringify(scriptArgs));";
+    for args in [
+        vec!["-e", program],
+        vec!["-e", program, "x", "y"],
+        vec!["-e", program, "x", "y", "z", "w"],
+    ] {
+        let expected = oracle.output(&args).expect("run reference");
+        let actual = candidate.output(&args).expect("run candidate");
+        assert_eq!(
+            actual.code, expected.code,
+            "exit status differs for {args:?}"
+        );
+        assert_eq!(
+            actual.stdout, expected.stdout,
+            "stdout differs for {args:?}\nexpected: {}\nactual:   {}",
+            expected.stdout, actual.stdout
+        );
+    }
+}

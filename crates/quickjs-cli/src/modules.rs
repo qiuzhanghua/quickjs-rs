@@ -111,8 +111,18 @@ impl ModuleLoader for FileModuleLoader {
             // fails, and this engine has no C modules to load.
             return Err(format!("could not load module filename '{specifier}'"));
         };
-        let source =
-            std::fs::read(&path).map_err(|_| format!("could not load module filename '{name}'"))?;
+        let source = std::fs::read(&path).map_err(|_| {
+            // The reference registers a `.so` handler for native modules, so a missing one
+            // says so explicitly ("as shared library"). Every other extension gets the
+            // plain message. Matching the wording matters here because a `.so` import is
+            // the one case where the failure is not about a missing file at all — it is
+            // about a C module this engine cannot load.
+            if name.ends_with(".so") {
+                format!("could not load module filename '{name}' as shared library")
+            } else {
+                format!("could not load module filename '{name}'")
+            }
+        })?;
         // The *url* is resolved because it identifies the file; the *name* stays textual
         // because it is what diagnostics print. `qjs` does the same, which is why
         // `import.meta.url` shows `/private/tmp` on macOS while an error message shows the
