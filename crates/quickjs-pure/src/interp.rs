@@ -172,6 +172,12 @@ pub struct Realm {
     /// untouched and does *not* override `@@toStringTag`, so
     /// `Object.prototype.toString.call(Iterator.from(xs))` says `[object Iterator]`.
     pub iterator_wrap_proto: Option<Gc<JsObject>>,
+    /// `%GeneratorFunction.prototype%` — what a generator function inherits from.
+    pub generator_function_proto: Option<Gc<JsObject>>,
+    /// `%AsyncFunction.prototype%`.
+    pub async_function_proto: Option<Gc<JsObject>>,
+    /// `%AsyncGeneratorFunction.prototype%`.
+    pub async_generator_function_proto: Option<Gc<JsObject>>,
     /// One `%…IteratorPrototype%` per kind, keyed by its `@@toStringTag`.
     ///
     /// Cached because the *identity* is observable: `Object.getPrototypeOf([].values())`
@@ -700,6 +706,9 @@ impl<'a> Interp<'a> {
                 iterator_proto: None,
                 iterator_helper_proto: None,
                 iterator_wrap_proto: None,
+                generator_function_proto: None,
+                async_function_proto: None,
+                async_generator_function_proto: None,
                 iterator_protos: std::collections::BTreeMap::new(),
                 well_known_symbols: WellKnownSymbols::default(),
             },
@@ -4401,9 +4410,39 @@ impl<'a> Interp<'a> {
                 let args = self.frame().passed.clone();
                 let proto = self.realm.object_proto.clone();
                 let object = self.new_object(Some(proto));
-                object.define_data("length", Value::Int(args.len() as i32));
+                // The marker `Object.prototype.toString` needs: an arguments object is an
+                // ordinary object apart from reporting `[object Arguments]`, and that has
+                // no `Symbol.toStringTag` of its own. Set before the indices so it does not
+                // show up ahead of them in a key listing anyway — it is non-enumerable.
+                object.define(
+                    "_class",
+                    Property::with_attributes(self.string("Arguments"), false, false),
+                );
+                // `length` is writable and configurable but neither enumerable nor a
+                // plain data property: `Object.keys(arguments)` lists the indices only,
+                // which is how `{...arguments}` copies them without the length.
+                object.define(
+                    "length",
+                    Property::with_attributes(Value::Int(args.len() as i32), true, false),
+                );
                 for (index, value) in args.into_iter().enumerate() {
                     object.define_data(&index.to_string(), value);
+                }
+                // An arguments object is iterable: `[...arguments]` and
+                // `for (const a of arguments)` both work, through the *array* iterator
+                // because the object is array-like. Without this the whole spread form
+                // reported "not iterable".
+                let iterator_key = self.realm.well_known_key(WellKnown::Iterator);
+                let values = self
+                    .realm
+                    .array_proto
+                    .own_property("values")
+                    .and_then(|property| property.value);
+                if let Some(values) = values {
+                    object.define_key(
+                        &iterator_key,
+                        Property::with_attributes(values, true, false),
+                    );
                 }
                 Ok(Value::Object(object))
             }
@@ -6922,8 +6961,9 @@ impl<'a> Interp<'a> {
         // function and an arrow function do not. A *method* also does not, but that is not
         // known here — the method is marked when the `[[HomeObject]]` is attached (see
         // `set_home_object`), which is the moment it becomes a method.
+        let function_kind = function.kind;
         let constructible =
-            !function.is_arrow && function.kind == js_compile::bytecode::FunctionKind::Normal;
+            !function.is_arrow && function_kind == js_compile::bytecode::FunctionKind::Normal;
         let code = Gc::new(self.heap, CompiledCode::new(*function));
         // A closure built inside an `eval` inherits the eval's view of the enclosing
         // bindings, so it can still read them once the eval has returned.
@@ -6945,11 +6985,30 @@ impl<'a> Interp<'a> {
                 local_phase,
             },
         );
-        let object = JsObject::function(
-            self.heap,
-            Some(self.realm.function_proto.clone()),
-            Callable::Bytecode { code, env },
-        );
+        // A generator or async function inherits from `%GeneratorFunction.prototype%` or
+        // `%AsyncFunction.prototype%`, not straight from `Function.prototype`. That link is
+        // the only thing that carries `Symbol.toStringTag`, so without it
+        // `delete g.constructor.prototype[Symbol.toStringTag]` has nothing to delete and
+        // `Object.prototype.toString` keeps reporting `GeneratorFunction`.
+        let proto = match function_kind {
+            js_compile::bytecode::FunctionKind::AsyncGenerator => self
+                .realm
+                .async_generator_function_proto
+                .clone()
+                .or_else(|| self.realm.function_proto.clone().into()),
+            js_compile::bytecode::FunctionKind::Generator => self
+                .realm
+                .generator_function_proto
+                .clone()
+                .or_else(|| self.realm.function_proto.clone().into()),
+            js_compile::bytecode::FunctionKind::Async => self
+                .realm
+                .async_function_proto
+                .clone()
+                .or_else(|| self.realm.function_proto.clone().into()),
+            js_compile::bytecode::FunctionKind::Normal => self.realm.function_proto.clone().into(),
+        };
+        let object = JsObject::function(self.heap, proto, Callable::Bytecode { code, env });
         object.set_constructible(constructible);
         object.define(
             "length",
@@ -7422,6 +7481,48 @@ impl<'a> Interp<'a> {
     /// loop; the builtins reach this one.
     pub fn property_key(&mut self, value: &Value) -> PropertyKey {
         self.propkey(value)
+    }
+
+    /// `ToUint32` with `ArraySetLength`'s refusal, for an array's `length`.
+    ///
+    /// `ToUint32` is `ToNumber` *then* the modulo, but an object that yields a fraction or
+    /// `NaN` falls through to `ToString` and is parsed as decimal digits. That is why
+    /// `{toString: () => "2"}` is a legal length while `{valueOf: () => 2.5}` is a
+    /// `RangeError` — and why this cannot be a plain `ToNumber`.
+    pub fn array_length_of(&mut self, value: &Value) -> JsResult<u32> {
+        let number = match value {
+            Value::Int(number) => *number as f64,
+            Value::Float(number) => *number,
+            // `null`/`undefined`/`false` convert through `ToPrimitive` and then arithmetically:
+            // `null` is 0, `false` is 0, `true` is 1. Refusing them made
+            // `Object.defineProperty(a, "length", {value: null})` a `RangeError` where the
+            // reference answers 0.
+            Value::Null | Value::Bool(_) => value.to_number(),
+            _ => {
+                let primitive = self.to_primitive(value.clone(), Hint::Number)?;
+                match primitive {
+                    Value::Int(number) => number as f64,
+                    Value::Float(number) => number,
+                    other => {
+                        // `ToString` then `ToNumber`, so a string length goes through the
+                        // full numeric-literal grammar: `"0x00B"` is 11 and `"  5  "` is 5.
+                        // `Value::to_number` on the string already implements exactly that.
+                        let text = self.to_js_string(&other)?;
+                        crate::value::string_to_number(&text)
+                    }
+                }
+            }
+        };
+        // `ToUint32` of anything outside `0 ..= 2^32-1` that is still an integer is a
+        // modulo in the spec, but `ArraySetLength` refuses it outright: `a.length = 2**32`
+        // is a `RangeError`, not `0`.
+        if !number.is_finite()
+            || number.fract() != 0.0
+            || !(0.0..=u32::MAX as f64).contains(&number)
+        {
+            return Err(self.range_error("invalid array length"));
+        }
+        Ok(number as u32)
     }
 
     /// `ToPropertyKey` that can fail.

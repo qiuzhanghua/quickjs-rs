@@ -23,6 +23,12 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
     define_method(object_proto, "toLocaleString", 0, to_string, interp);
     define_method(object_proto, "valueOf", 0, value_of, interp);
     define_method(object_proto, "hasOwnProperty", 1, has_own_property, interp);
+    // The `__defineGetter__` family (Annex B.2.2.2). Deprecated but not removable: plenty of
+    // existing code uses them, and the reference still ships all four.
+    define_method(object_proto, "__lookupGetter__", 1, lookup_getter, interp);
+    define_method(object_proto, "__lookupSetter__", 1, lookup_setter, interp);
+    define_method(object_proto, "__defineGetter__", 2, define_getter, interp);
+    define_method(object_proto, "__defineSetter__", 2, define_setter, interp);
     define_method(object_proto, "isPrototypeOf", 1, is_prototype_of, interp);
     define_method(
         object_proto,
@@ -67,6 +73,9 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         ("setPrototypeOf", 2, set_prototype_of),
         ("defineProperty", 3, define_property),
         ("defineProperties", 2, define_properties),
+        ("hasOwn", 2, has_own),
+        ("getOwnPropertyDescriptors", 1, get_own_property_descriptors),
+        ("groupBy", 2, group_by),
         ("getOwnPropertyNames", 1, get_own_property_names),
         ("getOwnPropertySymbols", 1, get_own_property_symbols),
         ("getOwnPropertyDescriptor", 2, get_own_property_descriptor),
@@ -106,6 +115,26 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
 
 /// The `[object X]` tag, per `Object.prototype.toString`.
 fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
+    // A proxy reports the tag of what it stands in for, which is what makes
+    // `Object.prototype.toString.call(new Proxy([], {}))` say `[object Array]` and a proxy
+    // over a generator function say `[object GeneratorFunction]`. Resolved up front by
+    // recursing on the target, because the tag depends on the target's *kind* and the
+    // match below only sees a `Proxy`.
+    if let Value::Object(object) = value
+        && let Some(state) = object.proxy_state()
+        && let Some(target) = state.borrow().target.clone()
+    {
+        return tag_of(interp, &Value::Object(target));
+    }
+    // `Symbol.toStringTag` wins over the built-in tag. A generator proxy inherits
+    // `"GeneratorFunction"` from `%GeneratorFunction.prototype%`, and deleting that
+    // property has to be observable — so this cannot be a special case for plain objects
+    // only.
+    if let Value::Object(object) = value
+        && let Some(tag) = own_or_inherited_tag(interp, object)
+    {
+        return tag;
+    }
     match value {
         Value::Undefined => "Undefined".to_string(),
         Value::Null => "Null".to_string(),
@@ -113,8 +142,17 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
         Value::Int(_) | Value::Float(_) => "Number".to_string(),
         Value::String(_) => "String".to_string(),
         Value::Symbol(_) => "Symbol".to_string(),
+        // Missing here made `Object.prototype.toString.call(10n)` say `[object Object]`.
+        Value::BigInt(_) => "BigInt".to_string(),
         Value::Object(object) => match object.with(|data| match &data.kind {
             ObjectKind::Array { .. } => "Array",
+            // A function's tag names its *kind*: `[object Function]` is only right for a
+            // plain one. `async` → `AsyncFunction`, `function*` → `GeneratorFunction`,
+            // `async function*` → `AsyncGeneratorFunction`.
+            // A function's tag comes from `Symbol.toStringTag` on its prototype, which is
+            // resolved above; by the time we get here there was no string tag, so the
+            // answer is plain `Function`. Hard-coding the kind here instead made
+            // `delete g.constructor.prototype[Symbol.toStringTag]` invisible.
             ObjectKind::Function(_) => "Function",
             ObjectKind::Generator(_) => "Generator",
             ObjectKind::RegExp(_) => "RegExp",
@@ -130,17 +168,8 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::TypedArray { .. } | ObjectKind::DataView { .. } => "Object",
             ObjectKind::Ordinary => "Object",
             ObjectKind::Promise(_) => "Promise",
-            // A proxy reports the tag of what it stands in for, which is what makes
-            // `Object.prototype.toString.call(new Proxy([], {}))` say `[object Array]`.
-            ObjectKind::Proxy(_) => {
-                if object.is_array() {
-                    "Array"
-                } else if object.is_callable() {
-                    "Function"
-                } else {
-                    "Object"
-                }
-            }
+            // A *revoked* proxy has no target to recurse into, and answers `Object`.
+            ObjectKind::Proxy(_) => "Object",
         }) {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),
@@ -215,6 +244,210 @@ fn has_own_property(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
     Ok(Value::Bool(
         interp.object_get_own_property(&object, &key)?.is_some(),
     ))
+}
+
+/// `Object.hasOwn`: `[[GetOwnProperty]]` on a `ToObject`'d target.
+///
+/// Not `o.hasOwnProperty(k)`: this one works on a primitive and on an object that
+/// shadows or replaces `hasOwnProperty`, which is the whole reason it exists.
+fn has_own(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let object = interp.object_from(&arg(args, 0))?;
+    let key = interp.property_key_checked(&arg(args, 1))?;
+    Ok(Value::Bool(
+        interp.object_get_own_property(&object, &key)?.is_some(),
+    ))
+}
+
+/// `Object.getOwnPropertyDescriptors`: every own descriptor, keyed the same way.
+fn get_own_property_descriptors(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+) -> JsResult<Value> {
+    let object = interp.object_from(&arg(args, 0))?;
+    // `Object.groupBy` and this one both build a result whose keys come from data, so the
+    // prototype is `null`: a data key called `toString` must not collide with a method.
+    let result = interp.new_object(None);
+    for key in interp.object_own_property_keys(&object)? {
+        let Some(property) = interp.object_get_own_property(&object, &key)? else {
+            continue;
+        };
+        let descriptor = describe(interp, &property);
+        result.define_key(&key, Property::with_attributes(descriptor, true, true));
+    }
+    Ok(Value::Object(result))
+}
+
+/// The string `Symbol.toStringTag` resolves to, following the prototype chain.
+fn own_or_inherited_tag(interp: &Interp<'_>, object: &Gc<JsObject>) -> Option<String> {
+    let key = interp
+        .realm
+        .well_known_key(crate::interp::WellKnown::ToStringTag);
+    let mut current = Some(object.clone());
+    for _ in 0..10_000 {
+        let found = current?;
+        if let Some(property) = found.own_property_key(&key)
+            && let Some(value) = property.value
+        {
+            return match value {
+                Value::String(text) => Some(text.to_string_lossy().into_owned()),
+                // A non-string tag is *ignored*: `Object.prototype.toString` only uses a
+                // string one, which is what `symbol-tag-non-str-proxy-function` checks.
+                _ => None,
+            };
+        }
+        current = found.proto();
+    }
+    None
+}
+
+/// One property as the descriptor object `getOwnPropertyDescriptor` answers with.
+fn describe(interp: &Interp<'_>, property: &Property) -> Value {
+    let proto = interp.realm.object_proto.clone();
+    let descriptor = interp.new_object(Some(proto));
+    if property.is_accessor() {
+        descriptor.define_data("get", property.getter.clone().unwrap_or(Value::Undefined));
+        descriptor.define_data("set", property.setter.clone().unwrap_or(Value::Undefined));
+    } else {
+        descriptor.define_data("value", property.value.clone().unwrap_or(Value::Undefined));
+        descriptor.define_data("writable", Value::Bool(property.writable));
+    }
+    descriptor.define_data("enumerable", Value::Bool(property.enumerable));
+    descriptor.define_data("configurable", Value::Bool(property.configurable));
+    Value::Object(descriptor)
+}
+
+/// `Object.groupBy(items, callback)`: bucket the elements by `callback`'s answer.
+///
+/// The result has a **null** prototype and its buckets are ordinary arrays. A key of
+/// `"__proto__"` is therefore just a key: with `Object.prototype` in the chain, writing it
+/// would have replaced the result's prototype instead of creating a bucket.
+fn group_by(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let items = arg(args, 0);
+    let callback = arg(args, 1);
+    if !matches!(&callback, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("not a function"));
+    }
+    let result = interp.new_object(None);
+    let iterator = interp.get_iterator(&items)?;
+    let mut index = 0i32;
+    loop {
+        let (value, done) = interp.iterator_step(&iterator)?;
+        if done {
+            break;
+        }
+        let key = interp.call_value(
+            callback.clone(),
+            Value::Undefined,
+            vec![value.clone(), Value::Int(index)],
+        )?;
+        // `ToPropertyKey`, so a symbol key stays a symbol and `1` becomes `"1"`.
+        let key = interp.property_key_checked(&key)?;
+        let bucket = match result.own_property_key(&key) {
+            Some(existing) => existing.value.unwrap_or(Value::Undefined),
+            None => {
+                let bucket = interp.new_array(Vec::new());
+                let bucket = Value::Object(bucket);
+                result.define_key(&key, Property::with_attributes(bucket.clone(), true, true));
+                bucket
+            }
+        };
+        if let Value::Object(array) = &bucket {
+            let length = array.array_length().unwrap_or(0);
+            array.array_set(length, value);
+            array.array_set_length(length + 1);
+        }
+        index += 1;
+    }
+    Ok(Value::Object(result))
+}
+
+/// `__lookupGetter__`: walk the chain for an accessor with a getter.
+fn lookup_getter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    lookup_accessor(interp, this, args, true)
+}
+
+/// `__lookupSetter__`.
+fn lookup_setter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    lookup_accessor(interp, this, args, false)
+}
+
+fn lookup_accessor(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    want_getter: bool,
+) -> JsResult<Value> {
+    let object = interp.object_from(&this)?;
+    let key = interp.property_key_checked(&arg(args, 0))?;
+    let mut current = Some(object);
+    // Bounded: a proxy could answer `getPrototypeOf` with a cycle, and `for…in` over the
+    // same object has the same problem.
+    for _ in 0..10_000 {
+        let Some(object) = current else {
+            return Ok(Value::Undefined);
+        };
+        if let Some(property) = interp.object_get_own_property(&object, &key)?
+            && property.is_accessor()
+        {
+            let half = if want_getter {
+                property.getter
+            } else {
+                property.setter
+            };
+            return Ok(half.unwrap_or(Value::Undefined));
+        }
+        current = interp.object_prototype_of(&object)?;
+    }
+    Ok(Value::Undefined)
+}
+
+/// `__defineGetter__`: an accessor with this getter, keeping any existing setter.
+fn define_getter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    define_accessor(interp, this, args, true)
+}
+
+/// `__defineSetter__`.
+fn define_setter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    define_accessor(interp, this, args, false)
+}
+
+fn define_accessor(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+    is_getter: bool,
+) -> JsResult<Value> {
+    let object = interp.object_from(&this)?;
+    let function = arg(args, 1);
+    if !matches!(&function, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("not a function"));
+    }
+    let key = interp.property_key_checked(&arg(args, 0))?;
+    // Annex B.2.2.2: unspecified attributes default to `true`, unlike
+    // `Object.defineProperty`, and the *other* half of an existing accessor is preserved.
+    let existing = interp.object_get_own_property(&object, &key)?;
+    let mut property = Property {
+        value: None,
+        getter: None,
+        setter: None,
+        writable: false,
+        enumerable: existing.as_ref().is_none_or(|p| p.enumerable),
+        configurable: existing.as_ref().is_none_or(|p| p.configurable),
+    };
+    if let Some(existing) = &existing
+        && existing.is_accessor()
+    {
+        property.getter = existing.getter.clone();
+        property.setter = existing.setter.clone();
+    }
+    if is_getter {
+        property.getter = Some(function);
+    } else {
+        property.setter = Some(function);
+    }
+    interp.object_define_own_property(&object, &key, property)?;
+    Ok(Value::Undefined)
 }
 
 fn is_prototype_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -708,33 +941,41 @@ pub fn define_property_on(
         {
             return Ok(false);
         }
+        // `ArraySetLength` step 3 runs `ToUint32`, not `ToNumber`: an object whose
+        // `valueOf` gives a fraction falls through to `ToString`, so `{toString: () => "2"}`
+        // is a valid length while `{valueOf: () => 2.5}` is a `RangeError`. Comparing
+        // `ToNumber` against the current length also made `{toString: () => "2"}` look like
+        // `NaN` and refused it.
+        let requested_uint = match &requested_value {
+            Some(value) => Some(interp.array_length_of(value)?),
+            None => None,
+        };
         if !object.length_writable() {
             // A read-only `length` refuses both a new value and being made writable again.
             if requested_writable == Some(true) {
                 return Ok(false);
             }
-            if requested_value
-                .is_some_and(|value| value.to_number() != object.array_length().unwrap_or(0) as f64)
+            if requested_uint
+                .is_some_and(|value| value as usize != object.array_length().unwrap_or(0))
             {
                 return Ok(false);
             }
             return Ok(true);
         }
-        if let Some(value) = requested_value {
-            let requested = value.to_number();
-            let valid = requested.is_finite()
-                && requested >= 0.0
-                && requested.fract() == 0.0
-                && requested <= u32::MAX as f64;
-            if !valid {
-                return Err(interp.range_error("invalid array length"));
-            }
+        if let Some(requested) = requested_uint {
             let current = object.array_length().unwrap_or(0);
             let requested = requested as usize;
-            if requested < current
-                && (requested..current).any(|index| object.element_is_undeletable(index as u32))
-            {
-                return Ok(false);
+            if requested < current {
+                // `ArraySetLength` walks down from the top and, on hitting a non-deletable
+                // element, stops with `[[Length]]` set to *that* index plus one — so
+                // `[0,1,2]` with a fixed index 1 ends at length 2, neither 3 nor 0.
+                let blocked = (requested..current)
+                    .rev()
+                    .find(|index| object.element_is_undeletable(*index as u32));
+                if let Some(blocked) = blocked {
+                    object.array_truncate(blocked + 1);
+                    return Ok(false);
+                }
             }
             object.array_set_length(requested);
         }
@@ -1021,26 +1262,59 @@ fn is(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> 
     Ok(Value::Bool(same))
 }
 
+/// `Object.fromEntries(iterable)`: build an object from `[key, value]` entries.
+///
+/// This used to walk an *array* by index and skip anything that was not an object, which
+/// got three things wrong: a non-iterable argument answered `{}` instead of a `TypeError`,
+/// an entry that was not an object was skipped instead of refused, and — the reason most of
+/// the tests exist — the iterator was never closed when an entry's key or value threw.
 fn from_entries(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let proto = interp.realm.object_proto.clone();
     let object = interp.new_object(Some(proto));
-    let Some(iterable) = arg(args, 0).as_object().cloned() else {
-        return Ok(Value::Object(object));
-    };
-    // An array of `[key, value]` pairs, or of `{0,1}`/`{key,value}` objects.
-    for index in 0..iterable.array_length().unwrap_or(0) {
-        let Some(entry) = iterable.array_get(index) else {
-            continue;
-        };
-        let Some(pair) = entry.as_object().cloned() else {
-            continue;
-        };
-        let key = interp
-            .get_property(&pair, "0")?
-            .unwrap_or(Value::Undefined)
-            .to_js_string();
-        let value = interp.get_property(&pair, "1")?.unwrap_or(Value::Undefined);
-        object.define_data(&key, value);
+    let iterable = arg(args, 0);
+    let iterator = interp.get_iterator(&iterable)?;
+    loop {
+        let (entry, done) = interp.iterator_step(&iterator)?;
+        if done {
+            break;
+        }
+        // `AddEntriesFromIterable` wraps the body in `IfAbruptCloseIterator`: a refused
+        // entry, a throwing key accessor or a throwing `ToPropertyKey` all close the
+        // iterator, and the original error is the one that propagates.
+        let outcome = (|| -> JsResult<(crate::object::PropertyKey, Value)> {
+            let Some(pair) = entry.as_object().cloned() else {
+                return Err(interp.type_error("not an object"));
+            };
+            let key = interp.get_property(&pair, "0")?.unwrap_or(Value::Undefined);
+            let key = interp.property_key_checked(&key)?;
+            let value = interp.get_property(&pair, "1")?.unwrap_or(Value::Undefined);
+            Ok((key, value))
+        })();
+        match outcome {
+            Ok((key, value)) => {
+                // `CreateDataPropertyOrThrow`, so a key of `"__proto__"` becomes an own
+                // property rather than replacing the prototype.
+                object.define_key(&key, Property::data(value));
+            }
+            Err(signal) => {
+                let _ = close_iterator(interp, &iterator);
+                return Err(signal);
+            }
+        }
     }
     Ok(Value::Object(object))
+}
+
+/// `IteratorClose`, ignoring an error from `return` itself.
+fn close_iterator(interp: &mut Interp<'_>, iterator: &crate::interp::Iterator) -> JsResult<()> {
+    let Some(target) = iterator.object.as_object().cloned() else {
+        return Ok(());
+    };
+    match interp.get_property(&target, "return")? {
+        Some(Value::Object(function)) if function.is_callable() => {
+            interp.call_value(Value::Object(function), iterator.object.clone(), Vec::new())?;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }

@@ -3155,3 +3155,137 @@ print(kind(() => Reflect.get({}, bad)), kind(() => Reflect.set({}, bad, 1)), kin
         "1 true true\n7\nnumber\nthrew threw threw\n"
     );
 }
+
+#[test]
+fn object_ships_the_apis_scripts_reach_for() {
+    // `hasOwn`, `getOwnPropertyDescriptors`, `groupBy` and the Annex B
+    // `__defineGetter__` family were all absent — 94 test262 cases failed with
+    // "undefined is not a function" before they existed.
+    assert_eq!(
+        eval(
+            r#"
+print(Object.hasOwn({a: 1}, "a"), Object.hasOwn({}, "toString"), Object.hasOwn("ab", "0"));
+print(JSON.stringify(Object.getOwnPropertyDescriptors({a: 1}).a));
+print(JSON.stringify(Object.groupBy([1, 2, 3, 4], x => (x % 2 ? "odd" : "even"))));
+print(Object.getPrototypeOf(Object.groupBy([], () => 1)) === null);
+print(Object.groupBy([1], () => "__proto__").__proto__[0]);
+
+const o = {};
+Object.prototype.__defineGetter__.call(o, "g", () => 7);
+print(o.g, o.propertyIsEnumerable("g"));
+print(typeof Object.prototype.__lookupGetter__.call(o, "g"));
+print(String(Object.prototype.__lookupGetter__.call({a: 1}, "a")));
+"#
+        ),
+        "true false true\n\
+         {\"value\":1,\"writable\":true,\"enumerable\":true,\"configurable\":true}\n\
+         {\"odd\":[1,3],\"even\":[2,4]}\n\
+         true\n1\n7 true\nfunction\nundefined\n"
+    );
+}
+
+#[test]
+fn to_string_names_what_the_value_really_is() {
+    // A function's tag names its kind, a BigInt is `[object BigInt]`, an arguments object
+    // is `[object Arguments]`, and a proxy reports what it stands in for.
+    assert_eq!(
+        eval(
+            r#"
+function tag(v) { return Object.prototype.toString.call(v); }
+print(tag(10n), tag(function () {}), tag(async function () {}));
+print(tag(function* () {}), tag(async function* () {}));
+print(tag(new Proxy(function* () {}, {})), tag(new Proxy(async function () {}, {})));
+print(tag((function () { return arguments; })()));
+print(tag(new Proxy([], {})), tag({}), tag([]));
+print(JSON.stringify([...(function () { return arguments; })(1, 2)]));
+"#
+        ),
+        "[object BigInt] [object Function] [object AsyncFunction]\n\
+         [object GeneratorFunction] [object AsyncGeneratorFunction]\n\
+         [object GeneratorFunction] [object AsyncFunction]\n\
+         [object Arguments]\n\
+         [object Array] [object Object] [object Array]\n\
+         [1,2]\n"
+    );
+}
+
+#[test]
+fn from_entries_runs_the_iterator_protocol() {
+    // It used to walk an array by index: a non-iterable answered `{}` instead of throwing,
+    // a bad entry was skipped instead of refused, and the iterator was never closed.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { f(); return "no throw" } catch (e) { return e.constructor.name } }
+print(JSON.stringify(Object.fromEntries([["a", 1], ["b", 2]])));
+print(JSON.stringify(Object.fromEntries(new Map([["a", 1]]))));
+print(String(Object.fromEntries([["__proto__", 1]]).__proto__));
+print(kind(() => Object.fromEntries(5)), kind(() => Object.fromEntries([1])));
+let closed = false;
+const iterable = {
+  [Symbol.iterator]() { return this; },
+  next() { return { value: 1, done: false }; },
+  return() { closed = true; return {}; },
+};
+kind(() => Object.fromEntries(iterable));
+print(closed);
+"#
+        ),
+        "{\"a\":1,\"b\":2}\n{\"a\":1}\n1\nTypeError TypeError\ntrue\n"
+    );
+}
+
+#[test]
+fn an_array_length_goes_through_to_uint_32() {
+    // `ArraySetLength` runs `ToUint32`, and an object yielding a fraction falls through to
+    // `ToString`: `{toString: () => "2"}` is a valid length, `{valueOf: () => 2.5}` is not,
+    // and `2**32` is a `RangeError` rather than a modulo.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { return String(f()) } catch (e) { return e.constructor.name } }
+function withLength(value) { const a = []; try { Object.defineProperty(a, "length", { value }); return a.length } catch (e) { return e.constructor.name } }
+print(withLength({ toString: () => "2" }), withLength({ valueOf: () => 3 }));
+print(kind(() => withLength({ valueOf: () => 2.5 })), kind(() => withLength(4294967296)));
+print(kind(() => withLength(-1)), kind(() => withLength("abc")), withLength("5"));
+const a = [0, 1, 2];
+Object.defineProperty(a, "1", { configurable: false });
+print(kind(() => Object.defineProperty(a, "length", { value: 0, writable: false })));
+print(a.length, JSON.stringify(a));
+"#
+        ),
+        "2 3\nRangeError RangeError\nRangeError RangeError 5\nTypeError\n2 [0,1]\n"
+    );
+}
+
+#[test]
+fn the_function_constructors_exist_and_build_their_kind() {
+    // `%GeneratorFunction%` and friends are reachable through
+    // `Object.getPrototypeOf(function*(){}).constructor`, and `new` on one really compiles
+    // a function of that kind. Their `Symbol.toStringTag` lives on the prototype so that
+    // `delete g.constructor.prototype[Symbol.toStringTag]` is observable.
+    assert_eq!(
+        eval(
+            r#"
+function tag(v) { return Object.prototype.toString.call(v); }
+const G = Object.getPrototypeOf(function* () {}).constructor;
+const made = new G("a", "yield a; return 1");
+print(tag(made), made.name, made.length, JSON.stringify([...made(7)]));
+print(G.name, G.length, function* () {} instanceof G);
+const A = Object.getPrototypeOf(async function () {}).constructor;
+const AG = Object.getPrototypeOf(async function* () {}).constructor;
+print(A.name, A.length, tag(new A("return 1")));
+print(AG.name, AG.length, tag(new AG("yield 1")));
+print(tag(function* () {}));
+delete G.prototype[Symbol.toStringTag];
+print(tag(function* () {}));
+"#
+        ),
+        "[object GeneratorFunction] anonymous 1 [7]\n\
+         GeneratorFunction 1 true\n\
+         AsyncFunction 1 [object AsyncFunction]\n\
+         AsyncGeneratorFunction 1 [object AsyncGeneratorFunction]\n\
+         [object GeneratorFunction]\n\
+         [object Function]\n"
+    );
+}

@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **12483（67.5%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6004 |
+| **可运行中通过** | **12678（68.6%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 5809 |
 | ↳ 其中挂起（引擎不终止） | 10 |
-| ↳ 其中答错 | 5994 |
+| ↳ 其中答错 | 5799 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -521,6 +521,47 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 
 第四条解释了为什么 Proxy 的 trap 明明跑了却没生效：trap 里写的是
 `Reflect.get(target, key, receiver)`，而 `Reflect.get` 把 symbol 键转成了 `""`。
+
+### 4.19 `Object` 的缺件与 `length` 的 `ToUint32`（✅ 已修，+195 例）
+
+`Object` 目录从 89.9% 到 **94.3%**。最大一簇是 94 条 `undefined is not a function` ——
+五个 API 根本不存在，而参考实现都有：
+
+| 缺失 | 说明 |
+|---|---|
+| `Object.hasOwn` | `[[GetOwnProperty]]` on `ToObject(target)`，不是 `o.hasOwnProperty(k)`：它对原语、对被遮蔽的 `hasOwnProperty` 都成立 |
+| `Object.getOwnPropertyDescriptors` | 全部自有描述符，键按 `[[OwnPropertyKeys]]` 的顺序 |
+| `Object.groupBy` | 分桶，结果对象原型为 `null` |
+| `Object.prototype.__lookupGetter__` / `__lookupSetter__` / `__defineGetter__` / `__defineSetter__` | Annex B，被弃用但仍在参考里 |
+
+另外三处不是缺件而是**做错**：
+
+- **`Object.fromEntries` 只是按索引遍历数组。** 非可迭代参数答 `{}`（应 `TypeError`）、
+  非对象条目被跳过（应拒绝）、条目键值抛错时迭代器从不关闭。现在走
+  `IteratorStep` + `IfAbruptCloseIterator`，和 4.17 建立的那套一致。
+- **`Object.prototype.toString` 的 tag 不完整。** 函数只报 `Function`，不看种类；
+  BigInt 报 `Object`；arguments 报 `Object`；Proxy 一律 `Function`。
+- **数组 `length` 的赋值走 `ToNumber` 而非 `ToUint32`。** 差别是可观察的：
+  `{toString: () => "0x00B"}` 是合法的 11，`{valueOf: () => 2.5}` 是 `RangeError`，
+  `null` 是 0。
+
+`length` 那条还有一半：缩短到某个索引时若该索引不可删除，`[[Length]]` 要停在**被阻止的
+索引 + 1**，而不是原值或目标值。`[0,1,2]` 固定索引 1 后把 `length` 改成 0，结果是 2。
+
+### 4.20 `%GeneratorFunction%` 这一层原型（✅ 已补）
+
+`Object.prototype.toString.call(function*(){})` 报 `[object Function]` 的根因不是分类写错，
+而是**缺了一层对象**：`%GeneratorFunction.prototype%` 不存在，于是生成器函数直接继承
+`Function.prototype`，`g.constructor` 也就是 `Function`。
+
+补上之后有三处连带收益：`g.constructor` 是真正的 `%GeneratorFunction%`；
+`function*(){} instanceof GeneratorFunction` 成立；`new %GeneratorFunction%("a","yield a")`
+真的编译出生成器函数（`%AsyncFunction%`／`%AsyncGeneratorFunction%` 同理）。
+
+`Symbol.toStringTag` 是这三层原型上唯一的可观察属性，而且必须 `configurable: true` ——
+`symbol-tag-non-str-proxy-function` 靠 `delete g.constructor.prototype[Symbol.toStringTag]`
+把它去掉再断言 tag 变回 `Function`。我一开始写成不可配置，`delete` 静默返回 `false`，
+测试才暴露出来。
 
 ## 5. 对里程碑结论的修正
 
