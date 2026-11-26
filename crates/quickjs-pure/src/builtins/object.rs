@@ -412,6 +412,18 @@ fn create(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Val
         }
     };
     let object = interp.new_object(proto);
+    // The second argument, `PropertiesFromDescriptors`, was read and then dropped: the
+    // object came out empty and `Object.create(null, {a: {value: 1}})` had no `a` at all.
+    // Five test262 cases depend on it just in the Iterator area, because a
+    // null-prototype object is how those tests build a clean properties bag.
+    let properties = arg(args, 1);
+    if !matches!(properties, Value::Undefined) {
+        define_properties(
+            interp,
+            Value::Undefined,
+            &[Value::Object(object.clone()), properties],
+        )?;
+    }
     Ok(Value::Object(object))
 }
 
@@ -519,8 +531,20 @@ fn define_properties(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> J
     let Value::Object(object) = &target else {
         return Err(interp.type_error("Object.defineProperties target is not an object"));
     };
-    let Some(descriptors) = arg(args, 1).as_object().cloned() else {
-        return Err(interp.type_error("Object.defineProperties descriptors is not an object"));
+    // `ObjectDefineProperties` runs `ToObject` on the descriptor map, so a primitive is
+    // not automatically an error: `Object.defineProperties({}, 5)` is a no-op because a
+    // Number wrapper has no own enumerable properties. Only `null`/`undefined` are
+    // refused outright, and a *non-empty* string is refused one step later, when its
+    // indexed values ("a", "b", …) fail `ToPropertyDescriptor`.
+    let descriptors = match arg(args, 1) {
+        Value::Object(object) => object,
+        Value::Undefined | Value::Null => {
+            return Err(interp.type_error("cannot convert to object"));
+        }
+        Value::String(text) if text.utf16_len() > 0 => {
+            return Err(interp.type_error("not an object"));
+        }
+        _ => return Ok(target),
     };
     // Collect first, apply second: a descriptor that throws must leave the target alone.
     let mut pending: Vec<(Value, Value)> = Vec::new();
@@ -584,10 +608,17 @@ pub fn define_property_on(
     let has_set = setter
         .as_ref()
         .is_some_and(|v| !matches!(v, Value::Undefined));
-    let has_accessor = has_get || has_set;
-    // Kept for the validation below, which runs after `property` has taken ownership.
-    let requested_getter = getter.clone();
-    let requested_setter = setter.clone();
+    // An accessor property *stays* an accessor when the descriptor only touches the
+    // generic attributes. `Object.defineProperty(o, "e", {enumerable: true})` on an
+    // accessor must keep the getter: ValidateAndApplyPropertyDescriptor step 9 says a
+    // descriptor with no `[[Value]]`/`[[Writable]]`/`[[Get]]`/`[[Set]]` only updates
+    // `[[Enumerable]]`/`[[Configurable]]`. Deciding `has_accessor` from the descriptor
+    // alone converted the property to a data property and blanked its value.
+    let descriptor_is_data = interp.get_property(&descriptor, "value")?.is_some()
+        || interp.get_property(&descriptor, "writable")?.is_some();
+    let has_accessor = has_get
+        || has_set
+        || (previous.as_ref().is_some_and(|p| p.is_accessor()) && !descriptor_is_data);
     // A descriptor may not be both kinds: `{value: 12, set: f}` is a TypeError, which
     // `ToPropertyDescriptor` refuses rather than silently preferring one half.
     if has_accessor
@@ -633,9 +664,13 @@ pub fn define_property_on(
     // `defineProperty` defaults every attribute to `false` when the descriptor omits
     // it, but keeps the *value* when the descriptor is a pure attribute change.
     let property = if has_accessor {
+        // A half-specified accessor keeps the other half: `{set: f}` on an existing
+        // getter/setter pair must not drop the getter.
+        let previous_getter = previous.as_ref().and_then(|p| p.getter.clone());
+        let previous_setter = previous.as_ref().and_then(|p| p.setter.clone());
         Property {
-            getter,
-            setter,
+            getter: getter.or(previous_getter),
+            setter: setter.or(previous_setter),
             enumerable,
             configurable,
             writable: false,
@@ -719,21 +754,16 @@ pub fn define_property_on(
         && !existing.configurable
     {
         let kind_changed = existing.is_accessor() != property.is_accessor();
-        let attribute_changed = enumerable != existing.enumerable
-            || configurable
-            || (kind_changed)
-            || (property.is_accessor()
-                // A getter/setter may only change while the property is configurable;
-                // defining the *same* one again is not a change.
-                && ((has_get
-                    && !requested_getter
-                        .as_ref()
-                        .is_some_and(|f| existing.getter.as_ref().is_some_and(|e| e.same_value(f))))
-                    || (has_set
-                        && !requested_setter.as_ref().is_some_and(|f| existing
-                            .setter
-                            .as_ref()
-                            .is_some_and(|e| e.same_value(f))))));
+        // Compare the *merged* accessor halves, not the descriptor's presence bits: a
+        // descriptor that says `set: undefined` presents no setter, yet on a
+        // non-configurable property that is still a change from a real setter. Judging by
+        // presence let `Object.defineProperties(arr, {1: {set: undefined}})` quietly
+        // succeed on a locked accessor.
+        let accessor_changed = property.is_accessor()
+            && (!same_accessor_half(&property.getter, &existing.getter)
+                || !same_accessor_half(&property.setter, &existing.setter));
+        let attribute_changed =
+            enumerable != existing.enumerable || configurable || kind_changed || accessor_changed;
         let data_changed = !kind_changed
             && existing.is_accessor() == property.is_accessor()
             && !existing.writable
@@ -757,6 +787,25 @@ pub fn define_property_on(
     // because `Object.defineProperty` reports failure that way.
     interp.object_define_own_property(object, &key, property)
 }
+/// Whether two getter/setter slots hold the same function.
+///
+/// An absent half and an explicit `undefined` are the same thing: an accessor with no
+/// getter reads as `undefined` either way, so redefining it as `undefined` is not a
+/// change and redefining it as a function is.
+fn same_accessor_half(left: &Option<Value>, right: &Option<Value>) -> bool {
+    let left = left
+        .as_ref()
+        .filter(|value| !matches!(value, Value::Undefined));
+    let right = right
+        .as_ref()
+        .filter(|value| !matches!(value, Value::Undefined));
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => left.same_value(right),
+        _ => false,
+    }
+}
+
 /// One boolean field of a property descriptor, or `None` when it is absent.
 fn descriptor_bool(
     interp: &mut Interp<'_>,

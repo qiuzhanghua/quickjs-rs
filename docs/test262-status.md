@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **12078（65.3%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6409 |
-| ↳ 其中挂起（引擎不终止） | 8 |
-| ↳ 其中答错 | 6400 |
+| **可运行中通过** | **12483（67.5%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6004 |
+| ↳ 其中挂起（引擎不终止） | 10 |
+| ↳ 其中答错 | 5994 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -52,8 +52,13 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立。
 
 在那之后再修掉可构造性（4.12）又得 +332 例、再修 `Math`/`Number` 的 `ToNumber`（4.13）
-得 +7 例，两次回归都是 0，通过率回到 62.5%。最后补上 Iterator helpers（4.16）
-再得 +523 例、回归 0 例，到 65.3%。
+得 +7 例，两次回归都是 0，通过率回到 62.5%。补上 Iterator helpers（4.16）再得 +523 例，
+再把 helper 的关闭语义与 `zip`/`zipKeyed` 对齐（4.17）得 +405 例，两次回归都是 0，
+到 67.5%。
+
+**基线绑定了 test262 的提交。** `docs/test262-baseline.txt.gz` 首行现在是
+`# test262 <commit>`。没有这一行时，检出被清掉后重新克隆会落到新的 HEAD，
+分母悄悄变化（实测从 23885 变成 23888），存下来的数字就对不上了。
 
 跳过不是"通过"，所以它单列。按原因：
 
@@ -463,6 +468,59 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 **仍然是缺口的**（166 条 Iterator 用例失败，均为细粒度顺序语义）：
 迭代器关闭的**逆序**（`close third, close second, close first`）、
 `zipKeyed` 只用**可枚举**自有键、以及若干 `Reflect.ownKeys` 级别的结果对象形状差异。
+
+### 4.17 helper 的关闭语义，与 `zip`/`zipKeyed` 的顺序细节（✅ 已修，+405 例）
+
+4.16 把 helper 建起来时，"什么时候关闭下层迭代器"是猜的。全量对比一次报出 26 条回归，
+方向还相反，逼出了规范里真正分开的三种情况：
+
+| 情形 | 规范 | 我一开始做的 |
+|---|---|---|
+| 回调抛错 | 关闭（`IfAbruptCloseIterator`） | 关闭 ✓ |
+| **迭代器自己的 `next`/`done`/`value` 抛错** | **不关闭**，原样上抛 | 关闭 ✗（26 条回归） |
+| 提前结束（`some`/`find` 命中） | 关闭 | 关闭 ✓ |
+
+`underlying-iterator-not-closed-when-step-throws` 这一族用例名就是在说这件事。
+修法是把"关闭"收进**回调调用**那一层，`step()` 的错误走 `?` 直接上抛。
+
+顺带纠正两处我之前写错的协议细节：
+
+- **`GetIteratorDirect` 不校验 `next` 是否可调用。** 我加了校验，"修好"了
+  `this-non-callable-next`，代价是把 `Iterator.from({return(){}})`（没有 `next` 的对象）
+  判成非法。规范把校验放在**调用**时，所以 `next` 缺失/不可调用要到第一次 `next` 才抛。
+- **`Iterator.zipKeyed` 的结果对象原型是 `null`。** 继承 `Object.prototype` 会让一个
+  来自数据的键（比如 `toString`）与继承来的方法相撞。
+
+`zipKeyed` 的键枚举还有三条一起修的语义：
+
+1. **只取可枚举自有键，且逐键重查。** 键列表快照一次，但每个键的可枚举性在**轮到时**
+   重读 —— 测试就在 `b` 的 getter 里把 `c` 改成不可枚举，并期望 `c` 被跳过。
+2. **值为 `undefined` 的属性跳过**（不是报错），`null` 才是 `TypeError`。
+3. **symbol 键保留为 symbol。** 我先把键转成字符串，结果 `zipKeyed({[sym]: xs})`
+   把属性整个丢了。
+
+关闭顺序也是逆序的，而且三种模式不一样：`shortest` 关闭**除报告 done 之外的全部**，
+`strict` 只关闭**它之后**的，`longest` 全做完时**什么都不关**。
+
+### 4.18 顺带挖出来的四个通用缺陷（✅ 已修）
+
+修 Iterator 时撞到的，都不在 Iterator 里，影响面反而更大：
+
+| 缺陷 | 症状 | 影响 |
+|---|---|---|
+| `Object.create` 丢掉第二个参数 | `Object.create(null, {a:{value:1}})` 出来是空对象 | 5 条以上用例，全部因属性表为空而失败 |
+| `defineProperty` 把访问器降级成数据属性 | 只改 `enumerable` 就丢了 getter，值变 `undefined` | `Object` 目录 +33 例 |
+| `NamedEvaluation` 应用到任意对象 | `({value: someObject})` 把 `someObject.name` 改成 `"value"` | **篡改无关对象**；`zipKeyed` 结果多出的 `name` 就是这个 |
+| `Reflect.get/set/has` 把键 `ToString` | `Reflect.get(o, sym)` 读的是 `""`；`has` 不看原型链 | Proxy 的 `get` trap 对 symbol 看起来返回 `undefined`，因为 `proxy_get` 正是转发到 `Reflect.get` |
+
+第三条值得单独说：它不是"少了个功能"，而是**改了别人的数据**。`zipKeyed` 的结果对象
+多出一个 `name: "value"`，我先后怀疑过结果对象的构造、`Reflect.ownKeys`、
+`zipKeyed` 自己的属性写入，最后靠一行 Rust 调试打印确认我们创建的对象是干净的 ——
+`name` 是在那之后被 `SetFunctionName` 加上去的，而触发它的是
+`Object.defineProperty(result, "value", {value: entry})`。
+
+第四条解释了为什么 Proxy 的 trap 明明跑了却没生效：trap 里写的是
+`Reflect.get(target, key, receiver)`，而 `Reflect.get` 把 symbol 键转成了 `""`。
 
 ## 5. 对里程碑结论的修正
 

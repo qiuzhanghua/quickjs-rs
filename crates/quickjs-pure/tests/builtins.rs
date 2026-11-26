@@ -3060,3 +3060,98 @@ print(kind(() => Iterator.zip([[1, 2], [3]], { mode: "strict" }).toArray()));
          TypeError: iterators have different lengths\n"
     );
 }
+
+#[test]
+fn object_create_applies_its_properties_argument() {
+    // `Object.create(proto, props)` used to drop `props` on the floor: the object came out
+    // empty. Five test262 cases in the Iterator area alone build a null-prototype
+    // properties bag that way.
+    assert_eq!(
+        eval(
+            r#"
+const o = Object.create(null, {
+  a: { value: 1, enumerable: true },
+  b: { get() { return 2; }, enumerable: true },
+  c: { value: 3, enumerable: false },
+});
+print(Object.getPrototypeOf(o) === null);
+print(Object.keys(o).join(","), Object.getOwnPropertyNames(o).join(","));
+print(o.a, o.b);
+const plain = Object.create(Object.prototype, { x: { value: 9 } });
+print(plain.x, Object.getPrototypeOf(plain) === Object.prototype);
+"#
+        ),
+        "true\na,b a,b,c\n1 2\n9 true\n"
+    );
+}
+
+#[test]
+fn define_property_keeps_an_accessor_whole() {
+    // A descriptor that only names `enumerable` must leave an accessor an accessor: the
+    // property used to be converted to a data property and its value blanked. And a
+    // descriptor that names *one* half must keep the other.
+    assert_eq!(
+        eval(
+            r#"
+const o = {};
+Object.defineProperty(o, "e", { get() { return "ve"; }, configurable: true });
+Object.defineProperty(o, "e", { enumerable: true });
+print(o.e, typeof Object.getOwnPropertyDescriptor(o, "e").get, o.propertyIsEnumerable("e"));
+
+let stored = 1;
+const p = {};
+Object.defineProperty(p, "x", { get() { return stored; }, set(v) { stored = v; }, configurable: true });
+Object.defineProperty(p, "x", { set(v) { stored = v * 10; } });
+p.x = 3;
+print(p.x);
+"#
+        ),
+        "ve function true\n30\n"
+    );
+}
+
+#[test]
+fn a_property_name_is_only_set_on_a_function() {
+    // `NamedEvaluation` applies to anonymous *functions*, never to whatever happens to sit
+    // on the right-hand side. Renaming plain objects was how a `zipKeyed` result object
+    // acquired an extra `name` property, and it happened through `Object.defineProperty`
+    // too, which has no `NamedEvaluation` at all.
+    assert_eq!(
+        eval(
+            r#"
+const value = {};
+Object.defineProperty({}, "value", { value });
+print(value.name === undefined);
+const other = {};
+({ key: other });
+print(other.name === undefined);
+print(({ m: function () {} }).m.name, ({ n: class {} }).n.name, ({ p: () => 1 }).p.name);
+"#
+        ),
+        "true\ntrue\nm n p\n"
+    );
+}
+
+#[test]
+fn reflect_keys_stay_symbols_and_propagate_errors() {
+    // `Reflect.get`/`set`/`has` coerced the key with `ToString`, so every symbol key read
+    // as `""` — which made a Proxy's `get` trap look like it returned `undefined`, because
+    // `proxy_get` forwards through `Reflect.get`. `has` also ignored the prototype chain.
+    assert_eq!(
+        eval(
+            r#"
+const s = Symbol.iterator;
+const o = { [s]: 1, a: 2 };
+print(Reflect.get(o, s), Reflect.has(o, s), Reflect.has({}, "toString"));
+Reflect.set(o, s, 7);
+print(o[s]);
+const p = new Proxy(o, { get: (t, k, r) => Reflect.get(t, k, r) });
+print(typeof p[s]);
+function kind(f) { try { f(); return "no throw" } catch (e) { return "threw" } }
+const bad = { toString() { throw new Error("boom"); } };
+print(kind(() => Reflect.get({}, bad)), kind(() => Reflect.set({}, bad, 1)), kind(() => Reflect.has({}, bad)));
+"#
+        ),
+        "1 true true\n7\nnumber\nthrew threw threw\n"
+    );
+}

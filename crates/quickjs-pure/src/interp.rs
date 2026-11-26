@@ -7424,6 +7424,25 @@ impl<'a> Interp<'a> {
         self.propkey(value)
     }
 
+    /// `ToPropertyKey` that can fail.
+    ///
+    /// [`Interp::property_key`] swallows a throwing `ToPrimitive` and answers
+    /// `"[object Object]"`, which is fine for a bytecode operand that has already been
+    /// coerced but wrong for `Reflect.get`, where a key whose `toString` throws has to
+    /// propagate that error (`return-abrupt-from-property-key`).
+    pub fn property_key_checked(&mut self, value: &Value) -> JsResult<PropertyKey> {
+        use crate::value::Wtf8;
+        match value {
+            Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol.clone())),
+            _ => match self.to_primitive(value.clone(), Hint::String)? {
+                Value::String(text) => Ok(PropertyKey::String(text.wtf8().clone())),
+                // A `ToPrimitive` that lands on a symbol is a symbol key, not `String(sym)`.
+                Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol)),
+                other => Ok(PropertyKey::String(Wtf8::new(other.to_js_string()))),
+            },
+        }
+    }
+
     /// A [`PropertyKey`] as the `Value` a script sees — what `Reflect.ownKeys` and
     /// `Object.getOwnPropertySymbols` put in their result array.
     pub fn key_value(&self, key: &PropertyKey) -> Value {
@@ -8165,6 +8184,15 @@ impl<'a> Interp<'a> {
         let Value::Object(object) = function else {
             return;
         };
+        // `SetFunctionName` applies to *functions* and classes only, and only when they are
+        // anonymous. Without the callability guard, `{value: someObject}` renamed
+        // `someObject` to `"value"` — silently mutating an unrelated object that merely sat
+        // on the right-hand side of a property. That is how a `zipKeyed` result object
+        // acquired a `name` property, and it applied to `Object.defineProperty` too, which
+        // has no `NamedEvaluation` at all.
+        if !object.is_callable() {
+            return;
+        }
         if let Some(Value::String(existing)) = object.own_property("name").and_then(|p| p.value)
             && !existing.wtf8().is_empty()
         {

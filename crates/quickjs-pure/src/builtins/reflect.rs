@@ -131,9 +131,13 @@ fn get(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.get target is not an object"));
     };
-    let key = interp.to_js_string(&arg(args, 1))?;
+    // `ToPropertyKey`, not `ToString`: a symbol has to stay a symbol. Going through a
+    // string turned every `Reflect.get(o, sym)` into a read of `""`, and `proxy_get`
+    // forwards through this function, so a Proxy's `get` trap appeared to return
+    // `undefined` for `Symbol.iterator` even when the trap answered with a function.
+    let key = interp.property_key_checked(&arg(args, 1))?;
     Ok(interp
-        .get_property(&object, &key)?
+        .get_property_key(&object, &key)?
         .unwrap_or(Value::Undefined))
 }
 
@@ -142,8 +146,13 @@ fn set(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.set target is not an object"));
     };
-    let key = interp.to_js_string(&arg(args, 1))?;
-    interp.set_property(&object, &key, arg(args, 2))?;
+    let key = interp.property_key_checked(&arg(args, 1))?;
+    interp.set_property_with_key(
+        &object,
+        &key,
+        arg(args, 2),
+        crate::interp::DeleteFailure::Throw,
+    )?;
     Ok(Value::Bool(true))
 }
 
@@ -152,15 +161,11 @@ fn has(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.has target is not an object"));
     };
-    let key = interp.to_js_string(&arg(args, 1))?;
-    if object.own_property(&key).is_some() || object.array_length().is_some() && key == "length" {
-        return Ok(Value::Bool(true));
-    }
-    let found = crate::object::lookup(&object, &key).is_some()
-        || crate::object::array_index(&key)
-            .and_then(|index| object.array_get(index as usize))
-            .is_some();
-    Ok(Value::Bool(found))
+    // `[[HasProperty]]`, which walks the prototype chain and asks a Proxy's `has` trap.
+    // The hand-rolled version here only looked at own properties and an array index, so
+    // `Reflect.has({}, "toString")` and every symbol key answered `false`.
+    let key = interp.property_key_checked(&arg(args, 1))?;
+    Ok(Value::Bool(interp.has_own_or_inherited(&object, &key)?))
 }
 
 fn own_keys(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
@@ -190,7 +195,7 @@ fn get_own_property_descriptor(
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.getOwnPropertyDescriptor target is not an object"));
     };
-    let key = interp.property_key(&arg(args, 1));
+    let key = interp.property_key_checked(&arg(args, 1))?;
     let Some(property) = interp.object_get_own_property(&object, &key)? else {
         return Ok(Value::Undefined);
     };

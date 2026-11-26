@@ -211,18 +211,31 @@ fn iterator_record(interp: &mut Interp<'_>, value: &Value) -> JsResult<crate::in
     let Some(object) = value.as_object().cloned() else {
         return Err(interp.type_error("not an object"));
     };
-    let next = interp.get_property(&object, "next")?;
-    if next.is_none() {
-        return Err(interp.type_error("not a function"));
-    }
+    // `Get(obj, "next")` and nothing more: §7.3.11 `GetIteratorDirect` does **not** check
+    // that `next` is callable. That check happens when the method is called, which is why
+    // `Iterator.from({return(){}})` — an object with no `next` at all — succeeds, while
+    // `Iterator.prototype.find.call({next: 0}, f)` still throws, just one step later. See
+    // [`step`] for where it happens.
+    let next = interp
+        .get_property(&object, "next")?
+        .unwrap_or(Value::Undefined);
     Ok(crate::interp::Iterator {
         object: Value::Object(object),
-        next: next.unwrap_or(Value::Undefined),
+        next,
     })
 }
 
 /// `IteratorStep`: one value, or `None` when the iterator is exhausted.
+///
+/// The callability check lives here rather than in [`iterator_record`], because that is
+/// where the spec puts it: `[[NextMethod]]` is whatever `next` was at record-creation time,
+/// and calling a non-callable is a `TypeError`. `iterator_step` treats a non-callable as
+/// "already exhausted", which is the right reading for a `for…of` over a finished iterator
+/// but not for a helper that was handed garbage.
 fn step(interp: &mut Interp<'_>, record: &crate::interp::Iterator) -> JsResult<Option<Value>> {
+    if !matches!(&record.next, Value::Object(function) if function.is_callable()) {
+        return Err(interp.type_error("not a function"));
+    }
     let (value, done) = interp.iterator_step(record)?;
     Ok(if done { None } else { Some(value) })
 }
@@ -373,10 +386,17 @@ fn source_of(interp: &mut Interp<'_>, this: &Value) -> JsResult<crate::interp::I
 }
 
 /// The callback argument, which must be callable.
-fn require_callback(interp: &mut Interp<'_>, value: &Value) -> JsResult<Value> {
+/// The callback argument, which must be callable.
+///
+/// The receiver is closed on refusal: §7.4.11 applies to a failed *validation* as much as
+/// to a throwing callback, and `argument-validation-failure-closes-underlying` checks it.
+fn require_callback(interp: &mut Interp<'_>, this: &Value, value: &Value) -> JsResult<Value> {
     match value {
         Value::Object(object) if object.is_callable() => Ok(value.clone()),
-        _ => Err(interp.type_error("not a function")),
+        _ => {
+            let _ = close_receiver(interp, this);
+            Err(interp.type_error("not a function"))
+        }
     }
 }
 
@@ -628,46 +648,78 @@ fn zip_next(interp: &mut Interp<'_>, object: &JsObject, keyed: bool) -> JsResult
     }
     let mut values = Vec::with_capacity(records.len());
     let mut exhausted = 0usize;
-    for record in &records {
-        match step(interp, record)? {
-            Some(value) => values.push(Some(value)),
-            None => {
+    // `stop` is the index that ended this round — either the one whose `next` threw, or
+    // the first one that reported `done`. What happens next depends on it, so it is
+    // remembered rather than recomputed.
+    let mut stop: Option<usize> = None;
+    for (index, record) in records.iter().enumerate() {
+        match step(interp, record) {
+            Ok(Some(value)) => values.push(Some(value)),
+            Ok(None) => {
                 values.push(None);
                 exhausted += 1;
+                if stop.is_none() && mode != 1 {
+                    // `shortest` stops *here* — the sources after it are closed, not
+                    // stepped. `strict` has to keep reading the remaining sources to know
+                    // whether they finished too, so it records the index and continues.
+                    stop = Some(index);
+                    if mode == 0 {
+                        break;
+                    }
+                }
+            }
+            Err(signal) => {
+                // A source that threw is *not* closed — it is already the one whose
+                // completion is abrupt. Everything opened after it is, and in reverse:
+                // `iterator-zip-iteration-strict-iterator-step-abrupt-completion` expects
+                // "call fourth return, call third return" after `second.next()` throws.
+                close_after(interp, &records, index);
+                write_hidden(object, DONE, Value::Bool(true));
+                return Err(signal);
             }
         }
     }
+    // Three ways this round can end, and they differ in what gets closed.
+    //
+    //  * every source finished together — a clean end, and nothing is closed: there is no
+    //    live iterator left to tell (`strict-checks-remaining-done` counts zero `return`
+    //    calls);
+    //  * the zip stops early — the sources *after* the one that finished are still live and
+    //    are closed in reverse, while the one that reported `done` is already finished;
+    //  * `strict` sees a mismatch — an error, and the same reverse close.
+    let all_done = exhausted == records.len();
     match mode {
+        // shortest: the first source to finish ends the zip. Every *other* source is
+        // closed — including ones before it — in reverse order, and a throwing `return`
+        // does not stop the unwind: the first such error is remembered and thrown at the
+        // end (`shortest-iterator-close-abrupt-completion` expects `fourth return` to
+        // throw and still see `third return` and `first return` after it).
         0 => {
-            // shortest: any exhausted source ends the zip, and the others are closed.
-            if exhausted > 0 {
+            if let Some(index) = stop {
                 write_hidden(object, DONE, Value::Bool(true));
-                for record in &records {
-                    close(interp, record)?;
+                if let Some(signal) = close_all_except(interp, &records, index) {
+                    return Err(signal);
                 }
                 return Ok(done_result(interp));
             }
         }
+        // longest: only when every source is finished.
         1 => {
-            // longest: keep going until every source is exhausted, padding with
-            // `undefined`.
-            if exhausted == records.len() {
+            if all_done {
                 write_hidden(object, DONE, Value::Bool(true));
                 return Ok(done_result(interp));
             }
         }
+        // strict: all must agree.
         _ => {
-            // strict: all sources must agree exactly.
-            if exhausted > 0 && exhausted < records.len() {
-                write_hidden(object, DONE, Value::Bool(true));
-                for record in &records {
-                    close(interp, record)?;
-                }
-                return Err(interp.type_error("iterators have different lengths"));
-            }
-            if exhausted == records.len() {
+            if all_done {
                 write_hidden(object, DONE, Value::Bool(true));
                 return Ok(done_result(interp));
+            }
+            if let Some(index) = stop {
+                write_hidden(object, DONE, Value::Bool(true));
+                close_after(interp, &records, index);
+                return Err(interp.type_error("iterators have different lengths"));
             }
         }
     }
@@ -691,18 +743,23 @@ fn zip_next(interp: &mut Interp<'_>, object: &JsObject, keyed: bool) -> JsResult
             .as_object()
             .map(|array| array.array_elements().unwrap_or_default())
             .unwrap_or_default();
-        let entry = interp.new_object(Some(interp.realm.object_proto.clone()));
+        // A **null** prototype, not `Object.prototype`: the result is a plain record whose
+        // keys come from script data, so inheriting anything would let a key like
+        // `toString` collide with a method. `results-object-has-default-attributes` and
+        // `results-object-from-array` both check this.
+        let entry = interp.new_object(None);
         for (index, value) in values.into_iter().enumerate() {
             let Some(name) = names.get(index).cloned() else {
                 continue;
             };
-            let Value::String(name) = name else {
-                continue;
+            // The stored key is a `Value` so that a symbol key stays a symbol; turning it
+            // into text here made `zipKeyed({[sym]: xs})` drop the property entirely.
+            let key = match &name {
+                Value::Symbol(symbol) => crate::object::PropertyKey::Symbol(symbol.clone()),
+                Value::String(text) => crate::object::PropertyKey::String(text.wtf8().clone()),
+                _ => continue,
             };
-            entry.define(
-                &name.to_string_lossy(),
-                Property::with_attributes(value, true, true),
-            );
+            entry.define_key(&key, Property::with_attributes(value, true, true));
         }
         Value::Object(entry)
     } else {
@@ -781,14 +838,25 @@ fn value_result(interp: &Interp<'_>, value: Value) -> Value {
 // The prototype methods
 // ---------------------------------------------------------------------------
 
+/// Close the receiver after a *validation* failure.
+///
+/// Only validation closes this way. Once iteration has started, the rule is narrower: a
+/// throwing callback closes the iterator, a throwing `next`/`done`/`value` does not. The
+/// first is `IfAbruptCloseIterator`; the second is the iterator failing on its own and is
+/// propagated untouched.
+fn rejected(interp: &mut Interp<'_>, this: &Value, signal: Signal) -> Signal {
+    let _ = close_receiver(interp, this);
+    signal
+}
+
 fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let source = source_of(interp, &this)?;
     helper(interp, source, KIND_MAP, Some(callback))
 }
 
 fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let source = source_of(interp, &this)?;
     helper(interp, source, KIND_FILTER, Some(callback))
 }
@@ -814,7 +882,7 @@ fn drop(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 }
 
 fn flat_map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let source = source_of(interp, &this)?;
     helper(interp, source, KIND_FLAT_MAP, Some(callback))
 }
@@ -835,7 +903,8 @@ fn windows(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Val
     // `TypeError`". It is checked before `next` is read, which is what
     // `argument-effect-order` records.
     if !matches!(args.get(1), None | Some(Value::Undefined)) {
-        return Err(interp.type_error("bad undersized option"));
+        let signal = interp.type_error("bad undersized option");
+        return Err(rejected(interp, &this, signal));
     }
     let size = integral_count(interp, &this, &arg(args, 0), "windowSize")?;
     let source = source_of(interp, &this)?;
@@ -850,26 +919,40 @@ fn windows(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Val
 type Consumer<'a> = dyn FnMut(&mut Interp<'_>, usize, Value) -> JsResult<Option<Value>> + 'a;
 
 /// Drain the receiver through `f`, passing the index as the second argument.
+///
+/// The three ways out are deliberately different. A *natural* end leaves the iterator
+/// alone: it is already done, and closing it would run a `return` the spec does not ask
+/// for. An *early* stop closes it and lets a throwing `return` surface. An abrupt
+/// completion **from the callback** closes it. An abrupt completion from the iterator's
+/// own `next`/`done`/`value` does *not* — `IfAbruptCloseIterator` only covers the
+/// callback, which is what all the `underlying-iterator-not-closed-when-step-throws`
+/// tests check.
 fn iterate(interp: &mut Interp<'_>, this: &Value, f: &mut Consumer<'_>) -> JsResult<Value> {
     let record = source_of(interp, this)?;
     let mut index = 0usize;
     loop {
-        match step(interp, &record)? {
-            Some(value) => {
-                if let Some(result) = f(interp, index, value)? {
-                    // An early exit has to close the source; `some`/`find` stopping at the
-                    // first match is the ordinary case.
-                    close(interp, &record)?;
-                    return Ok(result);
-                }
-                index += 1;
+        // `?` here is the "do not close" path: the iterator itself failed.
+        let Some(value) = step(interp, &record)? else {
+            return Ok(Value::Undefined);
+        };
+        match f(interp, index, value) {
+            Ok(Some(result)) => {
+                close(interp, &record)?;
+                return Ok(result);
             }
-            None => return Ok(Value::Undefined),
+            Ok(None) => index += 1,
+            Err(signal) => {
+                // The callback threw: close, but keep the original error.
+                let _ = close(interp, &record);
+                return Err(signal);
+            }
         }
     }
 }
 
 fn to_array(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    // No `closing` wrapper: `toArray` has no callback, so every way it can fail comes from
+    // the iterator itself and must propagate without closing it.
     let record = source_of(interp, &this)?;
     let mut items = Vec::new();
     while let Some(value) = step(interp, &record)? {
@@ -879,7 +962,7 @@ fn to_array(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<V
 }
 
 fn for_each(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     iterate(interp, &this, &mut |interp, index, value| {
         interp.call_value(
             callback.clone(),
@@ -892,7 +975,7 @@ fn for_each(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
 }
 
 fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let found = iterate(interp, &this, &mut |interp, index, value| {
         let answer = interp.call_value(
             callback.clone(),
@@ -901,15 +984,11 @@ fn some(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         )?;
         Ok(answer.to_boolean().then_some(Value::Bool(true)))
     })?;
-    Ok(if matches!(found, Value::Bool(true)) {
-        Value::Bool(true)
-    } else {
-        Value::Bool(false)
-    })
+    Ok(Value::Bool(matches!(found, Value::Bool(true))))
 }
 
 fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let stopped = iterate(interp, &this, &mut |interp, index, value| {
         let answer = interp.call_value(
             callback.clone(),
@@ -918,54 +997,53 @@ fn every(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
         )?;
         Ok((!answer.to_boolean()).then_some(Value::Bool(false)))
     })?;
-    Ok(if matches!(stopped, Value::Bool(false)) {
-        Value::Bool(false)
-    } else {
-        Value::Bool(true)
-    })
+    Ok(Value::Bool(!matches!(stopped, Value::Bool(false))))
 }
 
 fn find(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
-    let found = iterate(interp, &this, &mut |interp, index, value| {
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
+    iterate(interp, &this, &mut |interp, index, value| {
         let answer = interp.call_value(
             callback.clone(),
             Value::Undefined,
             vec![value.clone(), Value::Int(index as i32)],
         )?;
         Ok(answer.to_boolean().then_some(value))
-    })?;
-    Ok(found)
+    })
 }
 
 fn reduce(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    let callback = require_callback(interp, &arg(args, 0))?;
+    let callback = require_callback(interp, &this, &arg(args, 0))?;
     let record = source_of(interp, &this)?;
-    let mut accumulator = if args.len() > 1 {
-        arg(args, 1)
-    } else {
-        // No initial value: the first element becomes the accumulator, and an empty
-        // iterator is a `TypeError` rather than `undefined`.
-        match step(interp, &record)? {
-            Some(value) => value,
-            None => {
-                return Err(interp.type_error("reduce of empty iterator with no initial value"));
+    (|| -> JsResult<Value> {
+        let mut accumulator = if args.len() > 1 {
+            arg(args, 1)
+        } else {
+            // No initial value: the first element becomes the accumulator, and an
+            // empty iterator is a `TypeError` rather than `undefined`.
+            match step(interp, &record)? {
+                Some(value) => value,
+                None => {
+                    return Err(interp.type_error("reduce of empty iterator with no initial value"));
+                }
             }
+        };
+        let mut index = 0i32;
+        while let Some(value) = step(interp, &record)? {
+            accumulator = interp.call_value(
+                callback.clone(),
+                Value::Undefined,
+                vec![accumulator, value, Value::Int(index)],
+            )?;
+            index += 1;
         }
-    };
-    let mut index = 0i32;
-    while let Some(value) = step(interp, &record)? {
-        accumulator = interp.call_value(
-            callback.clone(),
-            Value::Undefined,
-            vec![accumulator, value, Value::Int(index)],
-        )?;
-        index += 1;
-    }
-    Ok(accumulator)
+        Ok(accumulator)
+    })()
 }
 
 fn join(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    // Like `toArray`, no callback means nothing to close for: `does-not-close-on-*`
+    // covers a throwing `next`, a protocol violation and a throwing `next` getter.
     let separator = match args.first() {
         None | Some(Value::Undefined) => ",".to_string(),
         Some(value) => interp.to_js_string(value)?,
@@ -973,8 +1051,7 @@ fn join(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     let record = source_of(interp, &this)?;
     let mut parts = Vec::new();
     while let Some(value) = step(interp, &record)? {
-        // `join` skips nullish elements rather than printing "undefined", which is the
-        // one place it differs from `Array.prototype.join`'s treatment of holes.
+        // A nullish element joins as the empty string rather than "undefined".
         if matches!(value, Value::Undefined | Value::Null) {
             parts.push(String::new());
         } else {
@@ -985,9 +1062,9 @@ fn join(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 }
 
 fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
-    // `includes(searchElement, skippedElements)`: the second argument counts elements to
-    // pass over first. It must be an integral Number — a string is a `TypeError` rather
-    // than a coercion, and a non-integral one such as `1.5` or `NaN` is too.
+    // `includes(searchElement, skippedElements)`: the second argument counts elements
+    // to pass over first. It must be an integral Number — a string is a `TypeError`
+    // rather than a coercion, and `1.5`/`NaN` are refused too.
     let mut skipped = match args.get(1) {
         None | Some(Value::Undefined) => 0.0,
         Some(value) => {
@@ -995,35 +1072,44 @@ fn includes(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
                 Value::Int(number) => *number as f64,
                 Value::Float(number) => *number,
                 _ => {
-                    return Err(interp.type_error("not a number"));
+                    // Validation failures close the receiver, and do it without reading
+                    // `next` — the count is checked before `GetIteratorDirect`.
+                    let signal = interp.type_error("not a number");
+                    return Err(rejected(interp, &this, signal));
                 }
             };
-            // `NaN` and a fraction are both "not an integral number"; `Infinity` is
-            // allowed and simply skips everything.
+            // `Infinity` is allowed and simply skips everything.
             if number.is_nan() || (number.is_finite() && number.trunc() != number) {
-                return Err(interp.type_error("not an integral number"));
+                let signal = interp.type_error("not an integral number");
+                return Err(rejected(interp, &this, signal));
             }
             if number < 0.0 {
-                close_receiver(interp, &this)?;
-                return Err(interp.range_error("must be positive"));
+                let signal = interp.range_error("must be positive");
+                return Err(rejected(interp, &this, signal));
             }
             number
         }
     };
     let needle = arg(args, 0);
     let record = source_of(interp, &this)?;
-    while let Some(value) = step(interp, &record)? {
-        if skipped > 0.0 {
-            skipped -= 1.0;
-            continue;
+    let outcome = (|| -> JsResult<bool> {
+        while let Some(value) = step(interp, &record)? {
+            if skipped > 0.0 {
+                skipped -= 1.0;
+                continue;
+            }
+            // `SameValueZero`: `NaN` finds `NaN`, and `-0` finds `0`.
+            if same_value_zero(&value, &needle) {
+                return Ok(true);
+            }
         }
-        // `SameValueZero`: `NaN` finds `NaN`, and `-0` finds `0`.
-        if same_value_zero(&value, &needle) {
-            close(interp, &record)?;
-            return Ok(Value::Bool(true));
-        }
+        Ok(false)
+    })();
+    let found = outcome?;
+    if found {
+        close(interp, &record)?;
     }
-    Ok(Value::Bool(false))
+    Ok(Value::Bool(found))
 }
 
 /// `SameValueZero`, which is `===` except that `NaN` matches itself.
@@ -1281,30 +1367,92 @@ fn zip_keyed(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
     let mut keys = Vec::new();
     let mut records = Vec::new();
     let mut pads = Vec::new();
+    // The key list is snapshotted once, but each key's *enumerability* is re-read at the
+    // moment it is reached. That is observable and tested: `iterables-iteration-enumerable`
+    // makes `c` non-enumerable from inside `b`'s getter and expects `c` to be skipped, then
+    // makes `e` enumerable from inside `d`'s getter and expects `e` to be included.
+    // Through the `[[OwnPropertyKeys]]` / `[[GetOwnProperty]]` internal methods, not the
+    // object's own tables: a Proxy has to see its traps, and the tests build exactly such
+    // a proxy to check the read order.
+    // Collect first, commit second: a key whose `[[Get]]` or `GetIteratorFlattenable`
+    // throws must leave the already-opened iterators closed, in reverse order — the most
+    // recently opened one first, which `iterables-iteration-get-abrupt-completion` records.
     let outcome = (|| -> JsResult<()> {
-        for key in source.own_keys() {
-            let name = key.to_string_lossy().into_owned();
-            let item = interp.get_property(&source, &name)?;
-            let Some(item) = item else { continue };
+        for key in interp.object_own_property_keys(&source)? {
+            let Some(property) = interp.object_get_own_property(&source, &key)? else {
+                continue;
+            };
+            if !property.enumerable {
+                continue;
+            }
+            // `[[GetOwnProperty]]` decides enumerability; the *value* comes from a separate
+            // `[[Get]]`, which is what runs a getter — readings a `Property` directly would
+            // miss accessor properties entirely, and they are the common case here.
+            let item = match interp.get_property_key(&source, &key)? {
+                // `undefined` is skipped rather than refused, so `{a: undefined, b: xs}` zips
+                // only `b`. Anything else that is not an object is a `TypeError`.
+                None | Some(Value::Undefined) => continue,
+                Some(value) => value,
+            };
             if !matches!(item, Value::Object(_)) {
                 return Err(interp.type_error("not an object"));
             }
             records.push(iterator_flattenable(interp, &item, false)?);
             pads.push(match &padding {
-                Some(map) => interp.get_property(map, &name)?.unwrap_or(Value::Undefined),
+                Some(map) => interp
+                    .get_property_key(map, &key)?
+                    .unwrap_or(Value::Undefined),
                 None => Value::Undefined,
             });
-            keys.push(interp.string(name));
+            // Kept as a `Value` so a symbol key stays a symbol in the result object.
+            keys.push(match &key {
+                crate::object::PropertyKey::Symbol(symbol) => Value::Symbol(symbol.clone()),
+                crate::object::PropertyKey::String(text) => interp.string_wtf8(text.clone()),
+            });
         }
         Ok(())
     })();
     if let Err(signal) = outcome {
-        for record in records.iter().rev() {
-            let _ = close(interp, record);
-        }
+        // Errors from a closing `return` are ignored: the completion is already abrupt.
+        let _ = close_all_except(interp, &records, usize::MAX);
         return Err(signal);
     }
     finish_zip(interp, KIND_ZIP_KEYED, mode, records, pads, Some(keys))
+}
+
+/// `IteratorClose` for every source except `skip`, in reverse order.
+///
+/// Returns the first error raised by a `return`, after finishing the unwind: one source
+/// refusing to close must not leave the others open.
+fn close_all_except(
+    interp: &mut Interp<'_>,
+    records: &[crate::interp::Iterator],
+    skip: usize,
+) -> Option<Signal> {
+    let mut first_error = None;
+    for (index, record) in records.iter().enumerate().rev() {
+        if index == skip {
+            continue;
+        }
+        if let Err(signal) = close(interp, record)
+            && first_error.is_none()
+        {
+            first_error = Some(signal);
+        }
+    }
+    first_error
+}
+
+/// `IteratorClose` for every source after `index`, in reverse order.
+///
+/// Reverse because the spec unwinds a partially-built list: the most recently opened
+/// iterator is the first to be told it will not be read again. Errors are swallowed — the
+/// completion being propagated is already abrupt, and §7.4.11 step 6 says the original
+/// error wins.
+fn close_after(interp: &mut Interp<'_>, records: &[crate::interp::Iterator], index: usize) {
+    for record in records.iter().skip(index + 1).rev() {
+        let _ = close(interp, record);
+    }
 }
 
 fn finish_zip(
