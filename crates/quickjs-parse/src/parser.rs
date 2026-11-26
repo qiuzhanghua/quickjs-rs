@@ -1399,6 +1399,14 @@ impl<'a> Parser<'a> {
         }
         self.switch_depth -= 1;
         self.bump()?; // }
+        // The switch body's block scope has to be popped here. Leaving it pushed leaked one
+        // scope per `switch` for the rest of the file, so everything after a switch was
+        // declared into a *stale* scope: `function f(value){ switch(value){} } let value=9`
+        // was rejected as "identifier 'value' has already been declared", and the `value`
+        // it clashed with was the function's own parameter. That made the parser refuse
+        // valid programs — and it never showed up on its own, only when a top-level `let`
+        // happened to reuse a name used inside an earlier switch.
+        self.pop_scope();
         Ok(Stmt::new(
             StmtKind::Switch {
                 discriminant: Box::new(discriminant),

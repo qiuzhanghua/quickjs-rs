@@ -52,8 +52,11 @@ fn generator_throw(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRe
 }
 
 pub fn install(interp: &mut Interp<'_>, proto: &Gc<JsObject>) {
-    let object_proto = interp.realm.object_proto.clone();
-    proto.set_proto(Some(object_proto));
+    // `%GeneratorPrototype%` inherits from `%IteratorPrototype%`, so a generator *is* an
+    // `Iterator` and `gen().map(f)` resolves `map` up the chain. Hanging it off
+    // `Object.prototype` instead left `.map` undefined.
+    let parent = interp.realm.iterator_proto.clone();
+    proto.set_proto(parent);
     for (name, length, func) in [
         ("next", 1, next as crate::object::NativeFn),
         ("return", 1, generator_return),

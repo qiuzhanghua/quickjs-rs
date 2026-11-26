@@ -157,6 +157,27 @@ pub struct Realm {
     pub data_view_proto: Option<Gc<JsObject>>,
     /// The `AsyncDisposableStack` prototype.
     pub async_disposable_stack_proto: Option<Gc<JsObject>>,
+    /// `Iterator.prototype`.
+    pub iterator_proto: Option<Gc<JsObject>>,
+    /// `%IteratorHelperPrototype%`, the prototype every lazy helper object gets.
+    ///
+    /// It sits between the helper and `Iterator.prototype`, which is how a helper is both
+    /// an `Iterator` and recognisable as a helper (`Object.prototype.toString` says
+    /// `[object Iterator Helper]`).
+    pub iterator_helper_proto: Option<Gc<JsObject>>,
+    /// `%WrapForValidIteratorPrototype%`, the prototype `Iterator.from` gives an iterable
+    /// that was not already an `Iterator`.
+    ///
+    /// Distinct from the helper prototype on purpose: it forwards `next` and `return`
+    /// untouched and does *not* override `@@toStringTag`, so
+    /// `Object.prototype.toString.call(Iterator.from(xs))` says `[object Iterator]`.
+    pub iterator_wrap_proto: Option<Gc<JsObject>>,
+    /// One `%…IteratorPrototype%` per kind, keyed by its `@@toStringTag`.
+    ///
+    /// Cached because the *identity* is observable: `Object.getPrototypeOf([].values())`
+    /// has to equal `Object.getPrototypeOf([][Symbol.iterator]())`, and building a fresh
+    /// prototype per iterator made every array iterator's prototype distinct.
+    pub iterator_protos: std::collections::BTreeMap<String, Gc<JsObject>>,
     /// `Symbol.iterator`, `Symbol.toPrimitive` and the other well-known symbols.
     ///
     /// Held as plain `Value`s rather than looked up on `Symbol` each time: the runtime
@@ -676,6 +697,10 @@ impl<'a> Interp<'a> {
                 typed_array_protos: Vec::new(),
                 data_view_proto: None,
                 async_disposable_stack_proto: None,
+                iterator_proto: None,
+                iterator_helper_proto: None,
+                iterator_wrap_proto: None,
+                iterator_protos: std::collections::BTreeMap::new(),
                 well_known_symbols: WellKnownSymbols::default(),
             },
             frames: Vec::new(),
@@ -725,6 +750,48 @@ impl<'a> Interp<'a> {
     /// A new ordinary object with the given prototype.
     pub fn new_object(&self, proto: Option<Gc<JsObject>>) -> Gc<JsObject> {
         JsObject::ordinary(self.heap, proto)
+    }
+
+    /// A prototype for a built-in iterator, inheriting from `Iterator.prototype`.
+    ///
+    /// Every built-in iterator has one — `%ArrayIteratorPrototype%`,
+    /// `%StringIteratorPrototype%` and so on — and the whole point of the chain is that
+    /// such an iterator *is* an `Iterator`: `[1,2].values().map(f)` resolves `map` by
+    /// walking up to `Iterator.prototype`. These used to be plain objects hanging off
+    /// `Object.prototype`, so `.map` was `undefined` and `Object.prototype.toString`
+    /// said `[object Object]` instead of `[object Array Iterator]`.
+    ///
+    /// The prototype carries `next`, `[Symbol.iterator]` answering `this`, and the
+    /// `@@toStringTag` that names it. `next` is passed in because each iterator kind has
+    /// its own.
+    pub fn new_iterator_prototype(
+        &mut self,
+        tag: &str,
+        next: crate::object::NativeFn,
+    ) -> Gc<JsObject> {
+        if let Some(existing) = self.realm.iterator_protos.get(tag) {
+            return existing.clone();
+        }
+        let parent = self.realm.iterator_proto.clone();
+        let proto = self.new_object(parent);
+        let next = self.new_native("next", 0, next);
+        proto.define(
+            "next",
+            Property::with_attributes(Value::Object(next), true, false),
+        );
+        let key = self.realm.well_known_key(WellKnown::Iterator);
+        let identity = self.new_native("[Symbol.iterator]", 0, self_iterator);
+        proto.define_key(
+            &key,
+            Property::with_attributes(Value::Object(identity), true, false),
+        );
+        let tag_key = self.realm.well_known_key(WellKnown::ToStringTag);
+        let tag_value = self.string(tag);
+        proto.define_key(&tag_key, Property::with_attributes(tag_value, false, false));
+        self.realm
+            .iterator_protos
+            .insert(tag.to_string(), proto.clone());
+        proto
     }
 
     /// `[[OwnPropertyKeys]]`, with the `ownKeys` trap when there is one.
@@ -7900,7 +7967,7 @@ impl<'a> Interp<'a> {
         })
     }
 
-    fn get_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
+    pub(crate) fn get_iterator(&mut self, value: &Value) -> JsResult<Iterator> {
         let key = self.realm.well_known_key(WellKnown::Iterator);
         let method = self.read_field_key(value, &key)?;
         let Value::Object(function) = &method else {
@@ -7955,7 +8022,7 @@ impl<'a> Interp<'a> {
     }
 
     /// One step of an internal iterator: the value and whether it is exhausted.
-    fn iterator_step(&mut self, iterator: &Iterator) -> JsResult<(Value, bool)> {
+    pub(crate) fn iterator_step(&mut self, iterator: &Iterator) -> JsResult<(Value, bool)> {
         // A real iterator (`next` is a function) answers with a result object.
         if matches!(&iterator.next, Value::Object(object) if object.is_callable()) {
             let result =
@@ -8279,10 +8346,15 @@ enum VarSlot {
     Closure,
 }
 
+/// `%IteratorPrototype%[Symbol.iterator]`, which answers the iterator itself.
+fn self_iterator(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    Ok(this)
+}
+
 /// An internal iterator: the sequence plus a cursor.
-struct Iterator {
-    object: Value,
-    next: Value,
+pub(crate) struct Iterator {
+    pub(crate) object: Value,
+    pub(crate) next: Value,
 }
 
 /// The name an accessor function gets: `get a` for a getter, `set a` for a setter,

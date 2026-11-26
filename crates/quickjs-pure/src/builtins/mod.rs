@@ -19,6 +19,7 @@ mod error;
 mod function;
 mod generator;
 mod global;
+pub mod iterator;
 mod json;
 pub mod map;
 mod math;
@@ -62,6 +63,10 @@ pub fn install(interp: &mut Interp<'_>) {
     // keys the other builtins store their methods under — `Array.prototype[Symbol.iterator]`
     // is defined during `array::install` below.
     symbol::install(interp);
+    // `Iterator` right after `Symbol` and before everything that makes an iterable:
+    // the array, string, map/set, typed-array and generator protos all inherit from
+    // `%IteratorPrototype%`, and they can only do that once it exists.
+    iterator::install(interp, &object_proto);
     object::install(interp, &object_proto);
     function::install(interp, &function_proto);
     array::install(interp, &array_proto);

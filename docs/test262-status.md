@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **11555（62.5%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6932 |
+| **可运行中通过** | **12078（65.3%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6409 |
 | ↳ 其中挂起（引擎不终止） | 8 |
-| ↳ 其中答错 | 6926 |
+| ↳ 其中答错 | 6400 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -52,7 +52,8 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立。
 
 在那之后再修掉可构造性（4.12）又得 +332 例、再修 `Math`/`Number` 的 `ToNumber`（4.13）
-得 +7 例，两次回归都是 0，通过率回到 62.5%。
+得 +7 例，两次回归都是 0，通过率回到 62.5%。最后补上 Iterator helpers（4.16）
+再得 +523 例、回归 0 例，到 65.3%。
 
 跳过不是"通过"，所以它单列。按原因：
 
@@ -419,6 +420,49 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 这正是"看起来对、结果是错答案"的那类陷阱。
 
 同一批里另一个未做的：`static { }` 静态块，编译器同样明确报错。
+
+### 4.16 Iterator helpers（✅ 新增，+523 例）
+
+`Iterator` 全局对象此前完全不存在：`typeof Iterator === "undefined"`，683 条
+`test/built-ins/Iterator` 用例全灭。现在：
+
+| 部分 | 内容 |
+|---|---|
+| `Iterator` 本体 | 抽象类：`new Iterator()` 抛 `abstract class not constructable`，无 `new` 抛 `constructor requires 'new'`，但**可被继承**（`class Sub extends Iterator {}` 后 `new Sub()` 成立） |
+| 原型方法 | `map` `filter` `take` `drop` `flatMap` `reduce` `toArray` `forEach` `some` `every` `find` `join` `includes` `chunks` `windows` |
+| 协议 | `Iterator.prototype[Symbol.iterator]` 返回 `this`，`[Symbol.dispose]` 关闭，`@@toStringTag` = `Iterator` |
+| 静态 | `Iterator.from` `Iterator.concat` `Iterator.zip` `Iterator.zipKeyed` |
+
+实测 `test/built-ins/Iterator`：**0 → 517/683（75.7%）**，全量 **+523 / −0**。
+`Iterator` 相关目录之外也修好了 `ArrayIteratorPrototype` 一族（此前数组迭代器的原型
+直接挂在 `Object.prototype` 上，`[object Object]`、没有 `Symbol.iterator` 继承、
+`.map` 为 `undefined`）。
+
+实现要点，两处都是"看起来对、结果错"的陷阱：
+
+1. **helper 必须按需执行。** 状态放在返回对象的隐藏属性里，一个共享的 `next` 按
+   `kind` 分派 —— 因为 `NativeFn` 是裸函数指针，捕获不了任何东西。这让
+   `(function*(){ while(true) yield i++ })().take(3)` 能终止。
+2. **`GetIteratorFlattenable` 的第 3 步。** 对象**没有** `@@iterator` 时，对象自己就是
+   迭代器记录。`Iterator.from({next(){...}})` 靠的是这一条；漏掉它就会去读
+   `Symbol.iterator` 然后报 `not iterable`。字符串是唯一被特批的非对象
+   （`iterate-strings` 模式），所以 `Iterator.from("ab")` 迭代字符而
+   `Iterator.from(1)` 抛 `not an object`。
+
+顺带修的三个真缺陷：
+
+- **`parse_switch` 从不 `pop_scope`。** 每遇到一个 `switch` 就往作用域栈上漏一层，
+  之后所有声明都落在过期的作用域里：`function f(value){ switch(value){} } let value=9`
+  被判 `identifier 'value' has already been declared`，冲突对象是函数自己的形参。
+  这是**拒绝合法程序**，而且只在顶层 `let` 恰好重用了前面某个 `switch` 里出现过的
+  名字时才现形。真正的冲突仍全部拦下，与参考逐条一致。
+- **数组迭代器没有 `%ArrayIteratorPrototype%`。** 见上。
+- **`chunks`/`windows` 不做 `ToNumber`。** `chunks("2")` 是 `TypeError` 而不是
+  `chunks(2)`——一个"看起来像数字"的字符串是错误而不是待猜的意图。
+
+**仍然是缺口的**（166 条 Iterator 用例失败，均为细粒度顺序语义）：
+迭代器关闭的**逆序**（`close third, close second, close first`）、
+`zipKeyed` 只用**可枚举**自有键、以及若干 `Reflect.ownKeys` 级别的结果对象形状差异。
 
 ## 5. 对里程碑结论的修正
 

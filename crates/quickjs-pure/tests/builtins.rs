@@ -3005,3 +3005,58 @@ print(kind(() => Number(Symbol())), kind(() => Number(Object(Symbol()))));
         "1 0 1\nTypeError TypeError\n"
     );
 }
+
+#[test]
+fn iterator_helpers_are_lazy_and_chainable() {
+    // The defining property of the API: `take` on an infinite generator has to terminate,
+    // which is only possible if nothing runs until `next` is called.
+    assert_eq!(
+        eval(
+            r#"
+function* naturals() { let i = 0; while (true) yield i++; }
+print(JSON.stringify(naturals().take(3).toArray()));
+print(JSON.stringify([1, 2, 3, 4].values().map(x => x * 2).filter(x => x > 4).toArray()));
+print(JSON.stringify([1, 2, 3, 4, 5].values().drop(3).toArray()));
+print(JSON.stringify([[1, 2], [3]].values().flatMap(x => x).toArray()));
+print(JSON.stringify([1, 2, 3].values().reduce((a, b) => a + b, 10)));
+print(JSON.stringify([1, 2, 3, 4].values().chunks(3).toArray()));
+print(JSON.stringify([1, 2, 3, 4].values().windows(3).toArray()));
+print(JSON.stringify([1, 2].values().join("-")), [1, 2].values().includes(2));
+print(JSON.stringify([1, 2, 3].values().map((v, i) => i).toArray()));
+"#
+        ),
+        "[0,1,2]\n[6,8]\n[4,5]\n[1,2,3]\n16\n[[1,2,3],[4]]\n[[1,2,3],[2,3,4]]\n\"1-2\" true\n[0,1,2]\n"
+    );
+}
+
+#[test]
+fn an_iterator_is_not_the_same_as_an_iterable() {
+    // `Iterator` may be subclassed but not instantiated, `Iterator.from` returns an
+    // existing iterator untouched, and a bare `{next}` counts as an iterator even without
+    // `Symbol.iterator`. All three are easy to get backwards.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { f(); return "no throw" } catch (e) { return e.constructor.name + ": " + e.message } }
+class Sub extends Iterator {}
+print(Object.getPrototypeOf(new Sub()) === Sub.prototype);
+print(kind(() => new Iterator()));
+print(kind(() => Iterator()));
+const existing = [1].values();
+print(Iterator.from(existing) === existing);
+print(JSON.stringify(Iterator.from("ab").toArray()));
+print(JSON.stringify(Iterator.from({ next() { return { done: true }; } }).toArray()));
+print(kind(() => Iterator.from(1)));
+print(JSON.stringify(Iterator.concat([1], [2]).toArray()));
+print(JSON.stringify(Iterator.zip([[1, 2], [3, 4]]).toArray()));
+print(JSON.stringify(Iterator.zip([[1, 2, 3], [4, 5]], { mode: "longest" }).toArray()));
+print(JSON.stringify(Iterator.zipKeyed({ a: [1], b: [2] }).toArray()));
+print(kind(() => Iterator.zip([[1, 2], [3]], { mode: "strict" }).toArray()));
+"#
+        ),
+        "true\nTypeError: abstract class not constructable\nTypeError: constructor requires 'new'\n\
+         true\n[\"a\",\"b\"]\n[]\nTypeError: not an object\n[1,2]\n[[1,3],[2,4]]\n\
+         [[1,4],[2,5],[3,null]]\n[{\"a\":1,\"b\":2}]\n\
+         TypeError: iterators have different lengths\n"
+    );
+}

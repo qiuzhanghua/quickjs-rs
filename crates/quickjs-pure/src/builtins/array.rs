@@ -583,7 +583,7 @@ pub(crate) fn iterator(
     // array-like up front, but an iterator must not, because
     // `Array.prototype.keys.call({length: 2**32 + 1})` is legal and only advances a
     // few steps before `break`.
-    let proto = interp.realm.object_proto.clone();
+    let proto = interp.new_iterator_prototype("Array Iterator", array_iterator_next);
     let object = interp.new_object(Some(proto));
     object.define_data("_source", this);
     object.define_data("_index", Value::Int(0));
@@ -595,21 +595,7 @@ pub(crate) fn iterator(
             IteratorKind::Entry => 2,
         }),
     );
-    let next = crate::builtins::method(interp, "next", 0, array_iterator_next)?;
-    object.define_data("next", next);
-    // An iterator is itself iterable — `for (var k of a.keys())` needs it — and the way
-    // it says so is a `Symbol.iterator` method answering `this`.
-    let key = interp
-        .realm
-        .well_known_key(crate::interp::WellKnown::Iterator);
-    let identity = crate::builtins::method(interp, "[Symbol.iterator]", 0, self_iterator)?;
-    object.define_key(&key, Property::data(identity));
     Ok(Value::Object(object))
-}
-
-/// `%ArrayIteratorPrototype%[Symbol.iterator]`, which answers the iterator itself.
-fn self_iterator(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(this)
 }
 
 /// The shared `next` of the three array iterators.
