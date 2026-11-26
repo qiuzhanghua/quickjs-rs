@@ -154,9 +154,6 @@ impl Test {
 
     /// Whether this test uses a flag or feature the runner cannot honour yet.
     fn unsupported_reason(&self) -> Option<String> {
-        if self.flags.iter().any(|flag| flag == "async") {
-            return Some("flag:async ($DONE) not wired up".to_string());
-        }
         // Features whose API the engine does not have. Named rather than guessed at, so
         // the count says which part of the engine is missing.
         const MISSING_FEATURES: &[&str] = &[
@@ -166,7 +163,6 @@ impl Test {
             "Intl",
             "tail-call-optimization",
             "decorators",
-            "explicit-resource-management",
         ];
         for feature in &self.features {
             if MISSING_FEATURES.contains(&feature.as_str()) {
@@ -174,6 +170,18 @@ impl Test {
             }
         }
         None
+    }
+
+    /// Whether this test is asynchronous (`flags: [async]`).
+    ///
+    /// INTERPRETING.md: for such a test the runner must evaluate `doneprintHandle.js` and
+    /// then wait for `print` to report either `Test262:AsyncTestComplete` or a line
+    /// beginning `Test262:AsyncTestFailure:`. This used to be a blanket skip ("$DONE not
+    /// wired up") on the grounds that the engine had neither Promise nor a job queue —
+    /// true when the skip was written, false since M5, so 632 tests were being excluded by
+    /// a note that had stopped being a fact.
+    fn is_async(&self) -> bool {
+        self.flags.iter().any(|flag| flag == "async")
     }
 }
 
@@ -213,6 +221,9 @@ fn unquote(value: &str) -> String {
 
 /// The harness files every test needs, per INTERPRETING.md.
 const ALWAYS_INCLUDED: &[&str] = &["sta.js", "assert.js"];
+
+/// The harness file a `flags: [async]` test needs, supplied by the runner.
+const ASYNC_HANDLE: &str = "doneprintHandle.js";
 
 /// The `$262` host object, per INTERPRETING.md §Test262-Defined Bindings.
 ///
@@ -357,9 +368,18 @@ impl Runner {
 
     /// The concatenated harness text for `test`, or the name of a missing file.
     fn harness_for(&self, test: &Test) -> Result<String, String> {
+        // INTERPRETING.md §flags/async: `doneprintHandle.js` is added by the runner rather
+        // than listed in the test, and it goes *after* the always-included files and
+        // before the test's own `includes`.
+        let async_handle: &[&str] = if test.is_async() {
+            std::slice::from_ref(&ASYNC_HANDLE)
+        } else {
+            &[]
+        };
         let mut out = String::new();
         for name in ALWAYS_INCLUDED
             .iter()
+            .chain(async_handle.iter())
             .map(|name| name.to_string())
             .chain(test.includes.iter().cloned())
         {
@@ -520,7 +540,27 @@ fn run_with_timeout(mut command: Command, limit: Duration) -> RunResult {
 /// threw while running". This engine reports a compile error with a non-zero exit code and
 /// a message containing the constructor name, so the phase is inferred from that.
 fn judge(test: &Test, code: i32, stdout: &str, stderr: &str, is_module: bool) -> Outcome {
-    let _ = (stdout, is_module);
+    let _ = is_module;
+    // An `async` test passes only if the run *said so*: INTERPRETING.md requires judging
+    // on `$DONE`, not on the exit status. A test that never calls `$DONE` (because an
+    // assertion threw, or a promise never settled) is a failure, and stderr alone would
+    // miss the second case entirely — the process exits 0 having done nothing.
+    if test.is_async() {
+        const COMPLETE: &str = "Test262:AsyncTestComplete";
+        const FAILURE: &str = "Test262:AsyncTestFailure";
+        if let Some(line) = stdout.lines().find(|line| line.contains(FAILURE)) {
+            return Outcome::Fail(line.trim().to_string());
+        }
+        if stdout.lines().any(|line| line.contains(COMPLETE)) {
+            return Outcome::Pass;
+        }
+        let detail = stderr
+            .lines()
+            .chain(stdout.lines())
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("<no output>");
+        return Outcome::Fail(format!("$DONE was never called: {}", detail.trim()));
+    }
     match &test.negative {
         None => {
             if code == 0 {

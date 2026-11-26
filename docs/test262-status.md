@@ -40,31 +40,43 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 | | 数量 |
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
-| 可运行（runner 不跳过） | 17665 |
-| **可运行中通过** | **10845（61.4%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6820 |
-| ↳ 其中挂起（引擎不终止） | 6 |
-| ↳ 其中答错 | 6814 |
-| 跳过（引擎完全没这功能） | 6220 |
+| 可运行（runner 不跳过） | 18487 |
+| **可运行中通过** | **11216（60.7%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 7271 |
+| ↳ 其中挂起（引擎不终止） | 8 |
+| ↳ 其中答错 | 7263 |
+| 跳过（引擎完全没这功能） | 5398 |
 
-与上一次记录（10836）差的 9 例来自一处代理修复，见 4.11；挂起数从 45 降到 6，是因为
-每个测试进程现在都带 `ulimit -v` 512 MiB（见第 8 节），此前"挂起"里混着若干实际是
-被内存拖死的用例。
+与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
+是被过期的跳过表挡住的（`flag:async` 与 `explicit-resource-management`），解锁后分母
+变大，通过率因此从 61.4% 降到 60.7%。百分比下降与引擎变好同时成立，见第 2 节末尾。
 
 跳过不是"通过"，所以它单列。按原因：
 
 | 原因 | 数量 |
 |---|---|
 | `feature:Temporal` | 4624 |
-| `flag:async`（`$DONE` 未接线） | 632 |
 | `feature:Atomics` | 242 |
-| `feature:SharedArrayBuffer` | 233 |
-| `feature:explicit-resource-management` | 202 |
+| `feature:SharedArrayBuffer` | 245 |
 | `runner: $262.createRealm` 未实现 | 167 |
 | `runner: $262.agent` 未实现 | 112 |
 | `runner: $262` 在模块用例中不可用 | 8 |
 
-`runner:` 那 287 条是**本 runner 的缺口，不是引擎的**。Temporal（4624）占了跳过的 74%，它不在 `requirements.md` 的范围内，这只是把"没打算做"与"做了但坏了"分开。
+`runner:` 那 287 条是**本 runner 的缺口，不是引擎的**。Temporal（4624）占了跳过的 86%，
+它不在 `requirements.md` 的范围内，这只是把"没打算做"与"做了但坏了"分开。
+
+**跳过表曾经过期，代价是 822 条用例从未被测量。** 两张表原先还各有一条：
+
+| 已移除的跳过理由 | 实际情况 |
+|---|---|
+| `flag:async`（`$DONE` 未接线）632 条 | Promise 与微任务队列在 M5 就绪，跳过理由停在"M5 之前"。runner 按 INTERPRETING.md 补上 `doneprintHandle.js` 与 `$DONE` 判定后，这批用例立刻可跑 |
+| `feature:explicit-resource-management` 202 条 | `using`、`DisposableStack`、`AsyncDisposableStack`、`SuppressedError` 早已可用。解锁后 `DisposableStack` 单目录即 **75/92（81.5%）** 通过 |
+
+两张表与 `MISSING_FEATURES` 常量一样，是**写死的字符串**。它们的失效没有机制提醒，
+所以"跳过"从"暂时不算"悄悄变成了"永久不算"。解锁后净 +371 例、回归 0 例
+（`DisposableStack` 75/92、`AsyncDisposableStack` 81/103、`SuppressedError` 16/21）；
+同时可运行分母从 17665 涨到 18487，于是通过率反而从 61.4% 降到 60.7% ——
+**数字变低而引擎变强**，这是聚合指标会骗人的又一个例子。
 
 ## 3. 失败面在哪
 
@@ -264,6 +276,41 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 3. **`install_tag` 忽略了自己的 `tag` 参数**，永远返回 `"ArrayBuffer"`，
    于是 `Object.prototype.toString.call(dataView)` 报错类型。顺带修掉。
    同时发现 `Symbol.toStringTag` 被装成了访问器，规范是数据属性。
+
+### 4.12 每个原生方法都能被 `new`（新发现，未修）
+
+解锁 `$DONE` 之后浮出来的，影响面比 ERM 本身大得多：
+
+```js
+function isCtor(f) { try { Reflect.construct(function(){}, [], f); return true }
+                     catch (e) { return false } }
+isCtor(Array.prototype.map)        // 应为 false，实为 true
+isCtor(Object.keys)                // 应为 false，实为 true
+isCtor(JSON.stringify)             // 应为 false，实为 true
+isCtor(Math.max)                   // 应为 false，实为 true
+```
+
+参考实现全部返回 `false`。根因是**可构造性被写成了"可调用"**：
+
+- `Reflect.construct` 读的是 `is_callable()`，于是任何可调用对象都是合法 `newTarget`；
+- `JsObject::is_constructor()` 存在，但**没有任何一处调用它**，而且它自己的判据
+  （`ObjectKind::Function(_) => true`）与 `is_callable` 一样宽松。
+
+按规范可构造的是：普通函数、类构造器、原生构造器；**不可构造**的是箭头函数、
+生成器与 async 函数、类方法、对象字面量方法、以及绝大多数原生方法。当前表示里
+`Callable::Bytecode` 同时装着这两类，`CompiledFunction` 只有 `kind`（Normal/Generator/
+Async/AsyncGenerator）与 `is_arrow`，没有任何"这是方法"的位。
+
+所以修法不是改一行判断，而是要**新增一个可构造性标志并在两处落位**：
+
+1. 编译器：方法（类体、对象字面量、getter/setter）与箭头/生成器/async 标记为不可构造，
+   普通函数与类构造器标记为可构造，随 `CompiledFunction` 序列化；
+2. 内建安装：`Callable::Native` 需要区分构造器与方法
+   （现有 `own_instance` 只表达"谁建实例"，不表达"能不能被 new"）。
+
+test262 里 `not-a-constructor.js` 是一整族用例，每个内建都有，这也是
+`DisposableStack` 那 22 条失败里最密集的一类。价值上它比 ERM 本身大，因为它横跨
+所有部件。
 
 ## 5. 对里程碑结论的修正
 
