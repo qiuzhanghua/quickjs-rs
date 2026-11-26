@@ -2,6 +2,18 @@
 
 测量时间：2026-11-22（基线提交 `4a30079`，最后一轮修复到 `93ecc32`，均在 v0.4.0 之后）
 
+**可复现**：逐用例结果已入库为 `docs/test262-baseline.txt.gz`（23885 行，
+`PASS`/`FAIL`/`SKIP` + 用例名 + 跳过原因）。任何一次新跑都能和它做集合差分：
+
+```sh
+TEST262_OUTCOMES=/tmp/now.txt ./scripts/test262.sh
+python3 ./scripts/test262-diff.py /tmp/now.txt     # +N fixed / -M regressed
+```
+
+差分按**用例名**求，不按总数。这一点不是洁癖：下面第 7 节里"修好 978 例、回归 0 例"
+这类结论，全部靠这个比较得出；而总数相同的两次运行，完全可能是一次回归加一次修好
+互相抵消。`test262-diff.py` 遇到任何回归就返回非零。
+
 **已修**：4.1、4.2、4.3、4.4、4.7、4.8、4.10，可运行通过率 **42.7% → 61.3%**，
 净修好 2739 例、新引入失败 0 例。见第 7 节。
 
@@ -29,11 +41,15 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 17665 |
-| **可运行中通过** | **10836（61.3%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 6829 |
-| ↳ 其中挂起（引擎不终止） | 45 |
-| ↳ 其中答错 | 6784 |
+| **可运行中通过** | **10845（61.4%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 6820 |
+| ↳ 其中挂起（引擎不终止） | 6 |
+| ↳ 其中答错 | 6814 |
 | 跳过（引擎完全没这功能） | 6220 |
+
+与上一次记录（10836）差的 9 例来自一处代理修复，见 4.11；挂起数从 45 降到 6，是因为
+每个测试进程现在都带 `ulimit -v` 512 MiB（见第 8 节），此前"挂起"里混着若干实际是
+被内存拖死的用例。
 
 跳过不是"通过"，所以它单列。按原因：
 
@@ -368,3 +384,65 @@ var o = {length: 2, 0: "a", 1: "b"}; splice.call(o,0,1)  // o 应变成 {0:"b",l
 - **`Math` 缺 `ToNumber` 的 BigInt 拒绝**：`Math.max(1n)` 应抛 `TypeError`。
 - **`DataView` 的 resizable ArrayBuffer**：97 条剩余里 22 条是它，需要
   `ArrayBuffer.prototype.resize` 整套。
+
+## 8. 让全量跑变得安全（与 4.11 同批）
+
+接上 oracle 之后第一次跑全量，**把用户的会话跑掉了**：机器被登出。原因不是测试崩了，
+是测试把整机内存吃光。
+
+### 三个叠加的原因
+
+1. **并发数跟着核数走。** runner 原本用 `available_parallelism()`，
+   在 28 核机器上就是 28 个并发引擎，每个跑一个 test262 用例。
+2. **单进程没有内存上限。** `qjs --memory-limit 64M` **是装饰**：
+   `Runtime::set_memory_limit` 只把值存进字段，引擎里没有任何一处读它。
+   实测 `qjs --memory-limit 64M -e 'var a=[];for(;;)a.push(new Array(1e5))'`
+   一直吃到外部 `ulimit` 的 2 GB 才 abort，而不是在 64 MB 处停下。
+   `--stack-size` 同理。这两个都是 CLI 接受、帮助文本宣传、实际空转的选项。
+3. **内存耗尽时是 panic 而不是报错。** 分配失败直接
+   `memory allocation of N bytes failed` + 核心转储，`Error::OutOfMemory` 那条路径
+   从未被执行到。
+
+三者相乘：一个故意申请大数组的用例，在一个不设限的进程里，复制 28 份。
+
+### 修法（先止血，不是根治）
+
+- runner 改为用 `sh -c 'ulimit -v 512MiB; exec "$0" "$@"'` 起引擎，
+  上限加在**子进程**上，所以即使引擎自己的限额是装饰也照样成立。
+- 默认并发封顶 `min(核数, 8)`，可用 `TEST262_JOBS` 覆盖。
+
+改完后同一个"无限申请"用例变成一个普通 `FAIL`（`memory allocation ... failed`），
+机器内存全程稳定，全量跑 3 分半结束。
+
+### 仍然是缺口的
+
+- **`--memory-limit` / `--stack-size` 没有实现。** 这是**响亮失败原则的空白**：
+  选项被接受、被写进 `--help`、被 `Runtime` 存下，然后什么也不做。
+  按本项目的尺子，它应该抛错而不是静默忽略。
+- **分配失败应走 `Error::OutOfMemory`**，而不是让 Rust 的分配器 abort。
+  没有 `set_error_hook` 式的兜底，任何 OOM 都会变成核心转储。这需要把
+  `Vec` 的分配点收进一个可控的分配器，属于跨模块改动。
+
+### 4.11 代理的可调用性在撤销后被丢掉（+9 例）
+
+接线之后 `lang-diff.py` 从 SKIPPED 变成 `79/85`，唯一那条 gap 是
+`test_builtin.js test_function`，暴露出三处同源的静默错答案：
+
+```js
+var p = Proxy.revocable(function f(){}, {}); p.revoke();
+typeof p.proxy                              // 应为 "function"，实为 "object"
+Function.prototype.toString.call({})        // 应为 TypeError，实为返回 "[native code]"
+Function.prototype.toString.call(p.proxy)   // 应为字符串，见上
+```
+
+根因是 `is_callable()` 对代理的判据写成了"目标**现在**还在不在"
+（`target.as_ref().is_some_and(...)`）。撤销把 `target` 置空，于是撤销后的代理
+连带丢掉了 `[[Call]]`——而规范里撤销只影响 trap 转发，不影响代理本身是否可调用。
+
+修法是**创建时记下**可调用性（`ProxyState::callable`），而不是每次从 `target`
+重新推导。顺带补上 `Function.prototype.toString` 对非可调用接收者的 `TypeError`
+——此前它对任何对象都返回 `[native code]`，这恰好也是"报错被当成通过"的那一类：
+`assert_throws(TypeError, ...)` 在实现完全不校验时也能过。
+
+实测 `typeof revoked.proxy === "function"` 与三处 `TypeError` 均与参考一致，
+全量 +9 例（10836 → 10845），回归 0 例。

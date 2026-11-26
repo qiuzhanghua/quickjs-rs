@@ -83,8 +83,8 @@ quickjs = { package = "quickjs-pure", version = "0.4" }
 ## 开发
 
 ```sh
-./scripts/setup-oracle.sh     # 一次性：构建 C 参考实现到 /tmp/quickjs-master
-./scripts/check.sh            # fmt + clippy + test（提交前必跑）
+./scripts/setup-oracle.sh     # 一次性：构建 C 参考实现到 /tmp/quickjs-master（需网络 + C 工具链）
+./scripts/check.sh            # fmt + clippy + test + 上游差分（提交前必跑）
 cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 ```
 
@@ -146,11 +146,22 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 
 ## 一致性测量
 
-`cargo test` 里的差分套件只覆盖上游 `tests/*.js`（七个文件），样本窄；语言覆盖面的真实数字由 test262 给出：
+三个量具，回答三个不同的问题。都要求先跑一次 `./scripts/setup-oracle.sh`（构建 C 参考
+实现；不构建时差分套件会打印 `SKIPPED`，也就是什么也没测）。
+
+| 问题 | 命令 |
+|---|---|
+| 字节码／行为与参考实现是否一致 | `./scripts/check.sh`（内含 `scripts/lang-diff.py`） |
+| 语言覆盖面有多少 | `TEST262_OUTCOMES=/tmp/now.txt ./scripts/test262.sh` |
+| 这次改动是净修还是净退 | `python3 ./scripts/test262-diff.py /tmp/now.txt` |
+
+第三个输出 `+N fixed / -M regressed`，按**用例名**求集合差而不是比总数——总数相同的
+两次运行完全可能是一次回归加一次修好互相抵消。基线已入库
+（`docs/test262-baseline.txt.gz`，23885 行逐用例结果），遇到任何回归脚本返回非零。
 
 ```sh
-./scripts/test262.sh                 # 全部 test/built-ins
-TEST262_GROUP=1 ./scripts/test262.sh # 按部件看失败分布
+TEST262_GROUP=1 ./scripts/test262.sh        # 按部件看失败分布
+TEST262_SIGNATURES=1 ./scripts/test262.sh   # 失败形态聚类
 ```
 
 当前基线与已知缺陷见 [`docs/test262-status.md`](docs/test262-status.md)。

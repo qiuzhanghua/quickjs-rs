@@ -151,6 +151,12 @@ fn bind(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
 }
 
 fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+    // §20.2.3.5 step 1-2: a non-callable receiver is a `TypeError`, not a string. Read
+    // off the object, not by re-deriving callability from `this` being a function object:
+    // a proxy over a function is callable too, and a *revoked* one still is.
+    if !matches!(&this, Value::Object(object) if object.is_callable()) {
+        return Err(interp.type_error("Function.prototype.toString called on a non-callable"));
+    }
     let name = this
         .as_object()
         .and_then(|object| object.own_property("name"))

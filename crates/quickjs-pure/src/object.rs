@@ -814,6 +814,12 @@ pub struct ProxyState {
     pub target: Option<Gc<JsObject>>,
     /// The trap table, or `None` once revoked.
     pub handler: Option<Value>,
+    /// Whether this proxy has a `[[Call]]`, decided once when it is created.
+    ///
+    /// Revoking drops the target but does not take `[[Call]]` away, so this cannot be
+    /// re-derived from `target` being `Some`: `typeof p.proxy` has to stay `"function"`
+    /// after `Proxy.revocable(function(){}, {}).revoke()`, and the reference agrees.
+    pub callable: bool,
 }
 
 /// A `Promise`'s state, shared between the promise object and its resolve/reject
@@ -1161,14 +1167,11 @@ impl JsObject {
     pub fn is_callable(&self) -> bool {
         match &self.data.borrow().kind {
             ObjectKind::Function(_) => true,
-            // A proxy is callable exactly when its target is: the `apply` trap is what a
-            // call to it runs, and a target that cannot be called has nothing to forward
-            // to. This is what makes `typeof proxyOfFunction === "function"`.
-            ObjectKind::Proxy(state) => state
-                .borrow()
-                .target
-                .as_ref()
-                .is_some_and(|target| target.is_callable()),
+            // A proxy is callable exactly when its target was when the proxy was built.
+            // Not "when its target still is": revoking drops the target but leaves
+            // `[[Call]]` in place, so a revoked proxy over a function stays a function.
+            // This is what makes `typeof proxyOfFunction === "function"` survive revoke.
+            ObjectKind::Proxy(state) => state.borrow().callable,
             _ => false,
         }
     }
@@ -1200,10 +1203,14 @@ impl JsObject {
     /// the target through the `getPrototypeOf` trap, so copying the target's prototype
     /// here would be a second, disagreeing source of truth.
     pub fn proxy(heap: &js_gc::Heap, target: Gc<JsObject>, handler: Value) -> Gc<JsObject> {
+        // Read callability from the target *now*: it is the one moment the answer is
+        // available, and it outlives revocation.
+        let callable = target.is_callable();
         Gc::new(
             heap,
             JsObject::new(
                 ObjectKind::Proxy(std::rc::Rc::new(std::cell::RefCell::new(ProxyState {
+                    callable,
                     target: Some(target),
                     handler: Some(handler),
                 }))),

@@ -119,6 +119,46 @@ print(r.revoke());
 }
 
 #[test]
+fn a_revoked_proxy_over_a_function_is_still_callable() {
+    // Revoking drops the traps, not `[[Call]]`. The reference agrees, and the difference
+    // is observable three ways: `typeof`, `Function.prototype.toString`, and the fact
+    // that calling it is a `TypeError` about revocation rather than about being
+    // uncallable. Deriving callability from "the target is still set" gets all three
+    // wrong while looking right, which is why the callable-ness is recorded at creation.
+    assert_eq!(
+        eval(
+            r#"
+var r = Proxy.revocable(function named() {}, {});
+print(typeof r.proxy);
+r.revoke();
+print(typeof r.proxy);
+print(JSON.stringify(Function.prototype.toString.call(r.proxy)));
+print(Function.prototype.toString.call(r.proxy) === "function () {\n    [native code]\n}");
+"#
+        ),
+        "function\nfunction\n\"function () {\\n    [native code]\\n}\"\ntrue\n"
+    );
+}
+
+#[test]
+fn function_to_string_rejects_a_receiver_that_is_not_callable() {
+    // §20.2.3.5 step 2. Previously every object answered `[native code]`, which made
+    // `assert_throws(TypeError, ...)` pass while the check did not exist.
+    assert_eq!(
+        eval(
+            r#"
+function kind(f) { try { f(); return "no throw" } catch (e) { return e.constructor.name } }
+print(kind(() => Function.prototype.toString.call({})));
+print(kind(() => Function.prototype.toString.call(new Proxy({}, {}))));
+print(kind(() => Function.prototype.toString.call(1)));
+print(kind(() => Function.prototype.toString.call(function f() {})));
+"#
+        ),
+        "TypeError\nTypeError\nTypeError\nno throw\n"
+    );
+}
+
+#[test]
 fn a_fixed_property_cannot_be_hidden_or_rewritten() {
     // A non-configurable property is the engine's promise, and no handler may break it:
     // not by reporting another value, not by denying it exists, not by deleting it, and

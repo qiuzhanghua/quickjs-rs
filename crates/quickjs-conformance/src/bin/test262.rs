@@ -240,6 +240,21 @@ var $262 = {
 /// recursion). Anything slower than this is a loop the engine failed to break out of.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Address-space ceiling for one test's process, in KiB.
+///
+/// Enforced by the shell that spawns the engine (`ulimit -v`), because the engine's own
+/// `--memory-limit` is accepted and ignored. Sized to be unreachable by a legitimate
+/// test and still small enough that a runaway one cannot exhaust the host.
+const ADDRESS_SPACE_LIMIT_KB: usize = 512 * 1024;
+
+/// Upper bound on the default job count.
+///
+/// The harness runs one process per test, so the default used to scale with the machine:
+/// on a 28-core host that meant 28 concurrent engines, and a single unbounded allocation
+/// in one of them was enough to take the session down. A number this small is plenty,
+/// since the work is dominated by the minority of hangs, which are wall clock.
+const MAX_DEFAULT_JOBS: usize = 8;
+
 /// How a test that was still running at the deadline is recorded.
 ///
 /// Separate from `Fail` on purpose: a hang means the engine failed to break out of a loop
@@ -400,7 +415,24 @@ impl Runner {
             return Outcome::Unsupported(format!("cannot write test source: {error}"));
         }
 
-        let mut command = Command::new(&self.engine);
+        let mut command = Command::new("sh");
+        // Each test gets a hard address-space limit. Without it a single test that
+        // allocates in a loop takes the whole machine down: test262 has tests that build
+        // huge arrays on purpose, and this engine does not enforce `--memory-limit`
+        // (`Runtime::set_memory_limit` stores the value and nothing reads it), so the
+        // allocation goes to the real allocator. Measured consequence: running the suite
+        // with the default job count logged the user out of the machine.
+        //
+        // The limit is applied by `sh` rather than by the engine, so it holds even while
+        // the engine's own limit is decorative. 512 MiB is far above what any single
+        // test262 test needs and far below what it takes to starve the host.
+        command
+            .arg("-c")
+            .arg(format!(
+                "ulimit -v {} 2>/dev/null || true; exec \"$0\" \"$@\"",
+                ADDRESS_SPACE_LIMIT_KB
+            ))
+            .arg(&self.engine);
         if is_module {
             command.arg("-m");
         }
@@ -531,6 +563,7 @@ fn main() {
     let mut show_failures = 15usize;
     let mut timeout = TIMEOUT;
     let mut engine_path: Option<PathBuf> = None;
+    let mut outcomes_path: Option<PathBuf> = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
@@ -547,6 +580,13 @@ fn main() {
                     .next()
                     .and_then(|n| n.parse().ok())
                     .unwrap_or(show_failures);
+            }
+            // One line per test, sorted by name: the machine-readable form of the run.
+            // A summary alone cannot answer "did this change break anything", because
+            // two runs can pass the same number of tests with different test names, and
+            // the aggregate hides exactly the swap that matters.
+            "--outcomes" => {
+                outcomes_path = Some(PathBuf::from(args.next().expect("--outcomes needs a path")))
             }
             other => {
                 eprintln!("unknown option: {other}");
@@ -577,7 +617,11 @@ fn main() {
     let jobs: usize = std::env::var("TEST262_JOBS")
         .ok()
         .and_then(|n| n.parse().ok())
-        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .map(|n| n.get().min(MAX_DEFAULT_JOBS))
+        })
         .unwrap_or(4);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut pass = 0usize;
@@ -586,6 +630,8 @@ fn main() {
     let mut unsupported: BTreeMap<String, usize> = BTreeMap::new();
     let total = files.len();
     let progress = std::env::var_os("TEST262_PROGRESS").is_some();
+    // A per-test record is only worth its allocations when someone asked for it.
+    let record = outcomes_path.is_some();
     let mut batches = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -595,6 +641,7 @@ fn main() {
                 let mut local_failures: Vec<(String, String)> = Vec::new();
                 let mut local_hangs = 0usize;
                 let mut local_unsupported: BTreeMap<String, usize> = BTreeMap::new();
+                let mut local_outcomes: Vec<(String, Outcome)> = Vec::new();
                 loop {
                     let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(path) = files.get(index) else {
@@ -606,7 +653,11 @@ fn main() {
                     let Some(test) = runner.load(path) else {
                         continue;
                     };
-                    match runner.run(&test) {
+                    let outcome = runner.run(&test);
+                    if record {
+                        local_outcomes.push((test.name.clone(), outcome.clone()));
+                    }
+                    match outcome {
                         Outcome::Pass => local_pass += 1,
                         Outcome::Fail(detail) => {
                             if detail == HANG {
@@ -619,22 +670,51 @@ fn main() {
                         }
                     }
                 }
-                (local_pass, local_failures, local_hangs, local_unsupported)
+                (
+                    local_pass,
+                    local_failures,
+                    local_hangs,
+                    local_unsupported,
+                    local_outcomes,
+                )
             }));
         }
         for handle in handles {
             batches.push(handle.join().expect("test worker panicked"));
         }
     });
-    for (local_pass, mut local_failures, local_hangs, local_unsupported) in batches {
+    let mut outcomes_all: Vec<(String, Outcome)> = Vec::new();
+    for (local_pass, mut local_failures, local_hangs, local_unsupported, local_outcomes) in batches
+    {
         pass += local_pass;
         hangs += local_hangs;
         failures.append(&mut local_failures);
+        outcomes_all.extend(local_outcomes);
         for (reason, count) in local_unsupported {
             *unsupported.entry(reason).or_default() += count;
         }
     }
     failures.sort();
+    outcomes_all.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some(path) = outcomes_path.as_ref() {
+        // Tab separated and sorted by test name, so two runs diff as sets and nothing
+        // here depends on the order the workers happened to finish in.
+        let mut file = match std::fs::File::create(path) {
+            Ok(file) => std::io::BufWriter::new(file),
+            Err(error) => {
+                eprintln!("cannot write outcomes to {path:?}: {error}");
+                std::process::exit(2);
+            }
+        };
+        for (name, outcome) in &outcomes_all {
+            let line = match outcome {
+                Outcome::Pass => format!("PASS\t{name}"),
+                Outcome::Fail(_) => format!("FAIL\t{name}"),
+                Outcome::Unsupported(reason) => format!("SKIP\t{name}\t{reason}"),
+            };
+            let _ = writeln!(file, "{line}");
+        }
+    }
     let unsupported_total: usize = unsupported.values().sum();
     let runnable = pass + failures.len();
     println!("== test262 {}", search.display());

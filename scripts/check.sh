@@ -22,3 +22,10 @@ cargo test --offline
 # when the reference interpreter is not built.
 echo "== scripts/lang-diff.py (upstream differential suite)"
 python3 ./scripts/lang-diff.py
+
+# Ordinary program-shaped code, diffed against the reference. Upstream's own suite is
+# small and single-purpose; three of v0.4.0's wrong answers (the `Set` default iterator,
+# `Array.from(Set)`, `break label` inside `for…of`) were found by running code shaped
+# like this and by nothing else. Skips loudly when the reference is not built.
+echo "== scripts/realworld.sh (real-world corpus)"
+./scripts/realworld.sh
