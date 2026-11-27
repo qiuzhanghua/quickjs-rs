@@ -652,6 +652,15 @@ pub struct Interp<'a> {
     /// once at the end, which is also when upstream's line buffering becomes
     /// visible for the cases compared here.
     pub output: String,
+    /// Where `print` also writes, as it goes. `output` keeps the full log for
+    /// [`crate::Context::output`]; this is the live copy, flushed per line.
+    ///
+    /// Both exist on purpose. A host that gives a script a sink sees output *when it
+    /// happens* — which is what a timer callback's `console.log` has to do, and what the
+    /// reference does with `fputs` + `fflush` — while embedders and the 595 assertions in
+    /// this repository keep reading the accumulated `String`. Buffering only (no sink)
+    /// would show a script's output all at once when it finished.
+    pub output_sink: Option<Box<dyn std::io::Write>>,
     /// The most frames that may be live at once.
     pub max_frames: usize,
     /// The microtask queue, but see `Interp::jobs` — shared with the module machinery.
@@ -750,6 +759,7 @@ impl<'a> Interp<'a> {
             native_frames: Vec::new(),
             current_native: None,
             output: String::new(),
+            output_sink: None,
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
             modules: std::collections::BTreeMap::new(),
@@ -1764,6 +1774,70 @@ impl<'a> Interp<'a> {
     ) -> Gc<JsObject> {
         let function = self.new_native(name, length, func);
         function.set_constructible(true);
+        function
+    }
+
+    /// A new host function object: a native closure that carries its own state.
+    ///
+    /// Same observable surface as [`Interp::new_native`] — `name`, `length` and, for a
+    /// constructor, `prototype` — but the body is a closure, so it can hold an open-file
+    /// table or a timer queue. See [`crate::object::HostFn`] for the one rule that makes
+    /// this safe: the closure must not capture a `Gc`.
+    pub fn new_host_function(
+        &self,
+        name: impl Into<String>,
+        length: u32,
+        func: crate::object::HostFn,
+    ) -> Gc<JsObject> {
+        self.new_host_inner(name.into(), length, func, false)
+    }
+
+    /// A host constructor: `new` hands it `this = undefined`, so it validates its
+    /// arguments before building an instance, exactly like [`Interp::new_native_ctor`].
+    pub fn new_host_ctor(
+        &self,
+        name: impl Into<String>,
+        length: u32,
+        func: crate::object::HostFn,
+    ) -> Gc<JsObject> {
+        let function = self.new_host_inner(name.into(), length, func, true);
+        function.set_constructible(true);
+        // A constructor needs a `prototype` for `new` and for `instanceof`; the body
+        // installs its own methods on it, so it starts as a plain object.
+        let proto = JsObject::ordinary(self.heap, Some(self.realm.object_proto.clone()));
+        function.define(
+            "prototype",
+            Property {
+                value: Some(Value::Object(proto)),
+                writable: true,
+                enumerable: false,
+                configurable: false,
+                ..Property::default()
+            },
+        );
+        function
+    }
+
+    fn new_host_inner(
+        &self,
+        name: String,
+        length: u32,
+        func: crate::object::HostFn,
+        own_instance: bool,
+    ) -> Gc<JsObject> {
+        let function = JsObject::function(
+            self.heap,
+            Some(self.realm.function_proto.clone()),
+            Callable::Host {
+                func: std::rc::Rc::new(std::cell::RefCell::new(func)),
+                own_instance,
+            },
+        );
+        function.define(
+            "length",
+            Property::name_or_length(Value::Int(length as i32)),
+        );
+        function.define("name", Property::name_or_length(self.string(name)));
         function
     }
 
@@ -4225,6 +4299,9 @@ impl<'a> Interp<'a> {
         let callable = function.with(|data| match &data.kind {
             ObjectKind::Function(callable) => match callable {
                 Callable::Native { func, .. } => Some(NativeCall::Native(*func)),
+                // The `Rc` is cloned out so the borrow of this object's data is released
+                // before the closure runs: the closure may touch the same object.
+                Callable::Host { func, .. } => Some(NativeCall::Host(func.clone())),
                 Callable::Bound {
                     target,
                     this,
@@ -4307,6 +4384,34 @@ impl<'a> Interp<'a> {
             _ => None,
         });
         match callable {
+            Some(NativeCall::Host(func)) => {
+                // Same frame bookkeeping as a `Native`, so a stack trace shows the host
+                // function by name rather than stopping at the caller.
+                let frame_less = function
+                    .own_property("_frame_less")
+                    .and_then(|property| property.value)
+                    .is_some_and(|value| value.to_boolean());
+                let name = function
+                    .own_property("name")
+                    .and_then(|property| property.value)
+                    .map(|value| value.to_js_string())
+                    .unwrap_or_default();
+                let outer = if frame_less {
+                    None
+                } else {
+                    self.native_frames.push((name, function.clone()));
+                    Some(self.current_native.replace(function.clone()))
+                };
+                let result = {
+                    let mut body = func.borrow_mut();
+                    body(self, this, &args)
+                };
+                if !frame_less {
+                    self.native_frames.pop();
+                    self.current_native = outer.flatten();
+                }
+                result
+            }
             Some(NativeCall::Native(func)) => {
                 // A function marked `_frame_less` is one the reference implements
                 // without a call frame — `eval` is the only one so far.
@@ -8584,6 +8689,9 @@ fn bytecode_of(function: &Gc<JsObject>) -> Option<(Gc<CompiledCode>, Gc<ClosureE
 /// A native call target, extracted before the call so no borrow is held.
 enum NativeCall {
     Native(NativeFn),
+    /// A host closure. The `Rc` was cloned out of the function object, so calling it does
+    /// not hold that object's `RefCell` borrow.
+    Host(std::rc::Rc<std::cell::RefCell<crate::object::HostFn>>),
     Bytecode(Gc<CompiledCode>, Gc<ClosureEnv>),
     Bound {
         target: Value,

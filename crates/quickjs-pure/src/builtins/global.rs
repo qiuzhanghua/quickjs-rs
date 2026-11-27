@@ -84,6 +84,13 @@ fn js_print(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<V
     }
     line.push('\n');
     interp.output.push_str(&line);
+    // Straight through to the host, flushed per line, so output is visible as it happens
+    // rather than when the script ends. Dropping the error is deliberate: `print` cannot
+    // report a broken pipe to the script, and the reference ignores write failures too.
+    if let Some(sink) = interp.output_sink.as_mut() {
+        let _ = sink.write_all(line.as_bytes());
+        let _ = sink.flush();
+    }
     Ok(Value::Undefined)
 }
 

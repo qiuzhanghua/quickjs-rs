@@ -286,8 +286,17 @@ impl<'rt> Context<'rt> {
     /// An ordinary script's `if (typeof scriptArgs != "undefined")` branch therefore never
     /// ran, and `examples/pi_bigint.js` printed a thousand digits of pi where the
     /// reference printed `usage: pi n_digits`.
+    ///
+    /// Works whether or not the interpreter exists yet. The realm is built on first use,
+    /// so a host that installs something *else* first (an output sink, a host function)
+    /// would otherwise create it early and have these arguments silently dropped — which
+    /// is exactly what `print(JSON.stringify(scriptArgs))` caught.
     pub fn set_script_args(&mut self, args: Vec<String>) {
-        self.script_args = Some(args);
+        if let Some(interp) = self.interp.as_mut() {
+            install_script_args(interp, &args);
+        } else {
+            self.script_args = Some(args);
+        }
     }
 
     /// The runtime this context belongs to.
@@ -308,21 +317,8 @@ impl<'rt> Context<'rt> {
         self.interp.get_or_insert_with(|| {
             let mut interp = Interp::new(heap);
             interp.module_loader = loader;
-            // `scriptArgs` is a host addition, like `print`, so it is installed here
-            // rather than in the realm's builtins. `qjs` defines it only when there is
-            // something to put in it, which is why `-e` with no trailing arguments still
-            // leaves it as an empty array rather than absent.
             if let Some(args) = script_args {
-                let elements = args
-                    .iter()
-                    .map(|arg| interp.string(arg.clone()))
-                    .collect::<Vec<_>>();
-                let array = interp.new_array(elements);
-                interp
-                    .realm
-                    .global
-                    .clone()
-                    .define_data("scriptArgs", Value::Object(array));
+                install_script_args(&mut interp, &args);
             }
             interp
         })
@@ -396,4 +392,151 @@ impl<'rt> Context<'rt> {
     pub fn last_value(&self) -> &Value {
         &self.last_value
     }
+
+    // -----------------------------------------------------------------------
+    // Host surface: what an embedding needs to expose its own functions.
+    //
+    // These are narrow on purpose. Handing the host `&mut Interp` would let it hold a
+    // borrow that outlives the `Context`, and every method here would have to be
+    // re-derived at each call site. Each one below is a single well-defined operation.
+    // -----------------------------------------------------------------------
+
+    /// Install `value` on the global object as `name`.
+    ///
+    /// A host module is one object with functions on it, so mounting `std` is a single
+    /// `set_global` rather than a function per name — which is what
+    /// [`Context::set_global_function`] does.
+    pub fn set_global(&mut self, name: &str, value: Value) -> Result<()> {
+        let global = self.interp().realm.global.clone();
+        global.define(name, Property::with_attributes(value, true, false));
+        Ok(())
+    }
+
+    /// Install `f` on the global object as `name`.
+    ///
+    /// This is how a host module is built: `std.loadFile` is a global function the host
+    /// registers before the script runs. The closure may capture Rust state but **must
+    /// not capture a [`Gc`]** — see [`crate::object::HostFn`].
+    pub fn set_global_function(
+        &mut self,
+        name: &str,
+        length: u32,
+        f: crate::object::HostFn,
+    ) -> Result<()> {
+        let interp = self.interp();
+        let function = interp.new_host_function(name, length, f);
+        let global = interp.realm.global.clone();
+        global.define(
+            name,
+            Property::with_attributes(Value::Object(function), true, false),
+        );
+        Ok(())
+    }
+
+    /// Install `f` on the global object as the constructor `name`.
+    ///
+    /// Unlike [`Context::set_global_function`] this one gets a `prototype` object, which
+    /// it owns and which `new` uses — the shape a host class like `std.File` needs.
+    /// Returns the constructor so the host can put methods on its `prototype`.
+    pub fn set_global_constructor(
+        &mut self,
+        name: &str,
+        length: u32,
+        f: crate::object::HostFn,
+    ) -> Result<Value> {
+        let interp = self.interp();
+        let function = interp.new_host_ctor(name, length, f);
+        let global = interp.realm.global.clone();
+        global.define(
+            name,
+            Property::with_attributes(Value::Object(function.clone()), true, false),
+        );
+        Ok(Value::Object(function))
+    }
+
+    /// Call a JavaScript function from Rust.
+    ///
+    /// A thrown value comes back as [`Error::Exception`], so a host callback can report
+    /// the script's own error rather than swallowing it.
+    pub fn call(&mut self, function: Value, this: Value, args: Vec<Value>) -> Result<Value> {
+        let interp = self.interp();
+        match interp.call_value(function, this, args) {
+            Ok(value) => Ok(value),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// A fresh empty object, for the host to hand back to a script.
+    pub fn new_object(&mut self) -> Value {
+        let interp = self.interp();
+        let proto = interp.realm.object_proto.clone();
+        Value::Object(interp.new_object(Some(proto)))
+    }
+
+    /// Set `name` on `object` to `value`, as a plain writable property.
+    pub fn set_property(&mut self, object: &Value, name: &str, value: Value) -> Result<()> {
+        let Some(object) = object.as_object() else {
+            return Err(Error::Exception("set_property on a non-object".to_string()));
+        };
+        object.define(name, Property::with_attributes(value, true, true));
+        Ok(())
+    }
+
+    /// A string value.
+    pub fn new_string(&mut self, text: &str) -> Value {
+        let interp = self.interp();
+        interp.string(text)
+    }
+
+    /// A number value.
+    pub fn new_number(&mut self, number: f64) -> Value {
+        Value::Float(number)
+    }
+
+    /// A boolean value.
+    pub fn new_boolean(&mut self, value: bool) -> Value {
+        Value::Bool(value)
+    }
+
+    /// Route `print`'s output to `sink` as it happens, in addition to the buffer
+    /// [`Context::output`] reads.
+    ///
+    /// Without a sink a script's output appears only when it finishes. A timer callback
+    /// printing *after* earlier output has to be observably later, which needs the write
+    /// to go out at the moment `print` runs.
+    pub fn set_output_sink(&mut self, sink: Box<dyn std::io::Write>) {
+        self.interp().output_sink = Some(sink);
+    }
+
+    /// Take the buffered output, leaving the buffer empty.
+    ///
+    /// For a host that keeps running turns: [`Context::output`] grows without bound, so
+    /// draining after each turn bounds the memory without changing what any one
+    /// assertion sees.
+    pub fn take_output(&mut self) -> String {
+        match self.interp.as_mut() {
+            Some(interp) => std::mem::take(&mut interp.output),
+            None => String::new(),
+        }
+    }
+}
+
+/// Put `scriptArgs` on the global object.
+///
+/// `scriptArgs` is a host addition, like `print`, so it is installed from the host side
+/// rather than by the realm's builtins. `qjs` defines it only when there is something to
+/// put in it, which is why `-e` with no trailing arguments still leaves an empty array
+/// rather than an absent binding.
+fn install_script_args(interp: &mut Interp<'_>, args: &[String]) {
+    let elements = args
+        .iter()
+        .map(|arg| interp.string(arg.clone()))
+        .collect::<Vec<_>>();
+    let array = interp.new_array(elements);
+    interp
+        .realm
+        .global
+        .clone()
+        .define_data("scriptArgs", Value::Object(array));
 }

@@ -98,8 +98,9 @@ fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode
     // Stack traces name the script, so the context has to know it before compiling.
     ctx.set_script_name(filename);
     let result = ctx.eval(source);
-    let output = ctx.output().to_string();
-    print!("{output}");
+    // The sink already wrote every line as it was printed; the buffer is only a copy and
+    // would grow without bound in a long-running script, so it is drained here.
+    ctx.take_output();
     let _ = std::io::stdout().flush();
     match result {
         // Upstream `qjs -e '1+1'` prints nothing: `-e` reports only what the script
@@ -301,6 +302,10 @@ fn main() -> ExitCode {
 
     let mut ctx = quickjs::Context::new(&rt);
     ctx.set_module_loader(Box::new(modules::FileModuleLoader::new()));
+    // `print` writes straight to stdout, flushed per line, the way the reference does with
+    // `fputs` + `fflush`. Without it a script's output would only appear once it finished,
+    // which makes a timer callback's output indistinguishable from the script body's.
+    ctx.set_output_sink(Box::new(std::io::stdout()));
     // `scriptArgs` is the positional list as `qjs` defines it: element 0 is the script
     // when a script was named, and the trailing arguments when `-e` supplied the source.
     ctx.set_script_args(opts.script_args.clone());
@@ -337,8 +342,8 @@ fn main() -> ExitCode {
 /// again from somewhere else finds one record rather than two.
 fn run_module(ctx: &mut quickjs::Context<'_>, path: &str) -> ExitCode {
     let result = ctx.eval_module(path);
-    let output = ctx.output().to_string();
-    print!("{output}");
+    // Written live by the sink; drained rather than reprinted.
+    ctx.take_output();
     let _ = std::io::stdout().flush();
     match result {
         Ok(_) => ExitCode::SUCCESS,

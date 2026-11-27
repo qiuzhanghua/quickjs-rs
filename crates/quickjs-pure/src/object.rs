@@ -428,6 +428,34 @@ impl Trace for Property {
     }
 }
 
+/// A host function: a native function plus the state it captured.
+///
+/// `NativeFn` is a bare `fn` pointer, so a builtin that needs state (an open-file table,
+/// a timer queue, a sink to write to) has nowhere to put it. `HostFn` boxes the closure
+/// instead, and [`Callable::Host`] keeps it on the function object.
+///
+/// # Why the closure must not capture a `Gc`
+///
+/// The collector finds live objects by walking the object graph through [`Trace`]. A
+/// closure is opaque Rust, so nothing inside it is walked: a `Gc<JsObject>` captured here
+/// would be invisible to the collector and could be freed while the closure still holds
+/// it — a use-after-free.
+///
+/// Keep Rust-side state (file descriptors, timer ids, deadlines) in the closure, and keep
+/// every JavaScript value somewhere the collector already scans: a property of a real JS
+/// object, or a table hanging off [`Interp`]. `os.setTimeout(fn, ms)` stores `fn` in the
+/// interpreter's timer table for exactly this reason.
+///
+/// [`Trace`]: js_gc::Trace
+/// [`Interp`]: crate::interp::Interp
+pub type HostFn = Box<
+    dyn for<'i> FnMut(
+        &mut crate::interp::Interp<'i>,
+        Value,
+        &[Value],
+    ) -> crate::interp::JsResult<Value>,
+>;
+
 /// A native (Rust) function reachable from JavaScript.
 ///
 /// It receives the interpreter so a builtin can allocate (which needs the heap),
@@ -473,6 +501,18 @@ pub enum Callable {
         /// with real validation need to: `new Promise(nonCallable)` and `new DataView(…)`
         /// must refuse the argument before a throwing `prototype` getter can run. The rest
         /// keep the simpler shape where `new` has already made the object.
+        own_instance: bool,
+    },
+    /// A host function: a native closure that carries its own state.
+    ///
+    /// Behind an `Rc<RefCell<…>>` because the closure has to be *called* with
+    /// `&mut Interp`, and the call site would otherwise still be holding a borrow of this
+    /// object's data — the closure itself may reach the same object. Cloning the `Rc` out
+    /// and dropping the borrow first is what keeps that from panicking.
+    Host {
+        /// The body, with whatever it captured.
+        func: std::rc::Rc<std::cell::RefCell<HostFn>>,
+        /// Whether this constructor builds its own instance; see [`Callable::Native`].
         own_instance: bool,
     },
     /// The `revoke` function `Proxy.revocable` hands back.
@@ -596,6 +636,9 @@ impl Trace for Callable {
                 }
             }
             Callable::Native { .. } => {}
+            // Nothing to trace, by construction: the closure must not hold a `Gc`. See
+            // `HostFn`'s documentation.
+            Callable::Host { .. } => {}
             Callable::Revoker(slots) => slots.borrow().trace(tracer),
             Callable::PromiseResolve(promise) | Callable::PromiseReject(promise) => {
                 tracer.visit(promise)

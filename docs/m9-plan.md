@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**待开工**（v0.6.1 之后的第一项）
+状态：**M9a 已完成**（提交见 git log），M9b/c/d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -285,15 +285,25 @@ os.exec(["cat"], { block: false })                  // 再 kill(pid, SIGTERM)
 > `--memory-limit`/`--stack-size` 严格说是 M9 的邻域而不是核心。**建议拆出去**，
 > 见第 6 节。
 
-### 4.2 REPL
+### 4.2 REPL —— 照参考的 `repl.js`（1292 行）
 
-`main.rs:329` 现在是 `pending("interactive REPL", ...)`。参考实现的 `repl.js` 有 1292 行，
-大半是行编辑、历史、补全。**建议不照抄**：M9 只需要一个能用的 REPL——读一行、求值、
-打印、循环，`Ctrl-D` 退出，出错不退出循环。行编辑留给后面的里程碑，或用几百行的最小实现。
+`main.rs` 现在是 `pending("interactive REPL", ...)`。**决定照参考实现**，行编辑、历史、
+补全都要。
 
-REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`。fd 多路已决定不做（2.2），
-所以 REPL 只能走**面向行的** readline：`ttySetRaw` 与行编辑都不做，靠 `stdin` 的默认
-行缓冲，`Ctrl-D`（读到 EOF）退出。这和 4.2 开头"不建议照抄 `repl.js`"的结论一致。
+原判断"`ttySetRaw` 与 `setReadHandler` 需要 fd 多路 + termios，所以只能面向行"**不成立**。
+逐条核实过 `repl.js` 的实际用法：
+
+| 依赖 | `repl.js` 怎么用 | 原判断 | 实际 |
+|---|---|---|---|
+| `setReadHandler`（L137、L861） | 唯一用途是"stdin 有字节时读一次"，回调体就是 `os.read(fd, buf, 0, len)` 再逐个 `handle_byte` | 必须 fd 多路 | **可替代**：raw 模式下阻塞读 1 字节，循环喂 `handle_byte`，语义等价 |
+| `ttySetRaw`（L128） | 关回显、关行缓冲 | 必须 termios / `libc` | **可替代**：`Command::new("stty").args(["raw", "-echo"])` + `Stdio::inherit()`，零 `unsafe`、零 `libc` |
+| `os.signal(SIGINT)`（L133） | 装上后调 `handle_byte(3)` | 需要信号系统 | **不需要**：raw 模式下 Ctrl-C 就是字节 3，`repl.js` 自己就是按字节处理的 |
+
+即"不用 fd 多路、不用 `libc`、不用 `unsafe`"也能拿全行编辑/历史/补全。代价只有 Windows：
+`stty` 不存在，降级为行缓冲（NFR-8 仍满足，功能退化而非不可用）。
+
+**2.2 的"fd 多路不做"结论不变**，但它挡住的只是 `os.setReadHandler`/`setWriteHandler` 这两个
+API 和 `test_rw_handler.js`，**不挡住 REPL**——REPL 不需要在一堆 fd 里等，它只需要读 stdin。
 
 ### 4.3 选项矩阵验收
 
@@ -324,7 +334,7 @@ REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`。fd 多路已决定
 
 | 块 | 内容 | 预估 | 依赖 |
 |---|---|---|---|
-| **M9a** | 宿主 API：`Callable::Host`、`HostFn`、`Context::set_global_function`/`call`、`output` 的增量取走 | 中 | 无 |
+| ~~**M9a**~~ | ~~宿主 API~~ — **已完成**，见第 8 节 | 中 | 无 |
 | **M9b** | `std` 模块（纯 Rust 部分）+ 全局 helper | 大 | M9a |
 | **M9c** | 事件循环：`Task`、`schedule_timer`、`run_one_turn`、CLI 主循环 | 中 | M9a |
 | **M9d** | `os` 模块 + REPL + CLI 选项 | 大 | M9b、M9c |
@@ -336,13 +346,15 @@ REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`。fd 多路已决定
 
 ---
 
-## 7. 需要拍板的两个决定
+## 7. 需要拍板的两个决定 — 已定
 
-只有这两个还会改变实现路径，**动手前需要定**：
-
-1. **`console.log` 的输出路径**（1.4）：保留内存缓冲、每轮事件循环取走一次（改测试少），
-   还是改成 `Box<dyn Write>` 直写（与参考一致，但要改 30+ 个测试）？
-2. **REPL 的野心**（4.2）：最小可用（几百行，无行编辑），还是照参考的 `repl.js`（1292 行）？
+1. **`console.log` 的输出路径**（1.4）：**定了 B，直写**。`Interp` 加
+   `output_sink: Option<Box<dyn Write>>`，`print` 每行写进去并 `flush`，与参考的
+   `fputs` + `fflush` 一致。同时**保留** `output: String` 累积全量——它是 `Context::output()`
+   的来源，**595 处测试断言因此一处没改**。缓冲无界增长由 `Context::take_output()` 解决，
+   CLI 每次跑完取走（已写入 stdout，取走只是释放内存）。
+2. **REPL 的野心**（4.2）：**定了照参考的 `repl.js`**。见 4.2 的更正——原判断"必须 fd 多路 +
+   termios"不成立。
 
 ### 已定，不再讨论
 
@@ -352,3 +364,43 @@ REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`。fd 多路已决定
 
 我的建议：**保留缓冲 + 最小 REPL**，即 M9 交付 timer 与文件/进程 API，把 fd 多路和行编辑
 明确列为“不做”（和 `Atomics` 一样写进 README 的“不做”清单，而不是留成没说清的缺口）。
+
+---
+
+## 8. M9a 已完成（宿主 API）
+
+### 8.1 交付
+
+| 项 | 位置 |
+|---|---|
+| `HostFn`（带环境的原生函数） | `object.rs`，文档写死"闭包不得捕获 `Gc`"及其原因 |
+| `Callable::Host { func, own_instance }` | `object.rs`，`Trace` 分支为空并注明依据 |
+| `Interp::new_host_function` / `new_host_ctor` | `interp.rs` |
+| `Context::set_global_function` / `set_global_constructor` | `lib.rs` |
+| `Context::set_global` / `new_object` / `set_property` / `new_string` / `new_number` / `new_boolean` | `lib.rs` |
+| `Context::call` | `lib.rs` |
+| `Context::set_output_sink` / `take_output` | `lib.rs` + `builtins/global.rs` |
+| 验收测试 8 条 | `crates/quickjs-pure/tests/host.rs` |
+
+### 8.2 三个实现细节与原因
+
+1. **闭包要放在 `Rc<RefCell<…>>` 里**，不是 plan 写的裸 `Box`。调用时要 `&mut Interp`，
+   而调用点此刻正持有该函数对象 `data` 的 `RefCell` 借用；闭包本身可能再次碰到同一个对象。
+   把 `Rc` 克隆出去、先释放借用再调用，才不会 panic。
+
+2. **`Trace` 什么都不做是安全的，但只在一条约定下成立**：闭包捕获 `Gc` 会被回收器看不见，
+   导致 use-after-free。这条约定写进了 `HostFn` 的文档，并有测试
+   （`a_host_function_and_its_state_survive_collection`）显式 `run_gc()` 后仍能用。
+   注意那条测试断言了 `collected > 0`——否则它什么都没证明。
+
+3. **`set_script_args` 原本会被静默丢弃**。`Context::interp()` 在首次使用时把
+   `script_args`/`module_loader` take 走；`set_output_sink` 提前创建了 interpreter，
+   于是之后设置的 `scriptArgs` 无处可去，`print(JSON.stringify(scriptArgs))` 直接
+   `ReferenceError`。现在 `set_script_args` 对已存在的 interpreter 也会安装。
+   这是 `Context` 的一个通用陷阱（任何"先装别的再设参数"的宿主都会踩），已在文档注明。
+
+### 8.3 与 plan 的一处偏差
+
+plan 1.4 里 B 的代价写的是"要改 30+ 个测试、581 处断言"。实际不必：
+保留 `output: String` 作为 `output()` 的来源，**另加** sink 直写。
+两者并存，实时性和测试 API 都拿到，代价是 CLI 需要 `take_output()` 防无界增长。
