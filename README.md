@@ -37,18 +37,24 @@
 | M7 | 正则引擎 + Unicode 表 | 🟡 `RegExp` 可用，Unicode 属性表（`\p{…}`）已补（606/613）；缺 `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性 |
 | M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
 | ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ **不做**（见下） |
-| **M9** | **`std`/`os` 宿主模块 + 事件循环 + CLI + REPL** | ⬜ **下一项**（拆解见 [`docs/m9-plan.md`](docs/m9-plan.md)） |
+| ~~M9.5~~ | ~~`os.setReadHandler`/`setWriteHandler`~~ | ❌ **不做**（见下） |
+| **M9** | **`std`/`os` 宿主模块 + 事件循环（timer）+ CLI + REPL** | ⬜ **下一项**（拆解见 [`docs/m9-plan.md`](docs/m9-plan.md)；不含 fd 多路） |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
 | M12 | C ABI 层 | ⬜ |
 | ~~M13~~ | ~~`Temporal`~~ | ❌ **不做**（见下） |
 | ~~M14~~ | ~~`Intl`~~ | ❌ **不做**（见下） |
 
-**三项明确不做，理由不是"难"，而是"做了也不是真的"。**
+**四项明确不做，理由不是"难"，而是"做了也不是真的"。**
 
 - **`Atomics` / `SharedArrayBuffer`**：本引擎单线程，没有 Worker。`Atomics.wait` 无法真的
   阻塞，`Atomics.notify` 没有等待者——实现出来的会是一个永不执行其语义的 API 外壳。这正是
   本项目一直在修的那类问题（"接受即忽略，等于假的安全"）。487 条用例继续按 feature 跳过。
+- **`os.setReadHandler` / `os.setWriteHandler`（fd 多路复用）**：`quickjs-libc.c` 用一次
+  `poll(2)` 同时等 fd 和最近的 timer。NFR-7 禁止 `libc`，而零依赖的两条替代路线代价都过大：
+  手写 syscall 要绑死 unix（NFR-8 还要 Windows）且是 `unsafe`；用读线程模拟则注销不掉
+  （`drop` 后线程仍卡在 `read()`），stdin 会永久占一个线程。M9 只做 timer 一条腿，
+  `test_rw_handler.js` 继续跳过。详见 [`docs/m9-plan.md`](docs/m9-plan.md) 第 2.2 节。
 - **`Temporal`**（4624 条）：独立于引擎核心的巨型 API，对"qjs 能不能跑真实程序"几乎无影响
   ——真实程序极少用。它与 M9 争夺同一段时间，而 M9 决定这个引擎能不能被嵌入使用。
 - **`Intl`**：需要 CLDR 数据与 ICU 级别的区域设置支持，纯 Rust 零依赖的前提不成立。

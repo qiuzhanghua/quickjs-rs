@@ -1,7 +1,8 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
 状态：**待开工**（v0.6.1 之后的第一项）
-验收基准：参考实现 `tests/test_std.js` 通过、`tests/test_rw_handler.js` 通过、CLI 选项矩阵与 `qjs.c` 一致
+验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
+`tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
 ---
 
@@ -128,13 +129,16 @@ loop {
 `js_os_poll` 做三件事：取最近一个到期的 timer；没有到期的就阻塞等 fd 可读（stdin、
 pipe）或等到最近 timer 到期；没有 timer 也没有 fd 就返回 -1 让循环退出。
 
+**我们只抄 timer 那条腿。** `js_os_poll` 里 fd 那部分不实现（理由见本节末尾），所以
+"等"这件事退化为"睡到最近一个 timer 到期"，`poll(2)` 对应的位置就是
+`std::thread::sleep`——零依赖、全平台、无 `unsafe`。
+
 **引擎这边要新增的东西：**
 
 ```rust
-/// 宏任务：一次 `setTimeout` 到期，或一个 fd 就绪。
+/// 宏任务：一次 `setTimeout`/`setInterval` 到期。
 pub enum Task {
     Timer { id: u64, callback: Value, due_at: Instant, repeat: Option<Duration> },
-    Io { fd: i32, readable: bool },
 }
 ```
 
@@ -148,19 +152,54 @@ pub fn cancel_timer(&mut self, id: u64) -> bool;
 pub fn run_one_turn(&mut self) -> JsResult<bool>;
 ```
 
-`run_one_turn` 是**纯逻辑**，不做 IO。真正的"等 fd"留在 CLI 层，因为 `quickjs-pure`
+`run_one_turn` 是**纯逻辑**，不做阻塞等待。真正的 `sleep` 留在 CLI 层，因为 `quickjs-pure`
 是零依赖的（今天六个 crate 的外部依赖全为空，只有 workspace 内部依赖，这一点不能在
-M9 悄悄破掉）。fd 轮询有三条路：
+M9 悄悄破掉）。
 
-1. 引入 `libc` 调 `poll(2)` —— 一个依赖，最简单。
-2. 用 `std::os::unix::io` + 手写 `syscall` —— 零依赖，但要 `unsafe`，且绑死 unix。
-3. 不做 fd 轮询（见下）。
+**决定：M9 不做 fd 多路复用。** 这不是开放问题，`docs/requirements.md:172` 的 NFR-7
+已经写死：“runtime 零第三方 crate（`libc` 也避免，用 `std` + 少量 `sys` 封装）”。
+所以“为 `poll(2)` 破例引入 `libc`”这个选项根本不存在，不用再纠结。
 
-**要不要为 M9 破零依赖，是一个需要你拍板的决定。**
+排除掉 `libc` 之后还剩两条路，都不通：
 
-> 替代方案：M9 只做 timer，不做 `os.setReadHandler`/`setWriteHandler`。这样零依赖保得住，
-> `test_std.js` 除了 `test_os_exec` 之外都能过，但 `test_rw_handler.js` 过不了。
-> 参考实现的 `std` 也确实主要在 timer 和 fd 之间切换。
+1. **手写 `syscall`**：零依赖，但 Rust std 没有稳定的 `poll`/`select`，要自己声明
+   syscall 号，绑死 unix，且 Windows 得另起一套 `WaitForMultipleObjects`。NFR-8 要求
+   Windows 支持，等于写两套 `unsafe`。
+2. **用线程模拟多路**：`std::io::pipe()`（Rust 1.87+）给每个 fd 配一个阻塞读线程，
+   `mpsc::recv_timeout` 当计时器。**实测能跑通**（30ms timer 赢过 120ms IO），但**注销
+   不可靠**——`drop(rx)` 之后读线程仍卡在 `read()` 里（`is_finished() == false`），必须
+   关掉对端才能释放。而 stdin 这类对端不归脚本管的 fd 会**永久占住一个线程**。参考实现
+   一个 `poll(2)` 就能同时等 fd 和 timer，这里要付线程数 = fd 数的代价，且关不掉。
+
+两条路的代价都超出 M9 该付的。**`os.setReadHandler`/`setWriteHandler` 明确列入“不做”**，
+和 `Atomics` 一样写进 README 的“不做”清单，而不是留成没说清的缺口。代价是
+`test_rw_handler.js` 过不了（它有 4 处 `setReadHandler`/`setWriteHandler`）。另外提一句：
+`scripts/lang-diff.py:81` 现在把该文件的跳过理由写成 "needs Proxy (no Proxy in the realm yet)"，
+而 `Proxy` 早已实现（`builtins/mod.rs:90` 一带）——这条理由过时了，M9 动手时顺手改成
+"needs fd multiplexing (`poll(2)`), not implemented"。
+
+> 参考实现里 `std` 确实主要在 timer 和 fd 之间切换，砍掉 fd 之后事件循环只剩 timer
+> 一条腿——但这一条腿正是 `setTimeout`/`sleepAsync`/`performance.now` 需要的，M9 的
+> 目标（让“等一会儿再跑”有执行者）不受影响。
+
+**外部佐证：rquickjs 也不做这事。** 调研过 `DelSkayn/rquickjs`（现成最大的 Rust↔QuickJS
+绑定），它不是重写引擎，是把 C 版 `quickjs.c` vendor 进来包一层 FFI。它的 `build.rs:143`
+只编译 4 个文件：
+
+```rust
+let source_files = ["libregexp.c", "libunicode.c", "quickjs.c", "dtoa.c"];
+```
+
+`quickjs-libc.c` **在包里躺着但没编**，预生成的绑定里也搜不到任何 `js_os_*` / `js_std_loop`
+符号。也就是说它同样没有 `std`/`os`、没有事件循环、没有 `poll(2)`：它的 `execute_pending_job()`
+是**需要宿主手动调**的裸函数，`setTimeout` 只写在 `#[cfg(test)]` 里、靠 tokio 的
+`tokio::time::sleep` 实现。**结论：那个生态里没有"零依赖 fd 多路"的现成范例可以照抄**，
+它走的是"把定时器和事件循环外包给 tokio"这条路，而 tokio 对我们的 NFR-7 是一票否决。
+
+（它唯一值得借鉴的是 M9a：`Func::new` 把闭包 `Box` 起来作为函数对象自带的 opaque 数据，
+生命周期交给 JS 对象的 finalizer。但那依赖 `JS_NewClassID` 给 `RustFunction` 分配 class ID
+和 finalizer，而我们的 `crates/quickjs-pure/src/` 里还没有任何自定义 class 机制——
+详见 1.1。）
 
 ### 2.3 `os.sleepAsync` 与 `Atomics.wait`
 
@@ -204,7 +243,7 @@ M9 悄悄破掉）。fd 轮询有三条路：
 | 终端 | `isatty`、`ttyGetWinSize`、`ttySetRaw` | `ttySetRaw` 是 REPL 行编辑的前提 |
 | 定时器 | `now`、`setTimeout`、`clearTimeout`、`sleepAsync`、`sleep` | `now` 是 `performance.now()` 的来源 |
 | 并发 | `signal`、`pipe`、`kill`、`dup`、`dup2`、`getpid`、`waitpid`、`exec` | **`exec` 在 `test_std.js` 里用了 5 次**，见下 |
-| IO 多路 | `setReadHandler`、`setWriteHandler` | 见 2.2 的零依赖问题 |
+| IO 多路 | ~~`setReadHandler`、`setWriteHandler`~~ | **M9 不做**，见 2.2：NFR-7 禁 `libc`，零依赖的两条替代路线代价过高 |
 | 常量 | `platform`、`O_*`、`SIG*`、`S_IF*` | `platform` 是字符串 |
 
 **`os.exec` 的选项面比一个函数名所能暗示的多**（`test_std.js:241` 逐条压这些）：
@@ -252,7 +291,9 @@ os.exec(["cat"], { block: false })                  // 再 kill(pid, SIGTERM)
 大半是行编辑、历史、补全。**建议不照抄**：M9 只需要一个能用的 REPL——读一行、求值、
 打印、循环，`Ctrl-D` 退出，出错不退出循环。行编辑留给后面的里程碑，或用几百行的最小实现。
 
-REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`（见 2.2 的零依赖权衡）。
+REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`。fd 多路已决定不做（2.2），
+所以 REPL 只能走**面向行的** readline：`ttySetRaw` 与行编辑都不做，靠 `stdin` 的默认
+行缓冲，`Ctrl-D`（读到 EOF）退出。这和 4.2 开头"不建议照抄 `repl.js`"的结论一致。
 
 ### 4.3 选项矩阵验收
 
@@ -272,8 +313,8 @@ REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`（见 2.2 的零依�
 | 3 | 事件循环 + timer | `test_std.js` 的 `test_timer`、`test_async_promise_rejection` |
 | 4 | `os.exec`/`waitpid` | `test_std.js` 的 `test_os_exec` |
 | 5 | `os` 文件族 | `test_std.js` 的 `test_os` |
-| 6 | IO 多路 | `test_rw_handler.js`（**依赖第 2.2 的零依赖决定**） |
-| 7 | CLI 选项 | `--std` 可用；`-i` 进出 REPL |
+| ~~6~~ | ~~IO 多路~~ | ~~`test_rw_handler.js`~~ — **不做**（2.2），整个文件留在跳过表 |
+| 6 | CLI 选项 | `--std` 可用；`-i` 进出 REPL（面向行，无行编辑） |
 
 `scripts/check.sh` 要新增：`test_std.js` 的逐字节 diff（和 `lang-diff.py` 一样与参考对拍）。
 
@@ -295,16 +336,19 @@ REPL 的难点其实是 `os.ttySetRaw` 与 `setReadHandler`（见 2.2 的零依�
 
 ---
 
-## 7. 需要你拍板的三个决定
+## 7. 需要拍板的两个决定
 
-这三个都会改变实现路径，**动手前需要定**：
+只有这两个还会改变实现路径，**动手前需要定**：
 
 1. **`console.log` 的输出路径**（1.4）：保留内存缓冲、每轮事件循环取走一次（改测试少），
    还是改成 `Box<dyn Write>` 直写（与参考一致，但要改 30+ 个测试）？
-2. **零依赖要不要为 fd 轮询破例**（2.2）：守住零依赖就做不了 `os.setReadHandler`/
-   `setWriteHandler`，`test_rw_handler.js` 过不了；破例引入 `libc` 就只有它一个依赖。
-3. **REPL 的野心**（4.2）：最小可用（几百行，无行编辑），还是照参考的 `repl.js`（1292 行）？
+2. **REPL 的野心**（4.2）：最小可用（几百行，无行编辑），还是照参考的 `repl.js`（1292 行）？
 
-我的建议：**保留缓冲 + 守住零依赖 + 最小 REPL**，即 M9 交付 timer 与文件/进程 API，
-把 fd 多路和行编辑明确列为"不做"（和 `Atomics` 一样写进 README 的"不做"清单，而不是
-留成没说清的缺口）。
+### 已定，不再讨论
+
+- **fd 多路复用：不做**（2.2）。NFR-7 禁止 `libc`；剩下两条零依赖路线（手写 syscall、
+  线程模拟）的代价都超出 M9 该付的。`os.setReadHandler`/`setWriteHandler` 进"不做"清单。
+- **`Atomics`/`Temporal`：不做**（已在 README 的"不做"清单里）。
+
+我的建议：**保留缓冲 + 最小 REPL**，即 M9 交付 timer 与文件/进程 API，把 fd 多路和行编辑
+明确列为“不做”（和 `Atomics` 一样写进 README 的“不做”清单，而不是留成没说清的缺口）。
