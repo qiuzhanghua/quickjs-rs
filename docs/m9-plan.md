@@ -791,3 +791,11 @@ sparse 的 `built-ins`），不适合在这轮末尾仓促改。**REPL 因此暂
 
 - REPL：等上面的 bug 修掉，再把参考的 `repl.js` 原样跑起来（只差把两行 `import` 换成全局绑定，
   其余依赖 `os.setReadHandler`/`signal`/`ttySetRaw`/`std.in` 都已就位）。
+
+### 12.5 顺带修掉的一个测试竞态
+
+`scripts/check.sh` 开始必现地挂在 `verify-claims.py`（`too many values to unpack`）。
+原因是 `disasm_diff.rs` 的多个 `#[test]` 并行执行，各自以 append 方式打开同一个
+`disasm-cases.txt` 写一行——`O_APPEND` 只保证偏移更新是原子的，不保证写本身不交错，于是
+一行被拼成了多列。加一把锁、一次 `write_all` 即修。单独跑 `verify-claims.py` 从不复现，
+因为只有 `check.sh` 里的并行度才够。
