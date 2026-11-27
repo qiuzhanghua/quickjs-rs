@@ -24,6 +24,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
+use std::rc::Rc;
 
 /// The descriptors the script owns, keyed by the number it was given.
 #[derive(Default)]
@@ -34,6 +35,11 @@ pub struct FdTable {
 impl FdTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A table ready to share between `os` and `std`.
+    pub fn shared() -> Shared {
+        Rc::new(Self::default())
     }
 
     /// Take ownership of `fd` and return the number the script should see.
@@ -87,11 +93,27 @@ impl FdTable {
         }
     }
 
+    /// Take a descriptor out of the table, transferring ownership to the caller.
+    ///
+    /// `std.fdopen(fd, mode)` is the caller: `fdopen(3)` hands the descriptor to the
+    /// `FILE`, which owns it from then on and closes it at `fclose`. Keeping the table
+    /// entry as well would close the same number twice.
+    pub fn take(&self, fd: i32) -> Option<OwnedFd> {
+        self.inner.borrow_mut().remove(&fd)
+    }
+
     /// Whether `fd` is one this host can operate on.
     pub fn contains(&self, fd: i32) -> bool {
         self.inner.borrow().contains_key(&fd) || matches!(fd, 0..=2)
     }
 }
+
+/// A table shared by `os` and `std`.
+///
+/// The two modules have to agree, because a script does `var p = os.pipe();
+/// std.fdopen(p[0], "r")` — the reference's own `test_os_exec()` does exactly that. One
+/// table also means one answer to "does the script own this descriptor".
+pub type Shared = Rc<FdTable>;
 
 /// The descriptor number of an `OwnedFd` without giving up ownership.
 trait AsRawNumber {

@@ -328,19 +328,22 @@ fn main() -> ExitCode {
     // the rest arrives with M9d. Scripts that use the missing parts fail where they touch
     // them rather than silently getting `undefined`.
     if opts.load_std {
+        // One descriptor table for both modules: `std.fdopen(os.pipe()[0], "r")` has to
+        // work, and that is the reference's own `test_os_exec()`.
+        let fds = quickjs_host::fdtable::FdTable::shared();
         let os = ctx.new_object();
         if let Err(error) = quickjs_host::timers::install(&mut ctx, &os) {
             return die(&format!("qjs: cannot install os: {error}"), 1);
         }
         #[cfg(unix)]
-        if let Err(error) = quickjs_host::os::install(&mut ctx, &os) {
+        if let Err(error) = quickjs_host::os::install(&mut ctx, &os, &fds) {
             return die(&format!("qjs: cannot install os: {error}"), 1);
         }
         if let Err(error) = ctx.set_global("os", os) {
             return die(&format!("qjs: cannot mount os: {error}"), 1);
         }
         let std = ctx.new_object();
-        if let Err(error) = quickjs_host::std::install(&mut ctx, &std) {
+        if let Err(error) = quickjs_host::std::install(&mut ctx, &std, &fds) {
             return die(&format!("qjs: cannot install std: {error}"), 1);
         }
         if let Err(error) = ctx.set_global("std", std) {

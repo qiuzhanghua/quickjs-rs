@@ -14,12 +14,13 @@ use quickjs::{Context, Runtime};
 fn run(source: &str) -> String {
     let runtime = Runtime::new();
     let mut ctx = Context::new(&runtime);
+    let fds = quickjs_host::fdtable::FdTable::shared();
     let os = ctx.new_object();
     quickjs_host::timers::install(&mut ctx, &os).expect("timers");
-    quickjs_host::os::install(&mut ctx, &os).expect("os");
+    quickjs_host::os::install(&mut ctx, &os, &fds).expect("os");
     ctx.set_global("os", os).expect("mount os");
     let std = ctx.new_object();
-    quickjs_host::std::install(&mut ctx, &std).expect("std");
+    quickjs_host::std::install(&mut ctx, &std, &fds).expect("std");
     ctx.set_global("std", std).expect("mount std");
     ctx.eval(source).expect("script runs");
     ctx.output().to_string()

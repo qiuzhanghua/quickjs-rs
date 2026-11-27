@@ -46,12 +46,10 @@
 //! through `os.open`/`os.pipe` reports `EBADF`, because this process genuinely does not own
 //! it — and saying so is better than guessing.
 
-use std::rc::Rc;
-
 use quickjs::{Context, Interp, JsResult, Value};
 use rustix::fs::{FileType, Mode, OFlags};
 
-use crate::fdtable::FdTable;
+use crate::fdtable::{FdTable, Shared};
 
 /// How often a path argument is read.
 fn path(interp: &mut Interp<'_>, args: &[Value], index: usize) -> JsResult<String> {
@@ -98,16 +96,17 @@ const EBADF: i32 = 9;
 /// `EINVAL`, reported for an argument of the wrong shape.
 const EINVAL: i32 = 22;
 
-/// Install `os` into `object`.
-pub fn install(ctx: &mut Context<'_>, object: &Value) -> quickjs::Result<()> {
+/// Install `os` into `object`, sharing `table` with `std`.
+///
+/// The table is the caller's because `std.fdopen` has to see the descriptors `os.open` and
+/// `os.pipe` produced. See [`crate::fdtable::Shared`].
+pub fn install(ctx: &mut Context<'_>, object: &Value, table: &Shared) -> quickjs::Result<()> {
     if object.as_object().is_none() {
         return Err(quickjs::Error::Exception(
             "os: target is not an object".to_string(),
         ));
     }
-    let table = Rc::new(FdTable::new());
-
-    for (name, length, body) in functions(&table) {
+    for (name, length, body) in functions(table) {
         let function = ctx.new_host_function_value(name, length, body)?;
         ctx.set_property(object, name, function)?;
     }
@@ -122,7 +121,7 @@ pub fn install(ctx: &mut Context<'_>, object: &Value) -> quickjs::Result<()> {
 
 type Body = Box<dyn for<'i> FnMut(&mut Interp<'i>, Value, &[Value]) -> JsResult<Value>>;
 
-fn functions(table: &Rc<FdTable>) -> Vec<(&'static str, u32, Body)> {
+fn functions(table: &Shared) -> Vec<(&'static str, u32, Body)> {
     let mut out: Vec<(&'static str, u32, Body)> = Vec::new();
     macro_rules! add {
         ($name:literal, $length:expr, $body:expr) => {{
@@ -278,7 +277,7 @@ fn os_seek(
 /// The reference reads through `JS_GetArrayBuffer`, which accepts the buffer a typed array
 /// is a view of — so `os.read(fd, buf.buffer, 0, len)` and `os.read(fd, buf, 0, len)` both
 /// work there. Following `typed_array_parts` gives the same tolerance here.
-fn buffer_storage(
+pub(crate) fn buffer_storage(
     buffer: &Value,
 ) -> Option<std::rc::Rc<std::cell::RefCell<quickjs::object::BufferStorage>>> {
     let object = buffer.as_object()?;

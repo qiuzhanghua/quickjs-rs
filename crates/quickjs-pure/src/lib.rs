@@ -497,6 +497,48 @@ impl<'rt> Context<'rt> {
         Ok(())
     }
 
+    /// Define `name` on `object` as a **non-enumerable** data property.
+    ///
+    /// [`Context::set_property`] writes an enumerable property, which is right for the
+    /// members of a host module — `Object.keys(std)` should list them. A method on a host
+    /// class prototype is the opposite: `quickjs-libc.c` defines the seventeen `FILE`
+    /// methods with `JS_CFUNC_DEF`, whose flags leave `enumerable` off, so
+    /// `Object.keys(std.out)` is `[]` in the reference. A host class needs the same.
+    pub fn define_hidden(&mut self, object: &Value, name: &str, value: Value) -> Result<()> {
+        let Some(object) = object.as_object() else {
+            return Err(Error::Exception(
+                "define_hidden on a non-object".to_string(),
+            ));
+        };
+        object.define(name, Property::with_attributes(value, true, false));
+        Ok(())
+    }
+
+    /// A new ordinary object whose prototype is `proto`.
+    ///
+    /// [`Context::new_object`] gives an object whose prototype is `Object.prototype`; a
+    /// host class needs instances that inherit from its own prototype instead.
+    pub fn new_object_with_prototype(&mut self, proto: &Value) -> Result<Value> {
+        let Some(proto) = proto.as_object() else {
+            return Err(Error::Exception("prototype is not an object".to_string()));
+        };
+        let proto = proto.clone();
+        let interp = self.interp();
+        Ok(Value::Object(interp.new_object(Some(proto))))
+    }
+
+    /// The global object, for a host module that has to keep something reachable from
+    /// every host function it installs.
+    ///
+    /// A [`HostFn`](crate::object::HostFn) closure may not hold a `Gc` — the collector
+    /// cannot see into it — so a shared JavaScript value (a class prototype, say) has to
+    /// live where the collector already scans. The global object is the one object every
+    /// interpreter has.
+    pub fn global(&mut self) -> Value {
+        let interp = self.interp();
+        Value::Object(interp.realm.global.clone())
+    }
+
     /// A string value.
     pub fn new_string(&mut self, text: &str) -> Value {
         let interp = self.interp();

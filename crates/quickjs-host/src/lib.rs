@@ -34,6 +34,7 @@ pub mod fdtable;
 pub mod os;
 pub mod printf;
 pub mod std;
+pub mod stdio;
 pub mod timers;
 
 pub use eventloop::{RunError, run_until_idle};

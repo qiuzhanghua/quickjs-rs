@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a/M9b(部分)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
+状态：**M9a/M9b(大半)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -552,3 +552,44 @@ serde 实现的是 JSON 的**严格子集**，而这里需要**超集**。
 `std::env::set_var`/`remove_var` 都是 `unsafe`（真实的 `setenv` 改进程全局状态）。
 `rustix` 不管环境变量，没有 crate 能绕开。需要加 `unsafe` + `SAFETY` 注释，
 并相应放宽 NFR-6，或者把这两个函数列入「不做」。
+
+### 10.6 `std` 文件对象（17 个方法）
+
+| 项 | 位置 | 验收 |
+|---|---|---|
+| `std.open`/`popen`/`tmpfile`/`fdopen` | `quickjs-host/src/std.rs` | 模式校验 + `.errno` 报告，与参考一致 |
+| 17 个方法 | `quickjs-host/src/stdio.rs` | 18 条对拍全对 |
+| `std.out`/`in`/`err`、`SEEK_*` | 同上 | 形状与参考相同 |
+
+**参考自己的 `test_file1`/`test_file2`/`test_getline`/`test_popen` 原样通过。**
+
+三件值得记下的事：
+
+**1. 为什么不能用 `BufReader` 包一层。** `FILE` 是带位置的缓冲流，`test_file1` 的写法是
+「写 → seek 到末尾 → `tell()` 拿大小 → seek 回开头 → 读出同样的字节」。`tell()` 必须同时
+反映「已写」和「已读回」的字节，那是流的逻辑位置，不是描述符的偏移——缓冲写在描述符那边
+还没发生。所以 `stdio.rs` 自己维护读缓冲、写缓冲和位置，`seek` 靠丢弃缓冲实现。
+
+**2. `fdopen` 逼出一次架构修正。** 参考的 `test_os_exec` 里是
+`std.fdopen(os.pipe()[0], "r")`——`std` 必须看见 `os` 造出的描述符。原先两个模块各有一张
+`FdTable`，现在改成**一张共享表**（`FdTable::shared()`，`os::install` 与 `std::install`
+都接它）。`fdopen` 从表里 `take` 走所有权，正好对应 `fdopen(3)` 的语义：描述符归 `FILE`
+所有，`fclose` 关闭它。
+
+**3. `std.out` 走 sink 而不是 fd 1。** 宿主已经拥有 stdout（`print`/`std.printf` 都写
+sink），若 `std.out` 直接写 fd 1 就是同一个流上的两个缓冲，`std.out.puts("A"); print("B")`
+可能输出 `BA`。写 sink 才保得住顺序——对拍里 `AB / xy1` 两行确认了这点。
+
+**一处刻意的偏差**：实例要在大小的槽表里指认自己，原型方法只能靠实例上的一个属性做到，
+所以 `Object.getOwnPropertyNames(f)` 会多出 `"\u{0}std.file"`（参考是空）。换成 symbol 键
+只是把偏差从 `getOwnPropertyNames` 挪到 `getOwnPropertySymbols`，并不消失。`Object.keys`、
+`JSON.stringify`、`hasOwnProperty`、`for...in` 全部与参考一致。
+
+**另外补上的 `std` 成员**：`loadFile`、`loadScript`、`evalScript`、`strerror`、`getenv`、
+`getenviron`、`exit`、`gc`——都不需要 `unsafe`。`strerror` 的文字取自
+`std::io::Error`（它就是 `strerror_r`），去掉 `" (os error N)"` 后缀，所以
+`std.strerror(0)` 仍是 macOS 的 `"Undefined error: 0"` 而不是某张可移植表。
+
+**`setenv`/`unsetenv` 仍未做**，因为 edition 2024 里 `std::env::set_var` 是 `unsafe`。
+`loadScript` 当前走 `eval_in_global`，栈里显示 `<input>` 而不是文件名，与参考有差；修它需要
+一个带名字的 eval 入口。
