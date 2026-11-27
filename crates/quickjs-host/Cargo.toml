@@ -1,0 +1,45 @@
+[package]
+name = "quickjs-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+description = "Host modules (std/os) and the event loop for the pure-Rust QuickJS port"
+publish = false
+
+[dependencies]
+quickjs-pure.workspace = true
+
+# The host layer is where third-party dependencies live, and the only place they may.
+#
+# NFR-7 keeps the *engine* free of third-party crates — `quickjs-pure` and everything it
+# pulls in must have an empty `cargo tree` — because an embedder should be able to take
+# the interpreter without taking an async runtime. This crate is the equivalent of the
+# reference implementation's `quickjs-libc.c`: it sits beside the engine, not inside it.
+#
+# `tokio` gives the event loop two things `std` cannot: readiness multiplexing across
+# arbitrary fds (`AsyncFd`) and a timer that can be selected against it. `libc` is needed
+# for one narrow job tokio does not do — `fcntl(fd, F_SETFL, O_NONBLOCK)`, because
+# `AsyncFd` requires the fd to be non-blocking and `std::fs::File` has no `set_nonblocking`.
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Windows has no `poll(2)`, and tokio does not fill the gap: `tokio::io::unix::AsyncFd` is
+# `cfg(unix)` only, and `tokio::net::windows::named_pipe` covers only *named* pipes, while
+# `os.pipe()` makes anonymous ones. The reference implementation answers this the same way
+# for the same reason — its Windows branch of `js_os_poll` calls `WaitForMultipleObjects`
+# over the handles it has, and the only `os_rw_handler` it puts in that list is `fd == 0`
+# (stdin). So this crate does what upstream does on Windows: stdin handlers work, arbitrary
+# fds do not, and `tests/test_rw_handler.js` is excluded there by upstream's own Makefile.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }

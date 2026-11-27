@@ -6,6 +6,7 @@ members = [
     "crates/quickjs-regexp",
     "crates/quickjs-compile",
     "crates/quickjs-pure",
+    "crates/quickjs-host",
     "crates/quickjs-cli",
     "crates/quickjs-conformance",
 ]

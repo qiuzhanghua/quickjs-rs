@@ -156,27 +156,59 @@ pub fn run_one_turn(&mut self) -> JsResult<bool>;
 是零依赖的（今天六个 crate 的外部依赖全为空，只有 workspace 内部依赖，这一点不能在
 M9 悄悄破掉）。
 
-**决定：M9 不做 fd 多路复用。** 这不是开放问题，`docs/requirements.md:172` 的 NFR-7
-已经写死：“runtime 零第三方 crate（`libc` 也避免，用 `std` + 少量 `sys` 封装）”。
-所以“为 `poll(2)` 破例引入 `libc`”这个选项根本不存在，不用再纠结。
+**决定：做 fd 多路复用，依赖分层。**（本节原先写的是"不做"，根据实测证据改了。）
 
-排除掉 `libc` 之后还剩两条路，都不通：
+原结论链条是：`quickjs-libc.c` 用一次 `poll(2)` 同时等 fd 和 timer → NFR-7 禁 `libc` →
+零依赖的两条替代路线（手写 syscall / 读线程）代价都过高 → 不做。链条断在第一步和第二步
+之间的一个未经验证的假设上：**`poll()` 和 `AsyncFd` 的前置条件并不一样**。
 
-1. **手写 `syscall`**：零依赖，但 Rust std 没有稳定的 `poll`/`select`，要自己声明
-   syscall 号，绑死 unix，且 Windows 得另起一套 `WaitForMultipleObjects`。NFR-8 要求
-   Windows 支持，等于写两套 `unsafe`。
-2. **用线程模拟多路**：`std::io::pipe()`（Rust 1.87+）给每个 fd 配一个阻塞读线程，
-   `mpsc::recv_timeout` 当计时器。**实测能跑通**（30ms timer 赢过 120ms IO），但**注销
-   不可靠**——`drop(rx)` 之后读线程仍卡在 `read()` 里（`is_finished() == false`），必须
-   关掉对端才能释放。而 stdin 这类对端不归脚本管的 fd 会**永久占住一个线程**。参考实现
-   一个 `poll(2)` 就能同时等 fd 和 timer，这里要付线程数 = fd 数的代价，且关不掉。
+- `poll(2)` 只**查询**就绪状态，**不改 fd 模式**。整个 `quickjs-libc.c` 里 `O_NONBLOCK`
+  只出现两次，都是给它**自己的**唤醒 pipe 用的（`js_waker_init`，第 2372 行）；
+  `js_poll_add_poll_fd` 只记录 `fd` 和 `events`，用户 fd 一个字节都不动。
+- tokio 的 `AsyncFd` 要求「the file descriptor **must have the nonblocking mode set to
+  true**」。要注册任何 fd 都得先 `fcntl(F_SETFL, O_NONBLOCK)`，即 `libc`——而
+  `std::fs::File` 没有 `set_nonblocking`（实测 `error[E0599]`），tokio 也补不上。
 
-两条路的代价都超出 M9 该付的。**`os.setReadHandler`/`setWriteHandler` 明确列入“不做”**，
-和 `Atomics` 一样写进 README 的“不做”清单，而不是留成没说清的缺口。代价是
-`test_rw_handler.js` 过不了（它有 4 处 `setReadHandler`/`setWriteHandler`）。另外提一句：
-`scripts/lang-diff.py:81` 现在把该文件的跳过理由写成 "needs Proxy (no Proxy in the realm yet)"，
-而 `Proxy` 早已实现（`builtins/mod.rs:90` 一带）——这条理由过时了，M9 动手时顺手改成
-"needs fd multiplexing (`poll(2)`), not implemented"。
+也就是说 tokio 换来的东西（现成的 epoll/kqueue 封装）**不是免费的**，但也不是零收益：
+手写 `poll` 要自己声明 syscall 号、绑死 unix，读线程方案要处理注销。分层之后这笔开销
+落在宿主层而不脏引擎，是可接受的。
+
+**分层（NFR-7 已据此改写）：**
+
+| 层 | 依赖 | 职责 | 约束 |
+|---|---|---|---|
+| `quickjs-pure` 及其闭包 | **无** | 引擎、字节码、内建对象 | `cargo tree` 必须为空，`scripts/check.sh` 断言 |
+| `quickjs-host` | `tokio`、`libc`、`windows-sys` | `std`/`os` 模块、事件循环 | 相当于参考实现的 `quickjs-libc.c` 之于 `quickjs.c` |
+| `quickjs-cli` | 经 `quickjs-host` 传递 | 命令行与 REPL | 可以直接依赖宿主层 |
+
+理由不只是"干净"：嵌入者要的是解释器，不该被迫连带一个 async runtime。这与 NFR-11
+（可嵌入）是同一件事的两面。
+
+**Windows 的边界要说清**，因为 tokio 在这里帮不上忙：
+
+- `tokio::io::unix::AsyncFd` 是 `cfg(unix)` only。
+- `tokio::net::windows::named_pipe` 只覆盖**具名**管道，`os.pipe()` 是匿名管道。
+- 参考实现自己的 Windows 分支（`js_os_poll`，第 2485 行）用 `WaitForMultipleObjects`，
+  但放进等待列表的**只有 `fd == 0`（stdin）**：
+
+  ```c
+  if (rh->fd == 0 && !JS_IsNull(rh->rw_func[0])) {
+      handles[count++] = (HANDLE)_get_osfhandle(rh->fd);   /* stdin */
+  }
+  ```
+
+  并且 `Makefile` 第 474 行把这两个测试从 Windows 上整个排除：
+
+  ```make
+  ifndef CONFIG_WIN32
+      $(WINE) ./qjs$(EXE) tests/test_std.js
+      $(WINE) ./qjs$(EXE) tests/test_rw_handler.js
+  endif
+  ```
+
+所以目标是与上游**等价**而不是超越：Unix 上任意 fd 可注册（`AsyncFd`），Windows 上只有
+stdin（`windows-sys` 的 `WaitForMultipleObjects`），`test_rw_handler.js` 在 Windows 上
+与上游一致地跳过。这不是妥协，上游本身就没有那个能力。
 
 > 参考实现里 `std` 确实主要在 timer 和 fd 之间切换，砍掉 fd 之后事件循环只剩 timer
 > 一条腿——但这一条腿正是 `setTimeout`/`sleepAsync`/`performance.now` 需要的，M9 的
@@ -243,7 +275,7 @@ let source_files = ["libregexp.c", "libunicode.c", "quickjs.c", "dtoa.c"];
 | 终端 | `isatty`、`ttyGetWinSize`、`ttySetRaw` | `ttySetRaw` 是 REPL 行编辑的前提 |
 | 定时器 | `now`、`setTimeout`、`clearTimeout`、`sleepAsync`、`sleep` | `now` 是 `performance.now()` 的来源 |
 | 并发 | `signal`、`pipe`、`kill`、`dup`、`dup2`、`getpid`、`waitpid`、`exec` | **`exec` 在 `test_std.js` 里用了 5 次**，见下 |
-| IO 多路 | ~~`setReadHandler`、`setWriteHandler`~~ | **M9 不做**，见 2.2：NFR-7 禁 `libc`，零依赖的两条替代路线代价过高 |
+| IO 多路 | `setReadHandler`、`setWriteHandler` | **做**，见 2.2：Unix 用 `AsyncFd`，Windows 用 `WaitForMultipleObjects`（仅 stdin，与上游一致） |
 | 常量 | `platform`、`O_*`、`SIG*`、`S_IF*` | `platform` 是字符串 |
 
 **`os.exec` 的选项面比一个函数名所能暗示的多**（`test_std.js:241` 逐条压这些）：
@@ -323,7 +355,7 @@ API 和 `test_rw_handler.js`，**不挡住 REPL**——REPL 不需要在一堆 f
 | 3 | 事件循环 + timer | `test_std.js` 的 `test_timer`、`test_async_promise_rejection` |
 | 4 | `os.exec`/`waitpid` | `test_std.js` 的 `test_os_exec` |
 | 5 | `os` 文件族 | `test_std.js` 的 `test_os` |
-| ~~6~~ | ~~IO 多路~~ | ~~`test_rw_handler.js`~~ — **不做**（2.2），整个文件留在跳过表 |
+| 6 | IO 多路 | `test_rw_handler.js`（Unix 上；Windows 上按上游的 Makefile 跳过） |
 | 6 | CLI 选项 | `--std` 可用；`-i` 进出 REPL（面向行，无行编辑） |
 
 `scripts/check.sh` 要新增：`test_std.js` 的逐字节 diff（和 `lang-diff.py` 一样与参考对拍）。
@@ -358,8 +390,8 @@ API 和 `test_rw_handler.js`，**不挡住 REPL**——REPL 不需要在一堆 f
 
 ### 已定，不再讨论
 
-- **fd 多路复用：不做**（2.2）。NFR-7 禁止 `libc`；剩下两条零依赖路线（手写 syscall、
-  线程模拟）的代价都超出 M9 该付的。`os.setReadHandler`/`setWriteHandler` 进"不做"清单。
+- **fd 多路复用：做**（2.2，已推翻原结论）。依赖分层：引擎零依赖不变，`tokio`/`libc`/
+  `windows-sys` 只进 `quickjs-host`。
 - **`Atomics`/`Temporal`：不做**（已在 README 的"不做"清单里）。
 
 我的建议：**保留缓冲 + 最小 REPL**，即 M9 交付 timer 与文件/进程 API，把 fd 多路和行编辑

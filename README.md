@@ -50,14 +50,15 @@
 - **`Atomics` / `SharedArrayBuffer`**：本引擎单线程，没有 Worker。`Atomics.wait` 无法真的
   阻塞，`Atomics.notify` 没有等待者——实现出来的会是一个永不执行其语义的 API 外壳。这正是
   本项目一直在修的那类问题（"接受即忽略，等于假的安全"）。487 条用例继续按 feature 跳过。
-- **`os.setReadHandler` / `os.setWriteHandler`（fd 多路复用）**：`quickjs-libc.c` 用一次
-  `poll(2)` 同时等 fd 和最近的 timer。NFR-7 禁止 `libc`，而零依赖的两条替代路线代价都过大：
-  手写 syscall 要绑死 unix（NFR-8 还要 Windows）且是 `unsafe`；用读线程模拟则注销不掉
-  （`drop` 后线程仍卡在 `read()`），stdin 会永久占一个线程。M9 只做 timer 一条腿，
-  `test_rw_handler.js` 继续跳过。详见 [`docs/m9-plan.md`](docs/m9-plan.md) 第 2.2 节。
 - **`Temporal`**（4624 条）：独立于引擎核心的巨型 API，对"qjs 能不能跑真实程序"几乎无影响
   ——真实程序极少用。它与 M9 争夺同一段时间，而 M9 决定这个引擎能不能被嵌入使用。
 - **`Intl`**：需要 CLDR 数据与 ICU 级别的区域设置支持，纯 Rust 零依赖的前提不成立。
+
+**fd 多路复用（`os.setReadHandler`/`setWriteHandler`）改为要做**，但依赖分层：引擎
+（`quickjs-pure` 及其闭包）仍然零第三方依赖，`tokio` + `libc` 只进宿主层
+（`quickjs-host`/`quickjs-cli`），相当于参考实现的 `quickjs-libc.c` 之于 `quickjs.c`。
+NFR-7 已据此改写，`scripts/check.sh` 有断言守着引擎那一侧。详见
+[`docs/m9-plan.md`](docs/m9-plan.md) 第 2.2 节。
 
 **顺序也改了。** 原先 M9 排在 M8 之后、M8 又以 `Atomics` 收尾，于是"能嵌入当脚本引擎用"
 （读文件、定时器、事件循环）一直被一件做不真的东西挡着。现在 M9 提前到 M8 收尾之后。

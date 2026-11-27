@@ -17,6 +17,12 @@ fi
 echo "== cargo test"
 cargo test --offline
 
+# NFR-7: the engine has no third-party crates, the host layer has only the agreed ones.
+# A requirement nobody checks is a requirement nobody has, and this one decides whether the
+# interpreter can be embedded without dragging an async runtime along.
+echo "== scripts/check-no-engine-deps.sh (NFR-7)"
+./scripts/check-no-engine-deps.sh
+
 # The upstream suite, test by test. This is the step that used to be ad hoc, and the
 # reason `test_loop.js` and `test_bigint.js` went unmeasured: it is skipped, loudly,
 # when the reference interpreter is not built.

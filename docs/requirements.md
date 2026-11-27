@@ -169,7 +169,7 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 | NFR-4 | 确定性释放：`Rc` 语义，作用域结束即释放；循环引用由周期性 collector 回收（对齐上游 RD/GC 行为） | 析构计数器测试（finalizer 触发时机） |
 | NFR-5 | 无 panic 逃逸：宿主回调 panic 转为 `InternalError`；`catch_unwind` 边界；`--stack-size` 防爆栈 | fuzz + 深递归测试 |
 | NFR-6 | 安全：`unsafe` 只允许在 `gc`/`atomics`/`typed_array`/`c-api` 模块，逐处 `// SAFETY:` | `#![warn(unsafe_op_in_unsafe_fn)]` + review checklist |
-| NFR-7 | 依赖最小化：runtime 零第三方 crate（`libc` 也避免，用 `std` + 少量 `sys` 封装）；dev-deps 不限 | `cargo tree` 审计 |
+| NFR-7 | 依赖最小化：**引擎 crate 零第三方依赖**（`quickjs-pure`/`parse`/`compile`/`regexp`/`gc` 及其传递闭包，`libc` 也避免）；**宿主层**（`quickjs-host`/`quickjs-cli`）允许 `tokio`（Unix 的 fd 就绪）+ `libc`（`fcntl` 设 non-blocking）+ `windows-sys`（Windows 的 `WaitForMultipleObjects`），仅用于事件循环与 fd 就绪；dev-deps 不限 | `cargo tree -p quickjs-pure` 审计为空（`scripts/check.sh` 断言）+ `scripts/check.sh` 校验宿主层的依赖白名单 |
 | NFR-8 | 平台：macOS(arm64/x64)、Linux(x64/arm64)、Windows(msvc)；WASM 列为可选 | CI 矩阵 |
 | NFR-9 | 可调试：`--dump`、字节码反汇编、`trace` 分配跟踪、错误栈含行列与函数名 | 手工验收 |
 | NFR-10 | 可测试：差分 oracle 框架（跑 C 版 `qjs` vs Rust `qjs`）+ test262 harness + fuzz 目标 | `cargo test` 一键运行；test262 见 `docs/test262-status.md`（`scripts/test262.sh`，因需外部 checkout 与一分钟墙钟，不进 `check.sh`） |
