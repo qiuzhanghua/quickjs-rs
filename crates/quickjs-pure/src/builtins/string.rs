@@ -6,7 +6,7 @@
 //! the two places that difference shows up (`charAt`/`charCodeAt` versus
 //! `codePointAt`) are called out where they occur.
 
-use crate::builtins::{arg, arg_int_or, define_method, this_string};
+use crate::builtins::{arg, arg_int_or, define_method};
 use crate::interp::{Interp, JsResult, WellKnown};
 use crate::object::{JsObject, Property};
 use crate::value::Value;
@@ -173,19 +173,69 @@ fn from_code_point(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsR
 // ---------------------------------------------------------------------------
 
 /// The receiver text, or a `TypeError` when `this` is neither a string nor a box.
-fn text_of(interp: &Interp<'_>, this: &Value) -> Result<String, crate::interp::Signal> {
-    this_string(interp, this).ok_or_else(|| interp.type_error("String method on a non-string"))
+/// The text a string method operates on: `RequireObjectCoercible` then `ToString`.
+///
+/// This is **not** a brand check. §22.1's methods all say
+///
+/// ```text
+/// 1. Let O be ? RequireObjectCoercible(this value).
+/// 2. Let S be ? ToString(O).
+/// ```
+///
+/// so `String.prototype.trim.call(123)` is `"123"` and `.call({toString(){return " a "}})`
+/// trims that object. Only `toString` and `valueOf` do `thisStringValue`, and they are the
+/// two methods that do *not* come through here. Treating every method as a brand check made
+/// 116 test262 cases fail with `TypeError: String method on a non-string`.
+fn text_of(interp: &mut Interp<'_>, this: &Value) -> JsResult<String> {
+    Ok(require_string(interp, this)?.to_string_lossy().into_owned())
 }
 
 /// The receiver's code units without flattening an unpaired surrogate.
 ///
-/// The "at" family indexes code units, so it must not read through [`text_of`]: a lossy
-/// `String` would report `0xFFFD` where the string holds `0xD800`.
-fn wtf8_of(interp: &Interp<'_>, this: &Value) -> Result<crate::value::Wtf8, crate::interp::Signal> {
-    string_object(interp, this).map(|text| text.wtf8().clone())
+/// The "at" family indexes code units, so it must not read through a lossy `String`: a
+/// `0xFFFD` where the string holds `0xD800` would give wrong indices.
+fn wtf8_of(interp: &mut Interp<'_>, this: &Value) -> JsResult<crate::value::Wtf8> {
+    Ok(require_string(interp, this)?.wtf8().clone())
+}
+
+/// `RequireObjectCoercible(this)` followed by `ToString`, as the WTF-8 form.
+///
+/// `null` and `undefined` are refused; everything else converts, including an object whose
+/// `toString`/`valueOf` answers something else. A Symbol has no string form, so it is a
+/// `TypeError` too — that is `ToString`'s own rule, not a brand check.
+fn require_string(
+    interp: &mut Interp<'_>,
+    this: &Value,
+) -> JsResult<js_gc::Gc<crate::value::JsString>> {
+    if matches!(this, Value::Undefined | Value::Null) {
+        // `RequireObjectCoercible`'s message names the receiver, and both spellings are
+        // compared verbatim by test262.
+        let what = if matches!(this, Value::Null) {
+            "null"
+        } else {
+            "undefined"
+        };
+        return Err(interp.type_error(format!("cannot convert {what} to a string")));
+    }
+    // A primitive string needs no conversion, so keep the object and its cached units.
+    if let Value::String(text) = this {
+        return Ok(text.clone());
+    }
+    // A boxed string converts through `ToPrimitive`, which finds `_value` through
+    // `toString` — the same path `String(Object("ab"))` takes — so no special case.
+    let text = interp.checked_to_wtf8(this)?;
+    Ok(js_gc::Gc::new(
+        interp.heap,
+        crate::value::JsString::from_wtf8(text),
+    ))
 }
 
 /// The receiver's string object, so a caller can use its cached code units.
+///
+/// Only the two brand-checking methods use this: `String.prototype.toString` and
+/// `valueOf` both run `thisStringValue`, which refuses anything whose `_value` is not
+/// already a string. `String.prototype.toString.call(123)` is a `TypeError`, unlike
+/// `String.prototype.trim.call(123)`.
 fn string_object(
     interp: &Interp<'_>,
     this: &Value,
@@ -459,10 +509,12 @@ fn split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
                 vec![interp.string(text)]
             }
         }
-        Value::String(separator) => {
-            // A separator with an unpaired surrogate has no `&str` form; splitting by its
-            // replacement character is the documented lossy fallback.
-            let separator = separator.to_string_lossy();
+        // `ToString(separator)`, not "leave any other kind alone". An object separator runs
+        // its `toString`, and if that answers an object `ToPrimitive` throws — which is what
+        // `transferred-to-number-separator-override-tostring-returns-regexp` asserts. The
+        // `Symbol.split` dispatch above already handled a real RegExp.
+        separator => {
+            let separator = interp.to_js_string(&separator)?;
             if separator.is_empty() {
                 text.chars()
                     .map(|character| interp.string(character.to_string()))
@@ -473,7 +525,6 @@ fn split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value
                     .collect()
             }
         }
-        _ => vec![interp.string(text)],
     };
     let limited: Vec<Value> = parts.into_iter().take(limit).collect();
     let array = interp.new_array(limited);
@@ -589,23 +640,28 @@ fn search(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
 // ---------------------------------------------------------------------------
 
 fn to_upper_case(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?.to_uppercase()))
+    let text = text_of(interp, &this)?.to_uppercase();
+    Ok(interp.string(text))
 }
 
 fn to_lower_case(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?.to_lowercase()))
+    let text = text_of(interp, &this)?.to_lowercase();
+    Ok(interp.string(text))
 }
 
 fn trim(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?.trim().to_string()))
+    let text = text_of(interp, &this)?.trim().to_string();
+    Ok(interp.string(text))
 }
 
 fn trim_start(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?.trim_start().to_string()))
+    let text = text_of(interp, &this)?.trim_start().to_string();
+    Ok(interp.string(text))
 }
 
 fn trim_end(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?.trim_end().to_string()))
+    let text = text_of(interp, &this)?.trim_end().to_string();
+    Ok(interp.string(text))
 }
 
 fn repeat(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
@@ -657,6 +713,17 @@ fn pad(interp: &mut Interp<'_>, this: Value, args: &[Value], at_start: bool) -> 
     }))
 }
 
+/// `String.prototype.toString` and `valueOf`: `thisStringValue`, a real brand check.
+///
+/// These two are the *only* `String.prototype` methods that refuse a non-string receiver
+/// (§22.1.3.28): `String.prototype.toString.call(123)` is a `TypeError` while
+/// `String.prototype.trim.call(123)` is `"123"`.
+///
+/// They also have to be the brand check for a mechanical reason: they are what
+/// `ToPrimitive` calls on a boxed string, so routing them through `ToString` would ask
+/// `ToPrimitive` for the string while already inside `ToPrimitive` — unbounded recursion,
+/// which is how the process aborted before this was split apart.
 fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    Ok(interp.string(text_of(interp, &this)?))
+    let text = string_object(interp, &this)?.wtf8().clone();
+    Ok(interp.string_wtf8(text))
 }

@@ -2229,6 +2229,54 @@ fn typed_array_callbacks_receive_their_this_arg() {
 }
 
 #[test]
+fn string_methods_coerce_their_receiver_but_to_string_does_not() {
+    // §22.1: the methods run `RequireObjectCoercible` then `ToString`, so a non-string
+    // receiver is converted. Only `toString`/`valueOf` run `thisStringValue`, a brand
+    // check. Treating them all as brand checks made 116 test262 cases fail.
+    assert_eq!(
+        eval(
+            "print(String.prototype.trim.call(123),\n\
+                   String.prototype.toUpperCase.call(true),\n\
+                   String.prototype.slice.call(123, 1),\n\
+                   String.prototype.includes.call({ toString: function () { return 'ab'; } }, 'b'))"
+        ),
+        "123 TRUE 23 true\n"
+    );
+    // `null` and `undefined` are the one refusal: `RequireObjectCoercible` comes first.
+    assert!(throws("String.prototype.trim.call(null)").starts_with("TypeError"));
+    assert!(throws("String.prototype.trim.call(undefined)").starts_with("TypeError"));
+    // A Symbol has no string form at all, so `ToString` refuses it too.
+    assert!(throws("String.prototype.trim.call(Symbol())").starts_with("TypeError"));
+    // …but the two brand-checking methods refuse everything that is not a string.
+    assert!(throws("String.prototype.toString.call(123)").starts_with("TypeError"));
+    assert!(throws("String.prototype.valueOf.call(123)").starts_with("TypeError"));
+    assert!(throws("String.prototype.toString.call({})").starts_with("TypeError"));
+    assert_eq!(
+        eval("print(String.prototype.toString.call(new String('x')))"),
+        "x\n"
+    );
+}
+
+#[test]
+fn string_split_converts_its_separator() {
+    // `ToString(separator)`, so an object separator is observable — and a `toString` that
+    // answers another object is a `TypeError` out of `ToPrimitive`. Leaving a non-string
+    // separator alone made this "pass" for the wrong reason: the receiver refused first.
+    assert_eq!(
+        eval("print('a-b'.split({ toString: function () { return '-'; } }).join('|'))"),
+        "a|b\n"
+    );
+    assert!(
+        throws("'1'.split({ toString: function () { return /x/; } })").starts_with("TypeError")
+    );
+    // The default separator, and an empty one, keep their old shapes.
+    assert_eq!(
+        eval("print('abc'.split().length, ''.split().length, 'abc'.split('').join('|'))"),
+        "1 0 a|b|c\n"
+    );
+}
+
+#[test]
 fn typed_array_reads_and_detachment() {
     // Out-of-range reads and writes are silently `undefined`/ignored, not errors.
     assert_eq!(
