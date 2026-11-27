@@ -17,9 +17,11 @@ use crate::object::{JsObject, Property};
 use crate::value::Value;
 use js_gc::Gc;
 
-/// The name of the hidden property holding `[[DateValue]]`.
+/// The names of the hidden slots holding `[[DateValue]]` and the class tag.
+///
+/// Both are symbol keys (see `Interp::internal_slot`), so a Date does not report them
+/// from `Object.getOwnPropertyNames`.
 const VALUE: &str = "_date_value";
-/// The class tag, so a Date is distinguishable from a plain object.
 const CLASS: &str = "_class";
 
 const MS_PER_DAY: f64 = 86_400_000.0;
@@ -284,23 +286,18 @@ fn set_date_fields_checked(fields: &mut [f64; 7], is_local: bool) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Whether `object` is a Date instance.
-fn is_date(object: &Gc<JsObject>) -> bool {
-    object
-        .own_property(CLASS)
-        .and_then(|property| property.value)
+fn is_date(interp: &Interp<'_>, object: &Gc<JsObject>) -> bool {
+    interp
+        .internal_get(object, CLASS)
         .is_some_and(|value| value.to_js_string() == "Date")
 }
 
 /// `thisTimeValue`: the `[[DateValue]]` of a Date, or a `TypeError`.
 fn this_date_value(interp: &Interp<'_>, this: &Value) -> Result<f64, Signal> {
     if let Value::Object(object) = this
-        && is_date(object)
+        && is_date(interp, object)
     {
-        let value = object
-            .own_property(VALUE)
-            .and_then(|property| property.value)
-            .map(|value| value.to_number());
-        if let Some(value) = value {
+        if let Some(value) = interp.internal_get(object, VALUE).map(|v| v.to_number()) {
             return Ok(value);
         }
     }
@@ -308,14 +305,11 @@ fn this_date_value(interp: &Interp<'_>, this: &Value) -> Result<f64, Signal> {
 }
 
 /// `SetThisTimeValue`.
-fn set_this_date_value(interp: &Interp<'_>, this: &Value, value: f64) -> Result<f64, Signal> {
+fn set_this_date_value(interp: &mut Interp<'_>, this: &Value, value: f64) -> Result<f64, Signal> {
     if let Value::Object(object) = this
-        && is_date(object)
+        && is_date(interp, object)
     {
-        object.define(
-            VALUE,
-            Property::with_attributes(Value::Float(value), false, false),
-        );
+        interp.internal_set(object, VALUE, Value::Float(value));
         return Ok(value);
     }
     Err(interp.type_error("not a Date object"))
@@ -325,14 +319,8 @@ fn set_this_date_value(interp: &Interp<'_>, this: &Value, value: f64) -> Result<
 /// function-call form.
 fn new_date(interp: &mut Interp<'_>, proto: Gc<JsObject>, value: f64) -> JsResult<Value> {
     let object = interp.new_object(Some(proto));
-    object.define(
-        CLASS,
-        Property::with_attributes(interp.string("Date"), false, false),
-    );
-    object.define(
-        VALUE,
-        Property::with_attributes(Value::Float(value), false, false),
-    );
+    interp.internal_set(&object, CLASS, interp.string("Date"));
+    interp.internal_set(&object, VALUE, Value::Float(value));
     Ok(Value::Object(object))
 }
 
@@ -343,7 +331,7 @@ fn is_linked_to_date_proto(interp: &Interp<'_>, this: &Value) -> bool {
     let Value::Object(object) = this else {
         return false;
     };
-    if is_date(object) {
+    if is_date(interp, object) {
         return true;
     }
     let date_proto = interp.realm.date_proto.clone();
@@ -366,16 +354,10 @@ fn is_linked_to_date_proto(interp: &Interp<'_>, this: &Value) -> bool {
 /// `construct` already made a `this` with `Date.prototype` as its prototype, so the
 /// constructor only has to fill in the value. Keeping the receiver is what makes
 /// `class MyDate extends Date` work later.
-fn install_value(interp: &Interp<'_>, this: &Value, value: f64) -> JsResult<Value> {
+fn install_value(interp: &mut Interp<'_>, this: &Value, value: f64) -> JsResult<Value> {
     if let Value::Object(object) = this {
-        object.define(
-            CLASS,
-            Property::with_attributes(interp.string("Date"), false, false),
-        );
-        object.define(
-            VALUE,
-            Property::with_attributes(Value::Float(value), false, false),
-        );
+        interp.internal_set(object, CLASS, interp.string("Date"));
+        interp.internal_set(object, VALUE, Value::Float(value));
         return Ok(this.clone());
     }
     Err(interp.type_error("not a Date object"))
@@ -1049,10 +1031,9 @@ fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult
         let arg = &args[0];
         // A Date argument is copied by value, without going through ToPrimitive.
         let copied = match arg {
-            Value::Object(object) if is_date(object) => object
-                .own_property(VALUE)
-                .and_then(|property| property.value)
-                .map(|value| value.to_number()),
+            Value::Object(object) if is_date(interp, object) => {
+                interp.internal_get(object, VALUE).map(|v| v.to_number())
+            }
             _ => None,
         };
         match copied {

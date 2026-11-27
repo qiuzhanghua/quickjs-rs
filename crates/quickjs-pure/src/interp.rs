@@ -122,6 +122,18 @@ pub struct Realm {
     pub async_generator_proto: Option<Gc<JsObject>>,
     /// `Symbol.prototype`.
     pub symbol_proto: Option<Gc<JsObject>>,
+    /// The symbols behind the engine's own hidden slots: `_value`, `_class`,
+    /// `_date_value`.
+    ///
+    /// These are *symbol* keys on purpose. A `"_value"` property is visible to
+    /// `Object.getOwnPropertyNames`, so `new Number(1)` reported an own property the
+    /// language does not have and `new Error()` listed `_class` beside `message` and
+    /// `stack` — and a caller that copies every own property (which
+    /// `Object.create(null, props)` effectively does) tried to write an internal name and
+    /// threw. A symbol key is invisible to `getOwnPropertyNames`, `Object.keys`, `for…in`
+    /// and `JSON.stringify`, while remaining an ordinary traced property.
+    pub internal_slots: BTreeMap<&'static str, Value>,
+
     /// The `Symbol.for` registry: `key -> symbol`.
     ///
     /// Scoped to the realm, which is what makes `Symbol.for("k")` answer the same
@@ -692,6 +704,7 @@ impl<'a> Interp<'a> {
                 async_generator_proto: None,
                 symbol_proto: None,
                 symbol_registry: BTreeMap::new(),
+                internal_slots: BTreeMap::new(),
                 regexp_proto: None,
                 regexp_ctor: None,
                 suppressed_error_proto: None,
@@ -1760,6 +1773,50 @@ impl<'a> Interp<'a> {
     // -- running ------------------------------------------------------------
 
     /// Evaluate `code` as a script body and return its completion value.
+    /// Compile and run `source` for the engine's own use, returning its completion value.
+    ///
+    /// This is how a builtin can be written in JavaScript: [`crate::builtins::from_async`]
+    /// needs to be a real async function, and the engine already runs those as coroutines,
+    /// so compiling the algorithm is cheaper than rebuilding a coroutine by hand.
+    ///
+    /// Differences from [`Self::eval_in_global`], both deliberate:
+    ///
+    /// * It does **not** drain the microtask queue. Install runs while the realm is still
+    ///   being built, and the source is an IIFE that only constructs a closure, so there
+    ///   is nothing to drain — and draining here would run script-queued jobs in the
+    ///   middle of `install`.
+    /// * It reports a syntax error as an `InternalError` throw rather than as the usual
+    ///   `SyntaxError` with a position: a malformed builtin source is this crate's bug,
+    ///   and it should not look like the user wrote something wrong.
+    pub fn eval_builtin_source(&mut self, source: &str) -> JsResult<Value> {
+        let program = match js_parse::parse_script(source) {
+            Ok(program) => program,
+            Err(error) => {
+                let message = format!("builtin source does not parse: {error}");
+                return Err(Signal::Throw(self.make_error("InternalError", &message)));
+            }
+        };
+        let mut code = match js_compile::compile_script(&program) {
+            Ok(code) => code,
+            Err(error) => {
+                let message = format!("builtin source does not compile: {}", error.message);
+                return Err(Signal::Throw(self.make_error("InternalError", &message)));
+            }
+        };
+        // The frame has to name something, and `<builtin>` is what a stack trace through
+        // this code should say.
+        code.set_filename("<builtin>");
+        let compiled = Gc::new(self.heap, CompiledCode::new(code));
+        let closure_vars = compiled.code.closure_vars.clone();
+        let env = self.global_env(&closure_vars);
+        let this = Value::Object(self.realm.global.clone());
+        self.execute(compiled, env, this, Vec::new(), Value::Undefined)
+    }
+
+    /// Run an already-parsed script and drain the microtasks it queued.
+    ///
+    /// The drain is what lets an `async` function's body advance past its first `await`
+    /// before the host sees the result: nothing else pumps the job queue.
     pub fn run_script(&mut self, code: CompiledFunction) -> JsResult<Value> {
         let compiled = Gc::new(self.heap, CompiledCode::new(code));
         let closure_vars = compiled.code.closure_vars.clone();
@@ -4415,10 +4472,7 @@ impl<'a> Interp<'a> {
                 // ordinary object apart from reporting `[object Arguments]`, and that has
                 // no `Symbol.toStringTag` of its own. Set before the indices so it does not
                 // show up ahead of them in a key listing anyway — it is non-enumerable.
-                object.define(
-                    "_class",
-                    Property::with_attributes(self.string("Arguments"), false, false),
-                );
+                self.internal_set(&object, "_class", self.string("Arguments"));
                 // `length` is writable and configurable but neither enumerable nor a
                 // plain data property: `Object.keys(arguments)` lists the indices only,
                 // which is how `{...arguments}` copies them without the length.
@@ -4586,10 +4640,7 @@ impl<'a> Interp<'a> {
             "message",
             Property::with_attributes(self.string("SuppressedError"), true, true),
         );
-        object.define(
-            "_class",
-            Property::with_attributes(self.string("Error"), false, false),
-        );
+        self.internal_set(&object, "_class", self.string("Error"));
         self.add_stack(&object);
         Value::Object(object)
     }
@@ -6232,6 +6283,15 @@ impl<'a> Interp<'a> {
                 if let Value::Object(function) = &callee
                     && let Some((code, env)) = bytecode_of(function)
                 {
+                    // A generator or async body is not run here at all: calling it only
+                    // *creates* the generator/coroutine, so it must not inherit this
+                    // frame. Doing so made `function f(){ return g() }` push `g`'s body
+                    // onto `f`'s frame, and the first `yield`/`await` then reported
+                    // "a generator body ran as an ordinary call".
+                    if code.code.kind.is_generator() || code.code.kind.is_async() {
+                        let value = self.call_value(callee, this, args)?;
+                        return Ok(Step::Return(value));
+                    }
                     self.frame_mut().tail = true;
                     self.push_frame(code, env, this, args, callee)?;
                     return Ok(Step::Continue);
@@ -7018,7 +7078,14 @@ impl<'a> Interp<'a> {
         // Defined even when empty: `(function(){}).name` is `""`, not absent, and a test
         // that checks the own-property descriptor fails if the property is missing.
         object.define("name", Property::name_or_length(self.string(name)));
-        self.install_function_prototype(&object);
+        // Only a function that can be constructed has a `prototype`: §10.2.5 makes it
+        // when `[[Construct]]` is created, so a generator, an async function and an arrow
+        // function have none of their own. Installing it unconditionally gave
+        // `Array.fromAsync` (an async function) an own `prototype` property, which
+        // `builtin.js` checks for absence.
+        if constructible {
+            self.install_function_prototype(&object);
+        }
         Ok(Value::Object(object))
     }
 
@@ -7239,7 +7306,7 @@ impl<'a> Interp<'a> {
         // A Date overrides the default hint to mean "string", which is what
         // `Date.prototype[Symbol.toPrimitive]` does with hint `"default"`. Without
         // this, `"" + new Date()` would print the milliseconds, not the date.
-        let hint = if hint == Hint::Default && is_date_object(object) {
+        let hint = if hint == Hint::Default && is_date_object(self, object) {
             Hint::String
         } else {
             hint
@@ -7564,8 +7631,17 @@ impl<'a> Interp<'a> {
     ///
     /// The indices are *code units*, so an astral character occupies two of them — the
     /// same rule `s.length` and `s[i]` follow.
+    /// Give an already-created object the internal slot that makes it a wrapper of
+    /// `value`, so the primitive's prototype methods work on it.
+    ///
+    /// Used for `%Boolean.prototype%`, `%Number.prototype%` and `%String.prototype%`,
+    /// which are wrappers of their own type holding the empty value.
+    pub(crate) fn init_primitive_wrapper(&mut self, object: &Gc<JsObject>, value: Value) {
+        self.internal_set(object, "_value", value);
+    }
+
     pub(crate) fn init_string_wrapper(
-        &self,
+        &mut self,
         object: &Gc<JsObject>,
         text: &Gc<crate::value::JsString>,
     ) {
@@ -7582,8 +7658,8 @@ impl<'a> Interp<'a> {
                 );
             }
         }
-        object.define(
-            "_value",
+        object.define_key(
+            &self.internal_slot("_value"),
             Property::with_attributes(Value::String(text.clone()), false, false),
         );
     }
@@ -7620,7 +7696,7 @@ impl<'a> Interp<'a> {
             _ => (None, value.clone()),
         };
         let object = self.new_object(prototype);
-        object.define("_value", Property::with_attributes(primitive, false, false));
+        self.internal_set(&object, "_value", primitive);
         Ok(object)
     }
 
@@ -8064,6 +8140,40 @@ impl<'a> Interp<'a> {
         }
     }
 
+    /// The symbol key for one of the engine's own hidden slots.
+    ///
+    /// Cached on the realm, so every object of a kind shares one key and a slot can be
+    /// read back by name.
+    pub fn internal_slot(&mut self, name: &'static str) -> PropertyKey {
+        if let Some(Value::Symbol(symbol)) = self.realm.internal_slots.get(name) {
+            return PropertyKey::Symbol(symbol.clone());
+        }
+        let symbol = Gc::new(
+            self.heap,
+            crate::value::JsSymbol::new(Some(name.to_string())),
+        );
+        self.realm
+            .internal_slots
+            .insert(name, Value::Symbol(symbol.clone()));
+        PropertyKey::Symbol(symbol)
+    }
+
+    /// Read a hidden slot, or `None` when the object has none of that name.
+    pub fn internal_get(&self, object: &Gc<JsObject>, name: &'static str) -> Option<Value> {
+        let Value::Symbol(symbol) = self.realm.internal_slots.get(name)? else {
+            return None;
+        };
+        object
+            .own_property_key(&PropertyKey::Symbol(symbol.clone()))
+            .and_then(|property| property.value)
+    }
+
+    /// Define a hidden slot.
+    pub fn internal_set(&mut self, object: &Gc<JsObject>, name: &'static str, value: Value) {
+        let key = self.internal_slot(name);
+        object.define_key(&key, Property::with_attributes(value, false, false));
+    }
+
     /// `GetIterator(value)`: the real `Symbol.iterator` protocol.
     ///
     /// The method is looked up on the value (through its prototype), called with no
@@ -8465,10 +8575,9 @@ pub enum DeleteFailure {
 ///
 /// Lives here rather than in `builtins::date` so `ToPrimitive` can ask without the
 /// builtins module depending on the interpreter's conversion order.
-fn is_date_object(object: &Gc<JsObject>) -> bool {
-    object
-        .own_property("_class")
-        .and_then(|property| property.value)
+fn is_date_object(interp: &Interp<'_>, object: &Gc<JsObject>) -> bool {
+    interp
+        .internal_get(object, "_class")
         .is_some_and(|value| value.to_js_string() == "Date")
 }
 
@@ -8658,10 +8767,9 @@ pub fn debug_display(interp: &Interp<'_>, value: &Value) -> String {
 }
 
 /// The internal class name an object carries, when it has one.
-fn class_of(object: &Gc<JsObject>) -> Option<String> {
-    object
-        .own_property("_class")
-        .and_then(|property| property.value)
+fn class_of(interp: &Interp<'_>, object: &Gc<JsObject>) -> Option<String> {
+    interp
+        .internal_get(object, "_class")
         .map(|value| value.to_js_string())
 }
 
@@ -8750,7 +8858,7 @@ impl Printer<'_, '_> {
         }
         // `Date` and `Error` print as themselves rather than as bags of properties:
         // the ISO string, and `Name: message` followed by the trace.
-        if let Some(class) = class_of(object) {
+        if let Some(class) = class_of(self.interp, object) {
             if class == "Date" {
                 self.date(object);
                 return;
@@ -8772,9 +8880,9 @@ impl Printer<'_, '_> {
     /// A Date prints as its ISO string; an invalid one falls through to the plain
     /// object form, the way the reference falls back when `toISOString` throws.
     fn date(&mut self, object: &Gc<JsObject>) {
-        let value = object
-            .own_property("_date_value")
-            .and_then(|property| property.value)
+        let value = self
+            .interp
+            .internal_get(object, "_date_value")
             .map(|value| value.to_number());
         match value.and_then(crate::builtins::date::iso_string) {
             Some(text) => self.out.push_str(&text),

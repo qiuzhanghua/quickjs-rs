@@ -62,11 +62,11 @@ fn stringify(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 ///
 /// `_value` is the slot this engine's `new Number(x)` and `Object(x)` fill in, so it is
 /// the same thing the spec's internal slots carry.
-fn unwrap_primitive_wrapper(value: &Value) -> Value {
+fn unwrap_primitive_wrapper(interp: &Interp<'_>, value: &Value) -> Value {
     let Some(object) = value.as_object() else {
         return value.clone();
     };
-    let Some(inner) = object.own_property("_value").and_then(|p| p.value) else {
+    let Some(inner) = interp.internal_get(object, "_value") else {
         return value.clone();
     };
     // Only a box of a *primitive*: an ordinary object that happens to have `_value` must
@@ -96,7 +96,7 @@ fn write_value(
     // `[[StringData]]`, `[[BooleanData]]` and `[[BigIntData]]` before looking at the
     // object's enumerable keys, and a wrapper has none of its own — which is why skipping
     // the step printed an empty object.
-    let value = &unwrap_primitive_wrapper(value);
+    let value = &unwrap_primitive_wrapper(interp, value);
     match value {
         // A symbol serialises to nothing, exactly like `undefined`: `JSON.stringify`
         // drops it from an object and answers `undefined` for it at the top level.

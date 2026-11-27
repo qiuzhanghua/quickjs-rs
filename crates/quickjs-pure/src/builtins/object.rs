@@ -180,7 +180,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
                 // `[object Symbol]`, not `[object Object]`. `_value` is precisely the "this
                 // object is a box" marker, and nothing else uses it — a Date keeps its
                 // timestamp in `_date_value`.
-                if let Some(boxed) = object.own_property("_value").and_then(|p| p.value) {
+                if let Some(boxed) = interp.internal_get(object, "_value") {
                     let tag = match boxed {
                         Value::Bool(_) => Some("Boolean"),
                         Value::String(_) => Some("String"),
@@ -196,8 +196,7 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
                 // internal tag; `_class` carries it for the classes that have one
                 // (Date, the error classes), and everything else answers `Object`,
                 // which is what a plain `{}` does.
-                let _ = interp;
-                match object.own_property("_class").and_then(|p| p.value) {
+                match interp.internal_get(object, "_class") {
                     Some(class) => class.to_js_string(),
                     None => other.to_string(),
                 }
@@ -224,12 +223,11 @@ fn to_string(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<
     Ok(interp.string(format!("[object {tag}]")))
 }
 
-fn value_of(_interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
+fn value_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
     // `Object.prototype.valueOf` returns the object, unboxing a primitive receiver.
     match this {
-        Value::Object(object) => Ok(object
-            .own_property("_value")
-            .and_then(|property| property.value)
+        Value::Object(object) => Ok(interp
+            .internal_get(&object, "_value")
             .unwrap_or(Value::Object(object))),
         other => Ok(other),
     }

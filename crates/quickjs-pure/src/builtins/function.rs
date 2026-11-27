@@ -12,6 +12,13 @@ use js_gc::Gc;
 
 /// Install `Function` and its prototype methods.
 pub fn install(interp: &mut Interp<'_>, function_proto: &Gc<JsObject>) {
+    // `%Function.prototype%` is itself a function, so it has the two own data properties
+    // every function gets. They are load-bearing rather than decorative: `delete f.length`
+    // succeeds (the property is configurable) and then the read falls through to these,
+    // which is why `eval.length` is `0` after a successful delete instead of `undefined`.
+    // Their attributes are the function ones — not writable, not enumerable, configurable.
+    function_proto.define("length", Property::name_or_length(Value::Int(0)));
+    function_proto.define("name", Property::name_or_length(interp.string("")));
     define_method(function_proto, "call", 1, call, interp);
     define_method(function_proto, "apply", 2, apply, interp);
     define_method(function_proto, "bind", 1, bind, interp);
@@ -31,7 +38,14 @@ pub fn install(interp: &mut Interp<'_>, function_proto: &Gc<JsObject>) {
         ("columnNumber", column_number),
     ] {
         let getter = interp.new_native(name, 0, getter);
-        function_proto.define(name, Property::accessor(Some(Value::Object(getter)), None));
+        // Not enumerable: these are the reference's own extension on
+        // `Function.prototype`, and an enumerable one is inherited by *every* function,
+        // so `for (k in Boolean)` listed `fileName`/`lineNumber`/`columnNumber`. That is
+        // observable enough to break `for…in` over a function.
+        function_proto.define(
+            name,
+            Property::accessor_with(Some(Value::Object(getter)), None, false),
+        );
     }
 
     let constructor = interp.new_native_constructor("Function", 1, constructor);

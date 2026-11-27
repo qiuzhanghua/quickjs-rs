@@ -193,7 +193,7 @@ fn string_object(
     match this {
         Value::String(text) => Ok(text.clone()),
         // A boxed string carries the primitive in `_value`.
-        Value::Object(object) => match object.own_property("_value").and_then(|p| p.value) {
+        Value::Object(object) => match interp.internal_get(object, "_value") {
             Some(Value::String(text)) => Ok(text),
             _ => Err(interp.type_error("String method on a non-string")),
         },

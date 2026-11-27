@@ -76,7 +76,7 @@ fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult
     // `ToPrimitive` step on a wrapper throws. Called as a plain function there is no
     // receiver and the primitive is the answer.
     if let Value::Object(object) = &this {
-        object.define("_value", Property::with_attributes(number, false, false));
+        interp.internal_set(object, "_value", number);
         return Ok(this);
     }
     let _ = interp;
@@ -87,11 +87,13 @@ fn constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult
 fn number_of(interp: &Interp<'_>, this: &Value) -> Result<f64, crate::interp::Signal> {
     match this {
         Value::Int(_) | Value::Float(_) => Ok(this.to_number()),
-        Value::Object(object) => object
-            .own_property("_value")
-            .and_then(|property| property.value)
-            .map(|value| value.to_number())
-            .ok_or_else(|| interp.type_error("Number method on a non-number")),
+        // The slot has to hold a *number*: `to_number()` would happily convert a string
+        // or a boolean box, so `Number.prototype.valueOf.call(new String("x"))` answered
+        // `NaN` instead of throwing. `thisNumberValue` is a brand check, not a coercion.
+        Value::Object(object) => match interp.internal_get(object, "_value") {
+            Some(value @ (Value::Int(_) | Value::Float(_))) => Ok(value.to_number()),
+            _ => Err(interp.type_error("Number method on a non-number")),
+        },
         _ => Err(interp.type_error("Number method on a non-number")),
     }
 }
@@ -106,7 +108,9 @@ fn to_string(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<V
     let value = number_of(interp, &this)?;
     let radix = match args.first() {
         None | Some(Value::Undefined) => return Ok(interp.string(number_to_string(value))),
-        Some(other) => other.to_number() as u32,
+        // `ToNumber`, so a Symbol or a BigInt raises `TypeError` rather than quietly
+        // becoming radix 0.
+        Some(other) => interp.to_js_number(other)? as u32,
     };
     if radix == 10 {
         return Ok(interp.string(number_to_string(value)));
@@ -333,7 +337,7 @@ fn compare_bound(
 
 fn to_fixed(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let value = number_of(interp, &this)?;
-    let digits = arg(args, 0).to_number().max(0.0) as usize;
+    let digits = interp.to_js_number(&arg(args, 0))?.max(0.0) as usize;
     if digits > 100 {
         return Err(interp.range_error("toFixed argument out of range"));
     }
@@ -357,7 +361,7 @@ fn to_exponential(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
             // No argument: as many digits as needed, spelling normalised to `e+N`.
             return Ok(interp.string(normalise(&format!("{value:e}"))));
         }
-        Some(digits) => digits.to_number() as usize,
+        Some(digits) => interp.to_js_number(digits)? as usize,
     };
     if digits > 100 {
         return Err(interp.range_error("toExponential argument out of range"));
@@ -426,7 +430,10 @@ fn to_precision(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
     match args.first() {
         None | Some(Value::Undefined) => Ok(interp.string(number_to_string(value))),
         Some(precision) => {
-            let precision = precision.to_number() as usize;
+            // `ToNumber`, which refuses a Symbol and a BigInt: `to_number()` answers `NaN`
+            // for both, so `(1.5).toPrecision(Symbol())` reported a `RangeError` about the
+            // precision instead of the `TypeError` the conversion has to raise.
+            let precision = interp.to_js_number(precision)? as usize;
             if precision == 0 || precision > 100 {
                 return Err(interp.range_error("toPrecision argument out of range"));
             }
@@ -533,7 +540,7 @@ fn boolean_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> 
     let flag = Value::Bool(arg(args, 0).to_boolean());
     // Same wrapper rule as `Number`: `new Boolean(true)` stores the primitive.
     if let Value::Object(object) = &this {
-        object.define("_value", Property::with_attributes(flag, false, false));
+        interp.internal_set(object, "_value", flag);
         return Ok(this);
     }
     let _ = interp;
@@ -543,11 +550,13 @@ fn boolean_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> 
 fn boolean_receiver(interp: &Interp<'_>, this: &Value) -> Result<bool, crate::interp::Signal> {
     match this {
         Value::Bool(value) => Ok(*value),
-        Value::Object(object) => object
-            .own_property("_value")
-            .and_then(|property| property.value)
-            .map(|value| value.to_boolean())
-            .ok_or_else(|| interp.type_error("Boolean method on a non-boolean")),
+        // A brand check, not a coercion: `to_boolean()` accepts anything, so a String
+        // box passed the test and `Boolean.prototype.valueOf.call(new String())` answered
+        // `false` instead of throwing.
+        Value::Object(object) => match interp.internal_get(object, "_value") {
+            Some(Value::Bool(value)) => Ok(value),
+            _ => Err(interp.type_error("Boolean method on a non-boolean")),
+        },
         _ => Err(interp.type_error("Boolean method on a non-boolean")),
     }
 }

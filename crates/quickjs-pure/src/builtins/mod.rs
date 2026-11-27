@@ -16,6 +16,7 @@ pub mod bigint;
 pub(crate) mod date;
 pub mod disposable;
 mod error;
+mod from_async;
 mod function;
 mod generator;
 mod global;
@@ -49,6 +50,14 @@ pub fn install(interp: &mut Interp<'_>) {
     let string_proto = interp.new_object(Some(object_proto.clone()));
     let number_proto = interp.new_object(Some(object_proto.clone()));
     let boolean_proto = interp.new_object(Some(object_proto.clone()));
+    // Each of the three is a wrapper of its own type, carrying the empty value:
+    // `Boolean.prototype.valueOf()` is `false`, `Number.prototype.valueOf()` is `0` and
+    // `String.prototype.valueOf()` is `""`. Without the slot they were plain objects, so
+    // all three threw "not a boolean/number/string" from a method called on its own
+    // prototype — which §20.3.3, §21.1.3 and §22.1.3 make legal.
+    interp.init_primitive_wrapper(&boolean_proto, Value::Bool(false));
+    interp.init_primitive_wrapper(&number_proto, Value::Int(0));
+    interp.init_primitive_wrapper(&string_proto, interp.string(""));
     interp.realm.string_proto = Some(string_proto.clone());
     interp.realm.number_proto = Some(number_proto.clone());
     interp.realm.boolean_proto = Some(boolean_proto.clone());
@@ -98,6 +107,10 @@ pub fn install(interp: &mut Interp<'_>) {
     typedarray::install(interp, &object_proto);
     generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
+    // `Array.fromAsync` last: it is written in JavaScript and compiled here, so its
+    // source reaches for `Array`, `Promise`, `Reflect`, `Object`, `TypeError` and the
+    // well-known symbols by name. Every one of those has to exist by now.
+    from_async::install(interp);
 }
 
 // ---------------------------------------------------------------------------
@@ -201,9 +214,8 @@ pub fn this_object(interp: &mut Interp<'_>, this: &Value) -> crate::interp::JsRe
 pub fn this_string(interp: &Interp<'_>, this: &Value) -> Option<String> {
     match this {
         Value::String(text) => Some(text.to_string_lossy().into_owned()),
-        Value::Object(object) => object
-            .own_property("_value")
-            .and_then(|property| property.value)
+        Value::Object(object) => interp
+            .internal_get(object, "_value")
             .map(|value| value.to_js_string()),
         _ => {
             let _ = interp;

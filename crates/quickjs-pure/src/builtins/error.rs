@@ -62,10 +62,8 @@ pub fn install(interp: &mut Interp<'_>) {
         // which class it belongs to is carried in `_class`, because a `NativeFn` is
         // a plain function pointer and cannot capture.
         let constructor = interp.new_native_constructor(class, 1, error_constructor);
-        constructor.define(
-            "_class",
-            Property::with_attributes(interp.string(class), false, false),
-        );
+        let class_text = interp.string(class);
+        interp.internal_set(&constructor, "_class", class_text);
         constructor.define(
             "prototype",
             Property::with_attributes(Value::Object(proto.clone()), false, false),
@@ -160,10 +158,7 @@ fn suppressed_error_constructor(
             Property::with_attributes(interp.string(text), true, true),
         );
     }
-    object.define(
-        "_class",
-        Property::with_attributes(interp.string("Error"), false, false),
-    );
+    interp.internal_set(&object, "_class", interp.string("Error"));
     interp.add_stack(&object);
     Ok(Value::Object(object))
 }
@@ -182,8 +177,7 @@ fn error_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> Js
     // class is read off the constructor so one function serves all eight.
     let class = interp
         .current_callee()
-        .and_then(|callee| callee.own_property("_class"))
-        .and_then(|property| property.value)
+        .and_then(|callee| interp.internal_get(&callee, "_class"))
         .map(|value| value.to_js_string())
         .unwrap_or_else(|| "Error".to_string());
     let target = match &this {
@@ -216,11 +210,8 @@ fn error_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> Js
     // Every error instance shares the class name `Error`, whatever its constructor:
     // `Object.prototype.toString` answers `[object Error]` even for a `TypeError`,
     // and the print formatter uses it to choose `Name: message` + trace.
-    if !target.has_own("_class") {
-        target.define(
-            "_class",
-            Property::with_attributes(interp.string("Error"), false, false),
-        );
+    if interp.internal_get(&target, "_class").is_none() {
+        interp.internal_set(&target, "_class", interp.string("Error"));
     }
     // The trace is taken here, in the constructor, exactly as the reference does
     // (`JS_NewError` calls `build_backtrace`): an error object carries its stack from

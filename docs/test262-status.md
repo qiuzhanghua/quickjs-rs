@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **13152（71.1%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 5335 |
+| **可运行中通过** | **13371（72.3%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 5116 |
 | ↳ 其中挂起（引擎不终止） | 9 |
-| ↳ 其中答错 | 5326 |
+| ↳ 其中答错 | 5107 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -55,7 +55,8 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 得 +7 例，两次回归都是 0，通过率回到 62.5%。补上 Iterator helpers（4.16）再得 +523 例，
 再把 helper 的关闭语义与 `zip`/`zipKeyed` 对齐（4.17）得 +405 例，两次回归都是 0，
 到 67.5%。再补 `Array` 的缺件与两处语义（4.21）得 +475 例，回归 1 例——那 1 例经查是
-**此前的假通过**，见 4.21 末尾，所以真回归是 0，通过率到 71.1%。
+**此前的假通过**，见 4.21 末尾，所以真回归是 0，通过率到 71.1%（13152/18487）。
+再补 `Array.fromAsync`（4.23）得 +219 例、回归 0，到 72.3%（13371/18487）。
 
 **基线绑定了 test262 的提交。** `docs/test262-baseline.txt.gz` 首行现在是
 `# test262 <commit>`。没有这一行时，检出被清掉后重新克隆会落到新的 HEAD，
@@ -94,33 +95,35 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 
 | 部件 | 失败数 |
 |---|---|
-| RegExp | 1082 |
+| RegExp | 1081 |
 | TypedArray | 575 |
-| Array | 465 |
-| Promise | 465 |
-| String | 462 |
-| TypedArrayConstructors | 187 |
-| Set | 187 |
-| Object | 176 |
+| Promise | 461 |
+| String | 459 |
+| Array | 363 |
+| Set | 186 |
+| TypedArrayConstructors | 185 |
+| Object | 166 |
 | ArrayBuffer | 155 |
 | WeakMap | 140 |
-| Function | 122 |
+| Function | 113 |
 | Iterator | 101 |
 
-`Array` 从 912 条降到 476 条（见 4.21）；`Object` 从 1567 降到 180、`Iterator` 从 664
-降到 101，是此前几轮（4.16–4.20）的结果，本表已随之更新。
+`Array` 从 912 条降到 363 条（4.21 修两个根因与七个缺件，4.23 补 `fromAsync`）；
+`Object` 从 1567 降到 166、`Iterator` 从 664 降到 101，是此前几轮（4.16–4.20）的结果，
+本表已随之更新。
 
 按失败形态（同一缺陷会聚成一类）：
 
 | 数量 | 形态 | 等价于 |
 |---|---|---|
-| 463 | `TypeError: undefined is not a function` | 缺失方法（`RegExp.escape`、`Array.fromAsync`、部分 TypedArray 方法） |
-| 360 | `SameValue` 不符 | 逐条语义 |
-| 252 | 期望抛 `TypeError` 却没抛 | 缺参数/类型校验 |
+| 463 | `TypeError: undefined is not a function` | 缺失方法（`RegExp.escape`、部分 TypedArray 方法、`WeakRef` 一族） |
+| 344 | `SameValue` 不符 | 逐条语义 |
+| 243 | 期望抛 `TypeError` 却没抛 | 缺参数/类型校验 |
 | 192 | 期望 parse 期 `SyntaxError` 却执行了 | 早期错误检查缺失 |
 | 134 | `cannot convert a Number to a BigInt` | harness 的 `makeArray` 路径 |
-| 107 | `String method on a non-string` | 字符串方法对接收者的校验过松 |
+| 106 | `String method on a non-string` | 字符串方法对接收者的校验过松 |
 | 102 | 期望 `TypeError` 得到 `ReferenceError` | 缺失全局（`WeakMap`/`WeakSet`/`ShadowRealm`） |
+| 98 | 期望抛 `Test262Error` 却没抛 | 断言本身没被触发，即被测行为没有发生 |
 | 89+47+42 | `WeakMap`/`WeakSet`/`FinalizationRegistry is not defined` | 未实现 |
 | 76 | `implements ArrayBuffer.prototype.resize` | **resizable ArrayBuffer 未实现** |
 | 70+58 | 正则 `invalid group`／lookbehind 不支持 | 正则文法不完整 |
@@ -571,16 +574,18 @@ fclosure8 <class_fields_init> ; set_home_object ; put_loc4
 把它去掉再断言 tag 变回 `Function`。我一开始写成不可配置，`delete` 静默返回 `false`，
 测试才暴露出来。
 
-### 4.21 `Array` 的两个根因与七个缺件（✅ 已修，+460 例）
+### 4.21 `Array` 的两个根因与七个缺件（✅ 已修，+475 例）
 
-`test/built-ins/Array` 从 2155/3067（70.3%）到 **2577/3067（84.0%）**，全量从 68.6% 到
-**71.1%**（+460 例）。失败按形态聚成六类，前两类是**一个缺陷各自散在十几个方法里**：
+`test/built-ins/Array` 从 2155/3067（70.3%）到 **2602/3067（84.8%）**，全量从 68.6% 到
+**71.1%**（13152/18487；逐用例差分全局 +475 / -1，其中 `Array` 目录内 +448 / -1，
+余下的在 `String`/`Object`/`Number` 等——两个根因各自都散在 `Array` 之外）。
+失败按形态聚成六类，前两类是**一个缺陷各自散在十几个方法里**：
 
 | 数量 | 形态 | 根因 |
 |---|---|---|
 | 159 | 回调里 `this !== thisArg` | **所有**回调方法把 `undefined` 传给 `[[Call]]` |
 | 157 | `undefined is not a function` | 七个方法整个不存在 |
-| 95 | `Array.fromAsync is not a function` | 整块没做 |
+| 95 | `Array.fromAsync is not a function` | 整块没做（4.23 已补，95/95） |
 | 54 | `resizable ArrayBuffer` | 未实现（见下） |
 | 16 | `memory allocation of … failed` | 数组上限校验只在部分路径上 |
 | 其余 | 逐条语义 | — |
@@ -644,7 +649,7 @@ DataView 26 等）是**真缺口**，登记在 `docs/requirements.md` 的 FR-8 �
 同步迭代器上 `Await` 每个值，中途出错要 `AsyncIteratorClose`，还要支持
 `@@asyncIterator`。用现有原语拼一个近似实现会在异步与错误路径上**静默错答案**，
 而错答案比缺失更贵。按本项目的尺子，它现在响亮地报 `undefined is not a function`，
-这是可接受的状态；下一轮单独排期。
+这是可接受的状态；下一轮单独排期。**→ 见 4.23，已修，95/95。**
 
 回归保护：`crates/quickjs-pure/tests/builtins.rs` 的三条新测试
 `array_callbacks_receive_their_this_arg_and_wrapped_strings_have_length`、
@@ -691,6 +696,98 @@ panics-and-OOM 级的缺陷，不是覆盖率问题。
 `reverse`/`sort`/`splice`/`shift`/`unshift` 用 `padded_elements`（逻辑长度补齐空洞），
 因为它们本来就要写回、允许分配；`fill` 用 `receiver_length` 但要逐格 `[[Set]]`；
 `pop`/`shift` 的返回值要把 `Hole` 折成 `undefined`。
+
+### 4.23 `Array.fromAsync`，以及它顺带挖出的七个引擎 bug（✅ 已修，+219 例）
+
+`Array.fromAsync` 的 95 条用例上一轮留成了单独的排期项，理由是"要在同步迭代器上
+`Await` 每个值、出错要 `AsyncIteratorClose`、要支持 `@@asyncIterator`，用现有原语拼
+近似实现会在异步与错误路径上静默错答案"。这个判断是对的：**拼 Rust 原生实现会错**。
+但结论选错了——它不该是 `NativeFn`。
+
+它是规范里的 async 函数，而引擎已经会把 async 函数体跑成协程。于是实现写成
+`builtins/from_async.rs` 里的一段 JS，install 期编译成函数对象，`Await`、时序、
+`async` 标志全部由引擎自己处理。Rust 侧只负责编译、检查产物、按属性装上去。
+
+95 条用例从 0 到 95。而真正有价值的不是这 95 条，是它们逼出来的七个 bug——
+每一个都影响 `fromAsync` 之外：
+
+**1. `return g()` 让 generator 体继承调用者的帧**（`TailCall`）
+
+`tail_call` 优化只判断了"是不是字节码函数"，漏了 generator/async 分支。而调用
+generator 并不执行函数体，只创建对象，所以它不该复用当前帧：
+
+| 表达式 | 修前 | 修后 |
+|---|---|---|
+| `function f(){ return g() }` 其中 `g` 是 generator | `InternalError: a generator body ran as an ordinary call` | 正常 |
+| `async function f(){ return a() }` 其中 `a` 是 async | 同上 | 正常 |
+
+**2. `generator.return()` 不跑 `finally`**
+
+`it.return()` 从 `yield` 恢复后，编译器直接发 `return_async` 结束，没走
+`return_stmt` 的清理链。于是 `try { yield 1 } finally { cleanup() }` 的 `finally`
+在 `return()` 时被完全跳过——资源清理、`for…of` 的收尾都指望它。修法是把清理链抽成
+`emit_unwind_for_return`，`return` 与 `yield` 的 `return(v)` 两处共用。
+
+**3. test262 runner 的 strict 指令位置错了（不是引擎的 bug）**
+
+`INTERPRETING.md` §Strict Mode 要求 `"use strict";` 是**文件的初始字符序列**，
+"must precede any additional text modifications"。runner 把它放在 harness **之后**，
+那段文字就成了普通表达式语句，指令序言从未生效——**所有 `onlyStrict` 用例此前都在
+sloppy 模式下跑**。修好后 4 条用例从"通过"变"失败"，逐个查下来无一是引擎退化：
+
+- 两条是 `for (x in obj)` 里的隐式全局，strict 下本就该 `ReferenceError`；
+- 两条会去写 `Error` 实例的 `_class`（见第 4 条）。
+
+所以这 4 条不是回归，是假通过的结束。
+
+**4. 内部槽泄漏成可枚举的用户属性**
+
+引擎把 `[[Value]]`、`[[Class]]`、`[[DateValue]]` 存成 `"_value"`/`"_class"`/
+`"_date_value"` 字符串属性，于是：
+
+```
+Object.getOwnPropertyNames(new Number(1))   // 修前 ["_value"]，修后 []
+Object.getOwnPropertyNames(new Error("t"))  // 修前 ["message","_class","stack"]
+```
+
+`Object.create(null, props)` 那条用例正是遍历 `getOwnPropertyNames(new Error())`
+再逐个赋值，撞上不可写的 `_class` 就抛。改成**符号键**：对
+`getOwnPropertyNames`/`Object.keys`/`for…in`/`JSON.stringify` 都不可见，
+但仍是收集器追踪的普通属性。
+
+**5. 三个原型对象不是各自的包装器**
+
+`Boolean.prototype.valueOf()` 应为 `false`、`Number.prototype` 为 `0`、
+`String.prototype` 为 `""`——规范让这三个原型**本身**是空盒子。此前它们是普通对象，
+于是调用自己原型上的方法就抛 `not a boolean`。
+
+顺带修掉两处把 brand check 写成强制转换的地方：`Boolean.prototype.valueOf` 接受任何
+带 `_value` 的对象（`new String()` 也能过），`Number.prototype.valueOf` 同理。这也是
+内部槽从字符串改成符号之后才暴露出来的——修第 4 条时不得不逐个看清每个读取点。
+
+**6. `Function.prototype` 缺 `length`/`name`，`toPrecision` 等静默接受 Symbol**
+
+`delete f.length` 之后读 `f.length` 要回落到 `Function.prototype.length`（`0`），
+但那个属性根本不存在，于是 `eval.length` 删完变 `undefined` 而不是 `0`。
+
+`Number.prototype.toString/toFixed/toExponential/toPrecision` 用无错的 `to_number()`
+读参数，Symbol/BigInt 被换成 `NaN`，于是 `(1.5).toPrecision(Symbol())` 报的是
+`RangeError`（精度越界）而不是 `TypeError`（转换失败）。
+
+**7. `Function.prototype` 上的 `fileName`/`lineNumber`/`columnNumber` 可枚举**
+
+它们是参考实现的自有扩展，而 `Property::accessor` 的默认 `enumerable` 是 `true`。
+每个函数都继承它们，于是 `for (k in Boolean)` 列出三个本不该出现的键——
+`for…in` 一个函数的行为就这样被带偏了。
+
+### 关于"用 JS 写内建"这个决定
+
+值得写下来，因为它是本项目第一次这么做，也可能是最后一次：只有当**规范本身要求一个
+语言层语义**（这里是"是 async 函数"）而 Rust 侧实现那层语义要重造协程时，才划算。
+`fromAsync` 的 95 条用例里有 12 条直接测 `Await` 的时钟行为（`…-awaits-once.js`
+数 `then` 被调用几次），手写状态机等于把这些时序一条条对出来。反过来，任何没有这个
+性质的都该继续用 `NativeFn`：`fromAsync` 的源码是**字符串**，编译器不检查它，
+只有 install 期的一次成功编译在兜底。
 
 ## 5. 对里程碑结论的修正
 

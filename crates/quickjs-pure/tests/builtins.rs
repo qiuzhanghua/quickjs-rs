@@ -2944,6 +2944,161 @@ print(JSON.stringify(Array.prototype.map.call(Math, function (v, i, o) {
 }
 
 #[test]
+fn generator_return_and_throw_run_finally_blocks() {
+    // `it.return()` is a `return` from the body's point of view, so every enclosing
+    // `finally` has to run before the generator finishes. It emitted `return_async`
+    // directly, which ended the generator and skipped the cleanup entirely — the thing
+    // `for…of` and resource disposal rely on.
+    assert_eq!(
+        eval(
+            r#"
+function count(fn) { var n = 0; fn(function () { n++; }); return n; }
+
+var a = count(function (bump) {
+  var g = (function* () { try { yield 1; } finally { bump(); } })();
+  g.next(); g.return();
+});
+var b = count(function (bump) {
+  var g = (function* () { try { yield 1; yield 2; } finally { bump(); } })();
+  g.next(); g.next(); g.next();          // runs to the end naturally
+});
+var c = count(function (bump) {
+  var g = (function* () { try { yield 1; } catch (e) { bump(); } })();
+  g.next(); g.throw(new Error("x"));
+});
+print(a, b, c);
+
+// A tail call to a generator must not inherit the caller's frame: that made the first
+// `yield` report "a generator body ran as an ordinary call".
+function makeGenerator() { return (function* () { yield 7; })(); }
+print(JSON.stringify(makeGenerator().next()));
+"#
+        ),
+        concat!("1 1 1\n", "{\"value\":7,\"done\":false}\n"),
+    );
+}
+
+#[test]
+fn array_from_async_is_a_real_async_function() {
+    // `fromAsync` is written in JavaScript and compiled at install time, because it is
+    // specified as an *async* function: it must answer a promise even when `mapfn` is not
+    // callable, and each mapped value is awaited exactly once per iteration.
+    assert_eq!(
+        eval(
+            r#"
+print(typeof Array.fromAsync, Array.fromAsync.length, Array.fromAsync.name);
+print(Object.getPrototypeOf(Array.fromAsync) === Function.prototype);
+print(Object.getOwnPropertyDescriptor(Array.fromAsync, "prototype") === undefined);
+
+// Sequenced, not concurrent: several `fromAsync` calls interleave their microtasks, so
+// the order they print in is a property of the queue rather than of the method.
+(async function () {
+  print("iterable", (await Array.fromAsync([1, 2, 3])).join());
+  print("arraylike", (await Array.fromAsync({length: 2, 0: 4, 1: 5})).join());
+  print("mapped", (await Array.fromAsync([1, 2], function (v) { return v * 10; })).join());
+
+  try {
+    await Array.fromAsync([], null);
+    print("BUG: fulfilled");
+  } catch (e) {
+    print("bad mapfn", e.name);
+  }
+
+  // A thenable's `then` runs once per element.
+  var awaited = 0;
+  await Array.fromAsync([1, 2], function (v) {
+    return { then: function (resolve) { awaited++; resolve(v); } };
+  });
+  print("awaited", awaited);
+
+  // A rejecting thenable closes the source iterator, so its `finally` runs.
+  var closed = false;
+  function* source() {
+    try { yield { then: function (_, reject) { reject(new Error("no")); } }; }
+    finally { closed = true; }
+  }
+  try {
+    await Array.fromAsync(source());
+    print("BUG: fulfilled");
+  } catch (e) {
+    print("rejected", e.message, closed);
+  }
+})();
+"#
+        ),
+        concat!(
+            "function 1 fromAsync\n",
+            "true\n",
+            "true\n",
+            "iterable 1,2,3\n",
+            "arraylike 4,5\n",
+            "mapped 10,20\n",
+            "bad mapfn TypeError\n",
+            "awaited 2\n",
+            "rejected no true\n",
+        )
+    );
+}
+
+#[test]
+fn internal_slots_are_invisible_and_wrappers_are_branded() {
+    // The engine keeps `[[Value]]`, `[[Class]]` and `[[DateValue]]` in properties on the
+    // object. As string keys they showed up in `Object.getOwnPropertyNames`, which is a
+    // property the language does not define — and copying them (as
+    // `Object.create(null, props)` does) hit an internal name that is not writable.
+    assert_eq!(
+        eval(
+            r#"
+print(Object.getOwnPropertyNames(new Error("t")).join());
+print(Object.getOwnPropertyNames(new Number(1)).join(), "|");
+print(Object.getOwnPropertyNames(new Date(0)).join(), "|");
+print(Object.getOwnPropertyNames(new String("ab")).join());
+
+// A brand check, not a coercion.
+var boxed = new String("x");
+boxed.valueOf = Boolean.prototype.valueOf;
+try { boxed.valueOf(); print("BUG: no throw"); } catch (e) { print("string box", e.name); }
+try { Number.prototype.valueOf.call(boxed); print("BUG: no throw"); } catch (e) {
+  print("number brand", e.name);
+}
+
+// The three prototypes are wrappers of their own type holding the empty value.
+print(Boolean.prototype.valueOf(), Number.prototype.valueOf(),
+      JSON.stringify(String.prototype.valueOf()));
+
+// `Function.prototype` is a function, so it has the two own data properties — which is
+// what `delete f.length` falls through to.
+print(Function.prototype.length, JSON.stringify(Function.prototype.name));
+var f = function (a, b) {};
+delete f.length;
+print(f.length);
+print([].constructor === Array, (function () {}).length);
+
+// A Symbol argument to a numeric conversion raises `TypeError`, not a range complaint.
+try { (1.5).toPrecision(Symbol()); } catch (e) { print("precision", e.name); }
+try { (1).toString(Symbol()); } catch (e) { print("radix", e.name); }
+print((1.5).toFixed(1), (255).toString(16));
+"#
+        ),
+        concat!(
+            "message,stack\n",
+            " |\n",
+            " |\n",
+            "0,1,length\n",
+            "string box TypeError\n",
+            "number brand TypeError\n",
+            "false 0 \"\"\n",
+            "0 \"\"\n",
+            "0\n",
+            "true 0\n",
+            "precision TypeError\n",
+            "radix TypeError\n",
+            "1.5 ff\n",
+        )
+    );
+}
+
+#[test]
 fn array_length_and_index_beyond_i32_survive_the_trip_out() {
     // `Value::Int` is an `i32`, and an array's `length` may legitimately reach `2^32-1`,
     // so every place that cast was wrong: `Object.defineProperty(a, "length", …)` reported

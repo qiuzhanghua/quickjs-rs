@@ -4,6 +4,31 @@
 
 ## 未发布（在 v0.4.0 之后）
 
+### 加：`Array.fromAsync`，并用它逼出四个引擎 bug（+219 例）
+
+test262 全量 **13152 → 13371 / 18487（71.1% → 72.3%）**，回归 0 例；
+`Array.fromAsync` 的 95 条用例 0 → 95。逐用例差分见 `docs/test262-status.md` 4.23。
+
+实现方式值得单独记一笔：它**不是** `NativeFn`，而是 `builtins/from_async.rs` 里的一段
+JS，install 期编译成函数对象。规范要求它是 async 函数（失败也要给 promise 而不是
+向调用方抛出、两个 `await` 点的时序、`AsyncIteratorClose` 发生在映射值 reject
+**之后**），而引擎已经把 async 函数体跑成协程——在 Rust 里手写这个状态机等于把
+`…-awaits-once.js` 那 12 条时序用例逐条对一遍。Rust 侧只做编译、检查产物、按属性装上。
+
+顺带修掉四个影响 `fromAsync` 之外的缺陷：
+
+- `return g()` 让 generator/async 体继承调用者的帧（`tail_call` 漏了这个分支），
+  `function f(){ return g() }` 直接报 `a generator body ran as an ordinary call`；
+- `generator.return()` 跳过 `finally`：`it.return()` 从 `yield` 恢复后直接
+  `return_async`，没走 `return` 的清理链。抽成 `emit_unwind_for_return` 两处共用；
+- 内部槽（`_value`/`_class`/`_date_value`）是可枚举的**字符串**属性，于是
+  `Object.getOwnPropertyNames(new Number(1))` 报 `["_value"]`。改成符号键：对
+  `getOwnPropertyNames`/`keys`/`for…in`/`JSON.stringify` 不可见，仍是追踪属性；
+- 不可构造的函数不该有 `prototype`（§10.2.5 随 `[[Construct]]` 一起建），
+  此前 generator/async/箭头函数都拿到了一个；任何 async 函数都会被
+  `builtin.js` 的 own-property 检查抓到。
+
+
 **可用性边界未变**：`qjs` 能做的事与 v0.4.0 完全相同——这一节里没有一行逻辑代码被改过，
 记录的全是代码之外的东西：门禁本身，以及它周围那些还在说旧事实的文档。
 

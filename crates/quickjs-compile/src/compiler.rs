@@ -1401,6 +1401,34 @@ impl Compiler {
             }
             self.expr(expr)?;
         }
+        has_value = self.emit_unwind_for_return(has_value);
+        // A generator or async function does not return to its caller: it either
+        // finishes, and the value becomes `{value, done: true}`, or it suspends.
+        // `return_async` is the "finished" half, and it reads the value off the stack
+        // rather than carrying it, which is what the resume machinery expects.
+        if self.cur().is_suspending() {
+            if !has_value {
+                self.emit(Opcode::Undefined, &[]);
+            }
+            self.emit(Opcode::ReturnAsync, &[]);
+            return Ok(());
+        }
+        if has_value {
+            self.emit(Opcode::Return, &[]);
+        } else {
+            self.emit(Opcode::ReturnUndef, &[]);
+        }
+        Ok(())
+    }
+
+    /// Emit the finalizer/iterator cleanup for leaving the current position with a
+    /// return, and report whether a value is now on the stack for it to carry.
+    ///
+    /// Shared by `return` and by the `return(v)` half of a `yield`: both abandon every
+    /// enclosing `finally` at once, and the two used to be separate — the `yield` path
+    /// simply emitted `return_async`, so `it.return()` ended the generator without ever
+    /// running `finally` blocks the body was sitting inside.
+    fn emit_unwind_for_return(&mut self, mut has_value: bool) -> bool {
         let targets = self.cur().jump_targets.clone();
         for target in targets.iter().rev() {
             if target.finally_label.is_none() && !target.has_iterator {
@@ -1424,23 +1452,7 @@ impl Compiler {
                 self.emit_jump(Opcode::Gosub, finally, &[]);
             }
         }
-        // A generator or async function does not return to its caller: it either
-        // finishes, and the value becomes `{value, done: true}`, or it suspends.
-        // `return_async` is the "finished" half, and it reads the value off the stack
-        // rather than carrying it, which is what the resume machinery expects.
-        if self.cur().is_suspending() {
-            if !has_value {
-                self.emit(Opcode::Undefined, &[]);
-            }
-            self.emit(Opcode::ReturnAsync, &[]);
-            return Ok(());
-        }
-        if has_value {
-            self.emit(Opcode::Return, &[]);
-        } else {
-            self.emit(Opcode::ReturnUndef, &[]);
-        }
-        Ok(())
+        has_value
     }
 
     /// Compile a statement list, stopping at the first statement that cannot
@@ -4477,6 +4489,10 @@ impl Compiler {
         self.emit(Opcode::Yield, &[]);
         let resume = self.new_label();
         self.emit_jump(Opcode::IfFalse, resume, &[]);
+        // `return(v)` resumed us. It is a `return` from the *body's* point of view, so it
+        // runs the same cleanup chain: without it, `it.return()` inside `try { yield }`
+        // finished the generator and never ran the `finally`.
+        self.emit_unwind_for_return(true);
         self.emit(Opcode::ReturnAsync, &[]);
         self.place_label(resume);
         // Nothing is emitted here: the value the caller passed to `next` *is* the value

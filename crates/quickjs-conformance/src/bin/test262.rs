@@ -412,22 +412,27 @@ impl Runner {
         };
         let mut source = String::new();
         if is_module {
-            // A module is strict already; the directive would be a syntax error in a
-            // module's import/export position anyway, so it is only added for scripts.
-            if strict {
-                // Modules are strict by definition; nothing to add.
-            }
+            // Modules are strict by definition; nothing to add.
             source.push_str(&test.source);
         } else {
-            // A `raw` test gets no harness at all.
-            if !test.flags.iter().any(|flag| flag == "raw") {
-                source.push_str(HOST_OBJECT);
-                source.push_str(harness);
-            }
-            // §Strict Mode: the directive goes on the *test*, after the harness, so the
-            // harness itself stays sloppy.
+            // §Strict Mode of INTERPRETING.md: to run a test strict, the directive "must
+            // be inserted as the initial character sequence of the file ... This must
+            // precede any additional text modifications."
+            //
+            // That means it comes *before* the harness, and the harness runs strict too.
+            // Putting it after the harness — which is what this runner used to do — makes
+            // it a no-op: a directive prologue only exists at the start of a source text,
+            // so `"use strict"` in the middle is just an expression statement and every
+            // `onlyStrict` test was silently running in sloppy mode. The harness is
+            // written to work either way, so hoisting the directive costs nothing.
+            let raw = test.flags.iter().any(|flag| flag == "raw");
             if strict {
                 source.push_str("\"use strict\";\n");
+            }
+            // A `raw` test gets no harness at all.
+            if !raw {
+                source.push_str(HOST_OBJECT);
+                source.push_str(harness);
             }
             source.push_str(&test.source);
         }

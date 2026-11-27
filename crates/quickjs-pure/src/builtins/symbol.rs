@@ -172,10 +172,7 @@ fn this_symbol(interp: &Interp<'_>, this: &Value) -> JsResult<Gc<JsSymbol>> {
         Value::Symbol(symbol) => Ok(symbol.clone()),
         // `Object(sym)` boxes the symbol, and `valueOf`/`toString` have to reach through
         // the box — that is the whole point of the wrapper.
-        Value::Object(object) => match object
-            .own_property("_value")
-            .and_then(|property| property.value)
-        {
+        Value::Object(object) => match interp.internal_get(object, "_value") {
             Some(Value::Symbol(symbol)) => Ok(symbol),
             _ => Err(Signal::Throw(
                 interp.make_error("TypeError", "not a symbol"),

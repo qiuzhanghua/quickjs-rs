@@ -77,9 +77,19 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
 }
 
 /// The bigint `this` refers to.
+/// `thisBigIntValue`: the bigint a method operates on.
+///
+/// A `BigInt.prototype` method accepts either a primitive or a wrapper object, so
+/// `Object(1n).toString()` and `1n.toString()` both work. Only a wrapper whose
+/// `_value` really is a bigint counts — `BigInt.prototype.toString.call({})` is a
+/// `TypeError`, and so is calling it on a `Number` wrapper.
 fn this_bigint(interp: &Interp<'_>, this: &Value) -> JsResult<Gc<BigInt>> {
     match this {
         Value::BigInt(big) => Ok(big.clone()),
+        Value::Object(object) => match interp.internal_get(object, "_value") {
+            Some(Value::BigInt(big)) => Ok(big),
+            _ => Err(interp.type_error("not a BigInt")),
+        },
         _ => Err(interp.type_error("not a BigInt")),
     }
 }
@@ -102,8 +112,9 @@ fn to_string(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<V
 
 /// `bigint.valueOf()`.
 fn value_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Value> {
-    this_bigint(interp, &this)?;
-    Ok(this)
+    // The *primitive*, not the receiver: `Object(1n).valueOf()` answers `1n`, and
+    // `typeof` on it has to be `"bigint"` rather than `"object"`.
+    Ok(Value::BigInt(this_bigint(interp, &this)?))
 }
 
 /// The bit count an `asIntN`/`asUintN` call asks for.
