@@ -708,3 +708,86 @@ NFR-6 原来只是一句散文，于是它和代码早就对不上了。新脚�
 - `os.setReadHandler`/`os.setWriteHandler`：需要事件循环把 fd 就绪纳入 `Task`/`Turn`。
   `fds.rs` 已有文档说明 Linux/macOS/Windows 三平台各自的边界。
 - REPL：CLI 选项已齐全，`-i` 目前报 `not implemented yet`。
+
+---
+
+## 12. M9d: fd 就绪、信号，以及一个挡路的编译器 bug
+
+### 12.1 已完成
+
+| 项 | 验收 |
+|---|---|
+| `os.setReadHandler` / `os.setWriteHandler` | 参考自己的 `test_rw_handler.js`（100 轮读写握手）通过 |
+| `os.signal` | 三个形态（函数 / `null` / `undefined`）与参考一致 |
+| `Task`/`Turn` 接纳 fd 就绪 | 新增 `Turn::Poll`，编译器强制每个宿主分支处理它 |
+
+**`Turn::Poll` 单独成一个变体，不复用 `Turn::Wait`**：宿主若把「有 fd 注册」当成「睡一觉」，
+处理器会永远不触发——那正是本项目视为最坏的失败形态。用独立变体让两者不可能被混淆。
+
+引擎零依赖不能 `poll(2)`，所以分工是：引擎报「哪些 fd、哪个方向」（`Interp::pending_fds`），
+宿主 `poll(2)`（`fds::poll`，用 `rustix::event::poll`），就绪后回调
+（`Interp::fire_fd`）。参考每轮只调一个处理器然后重启循环（`goto done`），因为处理器可能改
+注册表；这里照做。
+
+**顺带修掉一个真 bug**：`std.in.fileno()` 拿到的描述符在 stdio 槽表里，而 `os.read` 只认
+fd 表——`repl.js` 正是 `os.read(std.in.fileno(), …)`，会一直读到 `-EBADF`。现在 fd 表挂了
+一个槽表视图（`FdTable::attach_slab`），两个方向都通了。
+
+### 12.2 `os.signal`：第二处 `unsafe` 例外
+
+信号处理器是操作系统回调 Rust 函数，没有安全包装可言。处理器只在一个
+`AtomicU64` 上置位，真正的 JS 调用由事件循环做——**这正是参考的做法**
+（`os_signal_handler` 只置 `sh->ishandling`，`os_poll` 发现）。
+
+机制选择有个实测发现：**`rustix` 1.1.6 把 `runtime` 模块标成 `pub(crate)`**，
+所以 `kernel_sigaction` 对外不可达。改用 `libc::signal`——它本来就是宿主层的声明依赖
+（当初为 tokio/`AsyncFd` 计划带的，一直没用上），而且参考调的就是 `signal(3)`。
+
+### 12.3 挡路的编译器 bug（预存在，本次未修）
+
+`repl.js` 跑不起来，卡在 `plen = prompt.length` 报 `cannot read property 'length' of undefined`。
+追下去是一个**静默返回错误值**的代码生成 bug，与 M9d 无关：
+
+```js
+(function(){ var p = ""; function f(){ p = "x"; if (false) { p = "a"; } return p; } f(); })()
+// 参考："x"    我们：undefined
+```
+
+最小复现的三个必要条件：**闭包变量** + 中间有标签（`if`/块）+ `return <该变量>`。
+局部变量不复现（`var q` 版本正确返回）。
+
+字节码直接暴露了它——`return p` 根本没被编译成读取：
+
+```text
+function: f
+  closure vars: 0: var p [loc0]
+  opcodes:
+        push_atom_value x
+        put_var_ref0 0: p      ← 消耗了值
+        return                 ← 栈上是空的
+```
+
+对照正确版本（`p="x"` 之后直接 `return p`，无 `if`）：
+
+```text
+        push_atom_value x
+        set_var_ref0 0: p      ← 保留值（put→set 折叠加返回）
+        return
+```
+
+`emit_var` 里有一条窥孔优化：`put_x v` 紧跟 `get_x v` 折叠成 `set_x v`（存值并留在栈上），
+且**标签会取消这次折叠**（`label_since_insn`）。但取消折叠之后，后续仍然没有发出
+`get_var_ref`——两处记账不一致：存值用了消耗型指令，而 `return` 仍以为值在栈上。
+
+危险之处在于它**不报错**，只是给出 `undefined`，所以大量测试会碰巧通过（值恰好等于前一条
+语句留在栈上的东西）。这也解释了为什么 `if (true)` 版本"看起来对"——它返回的是上一条赋值
+留下的值，不是读出来的。
+
+修复属于编译器子系统的独立工作（需要 test262 的 `language/` 用例做回归，而当前 checkout 是
+sparse 的 `built-ins`），不适合在这轮末尾仓促改。**REPL 因此暂缓**：它依赖参考的 `repl.js`
+原样运行，而这个 bug 就在它的启动路径上。
+
+### 12.4 还没做
+
+- REPL：等上面的 bug 修掉，再把参考的 `repl.js` 原样跑起来（只差把两行 `import` 换成全局绑定，
+  其余依赖 `os.setReadHandler`/`signal`/`ttySetRaw`/`std.in` 都已就位）。

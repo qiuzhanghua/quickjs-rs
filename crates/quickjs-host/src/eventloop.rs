@@ -61,10 +61,14 @@ pub fn run_until_idle(ctx: &mut Context<'_>) -> Result<Vec<String>, RunError> {
                  rescheduling itself (`setTimeout(f, 0)` or an uncleared `setInterval`)"
             )));
         }
+        // Signals first: the handler has to run before the loop decides it is idle, or a
+        // SIGINT that arrived during the last turn would be dropped at exit.
+        serve_signals(ctx)?;
         match ctx.run_one_turn().map_err(RunError::Script)? {
             Turn::Ran => {}
             Turn::Done => break,
             Turn::Wait(delay) => sleep(delay),
+            Turn::Poll(timeout) => poll_and_fire(ctx, timeout)?,
         }
     }
     // Collected after the loop: a callback that throws does not stop its successors, so
@@ -81,14 +85,69 @@ pub fn run_until_idle(ctx: &mut Context<'_>) -> Result<Vec<String>, RunError> {
 /// the caller can stop calling it.
 pub fn run_once(ctx: &mut Context<'_>, budget: usize) -> Result<bool, RunError> {
     for _ in 0..budget {
+        serve_signals(ctx)?;
         match ctx.run_one_turn().map_err(RunError::Script)? {
             Turn::Ran => {}
             Turn::Done => return Ok(false),
+            // A descriptor is registered. Serving it here rather than returning keeps
+            // `run_once` from reporting "idle" while a handler is waiting to fire.
+            Turn::Poll(timeout) => poll_and_fire(ctx, timeout)?,
             // Nothing due yet; the caller decides how to wait, so stop rather than sleep.
             Turn::Wait(_) => return Ok(true),
         }
     }
     Ok(true)
+}
+
+/// Run the JavaScript handler for every signal that arrived since the last call.
+///
+/// The kernel-side handler only sets a bit (see [`crate::signal`]); this is where the bit
+/// turns into a call, on the loop's thread rather than in signal context, which is what makes
+/// allocating and running script code safe.
+fn serve_signals(ctx: &mut Context<'_>) -> Result<(), RunError> {
+    for signal in crate::signal::take_pending() {
+        ctx.fire_signal(signal).map_err(RunError::Script)?;
+    }
+    Ok(())
+}
+
+/// Wait on the registered descriptors for at most `timeout`, then run a ready handler.
+///
+/// This is the host half of `os.setReadHandler`: the engine knows *which* descriptors have
+/// handlers but cannot call `poll(2)`, so it reports `Turn::Poll` and the host does the
+/// waiting. `poll(2)` with no descriptors left is a plain timed sleep, which is why the
+/// fallback is `sleep` rather than an error.
+fn poll_and_fire(ctx: &mut Context<'_>, timeout: std::time::Duration) -> Result<(), RunError> {
+    let interest = ctx.pending_fds();
+    if interest.is_empty() {
+        sleep(timeout);
+        return Ok(());
+    }
+    let mut watched: Vec<crate::fds::Watched> = Vec::with_capacity(interest.len());
+    for entry in &interest {
+        watched.push(crate::fds::Watched {
+            fd: entry.fd,
+            read: entry.read,
+            write: entry.write,
+        });
+    }
+    // The table is the thread's, registered when `os`/`std` were installed; without it there
+    // is nothing to borrow and the descriptors cannot be polled.
+    let ready = crate::fdtable::current(|table| match table {
+        Some(table) => crate::fds::poll(table, &watched, timeout),
+        None => vec![crate::fds::Ready::default(); watched.len()],
+    });
+    // One handler per iteration, matching the reference's `goto done`: the handler may have
+    // re-registered descriptors, so a second one would use stale state.
+    for (index, event) in ready.iter().enumerate() {
+        if event.read || event.write {
+            let fd = watched[index].fd;
+            ctx.fire_fd(fd, event.read, event.write)
+                .map_err(RunError::Script)?;
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Block for `delay`.

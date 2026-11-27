@@ -61,7 +61,7 @@ pub use quickjs_regexp as regexp;
 mod tzif;
 pub mod value;
 
-pub use interp::{Interp, JsResult, Signal, Task, Turn};
+pub use interp::{FdInterest, Interp, JsResult, Signal, Task, Turn};
 pub use object::{Callable, JsObject, ObjectKind, Property};
 pub use value::{Cell, JsString, Value};
 
@@ -590,6 +590,45 @@ impl<'rt> Context<'rt> {
         let interp = self.interp();
         match interp.sleep_async(delay_ms) {
             Ok(value) => Ok(value),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// Register or clear an `os.signal` handler.
+    pub fn set_signal_handler(&mut self, signal: i32, handler: Option<Value>) {
+        self.interp().set_signal_handler(signal, handler);
+    }
+
+    /// Run the handler for `signal`. `false` when none is registered.
+    pub fn fire_signal(&mut self, signal: i32) -> Result<bool> {
+        let interp = self.interp();
+        match interp.fire_signal(signal) {
+            Ok(ran) => Ok(ran),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// Register or clear an `os.setReadHandler`/`os.setWriteHandler` callback.
+    pub fn set_fd_handler(&mut self, fd: i32, readable: bool, callback: Option<Value>) {
+        self.interp().set_fd_handler(fd, readable, callback);
+    }
+
+    /// The descriptors the host must poll, and in which direction.
+    pub fn pending_fds(&self) -> Vec<FdInterest> {
+        // An interpreter that has not been created cannot have handlers: nothing has run.
+        self.interp
+            .as_ref()
+            .map(Interp::pending_fds)
+            .unwrap_or_default()
+    }
+
+    /// Report descriptor readiness, calling the handler. `false` when none was registered.
+    pub fn fire_fd(&mut self, fd: i32, readable: bool, writable: bool) -> Result<bool> {
+        let interp = self.interp();
+        match interp.fire_fd(fd, readable, writable) {
+            Ok(ran) => Ok(ran),
             Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
             Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
         }

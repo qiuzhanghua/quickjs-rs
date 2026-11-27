@@ -20,9 +20,17 @@ crates/quickjs-pure/src/capi.rs
 crates/quickjs-pure/src/value.rs
 "
 
-# The one host exception, with its argument in the file itself.
+# The two host exceptions, each with its argument in the file itself:
+#
+#   env.rs    — `setenv(3)` has no safe wrapper in any available crate.
+#   signal.rs — installing a signal handler is FFI to an OS callback; the handler only
+#               touches an `AtomicU64`, and the JavaScript call happens on the loop.
+#
+# Both are single-topic modules so a reviewer reads one file, and both are listed here so
+# that adding a third is a deliberate, visible act.
 allowed="$allowed
 crates/quickjs-host/src/env.rs
+crates/quickjs-host/src/signal.rs
 "
 
 # `unsafe_op_in_unsafe_fn` is a lint name, not an unsafe block; the deny attributes are the
@@ -43,6 +51,6 @@ for file in $(find crates -name '*.rs' -not -path '*/target/*' | sort); do
 done
 
 if [ "$found" -eq 0 ]; then
-    echo "NFR-6 ok: unsafe is confined to the engine modules and crates/quickjs-host/src/env.rs"
+    echo "NFR-6 ok: unsafe is confined to the engine modules and the two documented host exceptions"
 fi
 exit "$found"

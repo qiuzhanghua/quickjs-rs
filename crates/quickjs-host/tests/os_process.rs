@@ -30,6 +30,9 @@ fn run(source: &str) -> String {
         match ctx.run_one_turn().expect("a turn") {
             quickjs::Turn::Ran => {}
             quickjs::Turn::Wait(delay) => std::thread::sleep(delay),
+            // No descriptor handlers are registered in these tests, so a poll turn is only
+            // the loop asking to wait.
+            quickjs::Turn::Poll(delay) => std::thread::sleep(delay),
             quickjs::Turn::Done => break,
         }
     }

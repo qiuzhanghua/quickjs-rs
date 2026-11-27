@@ -27,9 +27,24 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, IntoRawFd, OwnedFd};
 use std::rc::Rc;
 
 /// The descriptors the script owns, keyed by the number it was given.
-#[derive(Default)]
 pub struct FdTable {
     inner: RefCell<BTreeMap<i32, OwnedFd>>,
+    /// Descriptors owned by `std`'s file objects, so `os.read(std.in.fileno(), …)` works.
+    ///
+    /// The two modules have to see each other's descriptors in both directions: `std.fdopen`
+    /// takes one out of this table, and `os.read` reaches one this table does not own. Without
+    /// the second half, `repl.js` would read `-EBADF` from `std.in` forever, because a
+    /// `FILE`'s descriptor lives in the stdio slab, not here.
+    slab: RefCell<Option<SlabRef>>,
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        FdTable {
+            inner: RefCell::new(BTreeMap::new()),
+            slab: RefCell::new(None),
+        }
+    }
 }
 
 impl FdTable {
@@ -37,9 +52,25 @@ impl FdTable {
         Self::default()
     }
 
+    /// Give this table a view of `std`'s file objects, so their descriptors are visible.
+    pub fn attach_slab(&self, slab: SlabRef) {
+        *self.slab.borrow_mut() = Some(slab);
+    }
+
     /// A table ready to share between `os` and `std`.
+    ///
+    /// The table also registers itself as **the** table for this thread, because the event
+    /// loop needs it and the loop is handed a `Context`, not the host modules. `poll(2)` is
+    /// the reason: it needs every descriptor borrowed at once, which only the table can do
+    /// (see [`FdTable::with_all`]).
+    ///
+    /// One table per thread is the same assumption the interpreter already makes — it is
+    /// single-threaded by construction — and making it here, at the single construction
+    /// point, is what keeps it from being an unstated invariant at the call sites.
     pub fn shared() -> Shared {
-        Rc::new(Self::default())
+        let table = Rc::new(Self::default());
+        CURRENT.with(|current| *current.borrow_mut() = Some(table.clone()));
+        table
     }
 
     /// Take ownership of `fd` and return the number the script should see.
@@ -89,7 +120,20 @@ impl FdTable {
                 let stderr = std::io::stderr();
                 Some(f(stderr.as_fd()))
             }
-            _ => None,
+            // Not ours, and not a standard stream: `std` may own it.
+            // Not ours and not a standard stream: `std` may own it. `f` is `FnOnce`, so it
+            // is called here rather than captured into a closure that would move it.
+            _ => {
+                let slab = self.slab.borrow();
+                let slab = slab.as_ref()?;
+                let files = slab.borrow();
+                let handle = files
+                    .iter()
+                    .flatten()
+                    .find(|state| !state.closed() && state.file_number() == fd)
+                    .and_then(|state| state.fd())?;
+                Some(f(handle))
+            }
         }
     }
 
@@ -119,10 +163,49 @@ impl FdTable {
         }
     }
 
+    /// Run `f` with a borrowed descriptor for each number in `fds`.
+    ///
+    /// This exists because `poll(2)` needs every descriptor at once: a [`FdTable::with`]
+    /// per entry cannot work, because the borrow for 0/1/2 comes from a local `stdin()`
+    /// handle that would die before the list was complete. Holding the handles for the whole
+    /// call is what makes one `poll` over mixed standard and script-owned descriptors
+    /// possible without `BorrowedFd::borrow_raw`.
+    ///
+    /// A number this table does not own yields `None`, which the caller reports as
+    /// "not ready" rather than failing the whole poll.
+    pub fn with_all<T>(&self, fds: &[i32], f: impl FnOnce(&[Option<BorrowedFd<'_>>]) -> T) -> T {
+        let table = self.inner.borrow();
+        // The standard handles have to outlive the call, so they are bound here rather than
+        // inline in the closure.
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        let stderr = std::io::stderr();
+        let borrowed: Vec<Option<BorrowedFd<'_>>> = fds
+            .iter()
+            .map(|fd| match fd {
+                0 => Some(stdin.as_fd()),
+                1 => Some(stdout.as_fd()),
+                2 => Some(stderr.as_fd()),
+                other => table.get(other).map(OwnedFd::as_fd),
+            })
+            .collect();
+        f(&borrowed)
+    }
+
     /// Whether `fd` is one this host can operate on.
     pub fn contains(&self, fd: i32) -> bool {
         self.inner.borrow().contains_key(&fd) || matches!(fd, 0..=2)
     }
+}
+
+thread_local! {
+    /// The table the event loop should poll descriptors through.
+    static CURRENT: RefCell<Option<Shared>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with this thread's table, if one has been created.
+pub fn current<T>(f: impl FnOnce(Option<&FdTable>) -> T) -> T {
+    CURRENT.with(|current| f(current.borrow().as_deref()))
 }
 
 /// A table shared by `os` and `std`.
@@ -131,6 +214,9 @@ impl FdTable {
 /// std.fdopen(p[0], "r")` — the reference's own `test_os_exec()` does exactly that. One
 /// table also means one answer to "does the script own this descriptor".
 pub type Shared = Rc<FdTable>;
+
+/// A handle on `std`'s descriptor table, for the fallback lookup above.
+pub type SlabRef = Rc<RefCell<Vec<Option<crate::stdio::FileState>>>>;
 
 /// The descriptor number of an `OwnedFd` without giving up ownership.
 trait AsRawNumber {

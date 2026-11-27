@@ -401,6 +401,30 @@ pub enum Task {
     },
 }
 
+/// A descriptor the host has to poll, and which directions have a handler.
+///
+/// The engine cannot poll for itself: `quickjs-pure` has no dependencies and no platform
+/// knowledge, and `poll(2)` is neither. So the loop hands this list to the host, the host
+/// blocks on it, and the host reports back through [`Interp::fire_fd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdInterest {
+    /// The descriptor to watch.
+    pub fd: i32,
+    /// Whether `os.setReadHandler` registered a callback.
+    pub read: bool,
+    /// Whether `os.setWriteHandler` registered a callback.
+    pub write: bool,
+}
+
+/// The callbacks registered for one descriptor, per direction.
+#[derive(Default)]
+pub(crate) struct FdHandlers {
+    /// `os.setReadHandler`'s callback.
+    pub read: Option<Value>,
+    /// `os.setWriteHandler`'s callback.
+    pub write: Option<Value>,
+}
+
 /// A delay in milliseconds as a `Duration`, clamped to something `Instant` accepts.
 ///
 /// Negative and `NaN` both mean "as soon as possible": the reference runs the delay through
@@ -430,6 +454,14 @@ impl js_gc::Trace for Task {
 pub enum Turn {
     /// Something ran. Call again immediately — there may be more ready work.
     Ran,
+    /// Nothing is runnable, but descriptors are registered: the host must poll
+    /// [`Interp::pending_fds`] for at most this long, then report readiness with
+    /// [`Interp::fire_fd`].
+    ///
+    /// A separate variant from [`Turn::Wait`] on purpose. Sleeping instead of polling is
+    /// the failure this project treats as worst — a handler that silently never fires —
+    /// so the two cannot be confused by accident.
+    Poll(std::time::Duration),
     /// Nothing is runnable yet, but something is pending. Block at most this long, then
     /// call again.
     Wait(std::time::Duration),
@@ -740,6 +772,16 @@ pub struct Interp<'a> {
     /// A `Vec` rather than a heap because the queue is short (a script rarely has more than
     /// a handful) and `run_one_turn` has to scan it anyway to find the earliest deadline.
     pub(crate) tasks: Vec<Task>,
+    /// `os.signal` handlers, keyed by signal number.
+    ///
+    /// Kept here for the same reason as `fd_handlers`: the collector walks these values, so
+    /// a handler cannot be freed while it is still registered.
+    pub(crate) signal_handlers: std::collections::BTreeMap<i32, Value>,
+    /// `os.setReadHandler`/`os.setWriteHandler` callbacks, keyed by descriptor.
+    ///
+    /// Kept here rather than in a closure so the collector walks the callbacks: a handler
+    /// that is only reachable from a host closure could be freed while still registered.
+    pub(crate) fd_handlers: std::collections::BTreeMap<i32, FdHandlers>,
     /// The next timer id.
     ///
     /// Starts at 1 and wraps back to 1 at `INT32_MAX`, matching `js_os_setTimeout`, because
@@ -844,6 +886,8 @@ impl<'a> Interp<'a> {
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
             tasks: Vec::new(),
+            signal_handlers: std::collections::BTreeMap::new(),
+            fd_handlers: std::collections::BTreeMap::new(),
             next_timer_id: 1,
             timer_errors: Vec::new(),
             modules: std::collections::BTreeMap::new(),
@@ -1325,6 +1369,20 @@ impl<'a> Interp<'a> {
             })
             .map(|(index, _)| index);
         let Some(index) = due else {
+            // The reference caps its wait at `min_delay = 10000` (ten seconds) when a
+            // descriptor is registered but no timer is closer, so a script that never
+            // touches the descriptor still gets control back. Without a cap a handler on a
+            // descriptor that is never ready would block for as long as the host allows.
+            let timeout = self
+                .next_timeout()
+                .unwrap_or(std::time::Duration::from_secs(10))
+                .min(std::time::Duration::from_secs(10));
+            if !self.fd_handlers.is_empty() {
+                // Blocking on a timer while descriptors are registered would starve them,
+                // and blocking on the descriptors while a timer is due would delay it; the
+                // host polls with the earlier of the two deadlines, which this timeout is.
+                return Ok(Turn::Poll(timeout));
+            }
             return Ok(match self.next_timeout() {
                 Some(wait) => Turn::Wait(wait),
                 None => Turn::Done,
@@ -1348,6 +1406,110 @@ impl<'a> Interp<'a> {
         Ok(Turn::Ran)
     }
 
+    /// Register or clear one direction of an `os.setReadHandler`/`os.setWriteHandler` pair.
+    ///
+    /// `callback` of `None` unregisters that direction, and an entry with neither direction
+    /// left is removed — the reference does the same, so a script can rely on
+    /// `os.setReadHandler(fd, null)` stopping the loop from waiting on that descriptor.
+    pub fn set_fd_handler(&mut self, fd: i32, readable: bool, callback: Option<Value>) {
+        let entry = self.fd_handlers.entry(fd).or_default();
+        if readable {
+            entry.read = callback;
+        } else {
+            entry.write = callback;
+        }
+        if entry.read.is_none() && entry.write.is_none() {
+            self.fd_handlers.remove(&fd);
+        }
+    }
+
+    /// Register or clear an `os.signal` handler.
+    ///
+    /// `None` removes it; the host separately restores the default disposition or sets
+    /// ignore, because which of those happened is the script's choice (`null` versus
+    /// `undefined`) and not something this table can express.
+    pub fn set_signal_handler(&mut self, signal: i32, handler: Option<Value>) {
+        match handler {
+            Some(handler) => {
+                self.signal_handlers.insert(signal, handler);
+            }
+            None => {
+                self.signal_handlers.remove(&signal);
+            }
+        }
+    }
+
+    /// Run the handler for `signal`, reporting whether one ran.
+    ///
+    /// A throwing handler is reported and the loop continues, like a timer's.
+    pub fn fire_signal(&mut self, signal: i32) -> JsResult<bool> {
+        let Some(handler) = self.signal_handlers.get(&signal).cloned() else {
+            return Ok(false);
+        };
+        match self.call_value(handler, Value::Undefined, Vec::new()) {
+            Ok(_) => {}
+            Err(Signal::Throw(value)) => {
+                let text = self.describe_exception(&value);
+                self.timer_errors.push(text);
+            }
+            Err(Signal::OutOfMemory) => return Err(Signal::OutOfMemory),
+        }
+        self.drain_jobs()?;
+        Ok(true)
+    }
+
+    /// The descriptors the host has to poll, and in which direction.
+    ///
+    /// Empty means the loop has nothing to wait for on any descriptor. The host turns each
+    /// entry into a `pollfd` with `POLLIN`/`POLLOUT` — the same events the reference's
+    /// `os_poll` asks for.
+    pub fn pending_fds(&self) -> Vec<FdInterest> {
+        self.fd_handlers
+            .iter()
+            .map(|(fd, entry)| FdInterest {
+                fd: *fd,
+                read: entry.read.is_some(),
+                write: entry.write.is_some(),
+            })
+            .collect()
+    }
+
+    /// Call the handler registered for `fd`, reporting whether one ran.
+    ///
+    /// `readable`/`writable` come from `poll(2)`. The reference calls **one** handler per
+    /// poll iteration and then restarts the loop, because the handler may have changed the
+    /// registration list underneath it; doing the same here keeps a handler that
+    /// unregisters itself from being called with stale state.
+    ///
+    /// A throwing handler is reported and the loop continues — a bad handler must not stop
+    /// every later one, exactly as with timers.
+    pub fn fire_fd(&mut self, fd: i32, readable: bool, writable: bool) -> JsResult<bool> {
+        let Some(entry) = self.fd_handlers.get(&fd) else {
+            return Ok(false);
+        };
+        let callback = if readable {
+            entry.read.clone()
+        } else if writable {
+            entry.write.clone()
+        } else {
+            None
+        };
+        let Some(callback) = callback else {
+            return Ok(false);
+        };
+        self.drain_jobs()?;
+        match self.call_value(callback, Value::Undefined, Vec::new()) {
+            Ok(_) => {}
+            Err(Signal::Throw(value)) => {
+                let text = self.describe_exception(&value);
+                self.timer_errors.push(text);
+            }
+            Err(Signal::OutOfMemory) => return Err(Signal::OutOfMemory),
+        }
+        self.drain_jobs()?;
+        Ok(true)
+    }
+
     /// Take the errors timer callbacks threw, leaving the list empty.
     pub fn take_timer_errors(&mut self) -> Vec<String> {
         std::mem::take(&mut self.timer_errors)
@@ -1355,7 +1517,7 @@ impl<'a> Interp<'a> {
 
     /// Whether anything is still pending: a microtask or a timer.
     pub fn has_pending_work(&self) -> bool {
-        !self.jobs.is_empty() || !self.tasks.is_empty()
+        !self.jobs.is_empty() || !self.tasks.is_empty() || !self.fd_handlers.is_empty()
     }
 
     /// Run every queued microtask, including ones queued while draining.

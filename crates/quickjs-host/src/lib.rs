@@ -35,6 +35,7 @@ pub mod fdtable;
 pub mod os;
 pub mod print;
 pub mod printf;
+pub mod signal;
 pub mod std;
 pub mod stdio;
 pub mod timers;

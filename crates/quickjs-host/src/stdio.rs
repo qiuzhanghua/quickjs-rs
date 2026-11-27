@@ -141,7 +141,14 @@ impl FileState {
         }
     }
 
-    fn fd(&self) -> Option<BorrowedFd<'_>> {
+    /// Whether this stream has been closed, so a stale number is not mistaken for a live
+    /// descriptor.
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    /// The descriptor behind this stream, when it has one.
+    pub fn fd(&self) -> Option<BorrowedFd<'_>> {
         match &self.kind {
             Kind::Fd(fd) => Some(fd.as_fd()),
             Kind::Child { pipe, .. } => Some(pipe.as_fd()),
@@ -150,7 +157,7 @@ impl FileState {
     }
 
     /// The number `fileno()` reports.
-    fn file_number(&self) -> i32 {
+    pub fn file_number(&self) -> i32 {
         match &self.kind {
             Kind::Fd(fd) => fd.as_raw_fd(),
             Kind::Child { pipe, .. } => pipe.as_raw_fd(),

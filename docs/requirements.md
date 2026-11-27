@@ -168,7 +168,7 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 | NFR-3 | 内存：空 Runtime < 1 MB；`--memory-limit` 精确生效（超限抛 `InternalError: out of memory`） | 内存测试 + `-d` 统计对比 |
 | NFR-4 | 确定性释放：`Rc` 语义，作用域结束即释放；循环引用由周期性 collector 回收（对齐上游 RD/GC 行为） | 析构计数器测试（finalizer 触发时机） |
 | NFR-5 | 无 panic 逃逸：宿主回调 panic 转为 `InternalError`；`catch_unwind` 边界；`--stack-size` 防爆栈 | fuzz + 深递归测试 |
-| NFR-6 | 安全：`unsafe` 只允许在 `gc`/`atomics`/`typed_array`/`c-api`/`value` 五个引擎模块，另加**唯一一处宿主例外** `quickjs-host/src/env.rs`（见下），逐处 `// SAFETY:` | `#![warn(unsafe_op_in_unsafe_fn)]` + `scripts/check-unsafe.sh` 逐文件断言 `unsafe` 只出现在白名单里（进 `scripts/check.sh`） |
+| NFR-6 | 安全：`unsafe` 只允许在 `gc`/`atomics`/`typed_array`/`c-api`/`value` 五个引擎模块，另加**两处宿主例外** `quickjs-host/src/env.rs` 与 `crates/quickjs-host/src/signal.rs`（见下），逐处 `// SAFETY:` | `#![warn(unsafe_op_in_unsafe_fn)]` + `scripts/check-unsafe.sh` 逐文件断言 `unsafe` 只出现在白名单里（进 `scripts/check.sh`） |
 | NFR-7 | 依赖最小化：**引擎 crate 零第三方依赖**（`quickjs-pure`/`parse`/`compile`/`regexp`/`gc` 及其传递闭包，`libc` 也避免）；**宿主层**（`quickjs-host`/`quickjs-cli`）允许 `tokio`（Unix 的 fd 就绪）+ `libc`（`fcntl` 设 non-blocking）+ `windows-sys`（Windows 的 `WaitForMultipleObjects`），仅用于事件循环与 fd 就绪；dev-deps 不限 | `cargo tree -p quickjs-pure` 审计为空（`scripts/check.sh` 断言）+ `scripts/check.sh` 校验宿主层的依赖白名单 |
 | NFR-8 | 平台：macOS(arm64/x64)、Linux(x64/arm64)、Windows(msvc)；WASM 列为可选 | CI 矩阵 |
 | NFR-9 | 可调试：`--dump`、字节码反汇编、`trace` 分配跟踪、错误栈含行列与函数名 | 手工验收 |
@@ -176,7 +176,9 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 | NFR-11 | 可嵌入：`no_std` 不支持（明确），但 `std` 访问集中在 `sys` 层，便于后续移植 | 架构评审 |
 | NFR-12 | MSRV：edition 2024（rustc ≥ 1.85） | CI |
 
-**NFR-6 的唯一宿主例外：`quickjs-host/src/env.rs`**
+**NFR-6 的宿主例外（两处）**
+
+**其一：`quickjs-host/src/env.rs`**
 
 `std.setenv`/`std.unsetenv` 在参考实现里就是 `setenv(3)`/`unsetenv(3)`，Rust 对应
 `std::env::set_var`/`remove_var`，edition 2024 把它们标成 `unsafe`——理由是真实的：
@@ -199,6 +201,17 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 另有一处必须自己挡：`set_var`/`remove_var` 对空名、含 `=`、含 NUL 的名字是 **panic** 而非
 返回错误，脚本能造出这三种。`setenv(3)` 对这些返回 `EINVAL` 且参考实现忽略返回值，所以
 `env.rs` 在调用前拒绝，语义仍是「静默无效」。
+
+**其二：`quickjs-host/src/signal.rs`**
+
+`os.signal` 要装信号处理器，而「把 Rust 函数交给操作系统日后回调」这件事没有安全包装可言。
+处理器只在一个 `AtomicU64` 上置位，真正的 JS 调用由事件循环做——这正是参考的做法
+（`os_signal_handler` 只置 `sh->ishandling`，`os_poll` 发现），因此信号上下文里只有
+`fetch_or`，天然是 async-signal-safe 的。
+
+机制上有个实测结论：**`rustix` 1.1.6 把 `runtime` 模块标成 `pub(crate)`**，
+`kernel_sigaction` 对外不可达。改用 `libc::signal`——它本来就是宿主层的声明依赖
+（当初为 tokio/`AsyncFd` 计划带入，此前一直未被使用），且参考调的就是 `signal(3)`。
 
 ---
 

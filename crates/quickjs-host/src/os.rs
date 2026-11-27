@@ -163,6 +163,9 @@ fn functions(table: &Shared) -> Vec<(&'static str, u32, Body)> {
     add!("sleepAsync", 1, os_sleep_async);
     add!("ttyGetWinSize", 1, os_tty_get_win_size);
     add!("ttySetRaw", 1, os_tty_set_raw);
+    add!("setReadHandler", 2, os_set_read_handler);
+    add!("setWriteHandler", 2, os_set_write_handler);
+    add!("signal", 2, os_signal);
     out
 }
 
@@ -1114,4 +1117,95 @@ fn os_tty_set_raw(
         // The reference ignores the return value, so a non-tty is silently a no-op.
         _ => Value::Undefined,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor readiness: `os.setReadHandler` / `os.setWriteHandler`.
+// ---------------------------------------------------------------------------
+
+/// `os.setReadHandler(fd, func)` — call `func` when `fd` becomes readable.
+///
+/// `func = null` unregisters, and when neither direction is registered the descriptor
+/// leaves the host's watch list. The engine holds the callbacks so the collector walks them;
+/// the event loop polls the descriptors and calls [`Interp::fire_fd`] — see
+/// [`crate::eventloop`] and [`crate::fds`].
+fn os_set_read_handler(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    set_fd_handler(interp, args, true)
+}
+
+/// `os.setWriteHandler(fd, func)` — call `func` when `fd` becomes writable.
+fn os_set_write_handler(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    set_fd_handler(interp, args, false)
+}
+
+/// The body both handlers share; `readable` picks the direction.
+fn set_fd_handler(interp: &mut Interp<'_>, args: &[Value], readable: bool) -> JsResult<Value> {
+    let fd = args.first().map_or(-1, |value| value.to_number() as i32);
+    let callback = args.get(1).cloned().unwrap_or(Value::Undefined);
+    match callback {
+        // `null` clears the direction. `undefined` is *not* the same thing here: the
+        // reference tests `JS_IsNull` only, so `setReadHandler(fd, undefined)` falls through
+        // to the function check and throws.
+        Value::Null => {
+            interp.set_fd_handler(fd, readable, None);
+            Ok(Value::Undefined)
+        }
+        Value::Object(ref object) if object.is_callable() => {
+            interp.set_fd_handler(fd, readable, Some(callback));
+            Ok(Value::Undefined)
+        }
+        _ => Err(interp.type_error("not a function")),
+    }
+}
+
+/// `os.signal(signal, handler)` — install a JavaScript signal handler.
+///
+/// The three shapes are the reference's: a function registers, `null` restores the default
+/// disposition, and `undefined` ignores the signal. The distinction between the last two
+/// matters — `os.signal(os.SIGPIPE, undefined)` is how a script asks not to die when a pipe
+/// closes.
+///
+/// Handler numbers must be below 64, which is the reference's `RangeError`.
+fn os_signal(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let signal = args.first().map_or(0, |value| value.to_number() as u32);
+    if signal >= 64 {
+        return Err(interp.range_error("invalid signal number"));
+    }
+    let signal = signal as i32;
+    let handler = args.get(1).cloned().unwrap_or(Value::Undefined);
+    // Refusals come from the platform call, and the reference ignores its return value, so
+    // these are deliberately silent: an uninstallable signal leaves no handler registered.
+    match handler {
+        Value::Null => {
+            interp.set_signal_handler(signal, None);
+            let _ = crate::signal::reset(signal);
+        }
+        Value::Undefined => {
+            interp.set_signal_handler(signal, None);
+            let _ = crate::signal::ignore(signal);
+        }
+        Value::Object(ref object) if object.is_callable() => {
+            if crate::signal::install(signal).is_err() {
+                return Ok(Value::Undefined);
+            }
+            interp.set_signal_handler(signal, Some(handler.clone()));
+        }
+        _ => return Err(interp.type_error("not a function")),
+    }
+    Ok(Value::Undefined)
 }

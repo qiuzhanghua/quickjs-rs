@@ -924,12 +924,22 @@ fn assert_cases(name: &str, cases: &[&str]) {
     // drifted; a count in a table is a claim, so it gets measured rather than remembered.
     if let Some(dir) = std::env::var_os("QUICKJS_CASE_COUNTS") {
         use std::io::Write;
+        // The `#[test]` functions run in parallel and each appends one line to the same
+        // file. `O_APPEND` makes the offset update atomic but not the write itself, so two
+        // threads could interleave mid-line and hand `scripts/verify-claims.py` a row with
+        // too many columns — which is exactly what happened. One lock, one write.
+        static COUNTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = COUNTS_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let line = format!("{name}\t{}\t{compared}\n", cases.len());
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(std::path::Path::new(&dir).join("disasm-cases.txt"))
             .expect("open the case-count file");
-        writeln!(file, "{name}\t{}\t{compared}", cases.len()).expect("write the case count");
+        file.write_all(line.as_bytes())
+            .expect("write the case count");
     }
     assert!(
         failures.is_empty(),

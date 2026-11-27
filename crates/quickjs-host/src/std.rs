@@ -41,6 +41,8 @@ pub fn install(
     }
     let slab: Slab = Rc::new(RefCell::new(Vec::new()));
     let fds = fds.clone();
+    // So `os.read(std.in.fileno(), …)` works: `repl.js` does exactly that.
+    fds.attach_slab(slab.clone());
 
     // The prototype lives on the global object rather than in the closures below: a
     // `HostFn` may not hold a `Gc`, because the collector cannot see into the closure.
