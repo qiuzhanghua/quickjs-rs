@@ -168,21 +168,21 @@ impl ElementType {
     }
 
     /// Store `value` into the element at `offset`.
+    ///
+    /// `value` must already be the primitive this element type stores — a number for the
+    /// numeric types, a BigInt for the two `BigInt` ones. [`write_element`] is what
+    /// applies `ToNumber`/`ToBigInt` beforehand, because both can run script (`valueOf`)
+    /// and the storage borrow must not be held across that.
+    ///
     /// The `Err` carries the reason, which the caller turns into a `TypeError`.
-    pub fn write(self, bytes: &mut [u8], offset: usize, value: Value) -> Result<(), &'static str> {
+    pub fn write(self, bytes: &mut [u8], offset: usize, value: &Value) -> Result<(), &'static str> {
         let size = self.size();
         if offset + size > bytes.len() {
             return Ok(());
         }
-        // `ToNumber` refuses a Symbol and a BigInt; `Value::to_number` answers `NaN` so
-        // that it stays total, which here would store a wrong element instead of throwing.
-        if !self.is_bigint() && matches!(value, Value::Symbol(_) | Value::BigInt(_)) {
-            return Err(NOT_A_NUMBER);
-        }
-        // A BigInt element type runs `ToBigInt`, not `ToNumber`: a Number is a TypeError,
-        // and a BigInt is stored modulo `2^64`. That is why this can fail at all.
+        // A BigInt element type stores the BigInt itself, modulo `2^64`.
         if matches!(self, ElementType::BigInt64 | ElementType::BigUint64) {
-            let Value::BigInt(big) = &value else {
+            let Value::BigInt(big) = value else {
                 return Err(NOT_A_BIGINT);
             };
             let slice = &mut bytes[offset..offset + size];
@@ -192,6 +192,11 @@ impl ElementType {
             };
             slice.copy_from_slice(&bits.to_le_bytes());
             return Ok(());
+        }
+        // The numeric types: every primitive has a number form except a Symbol, which
+        // `ToNumber` refuses. Answering `NaN` here would store a wrong element silently.
+        if matches!(value, Value::Symbol(_)) {
+            return Err(NOT_A_NUMBER);
         }
         let number = value.to_number();
         let slice = &mut bytes[offset..offset + size];
@@ -709,9 +714,7 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
             for (index, value) in values.into_iter().enumerate() {
                 // `new BigInt64Array([1])` is a TypeError: the initialiser runs
                 // `ToBigInt` on each value, and a Number is not convertible.
-                if write_element(&buffer, element, 0, index, value).is_err() {
-                    return Err(interp.type_error("cannot convert a Number to a BigInt"));
-                }
+                write_element(interp, &buffer, element, 0, index, value)?;
             }
             (buffer, 0, count)
         }
@@ -729,13 +732,25 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
 }
 
 /// Write one element through a buffer, for the paths that do not have a view in hand.
+/// Store `value` into the element at `index`, applying `ToNumber` or `ToBigInt` first.
+///
+/// Both conversions are fallible *and* can run script — `ToPrimitive` calls `valueOf` —
+/// so they happen before the buffer's `RefCell` is borrowed. Doing it inside
+/// [`ElementType::write`] would either need the borrow held across a script call (a
+/// re-entrancy panic waiting to happen) or would silently store `NaN` for an object,
+/// which is how `new Uint8Array([{valueOf(){return 5}}])` used to produce `0` instead of
+/// `5`.
 fn write_element(
+    interp: &mut Interp<'_>,
     buffer: &Gc<JsObject>,
     element: ElementType,
     offset: usize,
     index: usize,
     value: Value,
-) -> Result<(), &'static str> {
+) -> JsResult<()> {
+    // The conversion first, and *outside* the storage borrow: `ToPrimitive` runs
+    // `valueOf`, which is script and can reach back into this very buffer.
+    let stored = interp.element_value(element, value)?;
     let Some(storage) = buffer.array_buffer_storage() else {
         return Ok(());
     };
@@ -743,7 +758,14 @@ fn write_element(
     if storage.detached {
         return Ok(());
     }
-    element.write(&mut storage.bytes, offset + index * element.size(), value)
+    // The bounds check inside `write` answers `Ok`, so an out-of-range index stays a
+    // no-op rather than an error.
+    element
+        .write(&mut storage.bytes, offset + index * element.size(), &stored)
+        .map_err(|reason| match reason {
+            NOT_A_BIGINT => interp.type_error("cannot convert a Number to a BigInt"),
+            other => interp.type_error(other),
+        })
 }
 
 /// Read the elements of a typed array, which `join`/`set`/`slice` all need.
@@ -801,9 +823,7 @@ fn set_from(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
                 .typed_array_parts()
                 .map(|(buffer, _, base, _)| (buffer, base))
                 .expect("a typed array has parts");
-            if write_element(&buffer, element, base, offset + index, value).is_err() {
-                return Err(interp.type_error("cannot convert a Number to a BigInt"));
-            }
+            write_element(interp, &buffer, element, base, offset + index, value)?;
         }
     }
     Ok(Value::Undefined)
@@ -844,9 +864,7 @@ fn fill(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
         .map(|(buffer, _, base, _)| (buffer, base))
         .expect("a typed array has parts");
     for index in start as usize..end.max(start) as usize {
-        if write_element(&buffer, element, base, index, value.clone()).is_err() {
-            return Err(interp.type_error("cannot convert a Number to a BigInt"));
-        }
+        write_element(interp, &buffer, element, base, index, value.clone())?;
     }
     Ok(Value::Object(object))
 }
@@ -1009,9 +1027,7 @@ fn new_view(
         detached: false,
     })));
     for (index, value) in values.iter().enumerate() {
-        if write_element(&buffer, element, 0, index, value.clone()).is_err() {
-            return Err(interp.type_error("cannot convert a Number to a BigInt"));
-        }
+        write_element(interp, &buffer, element, 0, index, value.clone())?;
     }
     let proto = interp
         .realm
@@ -1128,10 +1144,11 @@ fn call_typed(
     value: Value,
     index: usize,
     receiver: &Gc<JsObject>,
+    this_arg: Value,
 ) -> JsResult<Value> {
     interp.call_value(
         callback.clone(),
-        Value::Undefined,
+        this_arg,
         vec![
             value,
             Value::Int(index as i32),
@@ -1173,8 +1190,9 @@ fn quantify(
         .ok_or_else(|| interp.type_error("not a typed array"))?;
     let (elements, _) = view_parts(interp, &this)?;
     let callback = typed_callback(interp, args)?;
+    let this_arg = crate::builtins::array::callback_this(args);
     for (index, value) in elements.into_iter().enumerate() {
-        let answer = call_typed(interp, &callback, value, index, &receiver)?;
+        let answer = call_typed(interp, &callback, value, index, &receiver, this_arg.clone())?;
         // `every` stops on the first falsy answer, `some` on the first truthy one.
         if answer.to_boolean() == want_any {
             return Ok(Value::Bool(want_any));
@@ -1190,8 +1208,9 @@ fn for_each(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Va
         .ok_or_else(|| interp.type_error("not a typed array"))?;
     let (elements, _) = view_parts(interp, &this)?;
     let callback = typed_callback(interp, args)?;
+    let this_arg = crate::builtins::array::callback_this(args);
     for (index, value) in elements.into_iter().enumerate() {
-        call_typed(interp, &callback, value, index, &receiver)?;
+        call_typed(interp, &callback, value, index, &receiver, this_arg.clone())?;
     }
     Ok(Value::Undefined)
 }
@@ -1203,9 +1222,17 @@ fn map(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
         .ok_or_else(|| interp.type_error("not a typed array"))?;
     let (elements, element_type) = view_parts(interp, &this)?;
     let callback = typed_callback(interp, args)?;
+    let this_arg = crate::builtins::array::callback_this(args);
     let mut out = Vec::with_capacity(elements.len());
     for (index, value) in elements.into_iter().enumerate() {
-        out.push(call_typed(interp, &callback, value, index, &receiver)?);
+        out.push(call_typed(
+            interp,
+            &callback,
+            value,
+            index,
+            &receiver,
+            this_arg.clone(),
+        )?);
     }
     Ok(Value::Object(species_create(
         interp,
@@ -1222,9 +1249,17 @@ fn filter(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Valu
         .ok_or_else(|| interp.type_error("not a typed array"))?;
     let (elements, element_type) = view_parts(interp, &this)?;
     let callback = typed_callback(interp, args)?;
+    let this_arg = crate::builtins::array::callback_this(args);
     let mut out = Vec::new();
     for (index, value) in elements.into_iter().enumerate() {
-        let keep = call_typed(interp, &callback, value.clone(), index, &receiver)?;
+        let keep = call_typed(
+            interp,
+            &callback,
+            value.clone(),
+            index,
+            &receiver,
+            this_arg.clone(),
+        )?;
         if keep.to_boolean() {
             out.push(value);
         }
@@ -1321,13 +1356,21 @@ fn find_with(
         .ok_or_else(|| interp.type_error("not a typed array"))?;
     let (elements, _) = view_parts(interp, &this)?;
     let callback = typed_callback(interp, args)?;
+    let this_arg = crate::builtins::array::callback_this(args);
     let mut indices: Vec<usize> = (0..elements.len()).collect();
     if from_end {
         indices.reverse();
     }
     for index in indices {
         let value = elements[index].clone();
-        let answer = call_typed(interp, &callback, value.clone(), index, &receiver)?;
+        let answer = call_typed(
+            interp,
+            &callback,
+            value.clone(),
+            index,
+            &receiver,
+            this_arg.clone(),
+        )?;
         if answer.to_boolean() {
             return Ok(match kind {
                 FindKind::Value => value,
@@ -1535,9 +1578,7 @@ fn write_back(
         return Err(interp.type_error("not a typed array"));
     };
     for (index, value) in values.iter().enumerate() {
-        if write_element(&buffer, element_type, base, index, value.clone()).is_err() {
-            return Err(interp.type_error("cannot convert a Number to a BigInt"));
-        }
+        write_element(interp, &buffer, element_type, base, index, value.clone())?;
     }
     Ok(())
 }
@@ -1993,11 +2034,14 @@ fn data_view_set(
         return Err(interp.range_error("byte offset is out of range"));
     }
     let little_endian = arg(args, 2).to_boolean();
+    // The value conversion runs before the buffer is borrowed, for the same reason
+    // `write_element` does it: `valueOf` is script and can reach back into this buffer.
+    let stored = interp.element_value(element, arg(args, 1))?;
     // Little-endian first, into scratch, so the conversion (wrap, clamp, or BigInt modulo)
     // runs before any byte is reversed.
     let mut scratch = [0u8; 8];
     element
-        .write(&mut scratch, 0, arg(args, 1))
+        .write(&mut scratch, 0, &stored)
         .map_err(|reason| interp.type_error(reason))?;
     let storage = buffer
         .array_buffer_storage()

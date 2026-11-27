@@ -346,7 +346,7 @@ fn elements(interp: &mut Interp<'_>, object: &Gc<JsObject>) -> JsResult<Vec<Valu
 ///
 /// `reduce`/`reduceRight` are the exception: their second argument is the *initial
 /// accumulator*, so they have no `thisArg` at all.
-fn callback_this(args: &[Value]) -> Value {
+pub(crate) fn callback_this(args: &[Value]) -> Value {
     args.get(1).cloned().unwrap_or(Value::Undefined)
 }
 

@@ -2106,6 +2106,129 @@ fn typed_array_stores_wrap_and_clamp() {
 }
 
 #[test]
+fn typed_array_writes_convert_their_value_before_storing() {
+    // The value conversion is `ToNumber`/`ToBigInt`, both of which are observable script.
+    // Storing the raw `Value` made every object land as `NaN`, so a `valueOf` that returned
+    // a number was silently ignored: `new Uint8Array([{valueOf(){return 5}}])` was `0`.
+    assert_eq!(
+        eval(
+            "var a = new Uint8Array([{valueOf: function () { return 5; }}, '7', true]);\n\
+              print(a.join(','))"
+        ),
+        "5,7,1\n"
+    );
+    // `a[i] = obj` takes the same path, so it has to convert too.
+    assert_eq!(
+        eval(
+            "var b = new Float64Array(1); b[0] = {valueOf: function () { return 0.5; }};\n\
+              print(b[0])"
+        ),
+        "0.5\n"
+    );
+    // A BigInt element type runs `ToBigInt` on each value, so a BigInt-returning `valueOf`
+    // works and a String parses — but a Number is refused, and the two failures are
+    // *different kinds*: `TypeError` for the Number, `SyntaxError` for a bad literal.
+    assert_eq!(
+        eval(
+            "var c = new BigInt64Array([{valueOf: function () { return 3n; }}, '4', true]);\n\
+              print(c.join(','))"
+        ),
+        "3,4,1\n"
+    );
+    assert!(throws("new BigInt64Array([1])").starts_with("TypeError"));
+    assert_eq!(
+        throws("new BigInt64Array(['nope'])"),
+        "SyntaxError: invalid bigint literal"
+    );
+    // A Symbol has no number form at all, so both element families refuse it rather than
+    // storing `NaN` or `0n`.
+    assert!(throws("new Uint8Array([Symbol()])").starts_with("TypeError"));
+    assert!(throws("new BigInt64Array([Symbol()])").starts_with("TypeError"));
+}
+
+#[test]
+fn to_bigint_differs_from_the_bigint_constructor_on_a_number() {
+    // §7.1.14 versus §21.2.1: `BigInt(1)` is `1n` but `ToBigInt(1)` is a `TypeError`.
+    // Routing one through the other made `BigInt.asIntN(8, 1)` answer `1n` where the
+    // reference throws — and it is the same substitution that made `new BigInt64Array([1])`
+    // look legitimate.
+    assert!(throws("BigInt.asIntN(8, 1)").starts_with("TypeError"));
+    assert!(throws("BigInt.asUintN(8, 1)").starts_with("TypeError"));
+    // A String parses, with the radix forms and none of the sign rules of a Number.
+    assert_eq!(
+        eval(
+            "print(BigInt.asIntN(16, '255'), BigInt.asIntN(16, '0xff'),\n\
+              BigInt.asIntN(16, true), BigInt.asIntN(16, ''))"
+        ),
+        "255n 255n 1n 0n\n"
+    );
+    // `StrNonDecimalIntegerLiteral` carries no sign, so these are `SyntaxError`s.
+    for source in [
+        "BigInt('-0x10')",
+        "BigInt('+0x10')",
+        "BigInt('- 1')",
+        "BigInt(' +0x10 ')",
+    ] {
+        assert!(
+            throws(source).starts_with("SyntaxError"),
+            "{source} should be a SyntaxError"
+        );
+    }
+    // An object is `ToPrimitive`d first, and `Symbol()` is not convertible at all. That
+    // last one used to recurse forever: `to_primitive` hands a symbol straight back, so the
+    // conversion re-entered itself on the same value until the process aborted.
+    assert_eq!(
+        eval("print(BigInt({valueOf: function () { return 12n; }}), BigInt(Object(5n)))"),
+        "12n 5n\n"
+    );
+    assert!(throws("BigInt(Symbol())").starts_with("TypeError"));
+    assert!(throws("BigInt.asIntN(8, Symbol())").starts_with("TypeError"));
+}
+
+#[test]
+fn typed_array_callbacks_receive_their_this_arg() {
+    // The same root cause as the Array methods two rounds earlier: `call_typed` passed
+    // `undefined` to `[[Call]]`, so `typedArray.map(f, thisArg)` dropped it. test262's
+    // `map`/`filter`/`forEach`/`some`/`every`/`find`/`findIndex` callbackfn-this cases are
+    // nothing but `assert(this === thisArg)`.
+    //
+    // Each method is checked on its own rather than through a shared counter: the
+    // short-circuiting ones (`some`/`every`/`find`/`findIndex`) stop early by design, so a
+    // single counter would measure the short-circuit as much as the `this` binding.
+    assert_eq!(
+        eval(
+            "var t = { tag: 1 };\n\
+             var a = new Uint8Array([1, 2, 3]);\n\
+             function bound(f) { var ok = true; f(ok); return ok; }\n\
+             var results = [\n\
+               a.map(function (v) { return this === t ? v : -1; }, t).join(),\n\
+               a.filter(function () { return this === t; }, t).length,\n\
+               a.some(function () { return this === t; }, t),\n\
+               a.every(function () { return this === t; }, t),\n\
+               a.find(function () { return this === t; }, t),\n\
+               a.findIndex(function () { return this === t; }, t)\n\
+             ];\n\
+             var seen = [];\n\
+             a.forEach(function () { seen.push(this === t); }, t);\n\
+             print(results.join('/'), seen.length, seen.every(Boolean))"
+        ),
+        "1,2,3/3/true/true/1/0 3 true\n"
+    );
+    // `reduce`/`reduceRight` are the exception and must stay one: their second argument is
+    // the initial accumulator, so no `thisArg` is read — and in sloppy mode the callback's
+    // `this` is therefore the global object, not `undefined`.
+    assert_eq!(
+        eval(
+            "var a = new Uint8Array([1, 2]);\n\
+             print(a.reduce(function (x, y) { return x + y; }, 10),\n\
+                   a.reduceRight(function (x, y) { return x + y; }, 10),\n\
+                   a.reduce(function (x, y) { return this === globalThis ? x + y : -1; }, 10))"
+        ),
+        "13 13 13\n"
+    );
+}
+
+#[test]
 fn typed_array_reads_and_detachment() {
     // Out-of-range reads and writes are silently `undefined`/ignored, not errors.
     assert_eq!(

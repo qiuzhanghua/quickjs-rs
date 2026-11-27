@@ -59,16 +59,16 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
             Ok(interp.bigint(BigInt::from_f64_truncated(value)))
         }
         Value::String(text) => {
-            let text = text.to_string_lossy().into_owned();
-            match BigInt::from_string(&text) {
-                Some(big) => Ok(interp.bigint(big)),
-                None => Err(Signal::Throw(
-                    interp.make_error("SyntaxError", "cannot parse BigInt from this string"),
-                )),
-            }
+            let text = text.to_string_lossy();
+            let big = string_to_bigint(interp, &text)?;
+            Ok(interp.bigint(big))
         }
+        // A symbol has no primitive form at all: `to_primitive` hands it straight back, so
+        // the recursion below never advanced and `BigInt(Symbol())` overflowed the stack.
+        Value::Symbol(_) => Err(interp.type_error("cannot convert a Symbol to a BigInt")),
         Value::Undefined | Value::Null => Err(interp.type_error("cannot convert to BigInt")),
-        // An object goes through `ToPrimitive` first, and a symbol never converts.
+        // An object goes through `ToPrimitive` first; every arm above is primitive, so
+        // the recursion terminates.
         other => {
             let primitive = interp.to_primitive(other, crate::interp::Hint::Number)?;
             constructor(interp, Value::Undefined, &[primitive])
@@ -141,12 +141,58 @@ fn as_uint_n(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 }
 
 /// `ToBigInt`, which the `as*N` pair needs for their second argument.
-fn to_bigint(interp: &mut Interp<'_>, value: &Value) -> JsResult<BigInt> {
+///
+/// This is deliberately *not* `BigInt(value)`. The two differ on a Number, and only on a
+/// Number: `BigInt(1)` is `1n`, while `ToBigInt(1)` is a `TypeError` (§7.1.14 step 1 —
+/// a BigInt element type accepts a BigInt, a String, a Boolean, or an object, never a
+/// Number). Routing `ToBigInt` through the constructor made `BigInt.asIntN(8, 1)` answer
+/// `1n` where the reference throws, and it is the same substitution that made
+/// `new BigInt64Array([1])` look like it should work.
+pub fn to_bigint(interp: &mut Interp<'_>, value: &Value) -> JsResult<BigInt> {
     match value {
         Value::BigInt(big) => Ok((**big).clone()),
-        other => match constructor(interp, Value::Undefined, std::slice::from_ref(other))? {
-            Value::BigInt(big) => Ok((*big).clone()),
-            _ => Err(interp.type_error("cannot convert to BigInt")),
-        },
+        // `StringToBigInt` parses the literal; a malformed one is a `SyntaxError`, which
+        // is why this cannot go through `ToNumber`.
+        Value::String(text) => string_to_bigint(interp, &text.to_string_lossy()),
+        Value::Bool(flag) => Ok(BigInt::from_i64(if *flag { 1 } else { 0 })),
+        // A Number — including a boxed one, which `ToPrimitive` unwraps into this arm —
+        // has no default bigint conversion. `BigInt(1)` exists because it is explicit.
+        // The reference spells this one lowercase for `ToBigInt` (`BigInt.asIntN`), and the
+        // exact text is what several test262 assertions compare against.
+        Value::Int(_) | Value::Float(_) => Err(interp.type_error("cannot convert to bigint")),
+        Value::Undefined | Value::Null => Err(interp.type_error("cannot convert to bigint")),
+        Value::Symbol(_) => Err(interp.type_error("cannot convert to bigint")),
+        // An object goes through `ToPrimitive` first, then is converted again — and that
+        // recursion terminates: every arm above is primitive, and a `Symbol.toPrimitive`
+        // that answers an object is already a `TypeError` out of `to_primitive`.
+        Value::Object(_) => {
+            let primitive = interp.to_primitive(value.clone(), crate::interp::Hint::Number)?;
+            to_bigint(interp, &primitive)
+        }
+        // Not a JavaScript value at all: a bytecode-frame marker that no script can
+        // reach. Refusing loudly beats `unreachable!`, because a wrong stack here would
+        // otherwise take the process down.
+        _ => Err(interp.type_error("cannot convert to bigint")),
+    }
+}
+
+/// Implement the initializer list of a BigInt-element view: `ToBigInt` on every value.
+///
+/// Kept next to [`to_bigint`] because the message has to say what went wrong. The write
+/// path in `typedarray` reports a Number-into-BigInt error by name, but a bad *string*
+/// there would come out as the same `TypeError` — while the spec makes it a
+/// `SyntaxError` about the literal.
+pub fn bigint_element(interp: &mut Interp<'_>, value: &Value) -> JsResult<Gc<BigInt>> {
+    let big = to_bigint(interp, value)?;
+    Ok(Gc::new(interp.heap, big))
+}
+
+/// `StringToBigInt`, shared by `BigInt(str)` and `ToBigInt(str)`.
+pub fn string_to_bigint(interp: &mut Interp<'_>, text: &str) -> JsResult<BigInt> {
+    match BigInt::from_string(text) {
+        Some(big) => Ok(big),
+        None => Err(Signal::Throw(
+            interp.make_error("SyntaxError", "invalid bigint literal"),
+        )),
     }
 }

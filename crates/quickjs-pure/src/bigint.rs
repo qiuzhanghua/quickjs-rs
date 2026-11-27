@@ -186,18 +186,38 @@ impl BigInt {
     }
 
     /// Parse a JS `BigInt` string: optional sign, optional `0x`/`0o`/`0b`, no fraction.
+    ///
+    /// The grammar is `StringIntegerLiteral`, which is stricter than it looks and is why
+    /// `trim` only happens at the very edges:
+    ///
+    /// * whitespace may surround the literal, but not sit between the sign and the digits
+    ///   — `"- 1"` and `" +0x10 "` are both `SyntaxError`s, not `-1` and `16`;
+    /// * a radix prefix has to follow the sign directly, with no whitespace between;
+    /// * an empty literal (or all whitespace) is `0`, but a bare sign is not.
     pub fn from_string(text: &str) -> Option<BigInt> {
         let text = text.trim();
-        // `StringToBigInt` is a `StringNumericLiteral` without a fraction, and an empty
-        // literal is zero — but only when it is empty outright: `"+"` and `"-"` carry a
-        // sign and no digits, which stays a `SyntaxError`.
         if text.is_empty() {
             return Some(BigInt::zero());
         }
         let (negative, body) = match text.strip_prefix('-') {
-            Some(rest) => (true, rest.trim_start()),
-            None => (false, text.strip_prefix('+').unwrap_or(text).trim_start()),
+            Some(rest) => (true, rest),
+            None => (false, text.strip_prefix('+').unwrap_or(text)),
         };
+        // A radix prefix is part of a *non-decimal* literal, and `StrNonDecimalIntegerLiteral`
+        // has no sign: `BigInt("-0x10")` is a `SyntaxError`, not `-16`. Only the decimal
+        // form accepts `+`/`-`.
+        let has_radix_prefix = body.starts_with("0x")
+            || body.starts_with("0X")
+            || body.starts_with("0o")
+            || body.starts_with("0O")
+            || body.starts_with("0b")
+            || body.starts_with("0B");
+        if has_radix_prefix && negative {
+            return None;
+        }
+        if has_radix_prefix && text.starts_with('+') {
+            return None;
+        }
         let (radix, digits) =
             if let Some(rest) = body.strip_prefix("0x").or(body.strip_prefix("0X")) {
                 (16, rest)

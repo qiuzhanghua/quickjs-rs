@@ -3294,11 +3294,21 @@ impl<'a> Interp<'a> {
         // out-of-range or detached write is a silent no-op, as the spec says.
         if let Some(text) = text
             && let Some(index) = array_index(text)
-            && object.typed_array_parts().is_some()
+            && let Some(element) = object.typed_array_element_type()
         {
-            // A BigInt view refuses a Number; the spec makes that a `TypeError` rather
-            // than a silent skip, in strict mode and sloppy alike.
-            if let Some(Err(reason)) = object.typed_array_set(index as usize, value) {
+            // §10.4.5.5: an out-of-bounds index answers `true` *before* `V` is converted,
+            // so a `valueOf` with a side effect must not run. Checking the length first is
+            // what keeps `valueOfCalled` at 0 in `key-is-out-of-bounds-receiver-is-…`.
+            let length = object.typed_array_length().unwrap_or(0);
+            if index as usize >= length {
+                return Ok(());
+            }
+            // A BigInt view refuses a Number and a numeric one refuses a Symbol; the spec
+            // makes both a `TypeError` rather than a silent skip. The conversion runs here,
+            // in `Interp`, because it is script-observable and the storage borrow inside
+            // `typed_array_set` must not be held across it.
+            let stored = self.element_value(element, value)?;
+            if let Some(Err(reason)) = object.typed_array_set(index as usize, stored) {
                 return Err(self.type_error(reason));
             }
             return Ok(());
@@ -7402,6 +7412,34 @@ impl<'a> Interp<'a> {
             Value::BigInt(_) => Err(self.type_error("cannot convert bigint to number")),
             Value::Symbol(_) => Err(self.type_error("cannot convert symbol to number")),
             other => Ok(other.to_number()),
+        }
+    }
+
+    /// `ToNumber` or `ToBigInt`, whichever `element` stores, as a primitive ready for
+    /// [`ElementType::write`].
+    ///
+    /// This is separated from the write because both conversions are observable script —
+    /// `ToPrimitive` calls `valueOf` — and a conversion that runs script must not happen
+    /// with a buffer's `RefCell` borrowed. Every element-write path calls this first:
+    /// the constructor's initialiser list, `fill`/`set`/`sort`'s write-back, `DataView`'s
+    /// setters, and a plain `a[i] = v`.
+    pub(crate) fn element_value(
+        &mut self,
+        element: crate::builtins::typedarray::ElementType,
+        value: Value,
+    ) -> JsResult<Value> {
+        // `ToPrimitive` with the number hint, which is what turns `{valueOf(){return 5}}`
+        // into `5` and `{valueOf(){return 1n}}` into a BigInt. A primitive passes through.
+        let primitive = match &value {
+            Value::Object(_) => self.to_primitive(value, Hint::Number)?,
+            _ => value,
+        };
+        if element.is_bigint() {
+            let big = crate::builtins::bigint::to_bigint(self, &primitive)?;
+            Ok(Value::BigInt(Gc::new(self.heap, big)))
+        } else {
+            // `ToNumber` refuses a BigInt and a Symbol rather than answering `NaN`.
+            Ok(Value::Float(self.to_js_number(&primitive)?))
         }
     }
 

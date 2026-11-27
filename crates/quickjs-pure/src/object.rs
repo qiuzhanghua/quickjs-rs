@@ -197,7 +197,7 @@ impl JsObject {
         if storage.detached {
             return Some(Ok(()));
         }
-        let stored = element.write(&mut storage.bytes, offset + index * element.size(), value);
+        let stored = element.write(&mut storage.bytes, offset + index * element.size(), &value);
         Some(stored)
     }
 }
