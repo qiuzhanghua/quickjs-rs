@@ -2033,6 +2033,23 @@ impl JsObject {
         strings
     }
 
+    /// Own property keys in **definition order**, with symbols interleaved.
+    ///
+    /// [`JsObject::own_property_keys`] answers in the spec's order — integer-like keys
+    /// ascending, then strings, then symbols — because that is what `Reflect.ownKeys` and
+    /// `for...in` must do. A dumper has the opposite requirement: quickjs's
+    /// `JS_PrintValue` walks the shape, so `{[Symbol("t")]: 1, y: 2}` prints the symbol
+    /// first. That is not observable from a script except through such a dump, which is
+    /// why this is a separate accessor rather than a change to `own_property_keys`.
+    pub fn own_property_keys_in_definition_order(&self) -> Vec<PropertyKey> {
+        self.data
+            .borrow()
+            .props
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// The prototype chain, starting with the prototypes of this object.
     pub fn chain(&self) -> Vec<Gc<JsObject>> {
         let mut out = Vec::new();

@@ -90,7 +90,7 @@ pub fn install(
         ctx.set_property(object, name, function)?;
     }
 
-    let plain_functions: [(&str, u32, Body); 8] = [
+    let plain_functions: [(&str, u32, Body); 10] = [
         ("loadFile", 1, Box::new(js_load_file)),
         ("loadScript", 1, Box::new(js_load_script)),
         ("evalScript", 1, Box::new(js_eval_script)),
@@ -99,6 +99,8 @@ pub fn install(
         ("getenviron", 0, Box::new(js_getenviron)),
         ("exit", 1, Box::new(js_exit)),
         ("gc", 0, Box::new(js_gc)),
+        ("__sprintObject", 1, Box::new(js_sprint_object)),
+        ("__printObject", 1, Box::new(js_print_object)),
     ];
     for (name, length, body) in plain_functions {
         let function = ctx.new_host_function_value(name, length, body)?;
@@ -502,4 +504,18 @@ fn js_load_script(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsRe
 fn js_eval_script(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let source = interp.to_js_string(args.first().unwrap_or(&Value::Undefined))?;
     interp.eval_in_global(&source)
+}
+
+/// `std.__sprintObject(value)` — the reference's `JS_PrintValue` as a string.
+fn js_sprint_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
+    Ok(interp.string(text))
+}
+
+/// `std.__printObject(value)` — the same text written to stdout.
+fn js_print_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let mut text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
+    text.push('\n');
+    stdio::emit(interp, text.as_bytes());
+    Ok(Value::Undefined)
 }

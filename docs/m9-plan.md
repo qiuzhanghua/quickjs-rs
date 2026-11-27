@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a/M9b(大半)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
+状态：**M9a/M9b(除 setenv 外)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -593,3 +593,41 @@ sink），若 `std.out` 直接写 fd 1 就是同一个流上的两个缓冲，`s
 **`setenv`/`unsetenv` 仍未做**，因为 edition 2024 里 `std::env::set_var` 是 `unsafe`。
 `loadScript` 当前走 `eval_in_global`，栈里显示 `<input>` 而不是文件名，与参考有差；修它需要
 一个带名字的 eval 入口。
+
+### 10.7 `__sprintObject` / `__printObject`
+
+`quickjs-host/src/print.rs`，`JS_PrintValue` 的移植。**105 条用例逐字节一致**，含参考自己的
+`test_print_value`。
+
+它不是 `JSON.stringify`，也不是 `console.log`：它遍历 quickjs 的**对象形状**，所以规则都是
+从 `js_print_value`/`js_print_object` 抄的，不是发明的：
+
+```text
+[ 1, 2, 3 ]              数组方括号内侧有空格
+[  ]                     空数组也是两个空格
+{  }                     空对象两个空格
+{ a: 1, "a b": 2 }       标识符键不加引号，否则加
+{ a: { b: [Array] } }    超过 max_depth(2) 打类名
+{ self: [circular 0] }   环标出首次出现的层级
+[ 0: 1, 2: 3 ]           稀疏数组打 下标: 值
+[ 1, 2, 3, x: 4 ]        数组上的非索引属性也会打
+Map(1) { 1 => 2 } / Set(2) { 1, 2 } / Uint8Array(3) [ 1, 2, 255 ]
+```
+
+默认值也是参考的：`max_depth=2`、`max_string_length=1000`、`max_item_count=100`。
+超限会写进输出（`... 3 more items`、`... 5 more characters`），所以这三个数字必须精确。
+
+几个容易错的点：
+
+- `-0` 打 `-0`（`JS_DTOA_MINUS_ZERO`），而 `String(-0)` 是 `0`。其余浮点走 JS 的
+  Number→string，所以 `1e+21`/`1e-7`/`Infinity` 都对。
+- **键序是定义顺序，不是规范顺序**。`{[Symbol("t")]: 1, y: 2}` 参考打 symbol 在前，
+  而 `Reflect.ownKeys` 的规范顺序会把 symbol 放到最后。为此给引擎加了
+  `JsObject::own_property_keys_in_definition_order()`，`own_property_keys` 保持规范顺序不动。
+- `BigInt64Array` 的元素打裸整数（参考用 `%lld`，不走 BigInt 路径），所以没有 `n` 后缀。
+- `new Date(NaN)` 打 `Date {  }`——`toISOString` 抛异常，参考退回默认对象形态。
+- 包装对象（`new String("s")`）打 `String {  }`，体为空。
+
+**一处刻意的取舍**：`Error` 的栈来自 `stack` 属性，因此我们的栈里函数名/行号与参考不同
+（两个引擎的位置信息本来就不同）。参考自己的 `test_print_value` 里那条断言也只能靠
+`remove_line_nums` 才成立，所以这里不比栈内容。
