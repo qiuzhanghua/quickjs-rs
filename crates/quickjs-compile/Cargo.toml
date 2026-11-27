@@ -18,6 +18,7 @@ name = "js_compile"
 
 [dependencies]
 quickjs-parse.workspace = true
+quickjs-regexp.workspace = true
 
 [dev-dependencies]
 # 差分 harness 只用于本地测试，不上传，因此不加版本约束。

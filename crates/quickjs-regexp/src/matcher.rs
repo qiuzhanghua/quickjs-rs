@@ -7,7 +7,7 @@
 //! passed by shared reference and copied when a group is entered, rather than mutated in
 //! place: a branch that fails must not leave its captures behind.
 
-use super::{ClassSet, Flags, Node, PropertyKind};
+use super::{ClassSet, Flags, Node, PropertyKind, set_has_strings};
 
 /// Capture register: `caps[0]` is the whole match, `caps[n]` is group `n`.
 pub type Captures = Vec<Option<(usize, usize)>>;
@@ -36,11 +36,15 @@ pub fn exec(
     node: &Node,
     groups: usize,
     flags: Flags,
-    input: &[char],
+    input: &[u32],
     from: usize,
     anchoring: Anchoring,
 ) -> Option<Match> {
-    let matcher = Matcher { input, flags };
+    let matcher = Matcher {
+        input,
+        flags,
+        budget: std::cell::Cell::new(input.len().saturating_mul(BUDGET_PER_CHAR) + 4096),
+    };
     let starts: Box<dyn Iterator<Item = usize>> = match anchoring {
         Anchoring::At(position) => Box::new(std::iter::once(position)),
         Anchoring::Search => Box::new(from..=input.len()),
@@ -71,26 +75,52 @@ pub fn exec(
 }
 
 struct Matcher<'a> {
-    input: &'a [char],
+    input: &'a [u32],
     flags: Flags,
+    /// How deep the backtracking recursion may go.
+    ///
+    /// A backtracking matcher recurses once per repetition, so `/^\p{ASCII}+$/u` over a long
+    /// string is a stack overflow rather than a wrong answer — the harness builds exactly
+    /// such a string out of every ASCII code point. Rather than guess a depth that is both
+    /// safe and sufficient, the budget is spent per input byte: an unbounded repeat can
+    /// only recurse as deep as the input is long, so this bounds the recursion by the data
+    /// instead of by a constant.
+    ///
+    /// Running out of budget answers "no match" rather than aborting. That is a wrong answer
+    /// on a pattern that needed more, but it is a *contained* wrong answer: the alternative
+    /// is a process that dies mid-test-suite.
+    budget: std::cell::Cell<usize>,
 }
 
+/// How much backtracking recursion one input character may cost.
+///
+/// Sized so that the deepest legitimate pattern still fits: a nested quantifier recurses a
+/// few times per character, and the threads the suite runs already have multi-megabyte
+/// stacks. This is a guard rail, not the primary limit.
+const BUDGET_PER_CHAR: usize = 256;
+
 impl Matcher<'_> {
-    fn at(&self, position: usize) -> Option<char> {
+    fn at(&self, position: usize) -> Option<u32> {
         self.input.get(position).copied()
     }
 
-    fn fold(&self, c: char) -> char {
-        if self.flags.ignore_case {
-            // Full Unicode case folding needs the case tables; the simple mapping covers
-            // the ASCII and Latin-1 ranges scripts actually use.
-            c.to_lowercase().next().unwrap_or(c)
-        } else {
-            c
+    /// The simple lowercase mapping of a code point.
+    ///
+    /// A code point that is not a `char` — an unpaired surrogate — has no case mapping, so
+    /// it folds to itself rather than to U+FFFD.
+    fn fold(&self, cp: u32) -> u32 {
+        if !self.flags.ignore_case {
+            return cp;
+        }
+        // Full Unicode case folding needs the case tables; the simple mapping covers
+        // the ASCII and Latin-1 ranges scripts actually use.
+        match char::from_u32(cp) {
+            Some(c) => c.to_lowercase().next().unwrap_or(c) as u32,
+            None => cp,
         }
     }
 
-    fn chars_equal(&self, a: char, b: char) -> bool {
+    fn chars_equal(&self, a: u32, b: u32) -> bool {
         if self.flags.ignore_case {
             self.fold(a) == self.fold(b)
         } else {
@@ -176,7 +206,7 @@ impl Matcher<'_> {
     }
 
     /// Whether `member` matches the input starting at `position`.
-    fn matches_sequence(&self, member: &[char], position: usize) -> bool {
+    fn matches_sequence(&self, member: &[u32], position: usize) -> bool {
         member
             .iter()
             .enumerate()
@@ -187,7 +217,7 @@ impl Matcher<'_> {
     }
 
     /// Whether `c` lies in a range, honouring case-insensitivity.
-    fn in_range(&self, c: char, lo: char, hi: char) -> bool {
+    fn in_range(&self, c: u32, lo: u32, hi: u32) -> bool {
         self.in_class(c, &[(lo, hi)])
     }
 
@@ -198,15 +228,17 @@ impl Matcher<'_> {
     /// `a` canonicalises to the non-lowercase `A`), while `\P{Lower}/vi` does not (the set is
     /// case-closed first and only then complemented, so `a` stays inside). The test suite
     /// pins both, so the dialect decides.
-    fn property_holds(&self, kind: PropertyKind, negated: bool, c: char) -> bool {
+    fn property_holds(&self, kind: PropertyKind, negated: bool, c: u32) -> bool {
         let mut candidates = vec![c];
         if self.flags.ignore_case {
             candidates.push(self.fold(c));
-            if let Some(upper) = c.to_uppercase().next() {
-                candidates.push(upper);
-            }
-            if let Some(lower) = c.to_lowercase().next() {
-                candidates.push(lower);
+            if let Some(ch) = char::from_u32(c) {
+                if let Some(upper) = ch.to_uppercase().next() {
+                    candidates.push(upper as u32);
+                }
+                if let Some(lower) = ch.to_lowercase().next() {
+                    candidates.push(lower as u32);
+                }
             }
         }
         if self.flags.unicode_sets {
@@ -231,7 +263,7 @@ impl Matcher<'_> {
     /// therefore matches `a`. The folded form is only used while it is still ordered —
     /// `[A-_]` has a non-letter upper bound, and folding `A` to `a` would put the bound
     /// *below* `_`, so the unfolded comparison stays authoritative for that range.
-    fn in_class(&self, c: char, ranges: &[(char, char)]) -> bool {
+    fn in_class(&self, c: u32, ranges: &[(u32, u32)]) -> bool {
         let folded = self.fold(c);
         ranges.iter().any(|(lo, hi)| {
             (*lo..=*hi).contains(&c) || (*lo..=*hi).contains(&folded) || {
@@ -272,7 +304,7 @@ impl Matcher<'_> {
                 _ => false,
             },
             Node::Any => match self.at(position) {
-                Some(c) if self.flags.dot_all || c != '\n' => k(position + 1, caps),
+                Some(c) if self.flags.dot_all || c != LINE_FEED => k(position + 1, caps),
                 _ => false,
             },
             Node::Class(negated, ranges) => match self.at(position) {
@@ -414,6 +446,64 @@ impl Matcher<'_> {
         caps: &Captures,
         k: &mut dyn FnMut(usize, &Captures) -> bool,
     ) -> bool {
+        // The fast path: a single-character body with nothing to capture.
+        //
+        // A backtracking matcher recurses once per repetition, so `/^\P{ASCII}+$/u` over the
+        // ~1.1 M code points the conformance harness concatenates would be a million native
+        // frames. There is no backtracking decision to make in this shape — a one-character
+        // body either matches at a position or does not — so it is consumed by a loop, and
+        // only the *final* position is handed to the continuation after the minimum is met.
+        //
+        // The greedy answer has to be tried first (the longest run), then shorter ones from
+        // the end backwards, so the continuation sees the same choices recursion would give
+        // it. Lazy walks forwards from the minimum instead.
+        if count == 0
+            && inner_groups(node).is_none()
+            && match node {
+                Node::Char(_) | Node::Any | Node::Class(..) | Node::Property { .. } => true,
+                Node::Set(set) => !set_has_strings(set),
+                _ => false,
+            }
+        {
+            // How many single characters this body matches starting at `position`.
+            let mut end = position;
+            // `end` is exclusive, so the run may grow while it is still shorter than `max`.
+            while max.is_none_or(|max| ((end - position) as u32) < max) && end < self.input.len() {
+                if !self.single_char_matches(node, end) {
+                    break;
+                }
+                end += 1;
+            }
+            let available = (end - position) as u32;
+            if available < min {
+                return false;
+            }
+            let mut count = |taken: u32| -> bool {
+                let at = position + taken as usize;
+                k(at, caps)
+            };
+            if greedy {
+                for taken in (min..=available).rev() {
+                    if count(taken) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            for taken in min..=available {
+                if count(taken) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        // Spend one unit of recursion budget per iteration. Exhausting it stops the repeat
+        // rather than overflowing the native stack.
+        let budget = self.budget.get();
+        if budget == 0 {
+            return false;
+        }
+        self.budget.set(budget - 1);
         let may_iterate = max.is_none_or(|max| count < max);
         // Greedy tries one more iteration first; lazy tries the continuation first.
         let try_iterate = |k: &mut dyn FnMut(usize, &Captures) -> bool| {
@@ -459,12 +549,46 @@ impl Matcher<'_> {
         }
     }
 
+    /// Whether a one-character node matches at `at`.
+    ///
+    /// Only the nodes the repeat fast path accepts are handled; the caller has already
+    /// narrowed the type, so anything else is a programming error rather than a pattern.
+    fn single_char_matches(&self, node: &Node, at: usize) -> bool {
+        match node {
+            Node::Char(c) => self.at(at).is_some_and(|input| self.chars_equal(*c, input)),
+            Node::Any => match self.at(at) {
+                Some(c) => self.flags.dot_all || !is_line_terminator(c),
+                None => false,
+            },
+            Node::Class(negated, ranges) => match self.at(at) {
+                Some(c) => self.in_class(c, ranges) != *negated,
+                None => false,
+            },
+            // A `v`-mode set can contain multi-character members, so it only belongs on this
+            // path when every member is one character.
+            // Only a set whose members are all one code point belongs on the fast path. A
+            // `v`-mode set can hold multi-character members from `\q{…}`, and consuming one
+            // character of a longer member would leave the repetition misaligned.
+            Node::Set(set) => {
+                !set_has_strings(set)
+                    && self
+                        .at(at)
+                        .is_some_and(|_| self.set_lengths(set, at).first() == Some(&1))
+            }
+            Node::Property { kind, negated } => match self.at(at) {
+                Some(c) => self.property_holds(*kind, *negated, c),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
     fn after_newline(&self, position: usize) -> bool {
-        position > 0 && self.at(position - 1) == Some('\n')
+        position > 0 && self.at(position - 1) == Some(LINE_FEED)
     }
 
     fn at_newline(&self, position: usize) -> bool {
-        self.at(position) == Some('\n')
+        self.at(position) == Some(LINE_FEED)
     }
 }
 
@@ -495,6 +619,20 @@ fn inner_groups(node: &Node) -> Option<(usize, usize)> {
 }
 
 /// Whether `c` is a word character, as `\b` and `\w` define it.
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+/// U+000A, the code point `\n` spells.
+const LINE_FEED: u32 = 0x0A;
+
+/// The four line terminators `.` does not match without the `s` flag.
+fn is_line_terminator(cp: u32) -> bool {
+    matches!(cp, 0x0A | 0x0D | 0x2028 | 0x2029)
+}
+
+fn is_word(cp: u32) -> bool {
+    match char::from_u32(cp) {
+        Some(c) => c.is_alphanumeric() || c == '_',
+        // A surrogate is a word character: `\w` is `[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200C\u200D]`,
+        // and the reference treats a lone surrogate as belonging to no category, which for
+        // `\b` means "not a word boundary" on both sides.
+        None => false,
+    }
 }

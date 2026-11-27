@@ -137,12 +137,16 @@ fn exec(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
     let Some(object) = this.as_object() else {
         return Err(interp.type_error("RegExp.prototype.exec called on a non-object"));
     };
-    let text = interp.to_js_string(&arg(args, 0))?;
+    let text = interp.checked_to_wtf8(&arg(args, 0))?;
     exec_on(interp, object, &text)
 }
 
 /// The shared implementation of `exec`, used by the `String` methods as well.
-pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> JsResult<Value> {
+pub fn exec_on(
+    interp: &mut Interp<'_>,
+    object: &Gc<JsObject>,
+    text: &crate::value::Wtf8,
+) -> JsResult<Value> {
     let Some(data) = object.regexp() else {
         return Err(interp.type_error("method called on a non-RegExp"));
     };
@@ -158,7 +162,7 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
     } else {
         0
     };
-    let input: Vec<char> = text.chars().collect();
+    let input: Vec<u32> = text.code_point_values();
     // `lastIndex`, `index` and the `d` flag's pairs all count **UTF-16 code units**, while the
     // matcher works in characters. `unit_start[i]` is the code-unit offset of character `i`,
     // with one extra entry for the end, so the two unit systems convert both ways.
@@ -166,7 +170,7 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
     let mut units = 0;
     for character in &input {
         unit_start.push(units);
-        units += character.len_utf16();
+        units += if *character > 0xFFFF { 2 } else { 1 };
     }
     unit_start.push(units);
     // A `lastIndex` inside a surrogate pair has no character of its own; it belongs to the
@@ -200,13 +204,13 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
     let mut elements: Vec<Value> = Vec::with_capacity(found.captures.len());
     for capture in &found.captures {
         elements.push(match capture {
-            Some((start, end)) => interp.string(slice(&input, *start, *end)),
+            Some((start, end)) => interp.string_wtf8(slice(&input, *start, *end)),
             None => Value::Undefined,
         });
     }
     let array = interp.new_array(elements);
     let index = unit_start[found.start.min(unit_start.len() - 1)];
-    let input_value = interp.string(text);
+    let input_value = interp.string_wtf8(text.clone());
     interp.set_property(&array, "index", Value::Int(index as i32))?;
     interp.set_property(&array, "input", input_value.clone())?;
     interp.set_property(
@@ -241,11 +245,28 @@ pub fn exec_on(interp: &mut Interp<'_>, object: &Gc<JsObject>, text: &str) -> Js
     Ok(Value::Object(array))
 }
 
-fn slice(input: &[char], start: usize, end: usize) -> String {
-    input
-        .get(start..end)
-        .map(|chars| chars.iter().collect())
-        .unwrap_or_default()
+/// The text of `input[start..end]`, in code points.
+///
+/// Built through UTF-16 so that a lone surrogate survives: collecting code points into a
+/// `String` would turn one into U+FFFD, and then `exec` would report different text than
+/// the input it was given.
+fn slice(input: &[u32], start: usize, end: usize) -> crate::value::Wtf8 {
+    points_to_wtf8(input.get(start..end).unwrap_or_default())
+}
+
+/// Code points to WTF-8, keeping a lone surrogate instead of replacing it.
+fn points_to_wtf8(points: &[u32]) -> crate::value::Wtf8 {
+    let mut units = Vec::with_capacity(points.len());
+    for point in points {
+        if *point > 0xFFFF {
+            let value = point - 0x10000;
+            units.push(0xD800 + (value >> 10) as u16);
+            units.push(0xDC00 + (value & 0x3FF) as u16);
+        } else {
+            units.push(*point as u16);
+        }
+    }
+    crate::value::Wtf8::from_units(&units)
 }
 
 /// `RegExp.prototype.test(string)`.
@@ -331,7 +352,7 @@ fn symbol_match(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
     let Some(object) = this.as_object() else {
         return Err(interp.type_error("Symbol.match called on a non-object"));
     };
-    let text = interp.to_js_string(&arg(args, 0))?;
+    let text = interp.checked_to_wtf8(&arg(args, 0))?;
     let is_global = interp
         .get_property(object, "global")?
         .unwrap_or(Value::Undefined)
@@ -341,7 +362,7 @@ fn symbol_match(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
     }
     interp.set_property(object, "lastIndex", Value::Int(0))?;
     let mut results = Vec::new();
-    let input: Vec<char> = text.chars().collect();
+    let input: Vec<u32> = text.code_point_values();
     loop {
         let result = exec_on(interp, object, &text)?;
         if matches!(result, Value::Null) {
@@ -375,7 +396,7 @@ fn symbol_search(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResu
     let Some(object) = this.as_object() else {
         return Err(interp.type_error("Symbol.search called on a non-object"));
     };
-    let text = interp.to_js_string(&arg(args, 0))?;
+    let text = interp.checked_to_wtf8(&arg(args, 0))?;
     // `search` ignores the caller's `lastIndex`: it always looks from the start, and
     // leaves the property alone afterwards.
     interp.set_property(object, "lastIndex", Value::Int(0))?;
@@ -394,7 +415,7 @@ fn symbol_split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
     let Some(object) = this.as_object() else {
         return Err(interp.type_error("Symbol.split called on a non-object"));
     };
-    let text = interp.to_js_string(&arg(args, 0))?;
+    let text = interp.checked_to_wtf8(&arg(args, 0))?;
     let limit = match arg(args, 1) {
         Value::Undefined => u32::MAX,
         other => {
@@ -410,7 +431,7 @@ fn symbol_split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
         return Ok(Value::Object(interp.new_array(Vec::new())));
     }
     let data = data_of(interp, &Value::Object(object.clone()))?;
-    let input: Vec<char> = text.chars().collect();
+    let input: Vec<u32> = text.code_point_values();
     let mut parts: Vec<Value> = Vec::new();
     let mut last = 0usize;
     let mut scan = 0usize;
@@ -423,13 +444,13 @@ fn symbol_split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
             scan = found.start + 1;
             continue;
         }
-        parts.push(interp.string(slice(&input, last, found.start)));
+        parts.push(interp.string_wtf8(slice(&input, last, found.start)));
         if parts.len() as u32 >= limit {
             return Ok(Value::Object(interp.new_array(parts)));
         }
         for group in found.captures.iter().skip(1) {
             parts.push(match group {
-                Some((start, end)) => interp.string(slice(&input, *start, *end)),
+                Some((start, end)) => interp.string_wtf8(slice(&input, *start, *end)),
                 None => Value::Undefined,
             });
             if parts.len() as u32 >= limit {
@@ -439,7 +460,7 @@ fn symbol_split(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResul
         last = found.end;
         scan = found.end;
     }
-    parts.push(interp.string(slice(&input, last, input.len())));
+    parts.push(interp.string_wtf8(slice(&input, last, input.len())));
     Ok(Value::Object(interp.new_array(parts)))
 }
 
@@ -448,15 +469,17 @@ fn symbol_replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
     let Some(object) = this.as_object() else {
         return Err(interp.type_error("Symbol.replace called on a non-object"));
     };
-    let text = interp.to_js_string(&arg(args, 0))?;
+    let text = interp.checked_to_wtf8(&arg(args, 0))?;
     let replacement = arg(args, 1);
     let is_global = interp
         .get_property(object, "global")?
         .unwrap_or(Value::Undefined)
         .to_boolean();
     let data = data_of(interp, &Value::Object(object.clone()))?;
-    let input: Vec<char> = text.chars().collect();
-    let mut out = String::new();
+    let input: Vec<u32> = text.code_point_values();
+    // Code points, not bytes or `char`s: a replacement can contain a lone surrogate and a
+    // `String` would turn it into U+FFFD.
+    let mut out: Vec<u32> = Vec::new();
     let mut last = 0usize;
     let mut scan = 0usize;
     let mut replaced = false;
@@ -464,10 +487,10 @@ fn symbol_replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
         let Some(found) = data.regex.exec_at(&input, scan) else {
             break;
         };
-        out.extend(input[last..found.start].iter());
+        out.extend_from_slice(&input[last..found.start]);
         let matched = slice(&input, found.start, found.end);
         let substituted = substitute(interp, &replacement, &matched, &input, &found)?;
-        out.push_str(&substituted);
+        out.extend_from_slice(&substituted);
         last = found.end;
         let empty = found.start == found.end;
         scan = if empty { found.end + 1 } else { found.end };
@@ -480,10 +503,10 @@ fn symbol_replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
         }
     }
     if !replaced {
-        return Ok(interp.string(&text));
+        return Ok(interp.string_wtf8(text.clone()));
     }
-    out.extend(input[last.min(input.len())..].iter());
-    Ok(interp.string(&out))
+    out.extend_from_slice(&input[last.min(input.len())..]);
+    Ok(interp.string_wtf8(points_to_wtf8(&out)))
 }
 
 /// Apply a replacement: a function receives the match and its groups, a string
@@ -491,71 +514,72 @@ fn symbol_replace(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsRes
 fn substitute(
     interp: &mut Interp<'_>,
     replacement: &Value,
-    matched: &str,
-    input: &[char],
+    matched: &crate::value::Wtf8,
+    input: &[u32],
     found: &crate::regexp::Match,
-) -> JsResult<String> {
+) -> JsResult<Vec<u32>> {
     if let Value::Object(function) = replacement
         && function.is_callable()
     {
-        let mut args: Vec<Value> = vec![interp.string(matched)];
+        let mut args: Vec<Value> = vec![interp.string_wtf8(matched.clone())];
         for group in found.captures.iter().skip(1) {
             args.push(match group {
-                Some((start, end)) => interp.string(slice(input, *start, *end)),
+                Some((start, end)) => interp.string_wtf8(slice(input, *start, *end)),
                 None => Value::Undefined,
             });
         }
         args.push(Value::Int(found.start as i32));
-        args.push(interp.string(input.iter().collect::<String>()));
+        args.push(interp.string_wtf8(points_to_wtf8(input)));
         let this = Value::Undefined;
         let result = interp.call_value(Value::Object(function.clone()), this, args)?;
-        return interp.to_js_string(&result);
+        // The function's result keeps any unpaired surrogate it produced.
+        return Ok(interp.checked_to_wtf8(&result)?.code_point_values());
     }
-    let template = interp.to_js_string(replacement)?;
-    let mut out = String::new();
-    let mut chars = template.chars().peekable();
+    let template = interp.checked_to_wtf8(replacement)?;
+    let mut out: Vec<u32> = Vec::new();
+    let mut chars = template.code_point_values().into_iter().peekable();
     while let Some(c) = chars.next() {
-        if c != '$' {
+        if c != u32::from(b'$') {
             out.push(c);
             continue;
         }
-        match chars.peek() {
-            Some('$') => {
+        match chars.peek().copied() {
+            Some(dollar) if dollar == u32::from(b'$') => {
                 chars.next();
-                out.push('$');
+                out.push(u32::from(b'$'));
             }
-            Some('&') => {
+            Some(amp) if amp == u32::from(b'&') => {
                 chars.next();
-                out.push_str(matched);
+                out.extend_from_slice(&matched.code_point_values());
             }
-            Some('`') => {
+            Some(back) if back == u32::from(b'`') => {
                 chars.next();
-                out.extend(input[..found.start].iter());
+                out.extend_from_slice(&input[..found.start]);
             }
-            Some('\'') => {
+            Some(quote) if quote == u32::from(b'\'') => {
                 chars.next();
-                out.extend(input[found.end..].iter());
+                out.extend_from_slice(&input[found.end..]);
             }
-            Some(digit) if digit.is_ascii_digit() => {
+            Some(digit) if (u32::from(b'0')..=u32::from(b'9')).contains(&digit) => {
                 let mut digits = String::new();
                 while let Some(digit) = chars.peek().copied() {
-                    if !digit.is_ascii_digit() || digits.len() == 2 {
+                    if !(u32::from(b'0')..=u32::from(b'9')).contains(&digit) || digits.len() == 2 {
                         break;
                     }
-                    digits.push(digit);
+                    digits.push(char::from_u32(digit).unwrap_or('0'));
                     chars.next();
                 }
                 let index: usize = digits.parse().unwrap_or(0);
                 match found.captures.get(index) {
-                    Some(Some((start, end))) => out.extend(input[*start..*end].iter()),
+                    Some(Some((start, end))) => out.extend_from_slice(&input[*start..*end]),
                     // An index beyond the group count leaves the `$n` as written.
                     _ => {
-                        out.push('$');
-                        out.push_str(&digits);
+                        out.push(u32::from(b'$'));
+                        out.extend(digits.chars().map(|c| c as u32));
                     }
                 }
             }
-            _ => out.push('$'),
+            _ => out.push(u32::from(b'$')),
         }
     }
     Ok(out)

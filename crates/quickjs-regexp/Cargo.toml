@@ -1,0 +1,13 @@
+[package]
+name = "quickjs-regexp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Regular expression engine for quickjs-rs (parse, match, Unicode properties)"
+
+# No dependencies at all, and deliberately so: this crate sits *below* `quickjs-compile`, which
+# has to validate a `/…/u` literal at parse time, and below `quickjs-pure`, which has to run it.
+# Anything it pulled in would be pulled into both.
+[dependencies]

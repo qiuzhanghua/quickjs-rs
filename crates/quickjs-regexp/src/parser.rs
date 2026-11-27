@@ -11,7 +11,7 @@
 //! `char`s, which is already code-point granular. That matches the common cases and is
 //! documented as a limitation rather than pretended away.
 
-use super::{ClassSet, Node, PropertyKind};
+use super::{ClassSet, Node, PropertyKind, set_has_strings};
 
 /// Why a pattern could not be parsed.
 #[derive(Debug, Clone)]
@@ -46,7 +46,7 @@ struct Parser {
 }
 
 /// Parse `source` with `flags`.
-pub fn parse(source: &str, flags: crate::regexp::Flags) -> Result<Parsed, PatternError> {
+pub fn parse(source: &str, flags: crate::Flags) -> Result<Parsed, PatternError> {
     // `u` is the one flag the *syntax* depends on: it decides whether the Annex B
     // liberties below are allowed at all.
     let mut parser = Parser {
@@ -155,11 +155,11 @@ impl Parser {
     /// part of a real construct, so `/a]/u` is a `SyntaxError`. Reporting it is what the
     /// reference does, and a pattern that silently means something different under `u` than
     /// the spec says is worse than one that refuses to compile.
-    fn annex_b_char(&self, c: char) -> Result<char, PatternError> {
+    fn annex_b_char(&self, c: char) -> Result<u32, PatternError> {
         if self.unicode && matches!(c, '{' | '}' | ']') {
             return Err(self.error(&format!("lone '{c}' in unicode mode")));
         }
-        Ok(c)
+        Ok(c as u32)
     }
 
     fn quantifier(&mut self, term: Node) -> Result<Node, PatternError> {
@@ -349,11 +349,9 @@ impl Parser {
                 match letter {
                     Some(letter) if letter.is_ascii_alphabetic() => {
                         self.pos += 2;
-                        Ok(Node::Char(
-                            char::from_u32((letter as u32) % 32).unwrap_or('\0'),
-                        ))
+                        Ok(Node::Char(letter as u32 % 32))
                     }
-                    _ => Ok(Node::Char('\\')),
+                    _ => Ok(Node::Char(u32::from(b'\\'))),
                 }
             }
             _ => {
@@ -372,7 +370,11 @@ impl Parser {
         if !self.unicode {
             // Annex B: `\p` is an identity escape for `p`, and the `{…}` that follows is
             // read as ordinary text. The `p` is already consumed.
-            return Ok(Node::Char(if negated { 'P' } else { 'p' }));
+            return Ok(Node::Char(if negated {
+                u32::from(b'P')
+            } else {
+                u32::from(b'p')
+            }));
         }
         if !self.eat('{') {
             return Err(self.error("expecting '{' after \\p"));
@@ -385,8 +387,11 @@ impl Parser {
             return Err(self.error("expecting '}' after property name"));
         }
         let name: String = self.chars[start..self.pos - 1].iter().collect();
-        let kind = super::PropertyKind::from_name(&name)
-            .ok_or_else(|| self.error(&format!("unsupported property name '{name}'")))?;
+        // The name has to resolve to a real property, or the pattern is a `SyntaxError`.
+        // Answering "the empty set" instead would turn a typo into a pattern that silently
+        // never matches, which test262 checks in 163 cases.
+        let kind = super::unicode::lookup(&name)
+            .ok_or_else(|| self.error(&format!("invalid Unicode property '{name}'")))?;
         Ok(Node::Property { kind, negated })
     }
 
@@ -396,21 +401,21 @@ impl Parser {
     /// [`Parser::atom_escape`]'s fallback, which is why `\b` means backspace here: outside a
     /// class it never gets this far, because `atom_escape` reads it as a word boundary
     /// first.
-    fn escape_char(&mut self, c: char) -> Result<char, PatternError> {
+    fn escape_char(&mut self, c: char) -> Result<u32, PatternError> {
         Ok(match c {
-            'b' => '\u{8}',
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            'f' => '\u{c}',
-            'v' => '\u{b}',
-            '0' => '\0',
+            'b' => 0x08,
+            'n' => 0x0A,
+            'r' => 0x0D,
+            't' => 0x09,
+            'f' => 0x0C,
+            'v' => 0x0B,
+            '0' => 0x00,
             // Annex B: an incomplete `\x`/`\u` is an *identity* escape for the letter, so
             // `/\u{2}/` is `u` repeated twice while `/\u{2}/u` is the code point 2. The
             // strict grammars keep the error.
             'x' => match self.try_hex(2) {
                 Some(value) => value,
-                None if !self.unicode => 'x',
+                None if !self.unicode => u32::from(b'x'),
                 None => return Err(self.error("invalid escape")),
             },
             // `\u{…}` spells a whole code point; `\uXXXX` spells one code unit. The brace
@@ -438,26 +443,26 @@ impl Parser {
                 if (0xD800..0xE000).contains(&code) {
                     return Err(self.error("code point escape names a surrogate"));
                 }
-                char::from_u32(code).ok_or_else(|| self.error("invalid code point escape"))?
+                code
             }
             'u' => match self.try_hex(4) {
                 Some(value) => value,
-                None if !self.unicode => 'u',
+                None if !self.unicode => u32::from(b'u'),
                 None => return Err(self.error("invalid escape")),
             },
             'c' => {
                 // Inside a class the same Annex B rule applies: a non-letter after `\c`
                 // is a literal backslash, and the caller reads the letter itself.
                 let Some(letter) = self.peek() else {
-                    return Ok('\\');
+                    return Ok(u32::from(b'\\'));
                 };
                 if !letter.is_ascii_alphabetic() {
-                    return Ok('\\');
+                    return Ok(u32::from(b'\\'));
                 }
                 self.pos += 1;
-                char::from_u32((letter as u32) % 32).unwrap_or('\0')
+                letter as u32 % 32
             }
-            other => other,
+            other => other as u32,
         })
     }
 
@@ -465,7 +470,7 @@ impl Parser {
     ///
     /// Restoring matters: on a failure the caller falls back to reading the letter as an
     /// identity escape, and a half-consumed `\u12` would then leave the `12` behind.
-    fn try_hex(&mut self, digits: usize) -> Option<char> {
+    fn try_hex(&mut self, digits: usize) -> Option<u32> {
         let start = self.pos;
         let mut value = 0u32;
         for _ in 0..digits {
@@ -480,13 +485,9 @@ impl Parser {
                 }
             }
         }
-        match char::from_u32(value) {
-            Some(character) => Some(character),
-            None => {
-                self.pos = start;
-                None
-            }
-        }
+        // `\uD800` is a legal `\u` escape even though it names a surrogate, so there is no
+        // `char` conversion here: the value itself is the answer.
+        Some(value)
     }
 
     /// A `v`-mode character class: `[...]` with the set algebra.
@@ -585,12 +586,12 @@ impl Parser {
         if c == '-' {
             return Err(self.error("a literal '-' must be escaped inside a character class"));
         }
-        self.set_range_from(c)
+        self.set_range_from(c as u32)
     }
 
     /// Continue a `v`-mode operand after its first character, turning it into a range when
     /// a single `-` follows.
-    fn set_range_from(&mut self, lo: char) -> Result<ClassSet, PatternError> {
+    fn set_range_from(&mut self, lo: u32) -> Result<ClassSet, PatternError> {
         // `-` starts a range only when it is a single dash: `--` is the subtraction
         // operator and belongs to the caller.
         if self.peek() == Some('-') && !self.starts_with("--") {
@@ -607,7 +608,7 @@ impl Parser {
                 }
                 Some(character) => {
                     self.pos += 1;
-                    character
+                    character as u32
                 }
             };
             if hi < lo {
@@ -658,9 +659,9 @@ impl Parser {
         if !self.eat('{') {
             return Err(self.error("expecting '{' after \\q"));
         }
-        let mut members: Vec<Vec<char>> = Vec::new();
+        let mut members: Vec<Vec<u32>> = Vec::new();
         loop {
-            let mut member: Vec<char> = Vec::new();
+            let mut member: Vec<u32> = Vec::new();
             loop {
                 match self.peek() {
                     None => return Err(self.error("unterminated \\q{…}")),
@@ -675,7 +676,7 @@ impl Parser {
                     }
                     Some(character) => {
                         self.pos += 1;
-                        member.push(character);
+                        member.push(character as u32);
                     }
                 }
             }
@@ -708,7 +709,7 @@ impl Parser {
     fn character_class(&mut self) -> Result<Node, PatternError> {
         self.pos += 1; // '['
         let negated = self.eat('^');
-        let mut ranges: Vec<(char, char)> = Vec::new();
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
         // A property escape cannot be written as a range list, so its presence switches the
         // whole class over to the set representation. Everything else stays in `ranges`,
         // which is the cheaper form.
@@ -722,7 +723,7 @@ impl Parser {
                 if first {
                     // A `]` in the first position is a literal.
                     self.pos += 1;
-                    ranges.push((']', ']'));
+                    ranges.push((u32::from(b']'), u32::from(b']')));
                     first = false;
                     continue;
                 }
@@ -732,6 +733,17 @@ impl Parser {
             first = false;
             let mut atom = self.class_atom()?;
             // A range needs a single character on both sides: `[\d-z]` is a SyntaxError.
+            //
+            // An atom that is *not* one character but is followed by a `-` that is not the
+            // last thing in the class is the same error spelled differently, and it has to be
+            // reported rather than read as a literal dash: `[\p{Hex}--]` in `u` mode is an
+            // invalid range from a property to a `-`, not a property followed by two dashes.
+            if atom.single().is_none()
+                && self.peek() == Some('-')
+                && !matches!(self.chars.get(self.pos + 1), Some(']') | None)
+            {
+                return Err(self.error("invalid character class range"));
+            }
             if let Some((lo, _)) = atom.single()
                 && self.peek() == Some('-')
             {
@@ -788,7 +800,7 @@ impl Parser {
             .ok_or_else(|| self.error("unterminated character class"))?;
         if c != '\\' {
             self.pos += 1;
-            return Ok(ClassAtom::Range(c, c));
+            return Ok(ClassAtom::Range(c as u32, c as u32));
         }
         self.pos += 1;
         let e = self
@@ -829,9 +841,9 @@ impl Parser {
 /// What one atom of a character class contributed.
 enum ClassAtom {
     /// A single character (which a following `-` may turn into a range).
-    Range(char, char),
+    Range(u32, u32),
     /// Several ranges, from a `\d`-style escape.
-    Set(Vec<(char, char)>),
+    Set(Vec<(u32, u32)>),
     /// A Unicode property escape, which only the strict grammars allow inside a class.
     Property {
         /// Which property.
@@ -843,14 +855,14 @@ enum ClassAtom {
 
 impl ClassAtom {
     /// The bounds, when this atom is exactly one character.
-    fn single(&self) -> Option<(char, char)> {
+    fn single(&self) -> Option<(u32, u32)> {
         match self {
             ClassAtom::Range(lo, hi) if lo == hi => Some((*lo, *hi)),
             _ => None,
         }
     }
 
-    fn push_into(&self, out: &mut Vec<(char, char)>) {
+    fn push_into(&self, out: &mut Vec<(u32, u32)>) {
         match self {
             ClassAtom::Range(lo, hi) => out.push((*lo, *hi)),
             ClassAtom::Set(ranges) => out.extend_from_slice(ranges),
@@ -879,65 +891,31 @@ impl ClassAtom {
     }
 }
 
-/// The built-in character class a `\d`-style escape stands for.
-/// Whether a set contains a member longer than one character.
-///
-/// A negated set is a complement of characters, so such a member cannot be expressed and the
-/// grammar rejects the pattern instead of matching one character of a longer string.
-fn set_has_strings(set: &ClassSet) -> bool {
-    match set {
-        ClassSet::Strings(members) => members.iter().any(|member| member.len() > 1),
-        ClassSet::Union(operands) | ClassSet::Intersection(operands) => {
-            operands.iter().any(set_has_strings)
-        }
-        ClassSet::Difference(left, right) => set_has_strings(left) || set_has_strings(right),
-        ClassSet::Negated(inner) => set_has_strings(inner),
-        ClassSet::Char(_) | ClassSet::Range(..) | ClassSet::Property { .. } => false,
-        ClassSet::Predefined { .. } => false,
-    }
-}
-
-fn class_for(c: char) -> (bool, Vec<(char, char)>) {
+fn class_for(c: char) -> (bool, Vec<(u32, u32)>) {
+    /// The code points `\s` matches: WhiteSpace and LineTerminator, which is what the
+    /// grammar spells out and what the engine matched before the tables existed.
+    const SPACE: &[(u32, u32)] = &[
+        (0x09, 0x0D),
+        (0x20, 0x20),
+        (0xA0, 0xA0),
+        (0x1680, 0x1680),
+        (0x2000, 0x200A),
+        (0x2028, 0x2029),
+        (0x202F, 0x202F),
+        (0x205F, 0x205F),
+        (0x3000, 0x3000),
+        (0xFEFF, 0xFEFF),
+    ];
+    /// `\d` is `[0-9]` and `\w` is `[0-9A-Z_a-z]` — the *ASCII* sets, in both grammars.
+    /// The Unicode-aware `\w` that `u`/`v` imply is expressed through `\p{…}` instead.
+    const DIGIT: &[(u32, u32)] = &[(0x30, 0x39)];
+    const WORD: &[(u32, u32)] = &[(0x30, 0x39), (0x41, 0x5A), (0x5F, 0x5F), (0x61, 0x7A)];
     match c {
-        'd' => (false, vec![('0', '9')]),
-        'D' => (true, vec![('0', '9')]),
-        'w' => (false, vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')]),
-        'W' => (true, vec![('0', '9'), ('A', 'Z'), ('_', '_'), ('a', 'z')]),
-        's' => (
-            false,
-            vec![
-                ('\t', '\t'),
-                ('\n', '\n'),
-                ('\u{b}', '\u{c}'),
-                ('\r', '\r'),
-                (' ', ' '),
-                ('\u{a0}', '\u{a0}'),
-                ('\u{1680}', '\u{1680}'),
-                ('\u{2000}', '\u{200a}'),
-                ('\u{2028}', '\u{2029}'),
-                ('\u{202f}', '\u{202f}'),
-                ('\u{205f}', '\u{205f}'),
-                ('\u{3000}', '\u{3000}'),
-                ('\u{feff}', '\u{feff}'),
-            ],
-        ),
-        _ => (
-            true,
-            vec![
-                ('\t', '\t'),
-                ('\n', '\n'),
-                ('\u{b}', '\u{c}'),
-                ('\r', '\r'),
-                (' ', ' '),
-                ('\u{a0}', '\u{a0}'),
-                ('\u{1680}', '\u{1680}'),
-                ('\u{2000}', '\u{200a}'),
-                ('\u{2028}', '\u{2029}'),
-                ('\u{202f}', '\u{202f}'),
-                ('\u{205f}', '\u{205f}'),
-                ('\u{3000}', '\u{3000}'),
-                ('\u{feff}', '\u{feff}'),
-            ],
-        ),
+        'd' => (false, DIGIT.to_vec()),
+        'D' => (true, DIGIT.to_vec()),
+        'w' => (false, WORD.to_vec()),
+        'W' => (true, WORD.to_vec()),
+        's' => (false, SPACE.to_vec()),
+        _ => (true, SPACE.to_vec()),
     }
 }

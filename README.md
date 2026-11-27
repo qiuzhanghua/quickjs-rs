@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.5.0** —— 标准库补到位，test262 可运行用例通过率 42.7% → 72.3%：
+- 📌 当前版本：**v0.5.0** —— 标准库补到位，test262 可运行用例通过率 42.7% → 80.7%：
   class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
   循环导入、`import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、
   TypedArray（`DataView`、29 个数组方法中的 28 个、`Symbol.iterator`）、`Iterator` helpers、
@@ -33,7 +33,7 @@
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Reflect） | ✅ `test_builtin.js` 的 M4 部分 229/237 语句通过 |
 | M5 | ES6+ 运行期（class/generator/async/迭代/解构/模板/Proxy） | ✅ 残留：私有类字段 `#x` 编译器报错 |
 | M6 | 模块系统 + 动态 `import()` + JSON/text 模块 | ✅ `hello_module.js` 与参考逐字节一致 |
-| M7 | 正则引擎 + Unicode 表 | ⬜ `RegExp` 的常用部分可用；缺 `RegExp.escape`、lookbehind、Unicode 属性表 |
+| M7 | 正则引擎 + Unicode 表 | 🟡 `RegExp` 可用，Unicode 属性表（`\p{…}`）已补（606/613）；缺 `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性 |
 | M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | ⬜ BigInt/TypedArray/DataView 可用；`Atomics`/`SharedArrayBuffer`/`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 未开始 |
 | M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | ⬜ |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
@@ -78,7 +78,7 @@ quickjs = { package = "quickjs-pure", version = "0.5" }
 | `--memory-limit` / `--stack-size` | 报 `not implemented yet`（此前接受即忽略，等于假的安全） |
 | `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`（M8） | 均为 `undefined`，test262 里 300+ 条据此失败 |
 | `Atomics`/`SharedArrayBuffer`（M8） | `undefined`；相关用例按 feature 跳过 |
-| `RegExp.escape`、lookbehind、Unicode 属性表（M7） | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{ASCII_Hex_Digit}` 报 `unsupported property name` |
+| `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性（M7） | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{Basic_Emoji}` 报 `invalid Unicode property`（`\p{ASCII_Hex_Digit}` 等单码点属性已可用） |
 | resizable `ArrayBuffer`（`rab.resize`） | `undefined`，test262 里 76 条据此失败 |
 | 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported` |
 | `Uint8Array.prototype.toSpliced`  等个别方法 | 为 `undefined`（TypedArray 的 29 个数组方法里已有 28 个） |

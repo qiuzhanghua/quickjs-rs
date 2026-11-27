@@ -55,7 +55,9 @@ pub mod builtins;
 pub mod interp;
 pub mod module;
 pub mod object;
-pub mod regexp;
+// The engine lives in its own crate so that `quickjs-compile` can validate a `/…/u`
+// literal at parse time without depending on this one.
+pub use quickjs_regexp as regexp;
 mod tzif;
 pub mod value;
 
@@ -85,7 +87,10 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NotImplemented(what) => write!(f, "not implemented yet: {what}"),
-            Error::Syntax(what) => write!(f, "{what}"),
+            // A compile error is a `SyntaxError` in the language, and saying so is not
+            // cosmetic: the conformance runner classifies a `negative:` test by the
+            // constructor name in the message, and the reference prints the same prefix.
+            Error::Syntax(what) => write!(f, "SyntaxError: {what}"),
             Error::Exception(what) => write!(f, "{what}"),
             Error::OutOfMemory => write!(f, "out of memory"),
             Error::StackOverflow => write!(f, "stack overflow"),

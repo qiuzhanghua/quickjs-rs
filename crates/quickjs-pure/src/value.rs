@@ -228,6 +228,23 @@ impl Wtf8 {
         }
     }
 
+    /// The code points the regular expression engine matches against.
+    ///
+    /// This is [`Wtf8::code_points`] flattened to `u32`, with a lone surrogate kept as its
+    /// own value rather than becoming U+FFFD: `\p{Cs}` has to match it, and no `char` can
+    /// hold it. A valid pair is one code point, so an offset into this list is still a code
+    /// point boundary.
+    pub fn code_point_values(&self) -> Vec<u32> {
+        self.code_points()
+            .into_iter()
+            .map(|point| match point.as_str() {
+                Some(text) => text.chars().next().map_or(0xFFFD, |c| c as u32),
+                // A lone surrogate: three bytes, one code unit, which *is* the value.
+                None => point.to_units().first().copied().map_or(0xFFFD, u32::from),
+            })
+            .collect()
+    }
+
     /// The code units the sequence starting at `at` stands for, how many of them there are,
     /// and its byte width.
     fn sequence_at(&self, at: usize) -> ([u16; 2], usize, usize) {

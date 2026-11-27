@@ -24,6 +24,37 @@ README 说"TypedArray 只有 7/29"，可那时的代码已经比这多。把一�
 重复一遍尺子：**数量不是目的**。下面每一条都先有最小复现、再修，修完用逐用例差分
 比对，回归 0 例才算过。六轮合计 +3398 例。
 
+### 加：Unicode 属性转义 `\p{…}`，顺带修好字面量的编译时机（+648 例）
+
+`\p{…}` 此前只有 `Lower`/`Upper` 两个硬编码变体，其余一律"unsupported property name"，
+该目录 613 条用例 **0 条通过**，是 RegExp 失败的大头。
+
+表由 `scripts/gen-unicode-tables.py` 从 **UCD 自身**（`UnicodeData.txt`、`Scripts.txt`、
+`ScriptExtensions.txt`、`PropList.txt`、`Derived*Properties.txt`、`emoji-data.txt`）
+生成，不是从 test262 期望值反推——否则表与用例按构造一致，等于没测。产出 38 个
+General_Category 值、175 个 Script、175 个 Script_Extensions、53 个二进制属性、
+约 24500 个区间。
+
+三件**引擎层面**的事一并修了：
+
+| 问题 | 后果 |
+|---|---|
+| 正则**字面量在运行期**才编译 | 规范要求非法 `/…/u` 是 early error；`print(1); /\p{Nope}/u;` 会先打印 `1`。163 条用例专测这个 |
+| 单字符无界重复按层递归 | `/^\p{ASCII}+$/u` 撞上约 110 万码点的串 → 原生栈溢出。改为循环快路径 + 按输入长度计的预算 |
+| 匹配单位是 `char` | 孤立代理项是合法字符串内容，`\p{Cs}` 必须能匹配它，而 `char` 装不下。改为 `u32`，经 UTF-16 与 `Wtf8` 往返 |
+
+为了让编译期能校验、运行期又能执行，正则引擎从 `quickjs-pure` 里**下沉为独立 crate
+`quickjs-regexp`**（零依赖）——`pure` 依赖 `compile`，反向依赖会是循环。
+
+四处**数据/语法**细节同样被用例逐个纠正：裸名只能是二进制属性或 GC 值（不是 Script，
+所以 `\p{Greek}` 必须报错）；二进制属性是封闭列表（`Expands_On_NFC`/`Hyphen` 等必须
+拒绝）；`scx` 是**逐码点**回退到 `sc`（写成并集会让 `\p{scx=Common}` 多匹配 2 例）；
+`Scripts.txt` 与 `ScriptExtensions.txt` 的名字长短不同（`Balinese` vs `Bali`），别名表
+必须统一到长名。
+
+结果 0/613 → **606/613**；剩下 7 条是 `v` 模式的 emoji **字符串**属性，它们表示码点
+序列而非单码点集合，需要另一套表示与匹配路径，已在生成器里显式排除而不是假装支持。
+
 ### 加：`Iterator` 全局与全部 helper（+523 例）
 
 `Iterator.from`、`Iterator.prototype.{map,filter,take,drop,flatMap,reduce,toArray,forEach,

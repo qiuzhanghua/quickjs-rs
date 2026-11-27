@@ -3717,6 +3717,30 @@ impl Compiler {
             }
             ExprKind::Await(argument) => self.await_expression(argument)?,
             ExprKind::RegExp { pattern, flags } => {
+                // A literal is compiled *here*, at parse time, not when the line runs. The
+                // spec is explicit that an invalid pattern is an early error (§12.9.4:
+                // "/ RegularExpressionLiteral /u — it is a Syntax Error if … the pattern does
+                // not conform"), so `print(1); /\p{Nope}/u;` must not print anything. This
+                // also validates `\p{…}` names: 163 conformance cases are patterns that have
+                // to be rejected before any code runs.
+                //
+                // This is the whole reason the engine lives in its own crate rather than
+                // inside `quickjs-pure`: the compiler could not depend on the interpreter
+                // (`pure` depends on `compile`), but both need this.
+                // The lexer already rejected an unknown or repeated flag, so an unparsable
+                // flag string here would be a bug in the lexer rather than in the script;
+                // fall back to the default flags instead of inventing a second message.
+                let flags_parsed = quickjs_regexp::Flags::parse(flags).unwrap_or_default();
+                let parsed = quickjs_regexp::parse(pattern, flags_parsed).map_err(|error| {
+                    SyntaxError::new(
+                        format!("invalid regular expression: {}", error.message),
+                        expr.span,
+                    )
+                })?;
+                // The tree is thrown away and rebuilt when the literal first runs: keeping it
+                // would mean serialising the syntax tree into the function's constant pool,
+                // and a literal is created once per evaluation of its expression anyway.
+                let _ = parsed;
                 // The pattern and its flags travel as two string constants; `regexp` builds
                 // the object. A dedicated opcode (rather than a call to the constructor) is
                 // what the reference does too, so that a literal never goes through the

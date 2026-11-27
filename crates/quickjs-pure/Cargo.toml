@@ -21,3 +21,4 @@ name = "quickjs"
 quickjs-gc.workspace = true
 quickjs-parse.workspace = true
 quickjs-compile.workspace = true
+quickjs-regexp.workspace = true

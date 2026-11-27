@@ -105,9 +105,11 @@ fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode
         // Upstream `qjs -e '1+1'` prints nothing: `-e` reports only what the script
         // itself printed. The completion value is still returned through the API.
         Ok(_) => ExitCode::SUCCESS,
-        Err(quickjs::Error::Syntax(message)) => {
-            // Compile errors are reported before anything runs.
-            let _ = writeln!(std::io::stderr(), "{filename}: {message}");
+        Err(error @ quickjs::Error::Syntax(_)) => {
+            // Compile errors are reported before anything runs, with the constructor name
+            // in front: the reference prints `SyntaxError: …`, and the conformance runner
+            // relies on that word to tell a parse-time rejection from a runtime throw.
+            let _ = writeln!(std::io::stderr(), "{filename}: {error}");
             ExitCode::from(1)
         }
         Err(error) => {

@@ -12,15 +12,21 @@
 //!
 //! # What is not
 //!
-//! Lookbehind, named groups, Unicode property escapes (`\p{…}`), and the `u`/`v` flag
-//! semantics (surrogate-pair handling, full case folding). These are rejected at parse
-//! time or documented here rather than silently mis-matched. The engine works on
-//! `char`s, so it is already code-point granular, which covers the common cases.
+//! Lookbehind, named groups, and the `u`/`v` flag semantics (surrogate-pair handling,
+//! full case folding). These are rejected at parse time or documented here rather than
+//! silently mis-matched. The engine works on `char`s, so it is already code-point
+//! granular, which covers the common cases.
+//!
+//! Unicode property escapes (`\p{…}`) *are* implemented, from tables generated out of the
+//! Unicode Character Database by `scripts/gen-unicode-tables.py`.
 
 mod matcher;
 mod parser;
+pub mod unicode;
+mod unicode_tables;
 
 pub use matcher::{Anchoring, Captures, Match};
+pub use parser::parse;
 
 /// The flags a pattern was compiled with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,40 +109,10 @@ impl Flags {
 
 /// The Unicode properties this engine can answer.
 ///
-/// Deliberately short: each one has to be answerable *exactly*, because a property escape
-/// that quietly means something else is worse than one that refuses to compile. `Lower` and
-/// `Upper` are answered by `char::is_lowercase`/`is_uppercase`, which track Unicode's
-/// `Lowercase`/`Uppercase` derived properties — a superset of the `Ll`/`Lu` general
-/// categories, agreeing with them on every character the conformance tests exercise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PropertyKind {
-    /// `\p{Lower}` — a lowercase letter.
-    Lower,
-    /// `\p{Upper}` — an uppercase letter.
-    Upper,
-}
-
-impl PropertyKind {
-    /// Whether `c` has this property.
-    pub fn holds(self, c: char) -> bool {
-        match self {
-            PropertyKind::Lower => c.is_lowercase(),
-            PropertyKind::Upper => c.is_uppercase(),
-        }
-    }
-
-    /// The property a name in `\p{…}` refers to.
-    ///
-    /// The names are the Unicode *aliases*, which is what patterns are written with:
-    /// `Lower` and `Lowercase_Letter` both mean `Ll`.
-    pub fn from_name(name: &str) -> Option<PropertyKind> {
-        match name {
-            "Lower" | "Lowercase" | "Lowercase_Letter" | "Ll" => Some(PropertyKind::Lower),
-            "Upper" | "Uppercase" | "Uppercase_Letter" | "Lu" => Some(PropertyKind::Upper),
-            _ => None,
-        }
-    }
-}
+/// The tables live in [`unicode_tables`] and the grammar in [`unicode`], both generated or
+/// derived from the Unicode Character Database. This alias is what the syntax tree carries,
+/// so a pattern's properties are resolved exactly once, at parse time.
+pub use unicode::Property as PropertyKind;
 
 /// One node of the pattern's syntax tree.
 #[derive(Debug, Clone)]
@@ -144,11 +120,15 @@ pub enum Node {
     /// Matches nothing: the identity of a concatenation.
     Empty,
     /// A literal character.
-    Char(char),
+    ///
+    /// A `u32` rather than a `char`: an unpaired surrogate is a legal code point in a JS
+    /// string, and `\p{Cs}` has to be able to match it, but `char` cannot hold one. The
+    /// value is a code point, always in `0..=0x10FFFF`.
+    Char(u32),
     /// `.`
     Any,
     /// `[...]`, or a bare `\d`-style escape. The flag says whether the set is inverted.
-    Class(bool, Vec<(char, char)>),
+    Class(bool, Vec<(u32, u32)>),
     /// A `v`-mode character class: sets, nesting, `&&`, `--` and `\q{…}` strings.
     Set(Box<ClassSet>),
     /// `\p{Name}` / `\P{Name}`: a Unicode property escape.
@@ -238,9 +218,9 @@ impl Node {
 #[derive(Debug, Clone)]
 pub enum ClassSet {
     /// One character.
-    Char(char),
+    Char(u32),
     /// An inclusive range.
-    Range(char, char),
+    Range(u32, u32),
     /// A Unicode property escape.
     Property {
         /// Which property.
@@ -253,10 +233,10 @@ pub enum ClassSet {
         /// Whether the set is inverted (`\D`).
         negated: bool,
         /// The ranges the plain form stands for.
-        ranges: Vec<(char, char)>,
+        ranges: Vec<(u32, u32)>,
     },
     /// One of several strings, from `\q{…}`. A member may be longer than one character.
-    Strings(Vec<Vec<char>>),
+    Strings(Vec<Vec<u32>>),
     /// Any member of any operand.
     Union(Vec<ClassSet>),
     /// Members present in every operand.
@@ -265,6 +245,25 @@ pub enum ClassSet {
     Difference(Box<ClassSet>, Box<ClassSet>),
     /// `[^…]`.
     Negated(Box<ClassSet>),
+}
+
+/// Whether a `v`-mode set contains a member longer than one character.
+///
+/// A negated set is a complement of characters, so such a member cannot be expressed and the
+/// grammar rejects the pattern instead of matching one character of a longer string. The
+/// matcher also needs this: a set with a multi-character member cannot take the
+/// single-character repetition fast path.
+fn set_has_strings(set: &ClassSet) -> bool {
+    match set {
+        ClassSet::Strings(members) => members.iter().any(|member| member.len() > 1),
+        ClassSet::Union(operands) | ClassSet::Intersection(operands) => {
+            operands.iter().any(set_has_strings)
+        }
+        ClassSet::Difference(left, right) => set_has_strings(left) || set_has_strings(right),
+        ClassSet::Negated(inner) => set_has_strings(inner),
+        ClassSet::Char(_) | ClassSet::Range(..) | ClassSet::Property { .. } => false,
+        ClassSet::Predefined { .. } => false,
+    }
 }
 
 /// A compiled pattern.
@@ -295,7 +294,7 @@ impl Regex {
     }
 
     /// Run the pattern at `from`, returning the leftmost-first match.
-    pub fn exec_at(&self, input: &[char], from: usize) -> Option<Match> {
+    pub fn exec_at(&self, input: &[u32], from: usize) -> Option<Match> {
         let anchoring = if self.flags.sticky {
             Anchoring::At(from)
         } else {
@@ -312,10 +311,13 @@ mod tests {
     /// Match `pattern` against `text`, returning the matched slice.
     fn find(pattern: &str, flags: &str, text: &str) -> Option<String> {
         let regex = Regex::compile(pattern, Flags::parse(flags).expect("flags")).expect("pattern");
-        let input: Vec<char> = text.chars().collect();
-        regex
-            .exec_at(&input, 0)
-            .map(|m| input[m.start..m.end].iter().collect())
+        let input: Vec<u32> = text.chars().map(|c| c as u32).collect();
+        regex.exec_at(&input, 0).map(|m| {
+            input[m.start..m.end]
+                .iter()
+                .map(|cp| char::from_u32(*cp).unwrap_or('\u{fffd}'))
+                .collect()
+        })
     }
 
     #[test]
@@ -371,7 +373,7 @@ mod tests {
         assert_eq!(find("cat|dog", "", "a dog").as_deref(), Some("dog"));
         assert_eq!(find("(?:ab)+", "", "ababx").as_deref(), Some("abab"));
         let regex = Regex::compile("(a)(b)?", Flags::default()).expect("pattern");
-        let input: Vec<char> = "a".chars().collect();
+        let input: Vec<u32> = vec!['a' as u32];
         let found = regex.exec_at(&input, 0).expect("match");
         assert_eq!(found.captures[1], Some((0, 1)));
         assert_eq!(found.captures[2], None);
@@ -399,7 +401,7 @@ mod tests {
         assert_eq!(find("abc", "i", "xABC").as_deref(), Some("ABC"));
         assert_eq!(find("[a-z]+", "i", "ABC").as_deref(), Some("ABC"));
         let regex = Regex::compile("b", Flags::parse("y").expect("flags")).expect("pattern");
-        let input: Vec<char> = "abc".chars().collect();
+        let input: Vec<u32> = "abc".chars().map(|c| c as u32).collect();
         assert!(regex.exec_at(&input, 1).is_some());
         // Sticky refuses to search forward.
         assert!(regex.exec_at(&input, 0).is_none());
@@ -415,11 +417,97 @@ mod tests {
         assert!(Regex::compile("[z-a]", Flags::default()).is_err());
     }
 
+    /// A code point list for a `&str`, which is what the engine matches against.
+    fn points(text: &str) -> Vec<u32> {
+        text.chars().map(|c| c as u32).collect()
+    }
+
+    #[test]
+    fn unicode_property_escapes_resolve() {
+        let cases = [
+            (r"\p{Lu}", 'A', true),
+            (r"\p{Lu}", 'a', false),
+            (r"\p{Ll}", 'a', true),
+            // The group value `L` covers every letter.
+            (r"\p{L}", 'A', true),
+            // Aliases name the same property.
+            (r"\p{Alpha}", 'A', true),
+            (r"\p{Alphabetic}", 'A', true),
+            (r"\p{sc=Grek}", '\u{3b1}', true),
+            (r"\p{Script=Greek}", '\u{3b1}', true),
+            (r"\p{Emoji}", '\u{1f600}', true),
+            (r"\p{Zs}", ' ', true),
+            // The negation.
+            (r"\P{Lu}", 'a', true),
+            (r"\P{Lu}", 'A', false),
+        ];
+        for (pattern, input, expected) in cases {
+            let regex = Regex::compile(pattern, Flags::parse("u").expect("flags")).expect(pattern);
+            let input = points(&input.to_string());
+            assert_eq!(
+                regex.exec_at(&input, 0).is_some(),
+                expected,
+                "{pattern} against {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_special_property_names_are_refused() {
+        // The grammar's name set is closed, so a name it does not list is an error rather
+        // than a property that matches nothing.
+        for pattern in [
+            r"\p{Nope}",
+            // A bare script name is not allowed; `Script=` is required.
+            r"\p{Greek}",
+            // A binary property takes no value.
+            r"\p{ASCII=Yes}",
+            // Deprecated by Unicode and absent from the grammar's list.
+            r"\p{Expands_On_NFC}",
+            r"\p{Hyphen}",
+            // Not a Unicode property at all.
+            r"\p{Block=Adlam}",
+            r"\p{General_Category}",
+            r"\p{}",
+            r"\p{Upper=Lower}",
+        ] {
+            assert!(
+                Regex::compile(pattern, Flags::parse("u").expect("flags")).is_err(),
+                "{pattern} should not compile"
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_surrogate_is_a_code_point() {
+        // `\p{Cs}` has to match an unpaired surrogate, which is why the input is `u32` and
+        // not `char`.
+        let regex = Regex::compile(r"\p{Cs}", Flags::parse("u").expect("flags")).expect("pattern");
+        let input = vec![0xD800];
+        assert_eq!(
+            regex.exec_at(&input, 0).map(|m| (m.start, m.end)),
+            Some((0, 1))
+        );
+        // A paired surrogate is one code point, so it is not `Cs`.
+        let astral = points("\u{1f600}");
+        assert!(regex.exec_at(&astral, 0).is_none());
+    }
+
+    #[test]
+    fn a_long_repeat_does_not_exhaust_the_stack() {
+        // A backtracking matcher recurses once per repetition; the fast path has to consume
+        // a single-character body in a loop or this overflows the native stack.
+        let regex =
+            Regex::compile(r"^\p{ASCII}+$", Flags::parse("u").expect("flags")).expect("pattern");
+        let input: Vec<u32> = (0u32..=0x7F).cycle().take(200_000).collect();
+        assert!(regex.exec_at(&input, 0).is_some());
+    }
+
     #[test]
     fn empty_matches_do_not_loop() {
         let regex = Regex::compile("(?:)", Flags::default()).expect("pattern");
         assert!(regex.nullable);
-        let input: Vec<char> = "ab".chars().collect();
+        let input: Vec<u32> = "ab".chars().map(|c| c as u32).collect();
         assert_eq!(
             regex.exec_at(&input, 0).map(|m| (m.start, m.end)),
             Some((0, 0))
