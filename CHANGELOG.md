@@ -2,22 +2,24 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
-## v0.5.1 — 未发布
+## v0.6.0 — 未发布
 
-**这一版没有抬可用性边界之外的新结构**，但修了两个会计入"错答案"的东西：正则字面量的
-合法性此前在运行期才检查（`print(1); /\p{Nope}/u;` 会先打印 `1`），以及 `WeakMap`
-家族的 GC 在丢弃对象时存在 use-after-free。版本号走 patch 是因为 API 只有新增。
+**为什么是 minor 而不是 patch。** 这一版改了已发布 API 的签名：
+`quickjs_pure::regexp::Regex::exec_at` 从 `&[char]` 变成 `&[u32]`，`Node::Char` 与
+`ClassSet` 的成员从 `char` 变成 `u32`，`builtins::regexp::exec_on` 从 `&str` 变成
+`&Wtf8`。这三处都是 `pub` 项，改动是为了让孤立代理项能参与匹配（`char` 装不下它），
+没有兼容的写法。0.x 的破坏性变更按 semver 抬 minor，所以是 0.6.0 而不是 0.5.1。
 
-| 能力 | v0.5.0 | v0.5.1 |
+新增 crate `quickjs-regexp`：正则引擎原本在 `quickjs-pure` 内部，但字面量要在**解析期**
+校验，而 `quickjs-compile` 在 `quickjs-pure` 之下——两边都需要它，只能下沉。零依赖。
+
+| 能力 | v0.5.0 | v0.6.0 |
 |---|---|---|
 | `\p{…}` Unicode 属性转义 | 只有 `Lower`/`Upper`，其余报错 | 全部单码点属性，606/613 |
 | 正则字面量的 early error | 运行期才报 | 编译期，且带 `SyntaxError:` |
 | `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` | 不存在 | 全套，297/298 |
 | 孤立代理项参与匹配 | 不可能（`char` 装不下） | `u32` 码点，`\p{Cs}` 可匹配 |
 | test262 可运行通过率 | 72.3%（13371/18487） | **80.7%（14910/18487）** |
-
-新增 crate `quickjs-regexp`（零依赖）。正则引擎原本在 `quickjs-pure` 内部，但字面量要在
-**解析期**校验，而 `quickjs-compile` 在 `quickjs-pure` 之下——两边都需要它，只能下沉。
 
 两处文档与事实不符一并改了：README 的 M7 写着"缺 Unicode 属性表"（已补），M8 写着
 `WeakMap` 家族"均为 `undefined`"（已实现）；`scripts/publish.sh` 的发布顺序漏了新 crate，
