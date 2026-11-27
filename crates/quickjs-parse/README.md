@@ -10,7 +10,7 @@ parameter/body restrictions of a strict-mode function.
 
 ```toml
 [dependencies]
-quickjs-parse = "0.4"
+quickjs-parse = "0.5"
 ```
 
 The package is `quickjs-parse` but the library is `js_parse`:

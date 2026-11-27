@@ -4,9 +4,11 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.4.0** —— ES6+ 运行期与 ES 模块完成：
+- 📌 当前版本：**v0.5.0** —— 标准库补到位，test262 可运行用例通过率 42.7% → 72.3%：
   class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
-  循环导入、`import()`、JSON/text 模块）；另有 `RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
+  循环导入、`import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、
+  TypedArray（`DataView`、29 个数组方法中的 28 个、`Symbol.iterator`）、`Iterator` helpers、
+  `Array.fromAsync`
 - 🚧 当前进度：**M0–M6 已完成**；M7（正则引擎 + Unicode 表）起未开始
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
@@ -31,8 +33,8 @@
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/Reflect） | ✅ `test_builtin.js` 的 M4 部分 229/237 语句通过 |
 | M5 | ES6+ 运行期（class/generator/async/迭代/解构/模板/Proxy） | ✅ 残留：私有类字段 `#x` 编译器报错 |
 | M6 | 模块系统 + 动态 `import()` + JSON/text 模块 | ✅ `hello_module.js` 与参考逐字节一致 |
-| M7 | 正则引擎 + Unicode 表 | ⬜ `RegExp` 已可用；缺 `RegExp.escape`、lookbehind、Unicode 表 |
-| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | ⬜ 前三项已可用；`Atomics`/`WeakRef` 未开始 |
+| M7 | 正则引擎 + Unicode 表 | ⬜ `RegExp` 的常用部分可用；缺 `RegExp.escape`、lookbehind、Unicode 属性表 |
+| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | ⬜ BigInt/TypedArray/DataView 可用；`Atomics`/`SharedArrayBuffer`/`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 未开始 |
 | M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | ⬜ |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
@@ -53,14 +55,14 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**已发布到 crates.io（v0.4.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
+**已发布到 crates.io（v0.5.0）**：`quickjs-pure` 是门面 crate（lib 名仍是 `quickjs`），
 `quickjs-gc`/`quickjs-parse`/`quickjs-compile` 是其依赖。`quickjs-cli` 与
 `quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
 只是 dev-dependency。用法：
 
 ```toml
 [dependencies]
-quickjs = { package = "quickjs-pure", version = "0.4" }
+quickjs = { package = "quickjs-pure", version = "0.5" }
 ```
 
 语言与标准库：`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、
@@ -74,9 +76,17 @@ quickjs = { package = "quickjs-pure", version = "0.4" }
 |---|---|
 | `std`/`os` 宿主模块、事件循环、Worker（M9） | `--std` 报 `not implemented yet`；`setTimeout` 未定义 |
 | `--memory-limit` / `--stack-size` | 报 `not implemented yet`（此前接受即忽略，等于假的安全） |
+| `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`（M8） | 均为 `undefined`，test262 里 300+ 条据此失败 |
+| `Atomics`/`SharedArrayBuffer`（M8） | `undefined`；相关用例按 feature 跳过 |
+| `RegExp.escape`、lookbehind、Unicode 属性表（M7） | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{ASCII_Hex_Digit}` 报 `unsupported property name` |
+| resizable `ArrayBuffer`（`rab.resize`） | `undefined`，test262 里 76 条据此失败 |
 | 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported` |
-| `Iterator` helpers、`RegExp.escape`、lookbehind | `Iterator` 未定义；`RegExp.escape` 为 `undefined`；lookbehind 报 `invalid group` |
+| `Uint8Array.prototype.toSpliced`  等个别方法 | 为 `undefined`（TypedArray 的 29 个数组方法里已有 28 个） |
 | 通用语法错误的输出格式 | 我们 `<file>: <line>: <col>: <msg>`，参考 `SyntaxError: <msg>` + `at` 行 |
+| `Function.prototype.toString` | 用户函数返回 `[native code]` 而不是源码文本 |
+
+`Iterator` helpers、`Array.fromAsync`、`DataView`、TypedArray 的数组方法与迭代
+都已可用——它们不在上表里。
 
 完整清单（含每条的排期）见 `docs/requirements.md` 的「已知缺口」与
 `CHANGELOG.md`；发布计划见 `docs/requirements.md` 的「发布策略」。

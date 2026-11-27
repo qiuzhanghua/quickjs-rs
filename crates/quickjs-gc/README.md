@@ -10,7 +10,7 @@ last strong handle goes.
 
 ```toml
 [dependencies]
-quickjs-gc = "0.4"
+quickjs-gc = "0.5"
 ```
 
 The package is `quickjs-gc` but the library is `js_gc`, so the import is:

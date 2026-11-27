@@ -2,63 +2,137 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
-## 未发布（在 v0.4.0 之后）
+## v0.5.0 — 2026-11-27
+
+**可用性边界抬了一格**：`qjs` 能跑的语言和标准库比 v0.4.0 明显更宽。这不是"又一批
+文档修正"——标准库补了五个整块，test262 可运行用例通过率 **42.7% → 72.3%**。
+
+| 能力 | v0.4.0 | v0.5.0 |
+|---|---|---|
+| `DataView` | 不存在 | 423/520 用例 |
+| TypedArray 的数组方法 | 7/29，无 `Symbol.iterator` | 29 个里 28 个，迭代可用 |
+| `Iterator` 全局与 helpers | `Iterator` 未定义 | 全局 + 全部 helper（`map`/`filter`/`take`/`zip`…） |
+| `Array.fromAsync` | 不存在 | 95/95 |
+| `BigInt64Array`/`BigUint64Array` | 不存在 | 全套 + species + `%TypedArray%` |
+| test262 可运行通过率 | 42.7%（7536/17665） | **72.3%（13371/18487）** |
+
+**v0.4.0 的边界描述当时就不准。** 已发布的 `v0.4.0` 标签指向 `4a30079`（11-22），
+而 TypeArray、`DataView`、`Iterator`、`Object` 的缺件这些提交全在它**之后**；标签里那份
+README 说"TypedArray 只有 7/29"，可那时的代码已经比这多。把一个能力写少不算错答案，
+但它让"v0.4.0 能做什么"变成一个没人能核对的说法——这版把缺口表逐条对着实测重写了一遍。
+
+重复一遍尺子：**数量不是目的**。下面每一条都先有最小复现、再修，修完用逐用例差分
+比对，回归 0 例才算过。六轮合计 +3398 例。
+
+### 加：`Iterator` 全局与全部 helper（+523 例）
+
+`Iterator.from`、`Iterator.prototype.{map,filter,take,drop,flatMap,reduce,toArray,forEach,
+some,every,find}`，以及 `Iterator.{zip,zipKeyed,concat}`，配 `Iterator.prototype[@@toStringTag]`。
+"什么时候关闭下层迭代器"这件事，参考实现里是**三种**分开的情形，猜错的代价是 26 条回归：
+
+| 情形 | 是否关闭下层 |
+|---|---|
+| 回调抛错 | 关闭（`IfAbruptCloseIterator`） |
+| 迭代器自己的 `next`/`done`/`value` 抛错 | **不关闭**，原样上抛 |
+| 提前结束（`some`/`find` 命中） | 关闭 |
+
+第二行就是 `underlying-iterator-not-closed-when-step-throws` 这一族用例名在说的事。
+
+### 加：`Array` 的七个缺件与两个根因（+475 例）
+
+`copyWithin`、`toReversed`、`toSorted`、`toSpliced`、`with`、`findLast`、`findLastIndex`、
+`Array.prototype[@@unscopables]`。两个根因各自散在十几个方法里：
+
+- **所有回调方法把 `undefined` 传给 `[[Call]]`**，`thisArg` 被静默丢弃。
+  `forEach`/`map`/`filter`/`some`/`every`/`find`/`findIndex`/`flatMap` 全中，test262 里
+  159 个文件除了 `assert(this === thisArg)` 什么都不做。`reduce`/`reduceRight` 是例外且
+  必须保持例外：它们的第二个参数是累加值，不是 `thisArg`。
+- **`new String(x)` 只填了 `_value`**，没有 `length` 与索引属性，于是盒子是长度 0 的
+  array-like。
+
+### 修：数组的 `length` 截断成 `i32`（内存事故的根因）
+
+`Value::Int` 只装得下 `i32`，于是 `a.length = 2**32-1` 溢出负值，几条用例直接
+`memory allocation of 68719476720 bytes failed`。改法是 `length` 与存储解耦：
+逻辑长度按 `u32` 存，索引写入越过 `ARRAY_ELEMENT_LIMIT`（`2^26`）时返回失败并转成
+`RangeError`，而不是真的去填 68 GB 空洞。
 
 ### 加：`Array.fromAsync`，并用它逼出四个引擎 bug（+219 例）
 
-test262 全量 **13152 → 13371 / 18487（71.1% → 72.3%）**，回归 0 例；
-`Array.fromAsync` 的 95 条用例 0 → 95。逐用例差分见 `docs/test262-status.md` 4.23。
+它不是 `NativeFn`，而是 `builtins/from_async.rs` 里的一段 JS，install 期编译成函数对象。
+规范要求它是 async 函数，而引擎已经把 async 函数体跑成协程——在 Rust 里手写那个状态机
+等于把 `…-awaits-once.js` 那 12 条时序用例逐条对一遍。顺带修掉四个影响 `fromAsync` 之外的缺陷：
 
-实现方式值得单独记一笔：它**不是** `NativeFn`，而是 `builtins/from_async.rs` 里的一段
-JS，install 期编译成函数对象。规范要求它是 async 函数（失败也要给 promise 而不是
-向调用方抛出、两个 `await` 点的时序、`AsyncIteratorClose` 发生在映射值 reject
-**之后**），而引擎已经把 async 函数体跑成协程——在 Rust 里手写这个状态机等于把
-`…-awaits-once.js` 那 12 条时序用例逐条对一遍。Rust 侧只做编译、检查产物、按属性装上。
-
-顺带修掉四个影响 `fromAsync` 之外的缺陷：
-
-- `return g()` 让 generator/async 体继承调用者的帧（`tail_call` 漏了这个分支），
-  `function f(){ return g() }` 直接报 `a generator body ran as an ordinary call`；
-- `generator.return()` 跳过 `finally`：`it.return()` 从 `yield` 恢复后直接
-  `return_async`，没走 `return` 的清理链。抽成 `emit_unwind_for_return` 两处共用；
+- `return g()` 让 generator/async 体继承调用者的帧（`tail_call` 漏了这个分支）；
+- `generator.return()` 跳过 `finally`：从 `yield` 恢复后直接 `return_async`，没走
+  `return` 的清理链。抽成 `emit_unwind_for_return` 两处共用；
 - 内部槽（`_value`/`_class`/`_date_value`）是可枚举的**字符串**属性，于是
-  `Object.getOwnPropertyNames(new Number(1))` 报 `["_value"]`。改成符号键：对
-  `getOwnPropertyNames`/`keys`/`for…in`/`JSON.stringify` 不可见，仍是追踪属性；
-- 不可构造的函数不该有 `prototype`（§10.2.5 随 `[[Construct]]` 一起建），
-  此前 generator/async/箭头函数都拿到了一个；任何 async 函数都会被
-  `builtin.js` 的 own-property 检查抓到。
+  `Object.getOwnPropertyNames(new Number(1))` 报 `["_value"]`。改成符号键；
+- 不可构造的函数不该有 `prototype`（§10.2.5 随 `[[Construct]]` 建），
+  此前 generator/async/箭头函数都拿到了一个。
 
+### 加：`DataView`、BigInt64Array、TypedArray 的迭代族（+1474 例）
 
-**可用性边界未变**：`qjs` 能做的事与 v0.4.0 完全相同——这一节里没有一行逻辑代码被改过，
-记录的全是代码之外的东西：门禁本身，以及它周围那些还在说旧事实的文档。
+`DataView` 从 0 到 423/520，顺带修掉 `Reflect.construct` 与原生构造顺序；
+`BigInt64Array`/`BigUint64Array`、`%TypedArray%` 这一层原型、species 支持，
+以及让 `for…of` 能遍历 typed array。
 
-按 v0.1.1 立下的同一条尺子，扩大的不是可用性就不抬版本号。抬版本的时刻是
-M7（正则引擎 + Unicode 表）或者 M9（`std`/`os`/事件循环）真正落地。
+### 修：可构造性被写成了可调用（+332 例）
 
-### 修：门禁在 HEAD 上是红的，两处
+`is_callable()` 曾同时回答"能不能 `new`"。两者是独立的：箭头函数可调用不可构造，
+class 构造器可构造但直接调用报错。拆开之后 `Proxy.revocable(function f(){})` 撤销后
+仍应 `typeof === "function"`。
 
-发现时 `./scripts/check.sh` 两步都过不去，而 README 第 87、144 行与脚本自己的
-header 都写着它"提交前必跑"。两条都以"没人真的跑过"收尾，值得记下来：
+### 修：`Math`/`Number` 绕过 `ToNumber`（+7 例）
+
+Symbol 与 BigInt 被无错地换成 `NaN`，于是 `(1.5).toPrecision(Symbol())` 报的是
+`RangeError` 而不是 `TypeError`。同一个根因让 `--memory-limit`/`--stack-size`/`--std`
+三个"接受即忽略"的选项也改成了响亮失败——假的安全比缺功能更贵。
+
+### 测量工具：两张过期跳过表，与按用例名的差分
+
+`$DONE` 接线之前，所有异步用例都被判成 SKIP；两张跳过表（`flag:async`、
+`explicit-resource-management`）里 822 条根本不该跳。解锁后分母从 17665 涨到 18487，
+**通过率因此从 61.4% 降到 60.7%** ——数字变低而引擎变强，这是聚合指标会骗人的又一例。
+所以 `docs/test262-baseline.txt.gz` 入库，差分按**用例名**求，不按总数：总数相同的
+两次运行完全可能是一次回归加一次修好互相抵消。
+
+### 修：发布预检里两处永远不会触发的门禁
+
+`scripts/publish.sh` 的 `tar tzf … | grep -q` 在 `set -o pipefail` 下必然失败——
+`grep -q` 命中即退出，`tar` 收到 SIGPIPE（141），于是**每个 crate 都误报"README 不在
+包里"**。另一处 `grep -q … | grep -v version` 的第二个 `grep` 永远收不到输入，等于
+从未检查过"路径依赖有没有写版本"。两处都改成先把输出收进变量再判断。
+
+这两个 bug 有一个共同点，也正好是本轮反复出现的主题：**门禁只在真的跑过之后才算门禁**。
+`check.sh` 自己丢过可执行位，`fmt --check` 红着一个提交就进了仓库——不跑的门禁
+和不存在的门禁在结果上没有区别。同一句话在 `publish.sh` 上又应验了一次，见下。
+
+### 修：门禁本身，三处
+
+`./scripts/check.sh` 一度两步都过不去，而 README 与脚本自己的 header 都写着它
+"提交前必跑"。三条都以"没人真的跑过"收尾：
 
 1. **`cargo fmt --check` 失败** —— `crates/quickjs-pure/tests/builtins.rs` 里一处
    5 个片段的 `concat!` 是 rustfmt 要收成一行、而代码写成多行的形态。这是
    `check.sh` 的**第一道**关卡，也就是说"提交前必须全绿"这条约定在最后一个提交上
    并不成立。改成单个字符串字面量，内容逐字节不变。
-2. **`scripts/check.sh` 在 git 里是 `100644`** —— 四个脚本里只有它漏了可执行位
-   （`publish.sh`/`setup-oracle.sh`/`test262.sh`/`slice-builtin-test.py` 都是 `100755`），
+2. **`scripts/check.sh` 在 git 里是 `100644`** —— 几个脚本里只有它漏了可执行位，
    于是文档里那条命令执行时直接 `权限不够`。用 `git update-index --chmod=+x` 修，
-   不留一个只有本地才对的 `chmod`。
-
-第 2 条正好解释了第 1 条为什么能一直藏着：门禁自己跑不起来，红绿就没人看见。
+   不留一个只有本地才对的 `chmod`。第 2 条正好解释了第 1 条为什么能一直藏着：
+   门禁自己跑不起来，红绿就没人看见。
+3. **`scripts/publish.sh` 两处检查永远不会触发**（见上一节的 `pipefail`/`grep -q`）。
+   修好之后它立刻抓到了一条真问题——`quickjs-conformance` 这个 dev-dependency 没写
+   版本号，于是检查要限定在非 dev 段，因为 cargo 发布时会剥掉 dev-dependencies。
 
 ### 修：五处文档与事实不符
 
 | 位置 | 原状 | 现状 |
 |---|---|---|
-| `quickjs-pure/src/lib.rs` 模块文档 | `# Current state (M3)`，并写"Not there yet: classes and generators, and modules" | 改成 v0.4.0 / M0–M6，列出实际标准库与 ES6+ 运行期；新增 `# Not there yet` 段记录四个真实缺口 |
+| `quickjs-pure/src/lib.rs` 模块文档 | `# Current state (M3)`，并写"Not there yet: classes and generators, and modules" | 改成 M0–M6 的实际状态，列出实际标准库与 ES6+ 运行期；新增 `# Not there yet` 段记录真实缺口 |
 | `README.md` 里程碑表 | `M5–M11` 一整行 ⬜ | 拆成 M5 ✅（残留私有字段）、M6 ✅、M7–M11 各自 ⬜ 并标注"已可用 / 未开始" |
-| 四个 crate 的 `README.md` | 依赖示例写 `"0.2"` | `"0.4"`，与 `[workspace.dependencies]` 的宽版本写法一致，patch 升级不必再动 |
-| `docs/test262-status.md` 首行 | `测量时间：2026-02` | `2026-11-22`，并写明基线 `4a30079`、末轮 `93ecc32` |
+| 四个 crate 的 `README.md` | 依赖示例写 `"0.2"` | 跟 `[workspace.dependencies]` 的宽版本一起走，本版为 `"0.5"` |
+| `docs/test262-status.md` 首行 | `测量时间：2026-02` | 改成实测日期，并写明基线提交 |
 | `docs/test262-status.md` 4.3 末 | "仍未做：`DataView` 0/520，完全缺失" | 与 4.10 已修（423/520）矛盾，改为指向 4.10 |
 
 第一条最要紧：那是 `cargo doc` 的首屏，也是唯一一处会把"类、生成器、模块都没有"
@@ -66,30 +140,31 @@ header 都写着它"提交前必跑"。两条都以"没人真的跑过"收尾，
 
 ### 验证
 
-`./scripts/check.sh` 退出码 0，四步全跑：fmt 干净、`clippy -D warnings` 干净、
-`cargo test` **395 passed / 0 failed / 1 ignored**（ignored 仍是那 15 条
-"语义对但字节码不同"的优化层差分）。改动过的 `builtins.rs` 断言单独跑过：
-`-p quickjs-pure --test builtins` 113 passed。
+`./scripts/check.sh` 退出码 0，五步全跑：fmt 干净、`clippy -D warnings` 干净、
+`cargo test` 全绿、`lang-diff.py` **80/85**（5 条参考实现自己也失败，已登记为忽略）、
+`realworld.sh` 2/2 与参考一致、`verify-claims.py` 确认 README 发布的 18 个数字
+与套件实测一致。
 
-`scripts/lang-diff.py` 依旧打印 `SKIPPED`：本机没有 `/tmp/quickjs-master`
-参考实现，所以上面这些数字**没有一条是差分结论**，一致性回归这一轮没被测。
+test262 全量重跑一遍：`PASS 13371 / FAIL 5116 / SKIP 5398`，与入库基线逐字节相同。
+`lang-diff` 这一轮不再是 SKIPPED——oracle 建起来了，一致性回归这次**被测过**了。
 
 ### 顺带记录：仍未处理
 
-以下都是这一轮读代码与实跑时确认的、**不属于本次改动范围**的事，写在这里是为了
-不让它们留在对话里：
+以下都是读代码与实跑时确认的、**不属于本次改动范围**的事，写在这里是为了不让它们
+只留在对话里：
 
-- **README 的「已知缺口」表已过期。** 表里说 TypedArray 只有 7/29 个数组方法且没有
-  `Symbol.iterator`，实测 `map` 与 `[...new Uint8Array([1,2])]` 都已正确。现在的真实
-  缺口是 `Iterator` helpers（664 例）、`RegExp.escape` + lookbehind（1091 例）、
-  `Math.max(1n)` 返回 `NaN` 而不是抛 `TypeError`、resizable ArrayBuffer。
-- **`--std` 下 `typeof std === "undefined"`。** 文档说"模块不存在"，实际是对
-  `--std` 的全局注入静默给了 `undefined`——这与本项目"响亮失败、不给错答案"的
-  原则相左，应当抛错。
 - **FR-12 的 Rust 宿主 API 基本没做。** `Context` 只暴露 `eval`/`eval_module`/
   `output`/`last_value`；注册原生函数与回调 JS 函数的入口在 `Interp` 上，而
   `Context.interp` 是私有字段。作为门面 crate 发布出去之后，这是"可嵌入"这个定位上
   最实际的障碍。
+- **`--memory-limit` / `--stack-size` 现在是响亮失败，但仍未实现。** 选项被接受、
+  写进 `--help`、被 `Runtime` 存下，然后什么也不做——改成抛错只是让它在"没实现"时
+  诚实，不等于有了限制。
+- **分配失败应走 `Error::OutOfMemory`**，而不是让 Rust 分配器 abort。没有兜底的话
+  任何 OOM 都是核心转储。这需要把 `Vec` 的分配点收进一个可控分配器。
+- **稠密数组仍有 O(index) 的存储代价**（`test262-status.md` 4.22）：`a.length = 2**32-1`
+  是 O(1) 了，但 `a[2**32-2] = 1` 仍要真的填出空洞。现在至少会转成 `RangeError`
+  而不是拖垮整机。残留的 resizable-arraybuffer 用例属于已登记的表示层缺口。
 - **数组下标两个真相源**（`test262-status.md` 4.9）：8 个改写方法仍写快照副本，
   `Array.prototype.push.call(1, 2)` 抛 `TypeError: '0' is read-only` 而不是返回 1。
 

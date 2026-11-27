@@ -74,8 +74,14 @@ for crate in "${ORDER[@]}"; do
         echo "  $crate: no LICENSE" >&2
         exit 1
     fi
-    # A path dependency without a version is rejected at upload time, so catch it here.
-    if grep -qE '^\s*quickjs-[a-z]+ = \{ path' "$manifest" | grep -v 'version'; then
+    # A path *dependency* without a version is rejected at upload time, so catch it here.
+    # Scoped to `[dependencies]`-like sections and stopping at `[dev-dependencies]`:
+    # a dev-dependency may name a path alone, because cargo strips dev-dependencies from
+    # the published manifest, so `quickjs-conformance` is legitimately versionless.
+    # Not `grep -q … | grep -v …`: `-q` prints nothing, so the second `grep` never saw a
+    # line and this check could not fire at all. It has to be a filter that still prints.
+    if sed -nE '/^\[dev-dependencies\]/q
+                /^[[:space:]]*quickjs-[a-z]+ = \{ path/ { /version/!p }' "$manifest" | grep -q .; then
         echo "  $crate: a path dependency has no version" >&2
         exit 1
     fi
@@ -100,7 +106,11 @@ for crate in "${ORDER[@]}"; do
     files=$(tar tzf "$tarball" | wc -l | tr -d ' ')
     printf '  %-18s %s (%s files)\n' "$crate" "$(basename "$tarball")" "$files"
     for required in README.md LICENSE; do
-        if ! tar tzf "$tarball" | grep -q "/$required$"; then
+        # The listing is captured before grepping: `tar tzf … | grep -q` makes `grep`
+        # exit as soon as it matches, `tar` then dies of SIGPIPE (141), and `pipefail`
+        # turns that into "the file is missing" — a false alarm on every single crate.
+        listing=$(tar tzf "$tarball")
+        if ! printf '%s\n' "$listing" | grep -q "/$required$"; then
             echo "  $crate: $required is not in the tarball" >&2
             exit 1
         fi

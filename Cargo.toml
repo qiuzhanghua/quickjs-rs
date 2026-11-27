@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -24,15 +24,15 @@ categories = ["development-tools"]
 # 内部 crate 同时写 path 与 version：path 供本地构建，version 供发布解析
 # （`cargo publish` 会把 path 去掉，只留版本约束）。
 #
-# version 写宽版本 "0.4" 而不是精确的 "0.4.0"，这样 patch 升级只需改
+# version 写宽版本 "0.5" 而不是精确的 "0.5.0"，这样 patch 升级只需改
 # 上面 `workspace.package.version` 一处；抬 minor 时这里必须同步。
 #
 # 同步不是可选的：`^0.2` 解析不到 0.3.0，而 `quickjs-compile` 用到了比已发布的
 # `quickjs-parse 0.2.0` 更新的 API，抬 minor 却漏改这里，`scripts/publish.sh` 的
 # dry-run 就会拉回旧 parse 去编译新 compile，报一堆"方法不存在"。
-quickjs-gc = { path = "crates/quickjs-gc", version = "0.4" }
-quickjs-parse = { path = "crates/quickjs-parse", version = "0.4" }
-quickjs-compile = { path = "crates/quickjs-compile", version = "0.4" }
-quickjs-pure = { path = "crates/quickjs-pure", version = "0.4" }
+quickjs-gc = { path = "crates/quickjs-gc", version = "0.5" }
+quickjs-parse = { path = "crates/quickjs-parse", version = "0.5" }
+quickjs-compile = { path = "crates/quickjs-compile", version = "0.5" }
+quickjs-pure = { path = "crates/quickjs-pure", version = "0.5" }
 # 仅 dev 使用，不上传，因此不需要版本约束。
 quickjs-conformance = { path = "crates/quickjs-conformance" }
