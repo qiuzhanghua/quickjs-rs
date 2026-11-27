@@ -170,6 +170,12 @@ fn tag_of(interp: &Interp<'_>, value: &Value) -> String {
             ObjectKind::Promise(_) => "Promise",
             // A *revoked* proxy has no target to recurse into, and answers `Object`.
             ObjectKind::Proxy(_) => "Object",
+            // These four all name themselves through `Symbol.toStringTag` on their
+            // prototype, which is resolved before this function is reached, so a deleted
+            // tag leaves plain `Object`.
+            ObjectKind::WeakCollection { .. }
+            | ObjectKind::WeakRef { .. }
+            | ObjectKind::Finalization(_) => "Object",
         }) {
             "Array" => "Array".to_string(),
             "Function" => "Function".to_string(),

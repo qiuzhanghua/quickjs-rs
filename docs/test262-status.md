@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **13938（75.4%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 4549 |
-| ↳ 其中挂起（引擎不终止） | 9 |
-| ↳ 其中答错 | 4540 |
+| **可运行中通过** | **14262（77.1%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 4225 |
+| ↳ 其中挂起（引擎不终止） | 10 |
+| ↳ 其中答错 | 4215 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -58,7 +58,8 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 **此前的假通过**，见 4.21 末尾，所以真回归是 0，通过率到 71.1%（13152/18487）。
 再补 `Array.fromAsync`（4.23）得 +219 例、回归 0，到 72.3%（13371/18487）。之后四轮：
 `ToBigInt`（4.24）得 +219、`String.prototype` 的 `ToString`（4.25）得 +358、
-B 批的三个整块（4.26）得 +567，回归都是 0，到 75.4%（13938/18487）。
+B 批的三个整块（4.26）得 +567、弱引用一族（4.27）得 +324，回归都是 0，
+到 77.1%（14262/18487）。
 
 **基线绑定了 test262 的提交。** `docs/test262-baseline.txt.gz` 首行现在是
 `# test262 <commit>`。没有这一行时，检出被清掉后重新克隆会落到新的 HEAD，
@@ -102,14 +103,13 @@ B 批的三个整块（4.26）得 +567，回归都是 0，到 75.4%（13938/1848
 | TypedArray | 415 |
 | Array | 363 |
 | String | 320 |
-| Object | 163 |
+| Object | 157 |
 | ArrayBuffer | 155 |
-| WeakMap | 140 |
 | TypedArrayConstructors | 137 |
 | Function | 113 |
 | Iterator | 101 |
-| WeakSet | 84 |
-| Map | 83 |
+| JSON | 77 |
+| Proxy | 72 |
 | ArrayBuffer | 155 |
 | WeakMap | 140 |
 | Function | 113 |
@@ -861,6 +861,39 @@ isSupersetOf,isDisjointFrom}`。** 它们的参数是 `SetRecord`——任何带
 `IteratorToList(errors)`、再 `ToString(message)`、最后 `InstallErrorCause`，顺序可观察。
 `errors` 是实例自身的不可枚举数据属性；`cause` 的存在性用 `in` 判断，所以
 `{cause: undefined}` 会装上该属性。
+
+### 4.27 弱引用一族：`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`（✅ 已补，+324 例）
+
+四个目录从「全局不存在」到 298/298 可运行用例里 **297 条通过**（唯一未过的一条是需要真实
+GC 时序的 skip）。
+
+**为什么在这里便宜。** 引擎按引用计数释放，最后一个强句柄消失的瞬间就回收，所以
+`WeakGc`（本来就有，为这一刻准备的）已经具备这两件事：不持有强引用、不参与环检测。
+于是 `WeakMap` 的条目**恰好在键死亡时消失**，不需要第二遍"清扫死亡条目"，也不需要
+追踪式收集器。`WeakCollection` 在 `Trace` 里不访问键——这一处缺失就是"弱"的全部实现。
+
+**四个非显然之处**
+
+| 点 | 后果 |
+|---|---|
+| 构造器必须调用 `Get(instance, "set")` 再逐条 `Call` | 否则 `WeakMap.prototype.set = null` 时 `new WeakMap([])` 不抛错，且替换 `set` 看不到构造器的调用（4 条用例） |
+| `unregisterToken` 可以是 target，held value 不行 | 我曾把两者都禁止，`unregisterToken-same-as-target` 失败 |
+| `getOrInsertComputed` 回调后**无条件**覆盖 | 我加了二次查找，`overwrites-mutation-from-callbackfn` 失败（参考要 `3`，我给 `0`） |
+| `CanBeHeldWeakly`：对象 / 非注册 Symbol | `Symbol.for('k')` 拒绝（它永不死亡），`Symbol()` 与 well-known 允许；`unregister` 用同一规则而非"任意 Symbol" |
+
+**顺手修掉一个 use-after-free。** 写 gc 测试时撞到 SIGSEGV：`release()` 先调 `drop_fn`
+再读 header，而丢弃值的过程中可能放掉指向**本盒**的最后一个 `WeakGc`——`WeakMap` 的
+弱边正是这个形状——于是 header 被释放、后续读取越界。修法是丢弃期间假装还有一个强引用
+（收集器的步骤 4 早就这么做了，引用计数这条路径漏了）。
+
+**关于"何时"跑回调。** 引用计数能精确知道死亡时刻，但 gc crate 没有钩子，而在 `Drop`
+里跑脚本是最坏的重入场景（可能在任意 `RefCell` 借用中）。所以改为在**安全点**排空：
+`drain_jobs` 的每个任务边界。可观察差别只有"下一轮事件循环"而非"不可预测的稍后"，
+在 §9.10 允许范围内，也正是 test262 的 `$262.gc` 钩子模拟的东西。
+
+**交付的额外能力**：`__gc` 全局（不可枚举）+ `$262.gc` 现在真的触发回收。此前 harness
+声称"宿主不提供垃圾回收"直接抛错——那是个谎言，而且全 test262 零处使用 `$262.gc`，
+所以这只是把一个假话改成了真话，没有用例收益。
 
 ## 5. 对里程碑结论的修正
 

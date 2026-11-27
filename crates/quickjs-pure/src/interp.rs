@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use js_compile::bytecode::{Atom, ClosureType, Constant, Function as CompiledFunction};
 use js_compile::opcode::{OpFormat, Opcode};
-use js_gc::{Gc, Heap};
+use js_gc::{Gc, Heap, WeakGc};
 
 use crate::object::{
     Callable, ClosureEnv, CompiledCode, EvalScope, JsObject, LocalVars, NativeFn, ObjectKind,
@@ -155,6 +155,17 @@ pub struct Realm {
     pub map_proto: Option<Gc<JsObject>>,
     /// `Set.prototype`.
     pub set_proto: Option<Gc<JsObject>>,
+    /// Every live `FinalizationRegistry`, held weakly.
+    ///
+    /// The cleanup callback has to run from a *safe point* — a place where script is not
+    /// already executing and no engine borrow is held — and the collector cannot enumerate
+    /// heap objects by type. Registering each registry here gives the drain a list to walk.
+    ///
+    /// The handles are weak on purpose: a registry the script dropped must be collectable,
+    /// and it must not be resurrected merely because the drain knew about it. Entries whose
+    /// target has expired are swept out as the drain walks, so the vector does not grow
+    /// without bound in a program that creates many short-lived registries.
+    pub finalization_registries: Vec<WeakGc<JsObject>>,
     /// `ArrayBuffer.prototype`.
     pub array_buffer_proto: Option<Gc<JsObject>>,
     /// `%TypedArray%.prototype`, the prototype every view type inherits from.
@@ -711,6 +722,7 @@ impl<'a> Interp<'a> {
                 disposable_stack_proto: None,
                 map_proto: None,
                 set_proto: None,
+                finalization_registries: Vec::new(),
                 array_buffer_proto: None,
                 typed_array_proto: None,
                 typed_array_protos: Vec::new(),
@@ -1124,8 +1136,37 @@ impl<'a> Interp<'a> {
             }
             budget -= 1;
             self.run_job(job)?;
+            // `FinalizationRegistry` at the job boundary: this is the safe point where the
+            // engine may run script that the script itself did not ask for. Doing it here
+            // rather than from a drop hook is what keeps the callback out of arbitrary
+            // engine bookkeeping — see `builtins::weak`'s header.
+            crate::builtins::weak::drain_finalizers(self)?;
         }
+        // A script that queued no jobs may still have dropped targets, so the checkpoint
+        // runs once more after the queue empties.
+        crate::builtins::weak::drain_finalizers(self)?;
         Ok(())
+    }
+
+    /// Every live `FinalizationRegistry`, as `(handle, state)` pairs.
+    ///
+    /// The registry list is weak, so a registry the script dropped answers `upgrade` with
+    /// `None` and is swept out here. This is also where the realm learns that a registry
+    /// died, which is why it is a mutation rather than a read.
+    pub fn live_registries(&mut self) -> Vec<(Gc<JsObject>, crate::object::FinalizationState)> {
+        let handles = std::mem::take(&mut self.realm.finalization_registries);
+        let mut live = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let Some(object) = handle.upgrade() else {
+                continue;
+            };
+            let Some(state) = object.finalization_state() else {
+                continue;
+            };
+            live.push((object.clone(), *state));
+            self.realm.finalization_registries.push(object.downgrade());
+        }
+        live
     }
 
     /// Run one microtask.

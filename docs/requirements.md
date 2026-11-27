@@ -305,7 +305,6 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 |---|---|---|
 | `std` / `os` 宿主模块、事件循环、Worker | 模块不存在，`setTimeout` 未定义——写不了读写文件的脚本 | M9 |
 | 私有类字段/方法 `#x` | 编译器报 `private class fields are not supported`；19 个 `private_*` opcode 已定义、VM 未实现 | M5 残留 |
-| `WeakMap` / `WeakSet` / `WeakRef` / `FinalizationRegistry` | 均为 `undefined`；test262 里 300+ 条据此失败 | M8 |
 | `Atomics` / `SharedArrayBuffer` | `undefined`；相关用例按 feature 跳过（487 条） | M8 |
 | resizable `ArrayBuffer`（`rab.resize`/`transfer`） | `undefined`；test262 里 76 条据此失败 | M8 |
 | TypedArray 的 `toSpliced` 等个别方法 | 29 个数组方法里已有 28 个，缺 `toSpliced` | M8 收尾 |
@@ -315,8 +314,8 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 | 字符串拼接 | O(n²)，大循环慢 | M11 |
 
 `Iterator` helpers、`Array.fromAsync`、`DataView`、TypedArray 的数组方法/迭代、`Set` 的七个
-集合方法、`decodeURI`/`encodeURI`/`escape`/`unescape` 与 `AggregateError` 都已做完，
-从本表移除。
+集合方法、`decodeURI`/`encodeURI`/`escape`/`unescape`、`AggregateError` 以及弱引用一族
+（`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`）都已做完，从本表移除。
 
 理由与硬约束：
 

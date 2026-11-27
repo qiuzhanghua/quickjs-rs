@@ -22,6 +22,11 @@ pub fn install(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
         ("isNaN", 1, number::global_is_nan),
         ("isFinite", 1, number::global_is_finite),
         ("eval", 1, eval),
+        // The host-facing collector hook. Not a language global: it is installed under a
+        // double-underscore name and the `$262` harness object exposes it as `gc`, which is
+        // how a test asks for a collection. A script has no other way to request one, and
+        // the reference's `$262.gc` is the same arrangement.
+        ("__gc", 0, gc),
         ("encodeURIComponent", 1, encode_uri_component),
         ("decodeURIComponent", 1, decode_uri_component),
         ("encodeURI", 1, encode_uri),
@@ -96,6 +101,17 @@ fn eval(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
         None => return Ok(Value::Undefined),
     };
     interp.eval_in_global(&source)
+}
+
+/// Collect unreachable cycles and drain the finalizer queue.
+///
+/// Reference counting already reclaimed everything with no live handle; this only matters
+/// for a *cycle*, and for giving `FinalizationRegistry` a safe point to run its callbacks
+/// from. It is what `$262.gc()` in the test harness ends up calling.
+fn gc(interp: &mut Interp<'_>, _this: Value, _args: &[Value]) -> JsResult<Value> {
+    interp.heap.collect();
+    crate::builtins::weak::drain_finalizers(interp)?;
+    Ok(Value::Undefined)
 }
 
 /// `encodeURIComponent`, percent-encoding everything outside the unreserved set.

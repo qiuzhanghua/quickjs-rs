@@ -2186,6 +2186,114 @@ fn to_bigint_differs_from_the_bigint_constructor_on_a_number() {
 }
 
 #[test]
+fn weak_collections_do_not_keep_their_keys_alive() {
+    // The whole point of `WeakMap`: an entry keyed by an otherwise-unreachable object is
+    // reclaimed with that object. Here that happens the instant the last strong handle goes,
+    // because the engine frees on release rather than waiting for a collector.
+    assert_eq!(
+        eval(
+            "var wm = new WeakMap();\n\
+             var k = {};\n\
+             wm.set(k, 'v');\n\
+             print(wm.get(k), wm.has(k));\n\
+             k = null;\n\
+             print(wm.has({}), wm.get({}))"
+        ),
+        "v true\nfalse undefined\n"
+    );
+    // A `WeakSet` is the same machinery without a value slot.
+    assert_eq!(
+        eval(
+            "var ws = new WeakSet(); var o = {};\n\
+             ws.add(o); print(ws.has(o)); o = null; print(ws.has({}))"
+        ),
+        "true\nfalse\n"
+    );
+    // A key has to be an object or a symbol; a primitive is a `TypeError` from `set`/`add`
+    // but merely `undefined`/`false` from the readers.
+    assert!(throws("new WeakMap().set(1, 2)").starts_with("TypeError"));
+    assert!(throws("new WeakSet().add('s')").starts_with("TypeError"));
+    assert_eq!(
+        eval("print(new WeakMap().get(1), new WeakMap().has(1), new WeakSet().delete(1))"),
+        "undefined false false\n"
+    );
+    // A *registered* symbol cannot be held weakly (it never dies), but a plain one and a
+    // well-known one can — the `symbols-as-weakmap-keys` rule.
+    assert!(throws("new WeakMap().set(Symbol.for('k'), 1)").starts_with("TypeError"));
+    assert_eq!(
+        eval(
+            "var wm2 = new WeakMap(); var sym = Symbol('a');\n\
+             wm2.set(sym, 7); wm2.set(Symbol.hasInstance, 8);\n\
+             print(wm2.get(sym), wm2.get(Symbol.hasInstance))"
+        ),
+        "7 8\n"
+    );
+}
+
+#[test]
+fn weak_ref_derefs_until_the_target_dies() {
+    assert_eq!(
+        eval(
+            "var o = {}; var r = new WeakRef(o);\n\
+             print(r.deref() === o);\n\
+             o = null;\n\
+             print(r.deref() === undefined)"
+        ),
+        "true\ntrue\n"
+    );
+    // A symbol is a valid target too; a primitive is not.
+    assert_eq!(
+        eval("var s = Symbol('t'); print(new WeakRef(s).deref() === s)"),
+        "true\n"
+    );
+    assert!(throws("new WeakRef(1)").starts_with("TypeError"));
+    assert!(throws("new WeakRef()").starts_with("TypeError"));
+    // `WeakRef` is a constructor only: calling it without `new` is refused.
+    assert!(throws("WeakRef({})").starts_with("TypeError"));
+}
+
+#[test]
+fn finalization_registry_runs_its_callback_at_a_safe_point() {
+    // The callback runs at a job boundary, not from inside a drop: the engine never runs
+    // script while it is holding an internal borrow. A host can force the point with the
+    // collector hook.
+    assert_eq!(
+        eval(
+            "var seen = [];\n\
+             var fr = new FinalizationRegistry(function (held) { seen.push(held); });\n\
+             (function () { var target = {}; fr.register(target, 'held'); })();\n\
+             print(seen.length);\n\
+             __gc();\n\
+             print(seen.length, seen[0])"
+        ),
+        "0\n1 held\n"
+    );
+    // `unregister` cancels by `SameValue` token, and the held value must not be the target
+    // (it would be kept alive by the registry forever).
+    assert_eq!(
+        eval(
+            "var fired = 0;\n\
+             var fr2 = new FinalizationRegistry(function () { fired++; });\n\
+             var token = {};\n\
+             (function () { var t = {}; fr2.register(t, 1, token); })();\n\
+             print(fr2.unregister(token));\n\
+             __gc();\n\
+             print(fired)"
+        ),
+        "true\n0\n"
+    );
+    assert!(throws("new FinalizationRegistry(1)").starts_with("TypeError"));
+    assert_eq!(
+        eval(
+            "var t = {};\n\
+             try { new FinalizationRegistry(function(){}).register(t, t) }\n\
+             catch (e) { print(e.name) }"
+        ),
+        "TypeError\n"
+    );
+}
+
+#[test]
 fn typed_array_callbacks_receive_their_this_arg() {
     // The same root cause as the Array methods two rounds earlier: `call_typed` passed
     // `undefined` to `[[Call]]`, so `typedArray.map(f, thisArg)` dropped it. test262's

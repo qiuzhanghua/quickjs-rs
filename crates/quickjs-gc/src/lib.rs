@@ -539,6 +539,14 @@ impl<T: Trace + 'static> Gc<T> {
         self.ptr == other.ptr
     }
 
+    /// Whether this handle points at the box `other` refers to, expired or not.
+    ///
+    /// A `WeakMap` stores weak handles but compares against live keys, so the comparison
+    /// has to span both handle types without upgrading (which would resurrect the key).
+    pub fn upgrades_to(&self, other: &WeakGc<T>) -> bool {
+        self.ptr == other.ptr
+    }
+
     /// Create a non-owning handle.
     pub fn downgrade(&self) -> WeakGc<T> {
         // SAFETY: the handle keeps the box alive.
@@ -621,15 +629,24 @@ fn dec_strong(h: NonNull<Header>) {
 /// # Safety
 /// `h` must point at a box whose strong count just reached zero.
 unsafe fn release(h: NonNull<Header>) {
-    // SAFETY: caller guarantees the strong count is zero; dropping the value may
-    // free other boxes but never this one (we still own its allocation).
-    unsafe { (h.as_ref().drop_fn)(h) };
-    // SAFETY: header is still valid (the allocation is ours until we free it).
+    // Hold the allocation for the duration of the drop by pretending one strong reference
+    // still exists. Dropping the value can release the *last* `WeakGc` that points at this
+    // very box — `Owner { weak: WeakGc<Back> }` inside `Back { owner: Gc<Owner> }` is
+    // exactly that shape — and `WeakGc::drop` frees a box whose strong count is zero. The
+    // header reads below would then touch freed memory.
+    //
+    // The collector's step 4 already does this (it bumps every dead box before dropping
+    // it); this is the same trick on the reference-counting path.
     let header = unsafe { h.as_ref() };
-    // A box without a value is no longer part of the object graph, so the
-    // collector must not see it; weak handles may still point at the header.
+    header.strong.set(1);
+    unsafe { (header.drop_fn)(h) };
+    // SAFETY: the allocation was held above, so the header is still ours.
+    let header = unsafe { h.as_ref() };
+    // A box without a value is no longer part of the object graph, so the collector must
+    // not see it; weak handles may still point at the header.
     // SAFETY: the heap outlives its boxes (documented contract).
     unsafe { header.heap.as_ref() }.deregister(h);
+    header.strong.set(0);
     if header.weak.get() == 0 {
         // SAFETY: no strong or weak references remain.
         unsafe { dealloc_box(h) };
@@ -667,6 +684,15 @@ impl<T: Trace + 'static> WeakGc<T> {
     pub fn is_expired(&self) -> bool {
         // SAFETY: the weak handle keeps the box allocation alive.
         unsafe { self.ptr.as_ref() }.header.strong.get() == 0
+    }
+
+    /// Whether two handles point at the same box, live or expired.
+    ///
+    /// This is the key comparison a `WeakMap` needs: two objects are one key exactly when
+    /// they are one allocation, and comparing addresses answers that without upgrading —
+    /// so an expired entry still compares equal to nothing and can be swept.
+    pub fn ptr_eq(&self, other: &WeakGc<T>) -> bool {
+        self.ptr == other.ptr
     }
 }
 

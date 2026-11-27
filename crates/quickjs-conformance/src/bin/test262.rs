@@ -241,7 +241,9 @@ var $262 = {
     // side effect, which is exactly the operation wanted here.
     buffer.transfer();
   },
-  gc: function () { throw new TypeError("the host provides no garbage collection"); }
+  // The engine reclaims by reference counting, so this only has to break cycles and give
+  // `FinalizationRegistry` its safe point. `__gc` is the engine's non-standard hook for it.
+  gc: function () { __gc(); }
 };
 "#;
 

@@ -33,6 +33,7 @@ pub mod regexp;
 mod string;
 mod symbol;
 pub mod typedarray;
+pub mod weak;
 
 use crate::interp::Interp;
 use crate::object::{JsObject, NativeFn, Property};
@@ -107,6 +108,9 @@ pub fn install(interp: &mut Interp<'_>) {
     typedarray::install(interp, &object_proto);
     generator::install(interp, &generator_proto);
     global::install(interp, &boolean_proto);
+    // The weak-reference family needs the collection prototypes (it installs beside them),
+    // `Symbol.toStringTag`, and the error prototypes; nothing depends on it.
+    weak::install(interp, &object_proto);
     // `Array.fromAsync` last: it is written in JavaScript and compiled here, so its
     // source reaches for `Array`, `Promise`, `Reflect`, `Object`, `TypeError` and the
     // well-known symbols by name. Every one of those has to exist by now.

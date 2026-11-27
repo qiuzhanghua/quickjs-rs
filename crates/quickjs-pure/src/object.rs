@@ -13,7 +13,7 @@
 use std::cell::RefCell;
 
 use js_compile::bytecode::Function as CompiledFunction;
-use js_gc::{Gc, Trace, Tracer};
+use js_gc::{Gc, Trace, Tracer, WeakGc};
 
 use std::fmt;
 use std::rc::Rc;
@@ -64,6 +64,104 @@ impl JsObject {
     /// Make this object a `Map` or `Set` holding `entries`.
     pub fn set_collection(&self, entries: Vec<(Value, Value)>, is_set: bool) {
         self.data.borrow_mut().kind = ObjectKind::Collection { entries, is_set };
+    }
+
+    /// This object's weak entries, when it is a `WeakMap` or `WeakSet`.
+    ///
+    /// Expired handles are filtered out here rather than at the call site, so every reader
+    /// sees the same live view of the map and a dead key can never be observed.
+    pub fn weak_entries(&self) -> Option<Vec<(Value, Value)>> {
+        match &self.data.borrow().kind {
+            ObjectKind::WeakCollection { entries, .. } => Some(
+                entries
+                    .iter()
+                    .filter_map(|(key, value)| key.upgrade().map(|key| (key, value.clone())))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Whether this object is a `WeakSet` rather than a `WeakMap`.
+    pub fn weak_is_set(&self) -> Option<bool> {
+        match &self.data.borrow().kind {
+            ObjectKind::WeakCollection { is_set, .. } => Some(*is_set),
+            _ => None,
+        }
+    }
+
+    /// Make this object a `WeakMap` or `WeakSet`, replacing any entries it had.
+    pub fn set_weak_collection(&self, entries: Vec<(WeakKey, Value)>, is_set: bool) {
+        self.data.borrow_mut().kind = ObjectKind::WeakCollection { entries, is_set };
+    }
+
+    /// Store one entry in a weak collection, replacing the value for a live equal key.
+    ///
+    /// The comparison is pointer identity: a weak key has to be an object, and two objects
+    /// are the same key exactly when they are the same object. Expired entries are dropped
+    /// on the way through, which keeps the vector from growing without bound in a program
+    /// that churns keys.
+    pub fn weak_set(&self, key: WeakKey, value: Value) {
+        let mut data = self.data.borrow_mut();
+        let ObjectKind::WeakCollection { entries, .. } = &mut data.kind else {
+            return;
+        };
+        entries.retain(|(existing, _)| !existing.is_expired());
+        for (existing, slot) in entries.iter_mut() {
+            if existing.same(&key) {
+                *slot = value;
+                return;
+            }
+        }
+        entries.push((key, value));
+    }
+
+    /// Remove `key` from a weak collection, answering whether it was there.
+    pub fn weak_delete(&self, key: &Value) -> bool {
+        let mut data = self.data.borrow_mut();
+        let ObjectKind::WeakCollection { entries, .. } = &mut data.kind else {
+            return false;
+        };
+        let before = entries.len();
+        entries.retain(|(existing, _)| !existing.is_expired() && !existing.matches(key));
+        entries.len() != before
+    }
+
+    /// The target of a `WeakRef`, when this object is one.
+    pub fn weak_ref_target(&self) -> Option<WeakKey> {
+        match &self.data.borrow().kind {
+            ObjectKind::WeakRef { target } => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    /// Make this object a `WeakRef` to `target`.
+    pub fn set_weak_ref(&self, target: WeakKey) {
+        self.data.borrow_mut().kind = ObjectKind::WeakRef { target };
+    }
+
+    /// The registry state, when this object is a `FinalizationRegistry`.
+    pub fn finalization_state(&self) -> Option<Box<FinalizationState>> {
+        match &self.data.borrow().kind {
+            ObjectKind::Finalization(state) => Some(Box::new(FinalizationState {
+                registrations: state
+                    .registrations
+                    .iter()
+                    .map(|registration| Registration {
+                        target: registration.target.clone(),
+                        held_value: registration.held_value.clone(),
+                        token: registration.token.clone(),
+                    })
+                    .collect(),
+                cleanup: state.cleanup.clone(),
+            })),
+            _ => None,
+        }
+    }
+
+    /// Replace a registry's state.
+    pub fn set_finalization_state(&self, state: FinalizationState) {
+        self.data.borrow_mut().kind = ObjectKind::Finalization(Box::new(state));
     }
 
     /// `(buffer, element, offset, length)`, when this object is a typed-array view.
@@ -813,6 +911,129 @@ pub enum ObjectKind {
     /// `resolve`/`reject` pair handed to an executor has to settle *this* promise later,
     /// and those are function objects with no pointer back to it otherwise.
     Promise(PromiseRef),
+    /// A `WeakMap` or `WeakSet`: like a collection, but the *keys* are weak.
+    ///
+    /// The distinction lives entirely in [`Trace`]: a `Collection` traces its keys, a
+    /// `WeakCollection` does not. An entry keyed by an otherwise-unreachable object is
+    /// therefore reclaimed together with that object instead of keeping it alive, and the
+    /// entry simply stops being found — `upgrade` fails and a liveness sweep drops the
+    /// pair. That is the "ephemeron" behaviour `WeakMap` promises, and it falls out of
+    /// reference counting rather than needing a second collection pass.
+    WeakCollection {
+        /// The entries, in insertion order, keyed by a non-owning handle.
+        entries: Vec<(WeakKey, Value)>,
+        /// Whether this is a `WeakSet` rather than a `WeakMap`.
+        is_set: bool,
+    },
+    /// A `WeakRef`: one non-owning handle to a target object.
+    WeakRef {
+        /// The target. Once `upgrade` fails the reference is dead for good, because a box
+        /// whose strong count reached zero never comes back.
+        ///
+        /// A `WeakKey` rather than a `WeakGc<JsObject>`, because a symbol is a valid target
+        /// too — `new WeakRef(Symbol())` works and `deref` has to answer it back.
+        target: WeakKey,
+    },
+    /// A `FinalizationRegistry`: the cleanup callback and its live registrations.
+    Finalization(Box<FinalizationState>),
+}
+
+/// The mutable half of a `FinalizationRegistry`.
+///
+/// Boxed inside the [`ObjectKind`] variant because it holds a vector plus a value, and every
+/// `ObjectKind` is stored inline in the object header — an unboxed field this wide would
+/// make *every* object in the realm that much larger.
+pub struct FinalizationState {
+    /// One entry per successful `register` call.
+    pub registrations: Vec<Registration>,
+    /// The cleanup callback, validated as callable when the registry was built.
+    pub cleanup: Value,
+}
+
+/// A key that can be held weakly: an object, or a symbol.
+///
+/// Both are heap allocations in this engine (`Value::Symbol` carries a `Gc<JsSymbol>`), so a
+/// `WeakGc` holds either one just as well. Symbols became valid keys with the
+/// `symbols-as-weakmap-keys` proposal, which is what test262 already tests.
+#[derive(Clone)]
+pub enum WeakKey {
+    /// An object target.
+    Object(WeakGc<JsObject>),
+    /// A symbol target.
+    Symbol(WeakGc<JsSymbol>),
+}
+
+impl WeakKey {
+    /// Whether the allocation behind this key has been released.
+    pub fn is_expired(&self) -> bool {
+        match self {
+            WeakKey::Object(handle) => handle.is_expired(),
+            WeakKey::Symbol(handle) => handle.is_expired(),
+        }
+    }
+
+    /// Whether two weak keys are the same allocation.
+    pub fn same(&self, other: &WeakKey) -> bool {
+        match (self, other) {
+            (WeakKey::Object(left), WeakKey::Object(right)) => left.ptr_eq(right),
+            (WeakKey::Symbol(left), WeakKey::Symbol(right)) => left.ptr_eq(right),
+            _ => false,
+        }
+    }
+
+    /// Whether this key is the same allocation as `value`, without upgrading it.
+    ///
+    /// Upgrading would resurrect the key, which for a `WeakMap` lookup is exactly what must
+    /// not happen — a dead key has to compare equal to nothing.
+    pub fn matches(&self, value: &Value) -> bool {
+        match (self, value) {
+            (WeakKey::Object(handle), Value::Object(object)) => object.upgrades_to(handle),
+            (WeakKey::Symbol(handle), Value::Symbol(symbol)) => symbol.upgrades_to(handle),
+            _ => false,
+        }
+    }
+
+    /// The key as a strong value, when it is still alive.
+    pub fn upgrade(&self) -> Option<Value> {
+        match self {
+            WeakKey::Object(handle) => handle.upgrade().map(Value::Object),
+            WeakKey::Symbol(handle) => handle.upgrade().map(Value::Symbol),
+        }
+    }
+}
+
+impl Trace for WeakKey {
+    fn trace(&self, _tracer: &mut Tracer) {}
+}
+
+/// Turn a script value into a weak key, if `CanBeHeldWeakly` allows it.
+///
+/// The rule is "an object, or a symbol that is not in the registry". A registered symbol —
+/// one from `Symbol.for` — is refused on purpose: it lives in the realm's registry for the
+/// lifetime of the realm, so it never dies, and a weak entry keyed by it could never be
+/// observed to be collected. A plain `Symbol()` is a fresh allocation each time and so has
+/// a lifetime worth observing.
+pub fn weak_key(value: &Value) -> Option<WeakKey> {
+    match value {
+        Value::Object(object) => Some(WeakKey::Object(object.downgrade())),
+        Value::Symbol(symbol) if symbol.registry_key().is_none() => {
+            Some(WeakKey::Symbol(symbol.downgrade()))
+        }
+        _ => None,
+    }
+}
+
+/// One `FinalizationRegistry.register` call.
+///
+/// `token` is compared with `SameValue`, not `SameValueZero`, which is why it is kept as
+/// the original `Value` rather than normalised into a key.
+pub struct Registration {
+    /// The handle whose death fires the callback.
+    pub target: WeakKey,
+    /// What the callback receives: the script's held value, kept alive until it fires.
+    pub held_value: Value,
+    /// The cancellation token, if one was given.
+    pub token: Option<Value>,
 }
 
 /// The two slots of a proxy, shared with its `revoke` function.
@@ -968,6 +1189,29 @@ impl Trace for ObjectKind {
             ObjectKind::Generator(state) => state.trace(tracer),
             ObjectKind::Proxy(state) => state.borrow().trace(tracer),
             ObjectKind::Promise(state) => state.borrow().trace(tracer),
+            // The *keys* are deliberately not visited: that absence is what makes the
+            // collection weak, and it is also why a `WeakMap` cannot keep its key alive
+            // through a cycle that only the map closes. The values are traced, so
+            // `wm.set(k, v)` keeping `v` alive while `k` is reachable is the right half of
+            // the ephemeron rule to get right here — the other half (dropping the pair once
+            // the key dies) needs no liveness test, because `upgrade` on a dead key fails.
+            ObjectKind::WeakCollection { entries, .. } => {
+                for (_, value) in entries {
+                    value.trace(tracer);
+                }
+            }
+            // A `WeakRef` owns nothing at all: that is its whole purpose.
+            ObjectKind::WeakRef { .. } => {}
+            // A registry keeps its held values and its callback alive — the held value has
+            // to survive until the callback can run — but not the targets, which is the
+            // handle type's job rather than the tracer's.
+            ObjectKind::Finalization(state) => {
+                state.cleanup.trace(tracer);
+                for registration in &state.registrations {
+                    registration.held_value.trace(tracer);
+                    registration.token.trace(tracer);
+                }
+            }
         }
     }
 }

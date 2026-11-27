@@ -113,3 +113,89 @@ fn slots_are_reused_after_release() {
     assert_eq!(heap.live_count(), 0);
     assert_eq!(heap.allocated_bytes(), 0);
 }
+
+#[test]
+fn a_weak_handle_observes_the_release_without_causing_it() {
+    let heap = Heap::new();
+    let drops = drops();
+    let leaf = Gc::new(&heap, Leaf::new(&drops));
+    let weak = leaf.downgrade();
+
+    // Holding only a weak handle does not keep the value alive...
+    assert!(!weak.is_expired());
+    assert!(weak.upgrade().is_some());
+    assert_eq!(drops.get(), 0);
+
+    drop(leaf);
+    // ...and the release is immediate, because this is reference counting.
+    assert_eq!(drops.get(), 1);
+    assert!(weak.is_expired());
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn a_weak_handle_keeps_the_header_alive_so_expiry_is_answerable() {
+    let heap = Heap::new();
+    let drops = drops();
+    let weak = {
+        let leaf = Gc::new(&heap, Leaf::new(&drops));
+        leaf.downgrade()
+    };
+    // The value is gone but the box's header is not, which is what lets `is_expired` and
+    // `ptr_eq` stay sound after the target died. Releasing the weak handle then frees it.
+    assert_eq!(drops.get(), 1);
+    assert!(weak.is_expired());
+    let peers = vec![weak.clone()];
+    drop(weak);
+    assert!(peers[0].is_expired());
+    drop(peers);
+    assert_eq!(heap.allocated_bytes(), 0);
+}
+
+#[test]
+fn a_weak_edge_does_not_keep_a_cycle_alive() {
+    // The `WeakMap` shape: a strong cycle somewhere in the graph, plus a weak handle that
+    // watches one end of it. The cycle must still be reclaimed — a weak edge is invisible to
+    // `Trace` — and the weak handle must then report expiry. If `Trace for WeakGc` visited
+    // its target, the cycle would be reachable and this would leak.
+    struct Node {
+        peer: RefCell<Option<Gc<Node>>>,
+    }
+    impl Trace for Node {
+        fn trace(&self, tracer: &mut Tracer) {
+            self.peer.trace(tracer);
+        }
+    }
+
+    let heap = Heap::new();
+    let left = Gc::new(
+        &heap,
+        Node {
+            peer: RefCell::new(None),
+        },
+    );
+    let right = Gc::new(
+        &heap,
+        Node {
+            peer: RefCell::new(None),
+        },
+    );
+    // `left -> right -> left`: each holds the other, so dropping the outer handles leaves
+    // strong counts of 1 on both and reference counting alone cannot free either.
+    *left.peer.borrow_mut() = Some(right.clone());
+    *right.peer.borrow_mut() = Some(left.clone());
+    let watcher = right.downgrade();
+    drop(left);
+    drop(right);
+
+    assert_eq!(
+        heap.live_count(),
+        2,
+        "both nodes of the cycle are still alive"
+    );
+    assert!(!watcher.is_expired());
+    let stats = heap.collect();
+    assert_eq!(stats.collected, 2, "the cycle should have been reclaimed");
+    assert_eq!(heap.live_count(), 0);
+    assert!(watcher.is_expired(), "the weak handle outlives its target");
+}
