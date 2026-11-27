@@ -70,7 +70,7 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**发布到 crates.io**（最近已发布版本 v0.6.0，v0.6.1 待发）：`quickjs-pure` 是门面
+**已发布到 crates.io（v0.6.1）**：`quickjs-pure` 是门面
 crate（lib 名仍是 `quickjs`），`quickjs-gc`/`quickjs-parse`/`quickjs-regexp`/
 `quickjs-compile` 是其依赖。`quickjs-cli` 与
 `quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
