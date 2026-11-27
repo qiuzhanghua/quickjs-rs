@@ -314,8 +314,9 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 | `Function.prototype.toString` | 用户函数返回 `[native code]` 而非源码文本 | 未排期 |
 | 字符串拼接 | O(n²)，大循环慢 | M11 |
 
-`Iterator` helpers、`Array.fromAsync`、`DataView` 与 TypedArray 的数组方法/迭代已做完，
-从本表移除（原先记的"只有 7/29 且无 `Symbol.iterator`"已不成立）。
+`Iterator` helpers、`Array.fromAsync`、`DataView`、TypedArray 的数组方法/迭代、`Set` 的七个
+集合方法、`decodeURI`/`encodeURI`/`escape`/`unescape` 与 `AggregateError` 都已做完，
+从本表移除。
 
 理由与硬约束：
 

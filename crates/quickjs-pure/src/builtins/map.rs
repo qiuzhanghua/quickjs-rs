@@ -85,6 +85,16 @@ fn install_set(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         ("keys", 0, keys),
         ("values", 0, values),
         ("entries", 0, entries),
+        // The seven ES2025 set methods (§24.2.3.13–.19). All of them take a
+        // `SetRecord` — an arbitrary object read through `size`/`has`/`keys` — not just
+        // another `Set`, which is why they are not implemented in terms of each other.
+        ("union", 1, union),
+        ("intersection", 1, intersection),
+        ("difference", 1, difference),
+        ("symmetricDifference", 1, symmetric_difference),
+        ("isSubsetOf", 1, is_subset_of),
+        ("isSupersetOf", 1, is_superset_of),
+        ("isDisjointFrom", 1, is_disjoint_from),
     ] {
         define_method(&proto, name, length, func, interp);
     }
@@ -265,6 +275,241 @@ fn add(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> 
     }
     object.set_collection(entries, true);
     Ok(this)
+}
+
+/// A `SetRecord` (§24.2.1.2): the *shape* the set methods accept, not a `Set`.
+///
+/// `union`/`intersection`/`difference`/`symmetricDifference`/`isSubsetOf`/`isSupersetOf`/
+/// `isDisjointFrom` all take "a set-like object", so any object with a numeric `size`, a
+/// `has` method and a `keys` method works. That is why they cannot be written in terms of
+/// `Set.prototype.has` — the argument need not be a `Set`.
+///
+/// The reads are *observable and ordered*: `size` first (and it must be a number, else a
+/// `TypeError`), then `has`, and `keys` only where the algorithm needs to iterate. Getting
+/// the order wrong is visible to a test that logs each access.
+struct SetRecord {
+    size: f64,
+    has: Value,
+    /// `keys`, read and validated here even though `difference`/`isSubsetOf` never call it.
+    /// `GetSetRecord` (§24.2.1.2) validates all three members up front, so a non-callable
+    /// `keys` is a `TypeError` from `difference` too.
+    keys: Value,
+    /// The object the `has`/`keys` methods were read from, which is their `this`.
+    receiver: Value,
+}
+
+fn set_record(interp: &mut Interp<'_>, value: &Value) -> JsResult<SetRecord> {
+    let Some(object) = value.as_object().cloned() else {
+        return Err(interp.type_error("the argument is not a set-like object"));
+    };
+    let key = interp.property_key(&interp.string("size"));
+    let size = interp.get_property_key(&object, &key)?;
+    let size = match size {
+        None | Some(Value::Undefined) => {
+            return Err(interp.type_error("the argument has no size property"));
+        }
+        Some(value) => interp.to_js_number(&value)?,
+    };
+    let key = interp.property_key(&interp.string("has"));
+    let has = interp.get_property_key(&object, &key)?;
+    let has = match has {
+        Some(value) if value.as_object().is_some_and(|object| object.is_callable()) => value,
+        _ => return Err(interp.type_error("the argument's has property is not callable")),
+    };
+    let key = interp.property_key(&interp.string("keys"));
+    let keys = interp.get_property_key(&object, &key)?;
+    let keys = match keys {
+        Some(value) if value.as_object().is_some_and(|object| object.is_callable()) => value,
+        _ => return Err(interp.type_error("the argument's keys property is not callable")),
+    };
+    Ok(SetRecord {
+        size,
+        has,
+        keys,
+        receiver: Value::Object(object),
+    })
+}
+
+impl SetRecord {
+    /// `SetRecord.has(key)`, which is `[[Call]]` on the user's method.
+    fn has(&self, interp: &mut Interp<'_>, key: &Value) -> JsResult<bool> {
+        let answer =
+            interp.call_value(self.has.clone(), self.receiver.clone(), vec![key.clone()])?;
+        Ok(answer.to_boolean())
+    }
+}
+
+/// The keys a set-like object yields: `record.keys()` then iterate it.
+fn set_record_keys(interp: &mut Interp<'_>, record: &SetRecord) -> JsResult<Vec<Value>> {
+    // The receiver, not `undefined`: `keys` is a method on the *argument*, so it needs the
+    // argument as `this` — passing `undefined` made `Set.prototype.keys` report "method
+    // called on a non-collection" for a perfectly good Set.
+    let iterator = interp.call_value(record.keys.clone(), record.receiver.clone(), Vec::new())?;
+    interp.collect_iterable(&iterator)
+}
+
+/// A fresh `Set` holding `keys`, which every "answer with a new set" method needs.
+fn set_of(interp: &mut Interp<'_>, keys: Vec<Value>) -> JsResult<Value> {
+    let proto = interp.realm.set_proto.clone();
+    let object = interp.new_object(proto.or(Some(interp.realm.object_proto.clone())));
+    let mut entries: Entries = Vec::with_capacity(keys.len());
+    for key in keys {
+        if !entries
+            .iter()
+            .any(|(existing, _)| existing.same_value_zero(&key))
+        {
+            entries.push((key, Value::Undefined));
+        }
+    }
+    object.set_collection(entries, true);
+    Ok(Value::Object(object))
+}
+
+/// The receiver as a set's entries, refusing anything that is not one.
+fn this_set(interp: &Interp<'_>, this: &Value) -> JsResult<(Gc<JsObject>, Entries)> {
+    if !is_set(interp, this)? {
+        return Err(interp.type_error("method called on a non-Set"));
+    }
+    entries_of(interp, this)
+}
+
+/// `SameValueZero` membership over a bare list of keys.
+///
+/// Separate from [`has_entry`] because three of the seven methods compare *two key lists*
+/// (the receiver's keys and what `keys()` yielded), and round-tripping those through
+/// `(key, undefined)` pairs to reuse the tuple version was both slower and harder to read.
+fn contains_key(keys: &[Value], key: &Value) -> bool {
+    keys.iter().any(|existing| existing.same_value_zero(key))
+}
+
+fn has_entry(entries: &Entries, key: &Value) -> bool {
+    entries
+        .iter()
+        .any(|(existing, _)| existing.same_value_zero(key))
+}
+
+/// `Set.prototype.union(other)`: every key of both, receiver's order first.
+fn union(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    let mut keys: Vec<Value> = entries.into_iter().map(|(key, _)| key).collect();
+    for key in set_record_keys(interp, &record)? {
+        if !contains_key(&keys, &key) {
+            keys.push(key);
+        }
+    }
+    set_of(interp, keys)
+}
+
+/// `Set.prototype.intersection(other)`: keys present in both, in receiver order.
+fn intersection(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    let other_keys = set_record_keys(interp, &record)?;
+    let mut kept = Vec::new();
+    for (key, _) in entries {
+        // `size` bounds the work only when it is smaller; correctness needs the key list.
+        let _ = record.size;
+        if contains_key(&other_keys, &key) {
+            kept.push(key);
+        }
+    }
+    set_of(interp, kept)
+}
+
+/// `Set.prototype.difference(other)`: receiver keys that `other` lacks.
+fn difference(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    let mut kept = Vec::new();
+    for (key, _) in entries {
+        // `has` is called per key, not derived from `keys()`: that is what the record is
+        // for, and the call count is what test262 asserts.
+        if !record.has(interp, &key)? {
+            kept.push(key);
+        }
+    }
+    set_of(interp, kept)
+}
+
+/// `Set.prototype.symmetricDifference(other)`: keys in exactly one side.
+fn symmetric_difference(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    let other_keys = set_record_keys(interp, &record)?;
+    let mut kept = Vec::new();
+    for (key, _) in &entries {
+        if !contains_key(&other_keys, key) {
+            kept.push(key.clone());
+        }
+    }
+    for key in other_keys {
+        if !has_entry(&entries, &key) {
+            kept.push(key);
+        }
+    }
+    let _ = record;
+    set_of(interp, kept)
+}
+
+/// `Set.prototype.isSubsetOf(other)`: every receiver key is in `other`.
+fn is_subset_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let record = set_record(interp, &arg(args, 0))?;
+    if (entries.len() as f64) > record.size {
+        return Ok(Value::Bool(false));
+    }
+    for (key, _) in entries {
+        if !record.has(interp, &key)? {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `Set.prototype.isSupersetOf(other)`: every key of `other` is in the receiver.
+fn is_superset_of(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    if (entries.len() as f64) < record.size {
+        return Ok(Value::Bool(false));
+    }
+    for key in set_record_keys(interp, &record)? {
+        if !has_entry(&entries, &key) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// `Set.prototype.isDisjointFrom(other)`: the two share no key.
+fn is_disjoint_from(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
+    let (_, entries) = this_set(interp, &this)?;
+    let other = arg(args, 0);
+    let record = set_record(interp, &other)?;
+    let other_keys = set_record_keys(interp, &record)?;
+    // The smaller side drives the probe: `has` is a user call, so which direction is taken
+    // is observable as a different number of calls — and the spec asks for the smaller one.
+    if entries.len() <= other_keys.len() {
+        for (key, _) in entries {
+            if contains_key(&other_keys, &key) {
+                return Ok(Value::Bool(false));
+            }
+        }
+    } else {
+        for key in other_keys {
+            if has_entry(&entries, &key) {
+                return Ok(Value::Bool(false));
+            }
+        }
+    }
+    let _ = record;
+    Ok(Value::Bool(true))
 }
 
 fn has(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {

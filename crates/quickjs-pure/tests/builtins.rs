@@ -2229,6 +2229,116 @@ fn typed_array_callbacks_receive_their_this_arg() {
 }
 
 #[test]
+fn set_methods_take_a_set_like_record_not_just_a_set() {
+    // §24.2.3.13–.19 all take a `SetRecord`: any object with a numeric `size`, a `has`
+    // method and a `keys` method. That is why they cannot be layered on
+    // `Set.prototype.has` — the argument need not be a `Set` at all.
+    assert_eq!(
+        eval(
+            "var a = new Set([1, 2, 3]);\n\
+             var b = new Set([2, 3, 4]);\n\
+             function sorted(set) { return set instanceof Set ? [...set].sort().join() : set; }\n\
+             print(sorted(a.union(b)), sorted(a.intersection(b)),\n\
+                   sorted(a.difference(b)), sorted(a.symmetricDifference(b)))"
+        ),
+        "1,2,3,4 2,3 1 1,4\n"
+    );
+    assert_eq!(
+        eval(
+            "var a = new Set([1, 2]);\n\
+             var like = { size: 1, has: function (k) { return k === 9; },\n\
+                          keys: function () { return [9][Symbol.iterator](); } };\n\
+             print(a.isSubsetOf(new Set([1, 2, 3])), a.isSubsetOf(new Set([1])));\n\
+             print(a.isSupersetOf(new Set([1])), a.isSupersetOf(new Set([1, 9])));\n\
+             print(a.isDisjointFrom(new Set([9])), a.isDisjointFrom(new Set([1])));\n\
+             print([...a.union(like)].sort().join())"
+        ),
+        "true false\ntrue false\ntrue false\n1,2,9\n"
+    );
+    // `GetSetRecord` validates all three members, and `size` has to be a number — even
+    // for the methods that never call `keys`.
+    assert!(throws("new Set().union({ has: function () {} })").starts_with("TypeError"));
+    assert!(
+        throws("new Set().union({ size: 'x', has: function () {}, keys: function () {} })")
+            .starts_with("TypeError")
+    );
+    assert!(
+        throws("new Set().difference({ size: 1, has: function () {}, keys: {} })")
+            .starts_with("TypeError")
+    );
+    assert!(
+        throws("new Set().isSubsetOf({ size: 1, has: function () {}, keys: undefined })")
+            .starts_with("TypeError")
+    );
+}
+
+#[test]
+fn uri_and_escape_globals_follow_their_annex_b_rules() {
+    // `encodeURI` keeps the URI's own delimiters; `encodeURIComponent` does not. This pair
+    // is the whole difference between the two, and it was missing entirely.
+    assert_eq!(
+        eval("print(encodeURI('a b/c?d=e&f#g'), encodeURIComponent('a b/c?d=e&f#g'))"),
+        "a%20b/c?d=e&f#g a%20b%2Fc%3Fd%3De%26f%23g\n"
+    );
+    // `decodeURI` puts a decoded reserved character back in its `%XX` form.
+    assert_eq!(
+        eval("print(decodeURI('%2F%20'), decodeURIComponent('%2F%20'))"),
+        "%2F  / \n"
+    );
+    // `escape` works on *code units*, so `\u00FF` is one byte (`%FF`) while
+    // `encodeURIComponent` would produce the UTF-8 pair. Anything wider is `%uXXXX`.
+    assert_eq!(
+        eval("print(escape('a b'), escape('\\u00ff'), escape('\\u4e2d'), escape('@*_+-./'))"),
+        "a%20b %FF %u4E2D @*_+-./\n"
+    );
+    // `unescape` is the inverse and leaves a stray `%` alone rather than throwing.
+    assert_eq!(
+        eval(
+            "print(unescape('a%20b'), unescape('%FF') === '\\u00ff',\n\
+                   unescape('%u4E2D'), unescape('100%'))"
+        ),
+        "a b true 中 100%\n"
+    );
+    // A malformed escape is a `URIError` from the URI functions, but not from `unescape`.
+    assert!(throws("decodeURIComponent('%')").starts_with("URIError"));
+    assert!(throws("decodeURI('%zz')").starts_with("URIError"));
+}
+
+#[test]
+fn aggregate_error_takes_an_iterable_and_a_cause() {
+    assert_eq!(
+        eval(
+            "var e = new AggregateError([1, 2], 'msg');\n\
+             print(e.name, e.message, e.errors.join(), e instanceof Error,\n\
+                   e instanceof AggregateError, e.toString())"
+        ),
+        "AggregateError msg 1,2 true true AggregateError: msg\n"
+    );
+    // `errors` is an own, non-enumerable data property; `length` is 2 because the
+    // constructor takes `(errors, message, options)`.
+    assert_eq!(
+        eval(
+            "var e = new AggregateError([1]);\n\
+             print(Object.getOwnPropertyDescriptor(e, 'errors').enumerable,\n\
+                   AggregateError.length, AggregateError.name)"
+        ),
+        "false 2 AggregateError\n"
+    );
+    // `InstallErrorCause` tests `in`, so `{cause: undefined}` installs the property.
+    assert_eq!(
+        eval(
+            "print(new AggregateError([], 'm', { cause: 7 }).cause,\n\
+                   'cause' in new AggregateError([], 'm'),\n\
+                   'cause' in new AggregateError([], 'm', { cause: undefined }))"
+        ),
+        "7 false true\n"
+    );
+    // A missing `errors` is a `TypeError` from `IteratorToList`, called without `new` too.
+    assert!(throws("new AggregateError()").starts_with("TypeError"));
+    assert_eq!(eval("print(AggregateError([1], 'm').message)"), "m\n");
+}
+
+#[test]
 fn string_methods_coerce_their_receiver_but_to_string_does_not() {
     // §22.1: the methods run `RequireObjectCoercible` then `ToString`, so a non-string
     // receiver is converted. Only `toString`/`valueOf` run `thisStringValue`, a brand

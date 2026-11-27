@@ -41,10 +41,10 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
 | 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **13371（72.3%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 5116 |
+| **可运行中通过** | **13938（75.4%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 4549 |
 | ↳ 其中挂起（引擎不终止） | 9 |
-| ↳ 其中答错 | 5107 |
+| ↳ 其中答错 | 4540 |
 | 跳过（引擎完全没这功能） | 5398 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
@@ -56,7 +56,9 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 再把 helper 的关闭语义与 `zip`/`zipKeyed` 对齐（4.17）得 +405 例，两次回归都是 0，
 到 67.5%。再补 `Array` 的缺件与两处语义（4.21）得 +475 例，回归 1 例——那 1 例经查是
 **此前的假通过**，见 4.21 末尾，所以真回归是 0，通过率到 71.1%（13152/18487）。
-再补 `Array.fromAsync`（4.23）得 +219 例、回归 0，到 72.3%（13371/18487）。
+再补 `Array.fromAsync`（4.23）得 +219 例、回归 0，到 72.3%（13371/18487）。之后四轮：
+`ToBigInt`（4.24）得 +219、`String.prototype` 的 `ToString`（4.25）得 +358、
+B 批的三个整块（4.26）得 +567，回归都是 0，到 75.4%（13938/18487）。
 
 **基线绑定了 test262 的提交。** `docs/test262-baseline.txt.gz` 首行现在是
 `# test262 <commit>`。没有这一行时，检出被清掉后重新克隆会落到新的 HEAD，
@@ -96,13 +98,18 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 | 部件 | 失败数 |
 |---|---|
 | RegExp | 1081 |
-| TypedArray | 575 |
 | Promise | 461 |
-| String | 459 |
+| TypedArray | 415 |
 | Array | 363 |
-| Set | 186 |
-| TypedArrayConstructors | 185 |
-| Object | 166 |
+| String | 320 |
+| Object | 163 |
+| ArrayBuffer | 155 |
+| WeakMap | 140 |
+| TypedArrayConstructors | 137 |
+| Function | 113 |
+| Iterator | 101 |
+| WeakSet | 84 |
+| Map | 83 |
 | ArrayBuffer | 155 |
 | WeakMap | 140 |
 | Function | 113 |
@@ -788,6 +795,72 @@ Object.getOwnPropertyNames(new Error("t"))  // 修前 ["message","_class","stack
 数 `then` 被调用几次），手写状态机等于把这些时序一条条对出来。反过来，任何没有这个
 性质的都该继续用 `NativeFn`：`fromAsync` 的源码是**字符串**，编译器不检查它，
 只有 install 期的一次成功编译在兜底。
+
+### 4.24 `ToBigInt` 被写成了 `BigInt(value)`（✅ 已修，+219 例）
+
+三个缺陷，第一个会让进程 abort：
+
+**1. `BigInt(Symbol())` 无限递归。** `constructor` 的兜底分支对任何非原始值调
+`to_primitive`，而 `to_primitive` 对 Symbol 原样返回，于是同一个值再次进入兜底分支，
+直到栈溢出。不是抛 `TypeError`，是 `fatal runtime error: stack overflow`。
+
+**2. `ToBigInt` 与 `BigInt()` 在 Number 上不同。** §7.1.14 的 `ToBigInt` 接受
+BigInt／String／Boolean／对象，**拒绝 Number**；`BigInt(1)` 之所以是 `1n`，是因为它是
+显式转换。把两者接成一条路径，于是 `BigInt.asIntN(8, 1)` 返回 `1n` 而参考抛错——
+同一个替换也让 `new BigInt64Array([1])` 看起来"该能用"。
+
+**3. 元素写入把原始 `Value` 直接存进缓冲区。** 于是
+`new Uint8Array([{valueOf(){return 5}}])` 得到 `0` 而不是 `5`：`ToNumber` 从未运行。
+`ToNumber`/`ToBigInt` 都是可观察脚本（`valueOf`），必须在借用 `RefCell` **之前**跑，
+否则就是借着重入。抽出 `Interp::element_value`，构造函数初始化表、`fill`/`set`/`sort`
+写回、`DataView` 的 setter、以及 `a[i] = v` 四条路径共用。
+
+顺带把 `StringToBigInt` 的文法收严：`StrNonDecimalIntegerLiteral` 没有符号，所以
+`"-0x10"` 和 `" +0x10 "` 是 `SyntaxError` 而不是 `-16`/`16`。
+
+### 4.25 `String.prototype` 把 `ToString` 写成了 brand check（✅ 已修，+358 例）
+
+§22.1 的每个方法都是 `RequireObjectCoercible` + `ToString`：
+
+```js
+String.prototype.trim.call(123)                          // "123"
+String.prototype.trim.call({toString(){return " a "}})   // "a"
+```
+
+只有 `toString`/`valueOf` 走 `thisStringValue`——它们拒绝任何非字符串接收者。此前所有
+方法共用同一个判据，116 条 test262 直接命中 `String method on a non-string` 这条签名。
+
+`toString`/`valueOf` 保持 brand check 不只是为了符合规范，还有一个机械原因：它们是
+boxed String 上 `ToPrimitive` 的落点。若它们自己也走 `ToString`，就等于在
+`ToPrimitive` 内部再要一次 `ToPrimitive`——**无界递归**，第一次跑就 abort 了。
+
+顺带发现 `split` 对非字符串分隔符直接返回整串，从不做 `ToString(separator)`。修好接收者
+转换之后，`transferred-to-number-separator-override-tostring-returns-regexp` 从"通过"
+变成失败：它此前是靠**接收者先被拒绝**蒙对的，而用例真正断言的是分隔符的 `toString`
+返回对象时由 `ToPrimitive` 抛 `TypeError`。
+
+### 4.26 `Set` 的七个集合方法、四个 URI 全局、`AggregateError`（✅ 已补，+567 例）
+
+**`Set.prototype.{union,intersection,difference,symmetricDifference,isSubsetOf,
+isSupersetOf,isDisjointFrom}`。** 它们的参数是 `SetRecord`——任何带数字 `size`、
+可调用 `has`、可调用 `keys` 的对象——不是"另一个 Set"。所以不能按
+`Set.prototype.has` 层叠实现。三个易错点：
+
+| 点 | 后果 |
+|---|---|
+| `GetSetRecord` 一次读全 `size`/`has`/`keys` 并校验 | `difference` 不用 `keys`，但 `keys: undefined` 仍须 `TypeError` |
+| `keys()` 的 `this` 是**参数对象** | 传 `undefined` 让 `Set.prototype.keys` 报 "method called on a non-collection" |
+| 读取顺序 `size` → `keys` | 顺序可观察，测试会记录每次访问 |
+
+**`encodeURI`/`decodeURI`/`escape`/`unescape`。** 前两个与 `…Component` 只差一个保留字符
+集合：`encodeURI` 保留 `;/?:@&=+$,#`，`decodeURI` 把已解码的保留字符**重新编码**回去
+（`decodeURI("%2F")` 是 `"%2F"`）。后两个是 Annex B，且 `escape` 按**码元**工作——`"ÿ"`
+是单字节 `%FF`，不是 UTF-8 对；`unescape` 遇到无效转义时保留 `%` 原样而不是抛错。
+
+**`AggregateError`。** 它有独立构造器，因为参数是 `(errors, message, options)`：先
+`IteratorToList(errors)`、再 `ToString(message)`、最后 `InstallErrorCause`，顺序可观察。
+`errors` 是实例自身的不可枚举数据属性；`cause` 的存在性用 `in` 判断，所以
+`{cause: undefined}` 会装上该属性。
 
 ## 5. 对里程碑结论的修正
 

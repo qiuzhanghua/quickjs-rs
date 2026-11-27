@@ -24,6 +24,12 @@ pub fn install(interp: &mut Interp<'_>, boolean_proto: &Gc<JsObject>) {
         ("eval", 1, eval),
         ("encodeURIComponent", 1, encode_uri_component),
         ("decodeURIComponent", 1, decode_uri_component),
+        ("encodeURI", 1, encode_uri),
+        ("decodeURI", 1, decode_uri),
+        // `escape`/`unescape` are Annex B, not removed: they are still in every engine and
+        // test262 checks them (`test/built-ins/escape`, `…/unescape`).
+        ("escape", 1, escape),
+        ("unescape", 1, unescape),
     ] {
         define_method(&global, name, length, func, interp);
     }
@@ -95,25 +101,59 @@ fn eval(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value
 /// `encodeURIComponent`, percent-encoding everything outside the unreserved set.
 fn encode_uri_component(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let text = arg(args, 0).to_js_string();
+    Ok(interp.string(percent_encode(&text, false)))
+}
+
+/// `encodeURI`, which additionally leaves the URI's own delimiters alone.
+///
+/// §19.2.6.3's `uriReserved` plus `#`: `;/?:@&=+$,#`. The difference from
+/// `encodeURIComponent` is exactly this set, and it is why `encodeURI("a b/c")` is
+/// `"a%20b/c"` while the component form gives `"a%20b%2Fc"`.
+fn encode_uri(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = arg(args, 0).to_js_string();
+    Ok(interp.string(percent_encode(&text, true)))
+}
+
+/// The shared percent-encoder. `keep_reserved` is the only difference between the two.
+fn percent_encode(text: &str, keep_reserved: bool) -> String {
     let mut out = String::new();
     for byte in text.bytes() {
-        let keep = byte.is_ascii_alphanumeric()
+        let unreserved = byte.is_ascii_alphanumeric()
             || matches!(
                 byte,
                 b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
             );
-        if keep {
+        let reserved = keep_reserved
+            && matches!(
+                byte,
+                b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
+            );
+        if unreserved || reserved {
             out.push(byte as char);
         } else {
             out.push_str(&format!("%{byte:02X}"));
         }
     }
-    Ok(interp.string(out))
+    out
 }
 
 /// `decodeURIComponent`.
 fn decode_uri_component(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let text = arg(args, 0).to_js_string();
+    decode_percent(interp, &text, false)
+}
+
+/// `decodeURI`, which leaves a percent-encoded reserved character encoded.
+///
+/// §19.2.6.2: a decoded byte that is one of `;/?:@&=+$,#` is put back in its `%XX` form,
+/// so `decodeURI("%2F")` is `"%2F"` while `decodeURIComponent("%2F")` is `"/"`.
+fn decode_uri(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = arg(args, 0).to_js_string();
+    decode_percent(interp, &text, true)
+}
+
+/// The shared percent-decoder: `keep_reserved` is `decodeURI`'s extra re-encoding step.
+fn decode_percent(interp: &mut Interp<'_>, text: &str, keep_reserved: bool) -> JsResult<Value> {
     let bytes = text.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -126,23 +166,100 @@ fn decode_uri_component(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -
         // A `%` has to be followed by exactly two hex digits. Slicing the *bytes*
         // rather than the `&str` matters: a `%` inside multi-byte text would not sit
         // on a character boundary, and slicing by index would panic.
-        let Some(hex) = bytes.get(index + 1..index + 3) else {
-            return Err(uri_error(interp));
-        };
-        let Ok(hex) = std::str::from_utf8(hex) else {
-            return Err(uri_error(interp));
-        };
-        let Ok(byte) = u8::from_str_radix(hex, 16) else {
-            return Err(uri_error(interp));
-        };
-        out.push(byte);
-        index += 3;
+        let decoded = read_escape(bytes, index).ok_or_else(|| uri_error(interp))?;
+        let (byte, next) = decoded;
+        if keep_reserved
+            && matches!(
+                byte,
+                b';' | b'/' | b'?' | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b',' | b'#'
+            )
+        {
+            out.extend_from_slice(&bytes[index..next]);
+        } else {
+            out.push(byte);
+        }
+        index = next;
     }
     // The percent-decoded bytes have to spell valid UTF-8; a truncation such as
     // `decodeURIComponent("%E4%B8")` is a URI error, not replacement characters.
     String::from_utf8(out)
         .map(|text| interp.string(text))
         .map_err(|_| uri_error(interp))
+}
+
+/// One `%XX` escape at `index`, answering the byte and the index just past it.
+fn read_escape(bytes: &[u8], index: usize) -> Option<(u8, usize)> {
+    let hex = bytes.get(index + 1..index + 3)?;
+    let hex = std::str::from_utf8(hex).ok()?;
+    let byte = u8::from_str_radix(hex, 16).ok()?;
+    Some((byte, index + 3))
+}
+
+/// `escape(string)` (Annex B §B.2.1.1).
+///
+/// Not a URI function at all, whatever the name suggests: it works on *code units*. A unit
+/// that is ASCII alphanumeric or one of `@*_+-./` is kept, one below 256 becomes `%XX`, and
+/// anything wider becomes `%uXXXX`. That is why `escape("\u00FF")` is `"%FF"` — a single
+/// byte, not the UTF-8 pair `encodeURIComponent` would produce.
+fn escape(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = arg(args, 0).to_js_string();
+    let mut out = String::new();
+    for unit in text.encode_utf16() {
+        let kept = unit < 0x80
+            && (char::from(unit as u8).is_ascii_alphanumeric()
+                || matches!(unit as u8, b'@' | b'*' | b'_' | b'+' | b'-' | b'.' | b'/'));
+        if kept {
+            out.push(unit as u8 as char);
+        } else if unit < 0x100 {
+            out.push_str(&format!("%{unit:02X}"));
+        } else {
+            out.push_str(&format!("%u{unit:04X}"));
+        }
+    }
+    Ok(interp.string(out))
+}
+
+/// `unescape(string)` (Annex B §B.2.1.2): the inverse of [`escape`].
+///
+/// Only `%uXXXX` and `%XX` are recognised; any other `%` is left as itself rather than
+/// being a `URIError`, which is the one way this differs from `decodeURIComponent`.
+fn unescape(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = arg(args, 0).to_js_string();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut out: Vec<u16> = Vec::with_capacity(units.len());
+    let mut index = 0;
+    while index < units.len() {
+        if units[index] != b'%' as u16 {
+            out.push(units[index]);
+            index += 1;
+            continue;
+        }
+        // `%uXXXX` first: its `u` would otherwise make it an invalid `%XX`.
+        if units.get(index + 1) == Some(&(b'u' as u16)) {
+            if let Some(hex) = units.get(index + 2..index + 6) {
+                let digits: String = hex.iter().map(|unit| *unit as u8 as char).collect();
+                if let Ok(unit) = u16::from_str_radix(&digits, 16) {
+                    out.push(unit);
+                    index += 6;
+                    continue;
+                }
+            }
+        } else if let Some(hex) = units.get(index + 1..index + 3) {
+            let digits: String = hex.iter().map(|unit| *unit as u8 as char).collect();
+            if let Ok(byte) = u8::from_str_radix(&digits, 16) {
+                out.push(byte as u16);
+                index += 3;
+                continue;
+            }
+        }
+        // Not an escape: the `%` stands for itself. `unescape("%")` is `"%"`.
+        out.push(units[index]);
+        index += 1;
+    }
+    Ok(Value::String(js_gc::Gc::new(
+        interp.heap,
+        crate::value::JsString::from_wtf8(crate::value::Wtf8::from_units(&out)),
+    )))
 }
 
 /// The `URIError` a malformed percent-escape raises.

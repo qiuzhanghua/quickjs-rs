@@ -26,6 +26,137 @@ const CLASSES: [&str; 8] = [
     "InternalError",
 ];
 
+/// Install `AggregateError` (§20.5.7): the one error class with its own constructor.
+///
+/// It cannot go through [`CLASSES`]' shared `error_constructor` because it has a *third*
+/// parameter and an `errors` own property: `AggregateError(errors, message, options)` runs
+/// `IterableToList(errors)` **before** the message conversion, so a bad first argument is a
+/// `TypeError` even when the message would have thrown too — and the order is observable.
+fn install_aggregate_error(interp: &mut Interp<'_>, error_proto: &Gc<JsObject>) {
+    let proto = interp.new_object(Some(error_proto.clone()));
+    proto.define(
+        "name",
+        Property::with_attributes(interp.string("AggregateError"), true, false),
+    );
+    proto.define(
+        "message",
+        Property::with_attributes(interp.string(""), true, false),
+    );
+    let constructor =
+        interp.new_native_constructor("AggregateError", 2, aggregate_error_constructor);
+    constructor.define(
+        "prototype",
+        Property::with_attributes(Value::Object(proto.clone()), false, false),
+    );
+    proto.define(
+        "constructor",
+        Property::with_attributes(Value::Object(constructor.clone()), true, false),
+    );
+    interp
+        .realm
+        .errors
+        .insert("AggregateError", constructor.clone());
+    let global = interp.realm.global.clone();
+    global.define(
+        "AggregateError",
+        Property::with_attributes(Value::Object(constructor), true, false),
+    );
+}
+
+/// `AggregateError(errors, message, options)`.
+fn aggregate_error_constructor(
+    interp: &mut Interp<'_>,
+    this: Value,
+    args: &[Value],
+) -> JsResult<Value> {
+    // Step order is the spec's: `IteratorToList(errors)` first, then `ToString(message)`,
+    // then `InstallErrorCause` — so an invalid `errors` wins over an invalid `message`.
+    let errors = arg(args, 0);
+    let list = interp.collect_iterable(&errors)?;
+    let message = match args.get(1) {
+        None | Some(Value::Undefined) => None,
+        Some(value) => Some(interp.to_js_string(value)?),
+    };
+    // The instance, from `new.target` when called with `new` and from the class otherwise.
+    let target = match &this {
+        Value::Object(object) => object.clone(),
+        _ => {
+            let proto = interp
+                .realm
+                .errors
+                .get("AggregateError")
+                .map(|constructor| interp.prototype_of(constructor))
+                .unwrap_or_else(|| interp.realm.error_proto.clone());
+            interp.new_object(Some(proto))
+        }
+    };
+    if let Some(message) = message {
+        target.define(
+            "message",
+            Property::with_attributes(interp.string(message), true, false),
+        );
+    }
+    if !target.has_own("name") {
+        target.define(
+            "name",
+            Property::with_attributes(interp.string("AggregateError"), true, false),
+        );
+    }
+    // `errors` is an own, non-enumerable, writable and configurable data property: it is a
+    // real array built from the iterable, so `e.errors` is a fresh array each time.
+    let array = interp.new_array(list);
+    target.define(
+        "errors",
+        Property {
+            value: Some(Value::Object(array)),
+            enumerable: false,
+            configurable: true,
+            writable: true,
+            ..Property::default()
+        },
+    );
+    install_error_cause(interp, &target, args.get(2))?;
+    if interp.internal_get(&target, "_class").is_none() {
+        interp.internal_set(&target, "_class", interp.string("Error"));
+    }
+    interp.add_stack(&target);
+    Ok(Value::Object(target))
+}
+
+/// `InstallErrorCause(O, options)` (§20.5.8.1): copy `options.cause` when present.
+///
+/// `in` is deliberately the check, not "is it `undefined`": `{cause: undefined}` installs
+/// the property, so `"cause" in e` is `true` while `e.cause` is `undefined`.
+fn install_error_cause(
+    interp: &mut Interp<'_>,
+    target: &Gc<JsObject>,
+    options: Option<&Value>,
+) -> JsResult<()> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    let Some(options) = options.as_object().cloned() else {
+        // A primitive options object installs nothing rather than throwing.
+        return Ok(());
+    };
+    let key = interp.property_key(&interp.string("cause"));
+    if !interp.has_own_or_inherited(&options, &key)? {
+        return Ok(());
+    }
+    let cause = interp.get_property_key(&options, &key)?;
+    target.define(
+        "cause",
+        Property {
+            value: cause,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+            ..Property::default()
+        },
+    );
+    Ok(())
+}
+
 /// Install `Error` and its subclasses.
 pub fn install(interp: &mut Interp<'_>) {
     let object_proto = interp.realm.object_proto.clone();
@@ -83,6 +214,7 @@ pub fn install(interp: &mut Interp<'_>) {
         );
     }
 
+    install_aggregate_error(interp, &error_proto);
     install_suppressed_error(interp, &error_proto);
 }
 
