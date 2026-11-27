@@ -4,8 +4,10 @@
 #
 #   ./scripts/setup-oracle.sh [target-dir]
 #
-# Default target directory: /tmp/quickjs-master (one of the paths searched by
-# quickjs_conformance::locate_oracle, override with $QJS_ORACLE).
+# Default target directory: <repo>/oracle/quickjs-master, which `.gitignore` keeps out of
+# the tree (override with an argument or $QJS_ORACLE_DIR). It lives in the repository rather
+# than under /tmp so the oracle survives a reboot: without it `scripts/lang-diff.py` only
+# prints SKIPPED, and every "byte-for-byte identical" claim becomes unverifiable.
 #
 # Building this is not optional decoration: without it `scripts/lang-diff.py`
 # measures nothing and only prints SKIPPED, so every "byte-for-byte identical"
@@ -13,7 +15,8 @@
 # once, and a C toolchain.
 set -eu
 
-DEST="${1:-/tmp/quickjs-master}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+DEST="${1:-$REPO_ROOT/oracle/quickjs-master}"
 PARENT="$(dirname "$DEST")"
 TARBALL="$PARENT/quickjs-master.tar.gz"
 LOG="$PARENT/quickjs-oracle-build.log"
@@ -55,8 +58,13 @@ clean() {
 echo "downloading bellard/quickjs master -> $TARBALL"
 curl -fsSL -o "$TARBALL" https://codeload.github.com/bellard/quickjs/tar.gz/refs/heads/master
 
-rm -rf "$DEST.old"
-if [ -d "$DEST" ]; then mv "$DEST" "$DEST.old"; fi
+# A pre-existing `$DEST` whose binaries failed the check above is in the way: a stale or
+# half-built tree. Say so rather than deleting it, so a botched build cannot destroy the
+# previous one without the caller's say-so.
+if [ -e "$DEST" ] && [ "$DEST" != "$PARENT/quickjs-master" ]; then
+    echo "refusing to overwrite $DEST: remove it yourself, or pass another target" >&2
+    exit 1
+fi
 tar xzf "$TARBALL" -C "$PARENT"
 # The tarball's top-level directory is always `quickjs-master`, so nothing needs
 # moving unless the caller asked for another name.

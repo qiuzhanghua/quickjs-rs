@@ -1,2 +1,6 @@
 /target
 __pycache__/
+
+# scripts/setup-oracle.sh builds the C reference implementation here. It is a
+# comparison oracle, not vendored source, so it stays out of the tree.
+/oracle

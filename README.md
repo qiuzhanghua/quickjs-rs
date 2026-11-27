@@ -116,13 +116,14 @@ quickjs = { package = "quickjs-pure", version = "0.6" }
 ## 开发
 
 ```sh
-./scripts/setup-oracle.sh     # 一次性：构建 C 参考实现到 /tmp/quickjs-master（需网络 + C 工具链）
+./scripts/setup-oracle.sh     # 一次性：构建 C 参考实现到 oracle/（已 gitignore，需网络 + C 工具链）
 ./scripts/check.sh            # fmt + clippy + test + 上游差分（提交前必跑）
 cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 ```
 
-差分测试会自动寻找 `$QJS_ORACLE`、`/tmp/quickjs-master/qjs` 等路径；找不到参考实现时
-相关用例打印 `skipping:` 而不是失败。引擎尚未能执行 JS 时，`qjs` 以退出码 2 + stderr
+差分测试自动寻找 `$QJS_ORACLE`、`oracle/quickjs-master/qjs` 等路径；找不到参考实现时
+相关用例打印 `skipping:` 而不是失败。查找以仓库根为锚（`CARGO_MANIFEST_DIR`），所以从任意
+目录 `cargo test` 都能找到，不受 CWD 影响。引擎尚未能执行 JS 时，`qjs` 以退出码 2 + stderr
 `not implemented yet` 表示“待实现”，harness 记为 *pending* 而非失败。
 
 ## 与 C 版的一致性验证

@@ -17,18 +17,7 @@ fn oracle() -> Option<Engine> {
 
 /// Find a QuickJS checkout, if there is one.
 fn quickjs_root() -> Option<PathBuf> {
-    for candidate in [
-        "/tmp/quickjs-master",
-        "/tmp/quickjs",
-        "quickjs",
-        "vendor/quickjs",
-    ] {
-        let path = PathBuf::from(candidate);
-        if path.join("VERSION").is_file() || path.join("quickjs.c").is_file() {
-            return Some(path);
-        }
-    }
-    None
+    quickjs_conformance::locate_checkout()
 }
 
 /// Runs `qjsc -c` on one file. `true` = the reference parser accepted it.

@@ -29,7 +29,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lang_tests import Sliced  # noqa: E402
 
 # Where the upstream tests come from. `setup-oracle.sh` puts them here.
-ORACLE_DIR = os.environ.get("QJS_ORACLE_DIR", "/tmp/quickjs-master")
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ORACLE_DIR = os.environ.get(
+    "QJS_ORACLE_DIR", os.path.join(REPO_ROOT, "oracle", "quickjs-master")
+)
 TESTS_DIR = os.path.join(ORACLE_DIR, "tests")
 OURS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),

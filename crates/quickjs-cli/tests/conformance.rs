@@ -141,8 +141,14 @@ fn simple_language_cases_match_or_report_a_known_gap() {
 #[test]
 fn the_upstream_script_corpus_reports_a_verdict_for_every_case() {
     let oracle = require_oracle!();
-    let quickjs_root = std::path::Path::new("/tmp/quickjs-master");
-    let cases: Vec<Case> = quickjs_conformance::script_cases(quickjs_root);
+    let quickjs_root = match quickjs_conformance::locate_checkout() {
+        Some(root) => root,
+        None => {
+            eprintln!("skipping: no reference checkout; run scripts/setup-oracle.sh");
+            return;
+        }
+    };
+    let cases: Vec<Case> = quickjs_conformance::script_cases(&quickjs_root);
     if cases.is_empty() {
         eprintln!("skipping: no upstream test scripts found under {quickjs_root:?}");
         return;
@@ -176,13 +182,17 @@ fn the_upstream_script_corpus_reports_a_verdict_for_every_case() {
 #[test]
 fn hello_module_matches_the_reference() {
     let oracle = require_oracle!();
-    let path = std::path::Path::new("/tmp/quickjs-master/examples/hello_module.js");
+    let Some(checkout) = quickjs_conformance::locate_checkout() else {
+        eprintln!("skipping: no reference checkout; run scripts/setup-oracle.sh");
+        return;
+    };
+    let path = checkout.join("examples/hello_module.js");
     if !path.is_file() {
         eprintln!("skipping: {path:?} is not present");
         return;
     }
     let harness = Harness::new(candidate(), oracle);
-    let report = harness.run(&[Case::script(path)]);
+    let report = harness.run(&[Case::script(&path)]);
     assert!(
         report.failures() == 0,
         "hello_module.js differs from the reference:\n{}",

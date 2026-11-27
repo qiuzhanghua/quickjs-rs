@@ -354,11 +354,13 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 
 ## 9. 参考（本地可用）
 
-- C 版源码与参考二进制：`/tmp/quickjs-master`（`make qjs qjsc` 已构建，`qjs --help` 选项可枚举）
+- C 版源码与参考二进制：`oracle/quickjs-master`（`scripts/setup-oracle.sh` 构建，
+  `qjs --help` 选项可枚举）。这个目录已 gitignore——它是比对 oracle，不是 vendored 源码；
+  放在仓库内而非 `/tmp` 是因为 `/tmp` 会被清空，清空后 `scripts/lang-diff.py` 只剩 SKIPPED，
+  所有"逐字节一致"的结论就无法验证。
   重新获取（本机需直连、不经代理）：
   ```sh
-  curl -o qjs.tar.gz https://codeload.github.com/bellard/quickjs/tar.gz/refs/heads/master && tar xzf qjs.tar.gz
-  cd quickjs-master && make -j8 qjs qjsc      # 参考 oracle
+  ./scripts/setup-oracle.sh                   # 下载 + 构建 qjs/qjsc/qjsc-dump
   ```
 - 一致性基线命令：`./qjs tests/microbench.js`（total ≈ 4254）、`./qjs tests/test_builtin.js`、
   `./qjs tests/test_language.js`、`./qjs --experimental -e 'print(typeof Temporal)'`

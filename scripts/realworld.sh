@@ -17,9 +17,10 @@
 set -eu
 cd "$(dirname "$0")/.."
 
-ORACLE="${QJS_ORACLE:-/tmp/quickjs-master/qjs}"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ORACLE="${QJS_ORACLE:-$REPO_ROOT/oracle/quickjs-master/qjs}"
 if [ ! -x "$ORACLE" ]; then
-    for candidate in /tmp/quickjs-master/qjs /opt/quickjs/qjs; do
+    for candidate in "$REPO_ROOT"/oracle/quickjs-master/qjs /tmp/quickjs-master/qjs /opt/quickjs/qjs; do
         if [ -x "$candidate" ]; then
             ORACLE="$candidate"
             break

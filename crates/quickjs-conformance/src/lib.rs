@@ -290,6 +290,68 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or_default().to_string()
 }
 
+/// The repository root, so the oracle can be found whatever the CWD is.
+///
+/// Tests run with the CWD set to their own crate (`crates/<name>`), which is why the
+/// candidate lists below also carry `../`-relative paths. Those were fragile: a plain
+/// `cargo test` from a different directory found nothing, and the failure looked like a
+/// missing oracle rather than a path bug. Anchoring on `CARGO_MANIFEST_DIR` removes the
+/// guesswork.
+pub fn workspace_root() -> PathBuf {
+    // `crates/<name>` -> the root two levels up.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest
+        .ancestors()
+        .nth(2)
+        .map_or_else(|| manifest.to_path_buf(), Path::to_path_buf)
+}
+
+/// Search for the reference implementation's *checkout*: the directory holding its sources
+/// and its built binaries.
+///
+/// `scripts/setup-oracle.sh` puts it in `oracle/quickjs-master` and `.gitignore` keeps that
+/// directory out of the tree, so a fresh clone only needs that one script rather than a
+/// hand-built copy under `/tmp` that a reboot silently deletes.
+pub fn locate_checkout() -> Option<PathBuf> {
+    let root = workspace_root();
+    let mut candidates = vec![
+        root.join("oracle/quickjs-master"),
+        root.join("oracle/quickjs"),
+        root.join("oracle"),
+    ];
+    if let Some(dir) = std::env::var_os("QJS_ORACLE_DIR") {
+        candidates.insert(0, PathBuf::from(dir));
+    }
+    for candidate in [
+        "/tmp/quickjs-master",
+        "/tmp/quickjs",
+        "quickjs",
+        "vendor/quickjs",
+        "../quickjs",
+        "../../quickjs",
+    ] {
+        candidates.push(PathBuf::from(candidate));
+    }
+    candidates.into_iter().find(|path| {
+        path.join("quickjs.c").is_file()
+            || path.join("VERSION").is_file()
+            || path.join("examples/hello_module.js").is_file()
+    })
+}
+
+/// The checkout directory a binary of the given name would live in, as a search list.
+fn checkout_binaries(name: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(checkout) = locate_checkout() {
+        out.push(checkout.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        }));
+    }
+    out
+}
+
 /// Search for the reference `qjsc` compiler.
 ///
 /// `qjsc -c` is the parse-only oracle: it compiles a script to bytecode and does
@@ -307,21 +369,9 @@ pub fn locate_qjsc() -> Option<PathBuf> {
             return Some(sibling);
         }
     }
-    let candidates = [
-        "/tmp/quickjs-master/qjsc",
-        "/tmp/quickjs/qjsc",
-        "quickjs/qjsc",
-        "vendor/quickjs/qjsc",
-        "../quickjs/qjsc",
-        "../../quickjs/qjsc",
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if is_executable(&path) {
-            return Some(path);
-        }
-    }
-    None
+    checkout_binaries("qjsc")
+        .into_iter()
+        .find(|path| is_executable(path))
 }
 
 /// Search for a `qjsc` built with bytecode disassembly enabled.
@@ -336,20 +386,9 @@ pub fn locate_disassembler() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let candidates = [
-        "/tmp/quickjs-master/qjsc-dump",
-        "/tmp/quickjs/qjsc-dump",
-        "quickjs/qjsc-dump",
-        "vendor/quickjs/qjsc-dump",
-        "../quickjs/qjsc-dump",
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if is_executable(&path) {
-            return Some(path);
-        }
-    }
-    None
+    checkout_binaries("qjsc-dump")
+        .into_iter()
+        .find(|path| is_executable(path))
 }
 
 /// Search for a reference `qjs` binary.
@@ -360,21 +399,9 @@ pub fn locate_oracle() -> Option<PathBuf> {
             return Some(path);
         }
     }
-    let candidates = [
-        "/tmp/quickjs-master/qjs",
-        "/tmp/quickjs/qjs",
-        "quickjs/qjs",
-        "vendor/quickjs/qjs",
-        "../quickjs/qjs",
-        "../../quickjs/qjs",
-    ];
-    for candidate in candidates {
-        let path = PathBuf::from(candidate);
-        if is_executable(&path) {
-            return Some(path);
-        }
-    }
-    None
+    checkout_binaries("qjs")
+        .into_iter()
+        .find(|path| is_executable(path))
 }
 
 fn is_executable(path: &Path) -> bool {
