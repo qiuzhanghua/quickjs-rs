@@ -40,12 +40,12 @@ test262 是标准自己的套件，`requirements.md` 本来就把"test262 对应
 | | 数量 |
 |---|---|
 | `test/built-ins` 用例总数 | 23885 |
-| 可运行（runner 不跳过） | 18487 |
-| **可运行中通过** | **14910（80.7%）** ← 基线 7536（42.7%） |
-| 可运行中失败 | 3577 |
-| ↳ 其中挂起（引擎不终止） | 10 |
-| ↳ 其中答错 | 3567 |
-| 跳过（引擎完全没这功能） | 5398 |
+| 可运行（runner 不跳过） | 17822 |
+| **可运行中通过** | **14907（83.6%）** ← 基线 7536（42.7%） |
+| 可运行中失败 | 2915 |
+| ↳ 其中挂起（引擎不终止） | 11 |
+| ↳ 其中答错 | 2904 |
+| 跳过（引擎完全没这功能） | 6063 |
 
 与上一次记录（10845/17665）相比净 +371 例、回归 0 例，但那一次 6220 条跳过里有 822 条
 是被过期的跳过表挡住的（`flag:async` 与 `explicit-resource-management`），解锁后分母
@@ -942,6 +942,71 @@ name"。这个目录 613 条用例里 **0 条通过**，是 RegExp（1081 条失
 和匹配路径，已在生成器里显式排除而不是假装支持。
 
 全量：14262 → **14910/18487（77.1% → 80.7%）**，逐用例差分 **+648 / -0**。
+
+### 4.29 跳过表把"跑不通"算成了"答错"（✅ 已修，+真实 25 条，剔除 550 条假失败）
+
+上一节结束时账上是 14910/18487（80.7%）。但这个分母里混着一批**根本跑不起来**的用例：
+它们标着 `features: [resizable-arraybuffer]`，而引擎没有 `ArrayBuffer.prototype.resize`，
+于是 test262 自己的辅助函数 `CreateResizableArrayBuffer` 是 `undefined`，用例在第一条语句就
+死在 `TypeError: undefined is not a function` 上。
+
+这类失败统计里最大的单项正是 `TypeError: undefined is not a function`（375 条）。**它不是
+一个引擎 bug，而是跳过表漏了六个 feature。**
+
+| feature | 用例 | 引擎的实际状态 |
+|---|---|---|
+| `resizable-arraybuffer` | 461 | `resize`/`detached`/`transferToFixedLength` 都是 `undefined` |
+| `regexp-modifiers` | 147 | **不该跳过**，见下 |
+| `await-dictionary` | 89 | `using` 声明编译器没有分支 |
+| `uint8array-base64` | 70 | `fromBase64`/`toBase64`/`fromHex`/`toHex` 全缺 |
+| `json-parse-with-source` | 21 | reviver 的第三个参数 `context` 不存在 |
+| `regexp-duplicate-named-groups` | 15 | 跨分支重名组被拒绝 |
+| `ShadowRealm` | 61 | 单 realm 引擎，没有这个全局 |
+
+补上之后：分母 18487 → 17822，失败 3577 → 2915。**通过率从 80.7% 涨到 83.6%，但通过数
+只涨了 25**——因为剔掉的大部分本来就没在通过。
+
+**`regexp-modifiers` 是个反例，值得单独说。** 我一开始也把它跳过了，结果差分立刻报 77 条
+回归：那些用例是**负向**的（`early-err-modifiers-*`、`syntax-err-arithmetic-modifiers-*`），
+期望一个 `SyntaxError`，而引擎"不支持修饰符所以一律拒绝"恰好就是期望的答案。跳过它们
+等于把 77 条**真实的**通过抹掉。"引擎拒绝"和"引擎答对"在负向用例上是同一件事，跳过表
+分不开这两者。
+
+这条口径也决定了剩下 29 条 `PASS → SKIP`：它们在 v0.6.0 里"通过"，但通过的原因是
+harness 的 `CreateResizableArrayBuffer` 接受了 `maxByteLength` 参数却忽略它，用例的
+断言侥幸成立。那是**假通过**，跳过比留着诚实。
+
+### 4.30 `JSON` 的 replacer、reviver 与控制字符（✅ 已修，+13 例）
+
+三件事此前都是"参数被静默忽略"：
+
+| 忽略的东西 | 后果 |
+|---|---|
+| `JSON.stringify` 的 replacer | `JSON.stringify({a:1,b:2}, ["a"])` 输出两个键 |
+| `JSON.parse` 的 reviver | `JSON.parse('{"a":1}', (k,v) => v*2).a` 是 `1` |
+| JSON 字符串里的原始控制字符 | `JSON.parse('"a<TAB>b"')` 成功，而语法要求 `SyntaxError` |
+
+replacer 的两种形态（函数 / 键名数组）语义不同，不能合并：数组按**键名**过滤且只作用于
+对象（数组元素永远全留），函数按**值**改写且每个键都调用一次，`this` 是 holder。写成一个
+`Replacer` 枚举，两条路径各自 `keeps` / `apply`。
+
+reviver 是 `InternalizeJSONProperty`：自底向上遍历，**回调返回 `undefined` 就删除该属性**，
+根节点最后处理。删除用 `delete_property`，写回用 `CreateDataProperty` 的语义——一个被前面
+分支冻结成不可配置的属性，后面分支不能覆盖它（`reviver-*-non-configurable-prop-create`
+两条用例专门测这个，我第一版用 `Set` 写就成了 22 而不是 2）。
+
+### 4.31 `Array.prototype.sort` 把空洞弄丢了（✅ 已修，+2 类用例）
+
+`sort` 把 `padded_elements` 返回的空洞也塞进排序，排完再按顺序写回，于是空洞被换成了
+`undefined`、位置也跟着变。规范要求空洞**排在所有元素之后**，且从不传给比较函数
+（`SortCompare` 只对已定义的值调用）。
+
+```js
+var x = new Array(2); x[1] = 1; x.sort((a,b) => a-b);
+0 in x   // 参考：true  修复前：false
+```
+
+修法是把空洞数出来、只排有值的部分、再把空洞写回尾部（尾部空洞在存储里就是"截断"）。
 
 ## 5. 对里程碑结论的修正
 

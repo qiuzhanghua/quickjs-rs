@@ -230,14 +230,19 @@ crates/
 | M4 | 内建库第一波（Object/Function/Array/String/Number/Math/JSON/Error/栈回溯） | ✅ M4 范围内 `test_builtin.js` 全通过；`Date` 未做 |
 | M5 ✅ | ES6+ 语法运行期（class/generator/async/迭代/解构/模板/Proxy） | 已完成：`test_language.js`、`test_closure.js` 全部通过；`Promise`/async/`for await`/async generator 就位。**残留**：私有类字段（`#x`）编译器明确报错，19 个私有 opcode 已定义、VM 未实现 |
 | M6 ✅ | 模块系统 + 动态 import + JSON 模块 | 已完成：`test_cyclic_import.js`、`hello_module.js` 与参考**逐字节一致**；循环导入、live binding、`export *`、`with { type }`、`import.meta`、`import()` 全对拍 |
-| M7 | 正则引擎 + Unicode 表 | test262 RegExp 通过率达标 |
-| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | test262 对应目录达标 |
-| M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | `test_std.js`、`test_worker.js`、CLI 选项矩阵 |
+| M7 | 正则引擎 + Unicode 表 | 🟡 `\p{…}` 已补到 606/613；缺 `RegExp.escape`、lookbehind、`v` 模式字符串属性 |
+| M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView/弱引用一族已完成；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
+| ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ 不做：单线程引擎，`wait` 无法真阻塞、`notify` 无等待者 |
+| **M9** | **`std`/`os`/事件循环 + CLI + REPL** | ⬜ **下一项**：`test_std.js`、CLI 选项矩阵。Worker 随 `Atomics` 一起不做 |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | 产物可执行且输出一致 |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | microbench ≥ 0.5× C 版 |
 | M12 | C ABI 兼容层（`quickjs-capi`，233 个符号） | 上游 `examples/*.c`、`tests/bjson.c` 链接后运行一致 |
-| M13 | Temporal（tzdata + ISO 日历，9 个类型） | Temporal 官方测试子集；`--experimental` 行为对齐 |
-| M14 | Intl / ECMA-402（CLDR 子集，9 个构造器） | `tests/test_intl.js` 通过；locale 敏感输出与 C 版 diff 一致 |
+| ~~M13~~ | ~~Temporal（tzdata + ISO 日历，9 个类型）~~ | ❌ 不做：4624 条用例，与"能嵌入使用"无关 |
+| ~~M14~~ | ~~Intl / ECMA-402（CLDR 子集）~~ | ❌ 不做：需要 CLDR 数据，与零依赖前提冲突 |
+
+三项"不做"是 2026-11-28 的决定，不是尚未排期。理由写在 `README.md` 的里程碑表下面：它们
+要么在单线程引擎里无法真正执行其语义（`Atomics`），要么是独立于引擎核心的巨型 API
+（`Temporal`、`Intl`）。把"跳过"写成"待做"会让人以为数字会自己涨上来。
 
 规模量级（Rust 代码行数估算，仅供参考）：核心 ~45k、内建 ~25k、正则 ~8k、Unicode ~4k（大部分是生成表）、
 dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。**总计 ~100k+ 行，属于多阶段长期工程**，
@@ -303,13 +308,14 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 
 | 缺口 | 影响 | 计划 |
 |---|---|---|
-| `std` / `os` 宿主模块、事件循环、Worker | 模块不存在，`setTimeout` 未定义——写不了读写文件的脚本 | M9 |
+| `std` / `os` 宿主模块、事件循环 | 模块不存在，`setTimeout` 未定义——写不了读写文件的脚本 | **M9（下一项）** |
+| `Worker` | 不存在；与 `Atomics` 一起不做（没有并发模型） | ❌ 不做 |
 | 私有类字段/方法 `#x` | 编译器报 `private class fields are not supported`；19 个 `private_*` opcode 已定义、VM 未实现 | M5 残留 |
-| `Atomics` / `SharedArrayBuffer` | `undefined`；相关用例按 feature 跳过（487 条） | M8 |
+| `Atomics` / `SharedArrayBuffer` | `undefined`；487 条按 feature 跳过 | ❌ 不做（单线程，语义无法真实执行） |
 | resizable `ArrayBuffer`（`rab.resize`/`transfer`） | `undefined`；test262 里 76 条据此失败 | M8 |
 | TypedArray 的 `toSpliced` 等个别方法 | 29 个数组方法里已有 28 个，缺 `toSpliced` | M8 收尾 |
-| `RegExp.escape`、lookbehind、Unicode 属性表 | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{…}` 报 `unsupported property name` | M7 |
-| 通用语法错误的输出格式 | 我们 `file: line: col: msg`，参考 `SyntaxError: msg` + `at file:line:col`；消息文本已对齐 | 未排期 |
+| `RegExp.escape`、lookbehind、`v` 模式字符串属性 | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{Basic_Emoji}` 报 `invalid Unicode property`（`\p{ASCII_Hex_Digit}` 等单码点属性已可用） | M7 |
+| 通用语法错误的输出格式 | 已带 `SyntaxError:` 前缀，但仍缺参考的 `at file:line:col` 位置行 | 未排期 |
 | `Function.prototype.toString` | 用户函数返回 `[native code]` 而非源码文本 | 未排期 |
 | 字符串拼接 | O(n²)，大循环慢 | M11 |
 

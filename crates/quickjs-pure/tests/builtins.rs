@@ -409,6 +409,70 @@ fn json_parse_round_trips_and_rejects_garbage() {
     assert!(throws(r#"JSON.parse('{')"#).contains("SyntaxError"));
 }
 
+#[test]
+fn json_stringify_honours_the_replacer() {
+    // The array form filters by key, and only for strings and numbers.
+    assert_eq!(
+        eval(r#"print(JSON.stringify({a:1,b:2}, ["a"]))"#),
+        r#"{"a":1}"#.to_string() + "\n"
+    );
+    // A nested object only keeps keys that are in the list too.
+    assert_eq!(
+        eval(r#"print(JSON.stringify({a:{b:1,c:2}}, ["a","b"]))"#),
+        r#"{"a":{"b":1}}"#.to_string() + "\n"
+    );
+    // The function form may drop a key by answering `undefined`.
+    assert_eq!(
+        eval("print(JSON.stringify({a:1,b:2}, function(k,v){return k==='b'?undefined:v}))"),
+        r#"{"a":1}"#.to_string() + "\n"
+    );
+    // Its `this` is the holder, so a sibling is readable.
+    assert_eq!(
+        eval("print(JSON.stringify({a:1}, function(k,v){return k===''?v:this.a}))"),
+        r#"{"a":1}"#.to_string() + "\n"
+    );
+}
+
+#[test]
+fn json_parse_honours_the_reviver() {
+    assert_eq!(
+        eval("print(JSON.parse('{\"a\":1}', function(k,v){return typeof v==='number'?v*2:v}).a)"),
+        "2\n"
+    );
+    // Answering `undefined` deletes the property.
+    assert_eq!(
+        eval(
+            "print(JSON.stringify(JSON.parse('{\"a\":1,\"b\":2}', \
+             function(k,v){return k==='a'?undefined:v})))"
+        ),
+        r#"{"b":2}"#.to_string() + "\n"
+    );
+}
+
+#[test]
+fn json_rejects_a_raw_control_character_in_a_string() {
+    // The grammar requires the escape form; a literal tab is not valid JSON. The source
+    // passed to `eval` here has a real backslash-t inside the JSON text, which the *JSON*
+    // parser then evaluates -- so the first call has a raw tab and the second an escape.
+    assert!(throws("JSON.parse('\"a\tb\"')").contains("SyntaxError"));
+    // The escaped form decodes to three characters: `a`, the tab, `b`.
+    assert_eq!(eval("print(JSON.parse('\"a\\\\tb\"').length)"), "3\n");
+}
+
+#[test]
+fn sort_keeps_holes_at_the_end() {
+    // A hole is not `undefined`: it sorts after every present element, and the comparator
+    // is never called for it.
+    assert_eq!(
+        eval("var x=new Array(2); x[1]=1; x.sort(function(a,b){return a-b}); print(0 in x, x[0])"),
+        "true 1\n"
+    );
+    assert_eq!(
+        eval("var y=[3,,1]; y.sort(); print(JSON.stringify(y), 2 in y)"),
+        "[1,3,null] false\n"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Function and Reflect
 // ---------------------------------------------------------------------------

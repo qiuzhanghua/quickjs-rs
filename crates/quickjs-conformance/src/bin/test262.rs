@@ -156,13 +156,40 @@ impl Test {
     fn unsupported_reason(&self) -> Option<String> {
         // Features whose API the engine does not have. Named rather than guessed at, so
         // the count says which part of the engine is missing.
+        //
+        // Each entry here was checked against the engine, not guessed: `resizable-arraybuffer`
+        // is absent because `ArrayBuffer.prototype.resize` is `undefined`,
+        // `regexp-modifiers` because `new RegExp("(?i:a)")` throws, and `await-dictionary`
+        // because `using`/`await using` is not compiled. A feature the engine *does* support
+        // must not appear here — listing it would hide real failures behind a skip.
         const MISSING_FEATURES: &[&str] = &[
             "Atomics",
+            "Atomics.waitAsync",
             "SharedArrayBuffer",
             "Temporal",
             "Intl",
             "tail-call-optimization",
             "decorators",
+            // Grown array buffers: `resize`/`detached` are `undefined` and
+            // `transferToFixedLength` too, so every test that shrinks or grows one over
+            // `CreateResizableArrayBuffer` dies on the harness helper.
+            "resizable-arraybuffer",
+            // `regexp-modifiers` is deliberately *not* listed. The engine refuses `(?i:…)`
+            // outright, and most of that feature's tests are negative: they expect a
+            // `SyntaxError` for a bad modifier group, which a blanket refusal satisfies
+            // honestly. Skipping them discarded 77 tests that were really passing.
+            // `using` declarations, which the compiler has no case for.
+            "await-dictionary",
+            // `ShadowRealm` is a separate realm with its own intrinsics; the engine has one
+            // realm and no `ShadowRealm` global.
+            "ShadowRealm",
+            // `JSON.parse`'s reviver third argument (`context` with `source`). The reviver
+            // is called with two arguments only.
+            "json-parse-with-source",
+            // `Uint8Array.fromBase64`/`toBase64`/`fromHex`/`toHex` are all `undefined`.
+            "uint8array-base64",
+            // A duplicate group name across alternatives is rejected; the proposal allows it.
+            "regexp-duplicate-named-groups",
         ];
         for feature in &self.features {
             if MISSING_FEATURES.contains(&feature.as_str()) {

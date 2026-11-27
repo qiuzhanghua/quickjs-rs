@@ -4,7 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 📌 当前版本：**v0.6.0** —— 标准库补到位，test262 可运行用例通过率 42.7% → 80.7%：
+- 📌 当前版本：**v0.6.1** —— 标准库补到位，test262 可运行用例通过率 42.7% → 83.6%：
   class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
   循环导入、`import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、
   TypedArray（`DataView`、29 个数组方法中的 28 个、`Symbol.iterator`）、`Iterator` helpers、
@@ -34,11 +34,26 @@
 | M5 | ES6+ 运行期（class/generator/async/迭代/解构/模板/Proxy） | ✅ 残留：私有类字段 `#x` 编译器报错 |
 | M6 | 模块系统 + 动态 `import()` + JSON/text 模块 | ✅ `hello_module.js` 与参考逐字节一致 |
 | M7 | 正则引擎 + Unicode 表 | 🟡 `RegExp` 可用，Unicode 属性表（`\p{…}`）已补（606/613）；缺 `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性 |
-| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 `Atomics`/`SharedArrayBuffer` |
-| M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | ⬜ |
+| M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
+| ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ **不做**（见下） |
+| **M9** | **`std`/`os` 宿主模块 + 事件循环 + CLI + REPL** | ⬜ **下一项** |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
-| M12–M14 | C ABI 层、Temporal、Intl | ⬜ |
+| M12 | C ABI 层 | ⬜ |
+| ~~M13~~ | ~~`Temporal`~~ | ❌ **不做**（见下） |
+| ~~M14~~ | ~~`Intl`~~ | ❌ **不做**（见下） |
+
+**三项明确不做，理由不是"难"，而是"做了也不是真的"。**
+
+- **`Atomics` / `SharedArrayBuffer`**：本引擎单线程，没有 Worker。`Atomics.wait` 无法真的
+  阻塞，`Atomics.notify` 没有等待者——实现出来的会是一个永不执行其语义的 API 外壳。这正是
+  本项目一直在修的那类问题（"接受即忽略，等于假的安全"）。487 条用例继续按 feature 跳过。
+- **`Temporal`**（4624 条）：独立于引擎核心的巨型 API，对"qjs 能不能跑真实程序"几乎无影响
+  ——真实程序极少用。它与 M9 争夺同一段时间，而 M9 决定这个引擎能不能被嵌入使用。
+- **`Intl`**：需要 CLDR 数据与 ICU 级别的区域设置支持，纯 Rust 零依赖的前提不成立。
+
+**顺序也改了。** 原先 M9 排在 M8 之后、M8 又以 `Atomics` 收尾，于是"能嵌入当脚本引擎用"
+（读文件、定时器、事件循环）一直被一件做不真的东西挡着。现在 M9 提前到 M8 收尾之后。
 
 ## 已交付的结构
 
@@ -55,7 +70,7 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**发布到 crates.io**（最近已发布版本 v0.5.0，v0.6.0 待发）：`quickjs-pure` 是门面
+**发布到 crates.io**（最近已发布版本 v0.6.0，v0.6.1 待发）：`quickjs-pure` 是门面
 crate（lib 名仍是 `quickjs`），`quickjs-gc`/`quickjs-parse`/`quickjs-regexp`/
 `quickjs-compile` 是其依赖。`quickjs-cli` 与
 `quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及

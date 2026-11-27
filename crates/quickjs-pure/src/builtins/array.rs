@@ -1174,7 +1174,19 @@ fn reverse(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<Va
 fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let array = receiver_copy(interp, &this)?;
     // See `reverse`: the trailing holes are part of the array.
-    let mut current = padded_elements(interp, &array)?;
+    let padded = padded_elements(interp, &array)?;
+    // Holes sort *after* every present element and are never passed to the comparator
+    // (SortCompare is only called for defined values). Sorting them in place turned them
+    // into `undefined`, so `new Array(2)` with `x[1] = 1` came back with `0 in x` false —
+    // the hole moved, which the spec forbids.
+    let holes = padded
+        .iter()
+        .filter(|value| matches!(value, Value::Hole))
+        .count();
+    let mut current: Vec<Value> = padded
+        .into_iter()
+        .filter(|value| !matches!(value, Value::Hole))
+        .collect();
     let comparator = args
         .first()
         .cloned()
@@ -1192,8 +1204,14 @@ fn sort(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value>
             current.sort_by_key(|value| SortKey(value.to_js_string()));
         }
     }
+    // Present values first, then the holes: writing a hole back at the tail leaves the
+    // storage truncated, which is how a trailing hole is represented.
+    let present = current.len();
     for (index, value) in current.into_iter().enumerate() {
         store_or_throw(interp, &array, index, value)?;
+    }
+    for index in present..present + holes {
+        store_or_throw(interp, &array, index, Value::Hole)?;
     }
     Ok(Value::Object(array))
 }
