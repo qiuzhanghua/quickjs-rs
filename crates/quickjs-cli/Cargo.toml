@@ -21,6 +21,7 @@ path = "src/main.rs"
 
 [dependencies]
 quickjs-pure.workspace = true
+quickjs-host = { path = "../quickjs-host" }
 
 [dev-dependencies]
 quickjs-conformance = { path = "../quickjs-conformance" }

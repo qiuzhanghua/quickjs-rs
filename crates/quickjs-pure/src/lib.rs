@@ -61,7 +61,7 @@ pub use quickjs_regexp as regexp;
 mod tzif;
 pub mod value;
 
-pub use interp::{Interp, Signal};
+pub use interp::{Interp, JsResult, Signal, Task, Turn};
 pub use object::{Callable, JsObject, ObjectKind, Property};
 pub use value::{Cell, JsString, Value};
 
@@ -401,6 +401,20 @@ impl<'rt> Context<'rt> {
     // re-derived at each call site. Each one below is a single well-defined operation.
     // -----------------------------------------------------------------------
 
+    /// A host function as a value, for putting on an object rather than the global.
+    ///
+    /// [`Context::set_global_function`] is this plus the install; a host *module* needs the
+    /// function first and the install second, on its own object.
+    pub fn new_host_function_value(
+        &mut self,
+        name: &str,
+        length: u32,
+        f: crate::object::HostFn,
+    ) -> Result<Value> {
+        let interp = self.interp();
+        Ok(Value::Object(interp.new_host_function(name, length, f)))
+    }
+
     /// Install `value` on the global object as `name`.
     ///
     /// A host module is one object with functions on it, so mounting `std` is a single
@@ -507,6 +521,54 @@ impl<'rt> Context<'rt> {
     /// to go out at the moment `print` runs.
     pub fn set_output_sink(&mut self, sink: Box<dyn std::io::Write>) {
         self.interp().output_sink = Some(sink);
+    }
+
+    /// Schedule `callback` to run after `delay_ms` milliseconds; returns the timer id.
+    pub fn schedule_timer(&mut self, callback: Value, delay_ms: f64) -> i32 {
+        self.interp().schedule_timer(callback, delay_ms)
+    }
+
+    /// Cancel a pending timer. `false` when the id is unknown or already fired.
+    pub fn cancel_timer(&mut self, id: i32) -> bool {
+        self.interp().cancel_timer(id)
+    }
+
+    /// Run one turn of the event loop, reporting what the caller should do next.
+    ///
+    /// [`crate::Turn::Wait`] carries the delay to block for; this method never blocks, so
+    /// an embedder decides what "wait" means (a thread sleep, a tokio timer, a test clock).
+    pub fn run_one_turn(&mut self) -> Result<crate::Turn> {
+        let interp = self.interp();
+        match interp.run_one_turn() {
+            Ok(turn) => Ok(turn),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
+    /// Whether any microtask or timer is still pending.
+    pub fn has_pending_work(&self) -> bool {
+        self.interp.as_ref().is_some_and(Interp::has_pending_work)
+    }
+
+    /// Rejections nobody handled, drained.
+    ///
+    /// [`Context::eval`] turns these into an error, but an event loop needs them *after*
+    /// every turn rather than at the end of one script: a promise may only become
+    /// unhandled later.
+    pub fn take_unhandled_rejections(&mut self) -> Vec<String> {
+        match self.interp.as_mut() {
+            Some(interp) => interp.take_unhandled_rejections(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Errors that timer callbacks threw, drained.
+    pub fn take_timer_errors(&mut self) -> Vec<String> {
+        match self.interp.as_mut() {
+            Some(interp) => interp.take_timer_errors(),
+            None => Vec::new(),
+        }
     }
 
     /// Take the buffered output, leaving the buffer empty.

@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a 已完成**（提交见 git log），M9b/c/d 待开工
+状态：**M9a/M9c 已完成**（提交见 git log），M9b/M9d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -436,3 +436,45 @@ API 和 `test_rw_handler.js`，**不挡住 REPL**——REPL 不需要在一堆 f
 plan 1.4 里 B 的代价写的是"要改 30+ 个测试、581 处断言"。实际不必：
 保留 `output: String` 作为 `output()` 的来源，**另加** sink 直写。
 两者并存，实时性和测试 API 都拿到，代价是 CLI 需要 `take_output()` 防无界增长。
+
+---
+
+## 9. M9c 已完成（事件循环 + timer）
+
+### 9.1 切分
+
+| 层 | 内容 |
+|---|---|
+| `quickjs-pure` | `Task::Timer`、`schedule_timer`、`cancel_timer`、`next_timeout`、`run_one_turn`、`Take_timer_errors` — 纯逻辑，不阻塞 |
+| `quickjs-host::eventloop` | `run_until_idle`、`run_once`，唯一的 `thread::sleep` 在这里 |
+| `quickjs-host::timers` | `os.setTimeout`/`os.clearTimeout` 的注册与参数marshal |
+
+`run_one_turn` 返回 `Turn::{Ran, Wait(Duration), Done}` 而不是 `bool`。原计划写的是
+「返回 false 表示循环该退出」，但一个裸 `bool` 会诱使调用方不睡就死循环空转，把 CPU
+烧到 timer 到期。三个具名分支让「等多久」成为类型的一部分。
+
+### 9.2 对拍发现四处偏差（都已改）
+
+计划里没写这些，是拿探针跑 `qjs --std` 才看到的：
+
+| 用例 | 参考实现 | 我最初的实现 |
+|---|---|---|
+| `typeof os.setInterval` | `"undefined"`——根本没有 | 我加了 `setInterval`，还带 repeat 语义 |
+| `os.setTimeout(42, 1)` | 立刻抛 `TypeError: not a function` | 排到触发时才报 |
+| `os.setTimeout(f, 0, "x", "y")` | 回调**收不到**参数（`undefined,undefined`） | 我做了透传 |
+| `os.setTimeout(f,1)` 的返回值 | `JS_NewInt32`，`JSON.stringify` 得 `1` | 返回 float |
+
+`setInterval` 这一条最值得记：浏览器心智会让人反射性地加上它，但参考实现里
+`grep -c setInterval quickjs-libc.c` 是 0。加了它等于给引擎一个参考实现产不出来的
+timer，差分测试根本没有东西可比。`Task` 里的 `repeat` 字段因此删掉。
+
+### 9.3 端到端
+
+`qjs --std` 跑同一个探针脚本，输出与参考**逐字节一致**（含顺序、微任务在 timer 之间
+排空、参数为 `undefined`）。`cargo test` 全绿，`check.sh` 全绿。
+
+### 9.4 还剩
+
+- `os.setTimeout` 的 id 复用与 `INT32_MAX` 回绕已实现，但没有测到回绕本身（需要
+  INT32_MAX 次调度，不值得为它跑一次测试）。
+- `sleepAsync`/`performance.now` 属 M9d。

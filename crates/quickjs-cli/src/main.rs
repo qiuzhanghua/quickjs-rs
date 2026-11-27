@@ -102,10 +102,33 @@ fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode
     // would grow without bound in a long-running script, so it is drained here.
     ctx.take_output();
     let _ = std::io::stdout().flush();
+    // A clean script may still have left timers pending. `js_std_loop` runs them after the
+    // script returns, which is what makes `setTimeout` mean anything at all.
+    let loop_result = match &result {
+        Ok(_) => quickjs_host::run_until_idle(ctx).map_err(|error| error.to_string()),
+        Err(_) => Ok(Vec::new()),
+    };
+    ctx.take_output();
+    let _ = std::io::stdout().flush();
     match result {
         // Upstream `qjs -e '1+1'` prints nothing: `-e` reports only what the script
         // itself printed. The completion value is still returned through the API.
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => match loop_result {
+            Ok(errors) if errors.is_empty() => ExitCode::SUCCESS,
+            Ok(errors) => {
+                // Errors a timer callback threw are reported and then the process still
+                // fails: the reference prints them through `js_std_dump_error` and returns
+                // a non-zero status.
+                for text in errors {
+                    let _ = writeln!(std::io::stderr(), "{text}");
+                }
+                ExitCode::from(1)
+            }
+            Err(text) => {
+                let _ = writeln!(std::io::stderr(), "{text}");
+                ExitCode::from(1)
+            }
+        },
         Err(error @ quickjs::Error::Syntax(_)) => {
             // Compile errors are reported before anything runs, with the constructor name
             // in front: the reference prints `SyntaxError: …`, and the conformance runner
@@ -280,9 +303,7 @@ fn main() -> ExitCode {
     // dangerous — an unbounded test run took the whole session down.
     //
     // So they fail loudly instead, the way an unimplemented feature is meant to.
-    if opts.load_std {
-        return pending("std/os host modules", "milestone M9");
-    }
+
     if opts.memory_limit.is_some() {
         return pending(
             "--memory-limit",
@@ -302,6 +323,19 @@ fn main() -> ExitCode {
 
     let mut ctx = quickjs::Context::new(&rt);
     ctx.set_module_loader(Box::new(modules::FileModuleLoader::new()));
+    // `--std` mounts `std`/`os` on the global object, which is what the reference's
+    // `js_std_add_helpers` + `--std` do. Only the timer half of `os` exists so far (M9c);
+    // the rest arrives with M9d. Scripts that use the missing parts fail where they touch
+    // them rather than silently getting `undefined`.
+    if opts.load_std {
+        let os = ctx.new_object();
+        if let Err(error) = quickjs_host::timers::install(&mut ctx, &os) {
+            return die(&format!("qjs: cannot install os: {error}"), 1);
+        }
+        if let Err(error) = ctx.set_global("os", os) {
+            return die(&format!("qjs: cannot mount os: {error}"), 1);
+        }
+    }
     // `print` writes straight to stdout, flushed per line, the way the reference does with
     // `fputs` + `fflush`. Without it a script's output would only appear once it finished,
     // which makes a timer callback's output indistinguishable from the script body's.

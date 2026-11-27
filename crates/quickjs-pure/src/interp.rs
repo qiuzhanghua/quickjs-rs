@@ -372,6 +372,71 @@ pub enum Job {
     },
 }
 
+/// One macro-task: work the event loop owes the script but has not run yet.
+///
+/// The microtask queue ([`Job`]) is different: those run before the host regains control.
+/// A timer is the opposite — it is explicitly "later", and only an event loop can honour
+/// that. Keeping it here rather than in the host is what lets `run_one_turn` be pure
+/// logic: the engine decides *what* is due, the host decides *how to wait*.
+///
+/// The callback is a [`Value`], so the [`Gc`] inside it keeps the function alive by
+/// reference counting even though nothing else references it — the same rule the `HostFn`
+/// documentation states from the other side (a host closure must not hold a `Gc`, so the
+/// `Gc` lives here instead).
+pub enum Task {
+    /// A `setTimeout` that is due at `due_at`.
+    ///
+    /// There is no `setInterval` variant because the reference has no `os.setInterval` at
+    /// all: `quickjs-libc.c` defines only `setTimeout` and `clearTimeout`, and
+    /// `typeof os.setInterval` is `"undefined"` under `qjs --std`. A repeat field here
+    /// would give this engine a timer the reference cannot produce, with nothing to
+    /// compare it against.
+    Timer {
+        /// The id `setTimeout` returned, for `clearTimeout`.
+        id: i32,
+        /// What to call when it fires.
+        callback: Value,
+        /// When it becomes runnable, as a monotonic instant.
+        due_at: std::time::Instant,
+    },
+}
+
+/// A delay in milliseconds as a `Duration`, clamped to something `Instant` accepts.
+///
+/// Negative and `NaN` both mean "as soon as possible": the reference runs the delay through
+/// `JS_ToInt64`, so `setTimeout(f, NaN)` fires immediately rather than being rejected.
+fn clamp_delay(delay_ms: f64) -> std::time::Duration {
+    // `is_nan()` spelled out rather than `!(x > 0.0)`: the latter is a negated comparison
+    // on a float, which reads as a typo even when it is deliberate. Both NaN and a
+    // non-positive delay mean "due now".
+    if delay_ms.is_nan() || delay_ms <= 0.0 {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs_f64(delay_ms / 1000.0)
+}
+
+impl js_gc::Trace for Task {
+    fn trace(&self, tracer: &mut js_gc::Tracer) {
+        let Task::Timer { callback, .. } = self;
+        callback.trace(tracer);
+    }
+}
+
+/// What one turn of the event loop did, so the caller cannot spin by accident.
+///
+/// A bare `bool` invites the mistake of looping on it without sleeping, which burns a
+/// core until the timer is due. Naming the three cases makes the wait explicit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Turn {
+    /// Something ran. Call again immediately — there may be more ready work.
+    Ran,
+    /// Nothing is runnable yet, but something is pending. Block at most this long, then
+    /// call again.
+    Wait(std::time::Duration),
+    /// Nothing is pending at all: the loop is done.
+    Done,
+}
+
 impl js_gc::Trace for Job {
     fn trace(&self, tracer: &mut js_gc::Tracer) {
         match self {
@@ -670,6 +735,22 @@ pub struct Interp<'a> {
     /// than never. Reactions append to it while it drains, so the loop is a `while` and
     /// not a `for`.
     pub(crate) jobs: std::collections::VecDeque<Job>,
+    /// Macrotasks: the timers an event loop has to wait for. See [`Task`].
+    ///
+    /// A `Vec` rather than a heap because the queue is short (a script rarely has more than
+    /// a handful) and `run_one_turn` has to scan it anyway to find the earliest deadline.
+    pub(crate) tasks: Vec<Task>,
+    /// The next timer id.
+    ///
+    /// Starts at 1 and wraps back to 1 at `INT32_MAX`, matching `js_os_setTimeout`, because
+    /// the id reaches the script as an `Int32` and `clearTimeout(0)` must never match.
+    next_timer_id: i32,
+    /// Errors thrown by timer callbacks, already rendered.
+    ///
+    /// Kept apart from `unhandled`: that list is rejected promises, and a timer callback
+    /// that throws has no promise behind it. Both are reported by the host at the end of
+    /// the loop, but only one is fixed up by a later `.catch`.
+    timer_errors: Vec<String>,
     /// The module registry, keyed by canonical name.
     pub modules: std::collections::BTreeMap<String, Gc<crate::module::ModuleRecord>>,
     /// How the host turns a specifier into bytes.
@@ -762,6 +843,9 @@ impl<'a> Interp<'a> {
             output_sink: None,
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
+            tasks: Vec::new(),
+            next_timer_id: 1,
+            timer_errors: Vec::new(),
             modules: std::collections::BTreeMap::new(),
             module_loader: None,
             main_module_name: None,
@@ -1134,6 +1218,115 @@ impl<'a> Interp<'a> {
     ///
     /// Jobs queued while draining run in the same drain, FIFO, which is what makes
     /// `Promise.resolve().then(f).then(g)` call `f` before `g`.
+    /// Schedule `callback` to run after `delay_ms` milliseconds, returning its id.
+    ///
+    /// A negative or `NaN` delay runs as soon as possible rather than being rejected: the
+    /// reference passes the delay through `JS_ToInt64`, so `setTimeout(f, NaN)` schedules
+    /// immediately, and `setTimeout(f, -1)` is ordinary code.
+    ///
+    /// The callback is called with **no arguments**. The reference stores only the function
+    /// (`th->func = JS_DupValue(ctx, func)`) and calls it bare, so the `setTimeout(f, 0, a,
+    /// b)` passthrough that browsers offer does not exist here — verified against `qjs`:
+    /// extra arguments arrive as `undefined`.
+    pub fn schedule_timer(&mut self, callback: Value, delay_ms: f64) -> i32 {
+        let id = self.next_timer_id;
+        // Wrap rather than grow: the id reaches the script as an `Int32`.
+        self.next_timer_id = if self.next_timer_id == i32::MAX {
+            1
+        } else {
+            self.next_timer_id + 1
+        };
+        let due_at = std::time::Instant::now() + clamp_delay(delay_ms);
+        self.tasks.push(Task::Timer {
+            id,
+            callback,
+            due_at,
+        });
+        id
+    }
+
+    /// Cancel a pending timer. `false` when the id is unknown or already fired, which is
+    /// not an error — `clearTimeout` on a stale id is a no-op in the reference too.
+    pub fn cancel_timer(&mut self, id: i32) -> bool {
+        let before = self.tasks.len();
+        self.tasks.retain(|task| match task {
+            Task::Timer { id: task_id, .. } => *task_id != id,
+        });
+        self.tasks.len() != before
+    }
+
+    /// How long until the earliest pending timer, or `None` when none is pending.
+    pub fn next_timeout(&self) -> Option<std::time::Duration> {
+        let now = std::time::Instant::now();
+        self.tasks
+            .iter()
+            .map(|task| match task {
+                Task::Timer { due_at, .. } => due_at.saturating_duration_since(now),
+            })
+            .min()
+    }
+
+    /// Run one turn of the event loop.
+    ///
+    /// Structurally this is `js_std_loop`'s body minus the blocking: drain microtasks, then
+    /// run at most one due timer, then drain again. The blocking belongs to the caller
+    /// because `quickjs-pure` has no dependencies and no platform knowledge — [`Turn::Wait`]
+    /// is how it asks.
+    ///
+    /// One timer per turn rather than all of them: a timer callback may schedule another
+    /// timer, and running the whole batch would let a self-rescheduling `setTimeout(f, 0)`
+    /// starve the microtask queue.
+    pub fn run_one_turn(&mut self) -> JsResult<Turn> {
+        self.drain_jobs()?;
+        let now = std::time::Instant::now();
+        // Earliest due first: timers are not ordered by insertion, and `setTimeout(f, 100)`
+        // followed by `setTimeout(g, 1)` must run `g` first.
+        let due = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| match task {
+                Task::Timer { due_at, .. } => *due_at <= now,
+            })
+            .min_by_key(|(_, task)| match task {
+                Task::Timer { due_at, .. } => *due_at,
+            })
+            .map(|(index, _)| index);
+        let Some(index) = due else {
+            return Ok(match self.next_timeout() {
+                Some(wait) => Turn::Wait(wait),
+                None => Turn::Done,
+            });
+        };
+        let Task::Timer { callback, .. } = self.tasks.remove(index);
+        let this = Value::Undefined;
+        // A throwing timer callback must not stop the loop: the reference reports it and
+        // keeps going, because the alternative is that one bad timer silently stops every
+        // later one.
+        // No arguments: see `schedule_timer` — the reference calls the callback bare.
+        match self.call_value(callback, this, Vec::new()) {
+            Ok(_) => {}
+            Err(Signal::Throw(value)) => {
+                let text = self.describe_exception(&value);
+                self.timer_errors.push(text);
+            }
+            Err(Signal::OutOfMemory) => return Err(Signal::OutOfMemory),
+        }
+        self.drain_jobs()?;
+        Ok(Turn::Ran)
+    }
+
+    /// Take the errors timer callbacks threw, leaving the list empty.
+    pub fn take_timer_errors(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.timer_errors)
+    }
+
+    /// Whether anything is still pending: a microtask or a timer.
+    pub fn has_pending_work(&self) -> bool {
+        !self.jobs.is_empty() || !self.tasks.is_empty()
+    }
+
+    /// Run every queued microtask, including ones queued while draining.
     pub fn drain_jobs(&mut self) -> JsResult<()> {
         // A self-perpetuating chain (`function f(){ Promise.resolve().then(f) } f()`)
         // would spin forever, so the drain is bounded the way the call stack is.
