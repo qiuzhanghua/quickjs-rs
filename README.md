@@ -34,7 +34,7 @@
 | M5 | ES6+ 运行期（class/generator/async/迭代/解构/模板/Proxy） | ✅ 残留：私有类字段 `#x` 编译器报错 |
 | M6 | 模块系统 + 动态 `import()` + JSON/text 模块 | ✅ `hello_module.js` 与参考逐字节一致 |
 | M7 | 正则引擎 + Unicode 表 | 🟡 `RegExp` 可用，Unicode 属性表（`\p{…}`）已补（606/613）；缺 `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性 |
-| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | ⬜ BigInt/TypedArray/DataView 可用；`Atomics`/`SharedArrayBuffer`/`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 未开始 |
+| M8 | BigInt / TypedArray / ArrayBuffer / Atomics / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 `Atomics`/`SharedArrayBuffer` |
 | M9 | `std`/`os`/Worker/事件循环 + CLI + REPL | ⬜ |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
@@ -76,7 +76,6 @@ quickjs = { package = "quickjs-pure", version = "0.5" }
 |---|---|
 | `std`/`os` 宿主模块、事件循环、Worker（M9） | `--std` 报 `not implemented yet`；`setTimeout` 未定义 |
 | `--memory-limit` / `--stack-size` | 报 `not implemented yet`（此前接受即忽略，等于假的安全） |
-| `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`（M8） | 均为 `undefined`，test262 里 300+ 条据此失败 |
 | `Atomics`/`SharedArrayBuffer`（M8） | `undefined`；相关用例按 feature 跳过 |
 | `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性（M7） | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{Basic_Emoji}` 报 `invalid Unicode property`（`\p{ASCII_Hex_Digit}` 等单码点属性已可用） |
 | resizable `ArrayBuffer`（`rab.resize`） | `undefined`，test262 里 76 条据此失败 |

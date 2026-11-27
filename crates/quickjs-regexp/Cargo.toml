@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# Relative to this crate's directory; inheriting the workspace "README.md" would resolve
+# to ../../README.md, which is outside the package and makes cargo warn.
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
 description = "Regular expression engine for quickjs-rs (parse, match, Unicode properties)"
 
 # No dependencies at all, and deliberately so: this crate sits *below* `quickjs-compile`, which

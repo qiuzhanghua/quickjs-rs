@@ -2,27 +2,60 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
-## v0.5.0 — 2026-11-27
+## v0.5.1 — 未发布
 
-**可用性边界抬了一格**：`qjs` 能跑的语言和标准库比 v0.4.0 明显更宽。这不是"又一批
-文档修正"——标准库补了五个整块，test262 可运行用例通过率 **42.7% → 72.3%**。
+**这一版没有抬可用性边界之外的新结构**，但修了两个会计入"错答案"的东西：正则字面量的
+合法性此前在运行期才检查（`print(1); /\p{Nope}/u;` 会先打印 `1`），以及 `WeakMap`
+家族的 GC 在丢弃对象时存在 use-after-free。版本号走 patch 是因为 API 只有新增。
 
-| 能力 | v0.4.0 | v0.5.0 |
+| 能力 | v0.5.0 | v0.5.1 |
 |---|---|---|
-| `DataView` | 不存在 | 423/520 用例 |
-| TypedArray 的数组方法 | 7/29，无 `Symbol.iterator` | 29 个里 28 个，迭代可用 |
-| `Iterator` 全局与 helpers | `Iterator` 未定义 | 全局 + 全部 helper（`map`/`filter`/`take`/`zip`…） |
-| `Array.fromAsync` | 不存在 | 95/95 |
-| `BigInt64Array`/`BigUint64Array` | 不存在 | 全套 + species + `%TypedArray%` |
-| test262 可运行通过率 | 42.7%（7536/17665） | **72.3%（13371/18487）** |
+| `\p{…}` Unicode 属性转义 | 只有 `Lower`/`Upper`，其余报错 | 全部单码点属性，606/613 |
+| 正则字面量的 early error | 运行期才报 | 编译期，且带 `SyntaxError:` |
+| `WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` | 不存在 | 全套，297/298 |
+| 孤立代理项参与匹配 | 不可能（`char` 装不下） | `u32` 码点，`\p{Cs}` 可匹配 |
+| test262 可运行通过率 | 72.3%（13371/18487） | **80.7%（14910/18487）** |
 
-**v0.4.0 的边界描述当时就不准。** 已发布的 `v0.4.0` 标签指向 `4a30079`（11-22），
-而 TypeArray、`DataView`、`Iterator`、`Object` 的缺件这些提交全在它**之后**；标签里那份
-README 说"TypedArray 只有 7/29"，可那时的代码已经比这多。把一个能力写少不算错答案，
-但它让"v0.4.0 能做什么"变成一个没人能核对的说法——这版把缺口表逐条对着实测重写了一遍。
+新增 crate `quickjs-regexp`（零依赖）。正则引擎原本在 `quickjs-pure` 内部，但字面量要在
+**解析期**校验，而 `quickjs-compile` 在 `quickjs-pure` 之下——两边都需要它，只能下沉。
 
-重复一遍尺子：**数量不是目的**。下面每一条都先有最小复现、再修，修完用逐用例差分
-比对，回归 0 例才算过。六轮合计 +3398 例。
+两处文档与事实不符一并改了：README 的 M7 写着"缺 Unicode 属性表"（已补），M8 写着
+`WeakMap` 家族"均为 `undefined`"（已实现）；`scripts/publish.sh` 的发布顺序漏了新 crate，
+预检容忍"依赖尚未发布"所以照样变绿，而真实上架会在 `quickjs-compile` 处失败。
+
+### 加：`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry`（+324 例）
+
+引擎按引用计数释放，最后一个强句柄消失的瞬间就回收，所以 `WeakGc`（本来就有）已经具备
+"不持有强引用、不参与环检测"两件事。于是 `WeakMap` 的条目**恰好在键死亡时消失**，不需要
+第二遍清扫阶段，也不需要追踪式收集器。终结回调在 `drain_jobs` 的任务边界排空，而不是在
+`Drop` 里跑脚本（那是最坏的重入场景）。
+
+四处语义被用例纠正：构造器须 `Get(instance,"set")` 再逐条 `Call`；`unregisterToken` 可以
+是 target 而 held value 不行；`getOrInsertComputed` 回调后**无条件**覆盖；
+`CanBeHeldWeakly` 拒绝注册 Symbol。
+
+**顺手修掉一个 use-after-free**：`quickjs-gc` 的 `release()` 先调 `drop_fn` 再读 header，
+而丢弃值的过程可能放掉指向本盒的最后一个 `WeakGc` —— `WeakMap` 的弱边正是这个形状 ——
+于是 header 被释放、后续读取越界。
+
+### 加：`Set` 的七个集合方法、四个 URI 全局、`AggregateError`（+567 例）
+
+`union`/`intersection`/`difference`/`symmetricDifference`/`isSubsetOf`/`isSupersetOf`/
+`isDisjointFrom`，以及 `encodeURI`/`encodeURIComponent`/`decodeURI`/`decodeURIComponent`
+与 `AggregateError`。
+
+### 修：`String.prototype` 把 `ToString` 写成了 brand check（+358 例）
+
+`String.prototype.slice.call(1)` 这类调用此前抛 `TypeError`，而规范要求先 `ToString` 再
+操作。例外是 `toString`/`valueOf`，它们确实要求 `this` 是字符串。
+
+### 修：`ToBigInt` 被写成了 `BigInt(value)`（+219 例）
+
+TypedArray 写入 BigInt 元素时只接受 `Value::BigInt`，其余一律 `TypeError`。规范要求走
+`ToBigInt`：String → `StringToBigInt`（空串为 `0n`、单独符号是 `SyntaxError`、
+`0x`/`0o`/`0b` 前缀有效）、Boolean → `0n`/`1n`、Object → `ToPrimitive` 再递归、
+Number → `TypeError`。障碍是写入函数不接收解释器，而 `ToPrimitive` 需要它，所以换了
+转换的入口位置。
 
 ### 加：Unicode 属性转义 `\p{…}`，顺带修好字面量的编译时机（+648 例）
 
@@ -54,6 +87,28 @@ General_Category 值、175 个 Script、175 个 Script_Extensions、53 个二进
 
 结果 0/613 → **606/613**；剩下 7 条是 `v` 模式的 emoji **字符串**属性，它们表示码点
 序列而非单码点集合，需要另一套表示与匹配路径，已在生成器里显式排除而不是假装支持。
+
+## v0.5.0 — 2026-11-27
+
+**可用性边界抬了一格**：`qjs` 能跑的语言和标准库比 v0.4.0 明显更宽。这不是"又一批
+文档修正"——标准库补了五个整块，test262 可运行用例通过率 **42.7% → 72.3%**。
+
+| 能力 | v0.4.0 | v0.5.0 |
+|---|---|---|
+| `DataView` | 不存在 | 423/520 用例 |
+| TypedArray 的数组方法 | 7/29，无 `Symbol.iterator` | 29 个里 28 个，迭代可用 |
+| `Iterator` 全局与 helpers | `Iterator` 未定义 | 全局 + 全部 helper（`map`/`filter`/`take`/`zip`…） |
+| `Array.fromAsync` | 不存在 | 95/95 |
+| `BigInt64Array`/`BigUint64Array` | 不存在 | 全套 + species + `%TypedArray%` |
+| test262 可运行通过率 | 42.7%（7536/17665） | **72.3%（13371/18487）** |
+
+**v0.4.0 的边界描述当时就不准。** 已发布的 `v0.4.0` 标签指向 `4a30079`（11-22），
+而 TypeArray、`DataView`、`Iterator`、`Object` 的缺件这些提交全在它**之后**；标签里那份
+README 说"TypedArray 只有 7/29"，可那时的代码已经比这多。把一个能力写少不算错答案，
+但它让"v0.4.0 能做什么"变成一个没人能核对的说法——这版把缺口表逐条对着实测重写了一遍。
+
+重复一遍尺子：**数量不是目的**。下面每一条都先有最小复现、再修，修完用逐用例差分
+比对，回归 0 例才算过。六轮合计 +3398 例。
 
 ### 加：`Iterator` 全局与全部 helper（+523 例）
 

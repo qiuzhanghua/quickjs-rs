@@ -24,7 +24,12 @@ cd "$(dirname "$0")/.."
 # Dependency order. `quickjs-cli` and `quickjs-conformance` are `publish = false`:
 # the CLI would fight the C `qjs` for the same command name, and the conformance
 # harness is a dev-dependency that is stripped from every published manifest.
-ORDER=(quickjs-gc quickjs-parse quickjs-compile quickjs-pure)
+# `quickjs-regexp` comes before `quickjs-compile` and `quickjs-pure`: both depend on it,
+# and `cargo publish` builds each crate from its tarball, so a dependency must already be
+# on the registry. Leaving it out of this list is not a cosmetic omission — the preflight
+# still passes (it tolerates "not published yet") while the upload fails on
+# `quickjs-compile`.
+ORDER=(quickjs-gc quickjs-parse quickjs-regexp quickjs-compile quickjs-pure)
 
 # Whether a cargo failure is the "my dependency is not on the registry yet" case,
 # which is *expected* on a first release of a version and must not be reported as a
