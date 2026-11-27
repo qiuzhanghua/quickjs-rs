@@ -20,6 +20,9 @@ cargo test --offline
 # NFR-7: the engine has no third-party crates, the host layer has only the agreed ones.
 # A requirement nobody checks is a requirement nobody has, and this one decides whether the
 # interpreter can be embedded without dragging an async runtime along.
+echo "== scripts/check-unsafe.sh (NFR-6)"
+./scripts/check-unsafe.sh
+
 echo "== scripts/check-no-engine-deps.sh (NFR-7)"
 ./scripts/check-no-engine-deps.sh
 

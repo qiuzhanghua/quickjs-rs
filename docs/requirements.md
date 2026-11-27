@@ -168,13 +168,37 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 | NFR-3 | 内存：空 Runtime < 1 MB；`--memory-limit` 精确生效（超限抛 `InternalError: out of memory`） | 内存测试 + `-d` 统计对比 |
 | NFR-4 | 确定性释放：`Rc` 语义，作用域结束即释放；循环引用由周期性 collector 回收（对齐上游 RD/GC 行为） | 析构计数器测试（finalizer 触发时机） |
 | NFR-5 | 无 panic 逃逸：宿主回调 panic 转为 `InternalError`；`catch_unwind` 边界；`--stack-size` 防爆栈 | fuzz + 深递归测试 |
-| NFR-6 | 安全：`unsafe` 只允许在 `gc`/`atomics`/`typed_array`/`c-api` 模块，逐处 `// SAFETY:` | `#![warn(unsafe_op_in_unsafe_fn)]` + review checklist |
+| NFR-6 | 安全：`unsafe` 只允许在 `gc`/`atomics`/`typed_array`/`c-api`/`value` 五个引擎模块，另加**唯一一处宿主例外** `quickjs-host/src/env.rs`（见下），逐处 `// SAFETY:` | `#![warn(unsafe_op_in_unsafe_fn)]` + `scripts/check-unsafe.sh` 逐文件断言 `unsafe` 只出现在白名单里（进 `scripts/check.sh`） |
 | NFR-7 | 依赖最小化：**引擎 crate 零第三方依赖**（`quickjs-pure`/`parse`/`compile`/`regexp`/`gc` 及其传递闭包，`libc` 也避免）；**宿主层**（`quickjs-host`/`quickjs-cli`）允许 `tokio`（Unix 的 fd 就绪）+ `libc`（`fcntl` 设 non-blocking）+ `windows-sys`（Windows 的 `WaitForMultipleObjects`），仅用于事件循环与 fd 就绪；dev-deps 不限 | `cargo tree -p quickjs-pure` 审计为空（`scripts/check.sh` 断言）+ `scripts/check.sh` 校验宿主层的依赖白名单 |
 | NFR-8 | 平台：macOS(arm64/x64)、Linux(x64/arm64)、Windows(msvc)；WASM 列为可选 | CI 矩阵 |
 | NFR-9 | 可调试：`--dump`、字节码反汇编、`trace` 分配跟踪、错误栈含行列与函数名 | 手工验收 |
 | NFR-10 | 可测试：差分 oracle 框架（跑 C 版 `qjs` vs Rust `qjs`）+ test262 harness + fuzz 目标 | `cargo test` 一键运行；test262 见 `docs/test262-status.md`（`scripts/test262.sh`，因需外部 checkout 与一分钟墙钟，不进 `check.sh`） |
 | NFR-11 | 可嵌入：`no_std` 不支持（明确），但 `std` 访问集中在 `sys` 层，便于后续移植 | 架构评审 |
 | NFR-12 | MSRV：edition 2024（rustc ≥ 1.85） | CI |
+
+**NFR-6 的唯一宿主例外：`quickjs-host/src/env.rs`**
+
+`std.setenv`/`std.unsetenv` 在参考实现里就是 `setenv(3)`/`unsetenv(3)`，Rust 对应
+`std::env::set_var`/`remove_var`，edition 2024 把它们标成 `unsafe`——理由是真实的：
+改环境不安全是因为 `getenv` 可能返回指向 `setenv` 即将重新分配的存储的指针。
+
+为什么没有安全替代：
+
+- `rustix` **故意不包**环境变量（那是 `std` 已经拥有的进程状态），实测其源码里没有任何
+  `setenv`/`unsetenv`。
+- `dotenv`/`dotenvy` 不解决问题：`dotenvy 0.15.7` 的 `src/iter.rs` 内部就是 `env::set_var`，
+  是在它**之上**包一层，且额外承担「解析 `.env` 文件」的职责——而 `std.setenv` 拿到的
+  已经是分开的两个字符串，没有文件可解析。
+- 宿主侧 overlay map 能避开 `unsafe`，但会让子进程看不到改动（`popen`/`os.exec` 直接用
+  裸 `sh -c`），必须把 overlay 合并进每条 spawn 路径，四处不变量替代一次 `unsafe`。
+
+为什么此处是健全的：解释器全程单线程，`quickjs-host` 声明了 `tokio` 但不启动 runtime、
+不起工作线程，因此不存在与 `getenv` 的并发。若将来引入工作线程，`env.rs` 是必须重新论证
+的地方——把例外收敛到一个模块正是为了让这件事可审计。
+
+另有一处必须自己挡：`set_var`/`remove_var` 对空名、含 `=`、含 NUL 的名字是 **panic** 而非
+返回错误，脚本能造出这三种。`setenv(3)` 对这些返回 `EINVAL` 且参考实现忽略返回值，所以
+`env.rs` 在调用前拒绝，语义仍是「静默无效」。
 
 ---
 

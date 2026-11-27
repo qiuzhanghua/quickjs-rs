@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a/M9b(除 setenv 外)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
+状态：**M9a/M9b 已完成/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -631,3 +631,36 @@ Map(1) { 1 => 2 } / Set(2) { 1, 2 } / Uint8Array(3) [ 1, 2, 255 ]
 **一处刻意的取舍**：`Error` 的栈来自 `stack` 属性，因此我们的栈里函数名/行号与参考不同
 （两个引擎的位置信息本来就不同）。参考自己的 `test_print_value` 里那条断言也只能靠
 `remove_line_nums` 才成立，所以这里不比栈内容。
+
+### 10.8 `setenv`/`unsetenv`：NFR-6 的唯一宿主例外
+
+15 条对拍全对。走的是「加 `unsafe` + `SAFETY`」而不是「不做」，理由是 `os.exec` 的 `env`
+选项下一步同样绕不过去。
+
+**为什么没有安全替代**（三条都实测过，不是推测）：
+
+| 方案 | 结论 |
+|---|---|
+| `rustix` | 故意不包环境变量，grep 其源码零命中 `setenv`/`unsetenv` |
+| `dotenv`/`dotenvy` | `dotenvy 0.15.7` 的 `src/iter.rs:35,52` 内部就是 `env::set_var`——是它**之上**的一层，且额外承担 `.env` 文件解析，而 `std.setenv` 拿到的是分开的两个字符串，没有文件可解析 |
+| 宿主侧 overlay map | 安全，但子进程看不到。实测参考 `std.setenv("FOO","bar")` 之后 `std.popen("sh -c 'echo $FOO'")` 输出 `bar`；overlay 得合并进 `popen`/`os.exec`/`os.exec` 的 `env` 三处，四处不变量替代一次 `unsafe` |
+
+**为什么此处健全**：解释器全程单线程；`quickjs-host` 声明了 `tokio` 但不启动 runtime、不起
+工作线程。`unsafe` 收敛在 `quickjs-host/src/env.rs` 一个模块两个调用，为的就是这个论证有
+唯一审阅点。
+
+**顺带挡掉一个真 bug**：`set_var`/`remove_var` 对空名、含 `=`、含 NUL 的名字是 **panic**
+而非返回错误，脚本能造出这三种。`setenv(3)` 对这些返回 `EINVAL` 且参考忽略返回值，所以
+`env.rs` 在调用前拒绝，语义仍是「静默无效」。
+
+### 10.9 `scripts/check-unsafe.sh`：把 NFR-6 从句子变成门禁
+
+NFR-6 原来只是一句散文，于是它和代码早就对不上了。新脚本逐文件扫描 `crates/*`，`unsafe`
+只许出现在白名单里。第一次跑就抓出两处：
+
+- `quickjs-pure/src/builtins/math.rs` 的 `static mut STATE`（`Math.random` 的 xorshift）
+  ——**改成 `AtomicU64`**，零成本消掉 `unsafe`，`Relaxed` 在单线程下不花钱。
+- `quickjs-pure/src/value.rs` 的 `from_utf8_unchecked`——**加入白名单**。它是字符串表示层，
+  `valid` 只由编码器设置，每次访问改成 `from_utf8` 会在每个属性读取的热路径上加一次扫描。
+
+所以 NFR-6 现在写的是五个引擎模块（加了 `value`）加一处宿主例外，且这句话可执行。

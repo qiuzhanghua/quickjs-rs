@@ -22,6 +22,7 @@
 //!
 //! So the target is parity with upstream, not parity-plus.
 
+pub mod env;
 pub mod eventloop;
 pub mod fds;
 pub mod fdtable;

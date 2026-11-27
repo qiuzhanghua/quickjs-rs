@@ -428,22 +428,24 @@ fn next_after_toward_zero(value: f64) -> f64 {
 /// algorithm nor its sequence — no test can compare random numbers, so the only
 /// requirement is that successive calls differ.
 fn random(interp: &mut Interp<'_>, _this: Value, _args: &[Value]) -> JsResult<Value> {
-    static mut STATE: u64 = 0;
-    // SAFETY: the interpreter is single-threaded by construction (`Gc` is `!Send`),
-    // and this is only a generator seed.
-    let state = unsafe {
-        if STATE == 0 {
-            STATE = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos() as u64)
-                .unwrap_or(0x2545_F491_4F6C_DD1D)
-                | 1;
-        }
-        STATE ^= STATE << 13;
-        STATE ^= STATE >> 7;
-        STATE ^= STATE << 17;
-        STATE
-    };
+    // An `AtomicU64` rather than a `static mut`: the interpreter is single-threaded, so
+    // `Relaxed` costs nothing here, and it keeps this out of the `unsafe` the engine
+    // confines to its low-level modules.
+    static STATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering;
+    let mut state = STATE.load(Ordering::Relaxed);
+    if state == 0 {
+        state = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0x2545_F491_4F6C_DD1D)
+            | 1;
+    }
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    STATE.store(state, Ordering::Relaxed);
+    let state = state;
     let _ = interp;
     Ok(Value::Float((state >> 11) as f64 / (1u64 << 53) as f64))
 }

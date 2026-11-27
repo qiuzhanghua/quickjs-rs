@@ -90,7 +90,7 @@ pub fn install(
         ctx.set_property(object, name, function)?;
     }
 
-    let plain_functions: [(&str, u32, Body); 10] = [
+    let plain_functions: [(&str, u32, Body); 12] = [
         ("loadFile", 1, Box::new(js_load_file)),
         ("loadScript", 1, Box::new(js_load_script)),
         ("evalScript", 1, Box::new(js_eval_script)),
@@ -99,6 +99,8 @@ pub fn install(
         ("getenviron", 0, Box::new(js_getenviron)),
         ("exit", 1, Box::new(js_exit)),
         ("gc", 0, Box::new(js_gc)),
+        ("setenv", 2, Box::new(js_setenv)),
+        ("unsetenv", 1, Box::new(js_unsetenv)),
         ("__sprintObject", 1, Box::new(js_sprint_object)),
         ("__printObject", 1, Box::new(js_print_object)),
     ];
@@ -458,7 +460,10 @@ fn js_getenv(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
 
 /// `std.getenviron()` — every variable as one plain object.
 fn js_getenviron(interp: &mut Interp<'_>, _this: Value, _args: &[Value]) -> JsResult<Value> {
-    let object = interp.new_object(None);
+    // A plain object with `Object.prototype`, as `JS_NewObject` makes: `std.getenviron()
+    // .hasOwnProperty(...)` is a thing scripts do.
+    let proto = interp.realm.object_proto.clone();
+    let object = interp.new_object(Some(proto));
     for (name, value) in std::env::vars() {
         object.define_data(&name, interp.string(value));
     }
@@ -517,5 +522,23 @@ fn js_print_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsR
     let mut text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
     text.push('\n');
     stdio::emit(interp, text.as_bytes());
+    Ok(Value::Undefined)
+}
+
+/// `std.setenv(name, value)` — set an environment variable.
+///
+/// Returns `undefined` whatever happens, because the reference ignores `setenv`'s return
+/// value. The `unsafe` behind it lives in [`crate::env`], with its argument.
+fn js_setenv(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let name = interp.to_js_string(args.first().unwrap_or(&Value::Undefined))?;
+    let value = interp.to_js_string(args.get(1).unwrap_or(&Value::Undefined))?;
+    crate::env::set(&name, &value);
+    Ok(Value::Undefined)
+}
+
+/// `std.unsetenv(name)` — remove an environment variable.
+fn js_unsetenv(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let name = interp.to_js_string(args.first().unwrap_or(&Value::Undefined))?;
+    crate::env::unset(&name);
     Ok(Value::Undefined)
 }
