@@ -274,6 +274,13 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 ### 发布策略
 
 **结论：v0.2.0、v0.3.0、v0.4.0、v0.5.0 均已发布**（决策 5，经 M3/M4 两次修订，M5 完成后按同一策略再发一版）。
+
+v0.5.0（2026-11-27）是第一个"标准库算补齐一截"的版本：`DataView`、TypedArray 的数组方法
+与 `Symbol.iterator`、`Iterator` helpers、`Array.fromAsync`、`BigInt64Array` 一族。
+它比 v0.4.0 多走 18 个提交 —— v0.4.0 的标签指向 `4a30079`，而上面这些能力全在其后，
+所以 v0.4.0 那份 README 对 TypedArray 的描述当时就不准。发布后按惯例用独立项目
+`quickjs = { package = "quickjs-pure", version = "0.5" }` 验证：`toSorted`、`Iterator.from(...)`
+`.map(...).toArray()`、`DataView.setInt32/getInt32`、`Array.fromAsync` 全部跑通。
 v0.3.0 的边界是 M5 完成：语言特性齐了，但模块系统（M6）与 `std`/`os`（M9）仍缺，
 因此**尚不能跑真实脚本**——README 与 CHANGELOG 都把这条写在显眼处，而不是只说"已完成 M5"。
 
