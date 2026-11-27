@@ -4,6 +4,7 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
+- 🧭 下一项 M9 的拆解：[`docs/m9-plan.md`](docs/m9-plan.md)（`std`/`os` + 事件循环 + CLI/REPL，含三个待拍板的决定）
 - 📌 当前版本：**v0.6.1** —— 标准库补到位，test262 可运行用例通过率 42.7% → 83.6%：
   class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
   循环导入、`import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、
@@ -36,7 +37,7 @@
 | M7 | 正则引擎 + Unicode 表 | 🟡 `RegExp` 可用，Unicode 属性表（`\p{…}`）已补（606/613）；缺 `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性 |
 | M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
 | ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ **不做**（见下） |
-| **M9** | **`std`/`os` 宿主模块 + 事件循环 + CLI + REPL** | ⬜ **下一项** |
+| **M9** | **`std`/`os` 宿主模块 + 事件循环 + CLI + REPL** | ⬜ **下一项**（拆解见 [`docs/m9-plan.md`](docs/m9-plan.md)） |
 | M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
 | M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
 | M12 | C ABI 层 | ⬜ |
