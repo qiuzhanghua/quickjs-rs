@@ -30,6 +30,27 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `rustix` is the safe layer under the rest of the `os` module: `isatty`/`tcgetattr`/
+# `tcsetattr` for the terminal functions, `stat`/`lstat`/`utimensat` for `os.stat` and
+# `os.utimes`, the link and directory calls, and the `OFlags`/`Mode`/`Signal` bitflags that
+# `os` projects onto scripts as individual constants (`O_RDWR`, `S_IFDIR`, `SIGTERM`, …).
+#
+# The point is NFR-6: `unsafe` is confined to `gc`/`atomics`/`typed_array`/`c-api`, and a
+# host layer calling `libc` directly would break that on every one of those ~20 functions.
+# `rustix` is the same syscalls behind safe wrappers, and it costs three crates:
+# `bitflags`, `errno`, `libc`.
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+    "termios",
+    "time",
+    "mm",
+    "event",
+    "pipe",
+    "stdio",
+] }
+
 # Windows has no `poll(2)`, and tokio does not fill the gap: `tokio::io::unix::AsyncFd` is
 # `cfg(unix)` only, and `tokio::net::windows::named_pipe` covers only *named* pipes, while
 # `os.pipe()` makes anonymous ones. The reference implementation answers this the same way

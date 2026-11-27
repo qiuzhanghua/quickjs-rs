@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a/M9c 已完成**（提交见 git log），M9b/M9d 待开工
+状态：**M9a/M9b(部分)/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -478,3 +478,77 @@ timer，差分测试根本没有东西可比。`Task` 里的 `repeat` 字段因�
 - `os.setTimeout` 的 id 复用与 `INT32_MAX` 回绕已实现，但没有测到回绕本身（需要
   INT32_MAX 次调度，不值得为它跑一次测试）。
 - `sleepAsync`/`performance.now` 属 M9d。
+
+---
+
+## 10. M9b 进展（std/os 的纯 Rust 部分）
+
+### 10.1 已完成
+
+| 项 | 位置 | 验收 |
+|---|---|---|
+| `printf`/`sprintf` 全套格式 | `quickjs-host/src/printf.rs` | 89 条用例与 `qjs --std` **逐字节一致** |
+| `std.parseExtJSON` | `json.rs` 加 `ext` 标志 | 参考的 `test_ext_json` 原样通过 |
+| `os` 的文件/目录/进程面 | `quickjs-host/src/os.rs` | 31 条用例逐字节一致 |
+| `os.setTimeout`/`clearTimeout` | `quickjs-host/src/timers.rs` | 见第 9 节 |
+
+### 10.2 `parseExtJSON` 为什么不用 serde
+
+实测 `serde_json` 对扩展方言需要的 **12 项特性全部拒绝**：注释、行注释、裸键、
+尾逗号、单引号、`+1`、`0o10`、`0xa0`、`Infinity`、`NaN`、`.1`、换行续行。
+serde 实现的是 JSON 的**严格子集**，而这里需要**超集**。
+
+参考实现也不是「预处理成标准 JSON 再解析」，而是
+`JS_ParseJSON2(ctx, str, len, "<input>", JS_PARSE_JSON_EXT)` —— **同一个解析器加标志位**。
+所以照做了：`Parser` 加 `ext: bool`，每处放宽各自门控。这样 `JSON.parse` 保持严格，
+两条路径共享同一套错误位置。
+
+顺带修掉一个**预存在 bug**：`number()` 从不校验首字符，而 `f64::from_str` 接受 `+1` 和
+`.1`，所以 `JSON.parse("+1")` 和 `JSON.parse(".1")` 一直是成功的。参考实现两者都拒绝。
+
+### 10.3 `os` 的失败约定有**两套**，不是一套
+
+这是本轮最大的发现。第一次实现用了一致的一套，**31 条用例里错了 13 条**。
+
+| 约定 | 函数 | 失败形态 |
+|---|---|---|
+| 二元组 | `stat lstat readlink realpath readdir getcwd utimes` | `[value, **正** errno]`，`make_obj_error` |
+| 裸值 | `open close seek read write mkdir remove rename chdir` | **负** errno，`js_get_errno` = `if (ret==-1) ret=-errno` |
+
+```text
+> os.stat("/nope")        [null, 2]      正 errno，在二元组里
+> os.mkdir("/tmp", 0o755) -17            负 errno，裸值
+> os.open("/tmp", O_RDONLY) 3            就是 fd 本身
+```
+
+另有两处不规则：`os.isatty` 返回裸 Boolean，`os.pipe` 返回裸 `[r, w]`（失败是 `null`）。
+这些都不是笔误，是参考实现本来的样子；期望值全部来自 `qjs --std` 而非注释。
+
+还有一处：`os.remove` 是 `remove(3)` 而不是 `unlink(2)`，所以**能删目录**
+（`unlink` 会报 EPERM，`remove` 会退到 `rmdir`）。
+
+### 10.4 rustix，以及为什么这里没有 `unsafe`
+
+`os` 的 syscall 面用 `rustix`（3 个 crate：`bitflags`/`errno`/`libc`，加平台表
+`linux-raw-sys`）。理由是 NFR-6 把 `unsafe` 限制在四个引擎模块，宿主层直接调 `libc`
+会在 20 来个函数上逐处破例。
+
+还有一处本来也需要 `unsafe`：把脚本给的 fd 数字变回描述符
+（`BorrowedFd::borrow_raw` 是 `unsafe`）。解法是 `fdtable`：宿主持有 `OwnedFd`，
+只把数字交给脚本，读写时用 `OwnedFd::as_fd()`（安全）。0/1/2 走
+`std::io::stdin()` 的 `AsFd`。**结果：`os.rs` 里一个 `unsafe` 都没有**，NFR-6 不需要改。
+
+副作用是「宿主不持有的 fd 报 EBADF」。参考实现会真的去 `read(999)` 拿到 EBADF，结论相同。
+
+### 10.5 还没做
+
+- `std`：文件对象（`open`/`tmpfile`/`popen`/`fdopen` + 19 个方法）、环境变量、
+  `loadFile`/`loadScript`/`evalScript`、`strerror`、`urlGet`、`exit`、`gc`、
+  `__sprintObject`/`__printObject`
+- `os`：`exec`/`waitpid`/`kill`/`dup`/`dup2`/`signal`/`now`/`sleep`/`sleepAsync`、
+  `ttyGetWinSize`/`ttySetRaw`、`setReadHandler`/`setWriteHandler`
+
+**`std.setenv`/`unsetenv` 有个平台变化要注意**：edition 2024 里
+`std::env::set_var`/`remove_var` 都是 `unsafe`（真实的 `setenv` 改进程全局状态）。
+`rustix` 不管环境变量，没有 crate 能绕开。需要加 `unsafe` + `SAFETY` 注释，
+并相应放宽 NFR-6，或者把这两个函数列入「不做」。

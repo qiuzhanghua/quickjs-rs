@@ -332,8 +332,19 @@ fn main() -> ExitCode {
         if let Err(error) = quickjs_host::timers::install(&mut ctx, &os) {
             return die(&format!("qjs: cannot install os: {error}"), 1);
         }
+        #[cfg(unix)]
+        if let Err(error) = quickjs_host::os::install(&mut ctx, &os) {
+            return die(&format!("qjs: cannot install os: {error}"), 1);
+        }
         if let Err(error) = ctx.set_global("os", os) {
             return die(&format!("qjs: cannot mount os: {error}"), 1);
+        }
+        let std = ctx.new_object();
+        if let Err(error) = quickjs_host::std::install(&mut ctx, &std) {
+            return die(&format!("qjs: cannot install std: {error}"), 1);
+        }
+        if let Err(error) = ctx.set_global("std", std) {
+            return die(&format!("qjs: cannot mount std: {error}"), 1);
         }
     }
     // `print` writes straight to stdout, flushed per line, the way the reference does with

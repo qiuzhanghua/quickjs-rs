@@ -21,7 +21,7 @@ mod function;
 mod generator;
 mod global;
 pub mod iterator;
-mod json;
+pub(crate) mod json;
 pub mod map;
 mod math;
 mod number;

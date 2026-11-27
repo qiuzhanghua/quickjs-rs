@@ -441,19 +441,24 @@ fn write_string(text: &str, out: &mut String) {
 // parse
 // ---------------------------------------------------------------------------
 
-fn parse(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = arg(args, 0).to_js_string();
+/// Parse `text`, either as RFC 8259 JSON or in the extended dialect.
+///
+/// The extended dialect is what the reference calls `JS_PARSE_JSON_EXT`: the same parser
+/// with a flag, not a separate parser and not a pre-processing pass. It is exposed to
+/// scripts only through `std.parseExtJSON`, so `JSON.parse` stays strict.
+pub fn parse_text(interp: &mut Interp<'_>, text: &str, ext: bool) -> JsResult<Value> {
     let mut parser = Parser {
         bytes: text.as_bytes(),
-        text: &text,
+        text,
         position: 0,
+        ext,
     };
     parser.skip_whitespace();
     let value = match parser.value(interp) {
         Ok(value) => value,
         Err(error) => {
             return Err(crate::interp::Signal::Throw(json_error(
-                interp, &text, error,
+                interp, text, error,
             )));
         }
     };
@@ -461,13 +466,19 @@ fn parse(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Valu
     if parser.position != parser.bytes.len() {
         return Err(crate::interp::Signal::Throw(json_error(
             interp,
-            &text,
+            text,
             JsonError {
                 message: "unexpected data after JSON value".to_string(),
                 offset: parser.position,
             },
         )));
     }
+    Ok(value)
+}
+
+fn parse(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    let text = arg(args, 0).to_js_string();
+    let value = parse_text(interp, &text, false)?;
     // The second argument rewrites the parsed tree bottom-up. Ignoring it made
     // `JSON.parse('{"a":1}', (k, v) => v * 2).a` answer `1`.
     let reviver = arg(args, 1);
@@ -612,6 +623,14 @@ struct Parser<'a> {
     bytes: &'a [u8],
     text: &'a str,
     position: usize,
+    /// Whether the extended dialect is in force. Every relaxation below is gated on it, so
+    /// `JSON.parse` keeps rejecting what RFC 8259 rejects.
+    ext: bool,
+}
+
+/// Whether `byte` may start a bare identifier key: the reference's `TOK_IDENT` start set.
+fn is_identifier_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_' || byte == b'$'
 }
 
 impl Parser<'_> {
@@ -624,11 +643,56 @@ impl Parser<'_> {
     }
 
     fn skip_whitespace(&mut self) {
-        while let Some(byte) = self.bytes.get(self.position) {
-            match byte {
-                b' ' | b'\t' | b'\n' | b'\r' => self.position += 1,
-                _ => break,
+        loop {
+            while let Some(byte) = self.bytes.get(self.position) {
+                match byte {
+                    b' ' | b'\t' | b'\n' | b'\r' => self.position += 1,
+                    // `JSONWhitespace` does not match <VT> or <FF>; the extended dialect
+                    // does, so `formfeed` and `vertical tab` count as space there.
+                    b'\x0b' | b'\x0c' if self.ext => self.position += 1,
+                    _ => break,
+                }
             }
+            // Comments are whitespace in the extended dialect, and they may abut each other,
+            // so this is a loop rather than one check.
+            if !self.ext || !self.skip_one_comment() {
+                return;
+            }
+        }
+    }
+
+    /// Skip one `/* … */` or `// …` comment, reporting whether there was one.
+    ///
+    /// An unterminated block comment leaves the position at the end, so the caller reports
+    /// "unexpected end of JSON input" instead of silently accepting a truncated document.
+    fn skip_one_comment(&mut self) -> bool {
+        if self.bytes.get(self.position) != Some(&b'/') {
+            return false;
+        }
+        match self.bytes.get(self.position + 1) {
+            Some(b'*') => {
+                self.position += 2;
+                while self.position < self.bytes.len() {
+                    if self.bytes[self.position..].starts_with(b"*/") {
+                        self.position += 2;
+                        return true;
+                    }
+                    self.position += 1;
+                }
+                true
+            }
+            Some(b'/') => {
+                self.position += 2;
+                // A line comment ends at CR, LF, or a Unicode line separator.
+                while let Some(character) = self.text[self.position..].chars().next() {
+                    if matches!(character, '\r' | '\n' | '\u{2028}' | '\u{2029}') {
+                        break;
+                    }
+                    self.position += character.len_utf8();
+                }
+                true
+            }
+            _ => false,
         }
     }
 
@@ -643,9 +707,14 @@ impl Parser<'_> {
             Some(b'{') => self.object(interp),
             Some(b'[') => self.array(interp),
             Some(b'"') => Ok(interp.string(self.string()?)),
+            // A single-quoted string is only a value in the extended dialect.
+            Some(b'\'') if self.ext => Ok(interp.string(self.string()?)),
             Some(b't') => self.literal("true", Value::Bool(true)),
             Some(b'f') => self.literal("false", Value::Bool(false)),
             Some(b'n') => self.literal("null", Value::Null),
+            // The extended dialect starts a number at `.` (as in `.1`) and at `+`.
+            Some(b'.') if self.ext => self.number(),
+            Some(b'+') if self.ext => self.number(),
             Some(_) => self.number(),
         }
     }
@@ -660,9 +729,68 @@ impl Parser<'_> {
     }
 
     fn number(&mut self) -> Result<Value, JsonError> {
+        // RFC 8259 has a number start with `-` or a digit, and the scan below is happy to
+        // take a leading `+` or `.` — which `f64::from_str` then accepts. Without this
+        // guard `JSON.parse("+1")` and `JSON.parse(".1")` succeeded, which they must not.
+        // The extended dialect allows both, so those two are gated on `ext`.
+        // The extended dialect is checked by its own parser below: `Infinity` and `NaN`
+        // start with letters, and `+` and `.` are legal there, so a first-character rule
+        // would reject exactly the values it is meant to add.
+        if !self.ext {
+            match self.peek() {
+                Some(b'-') | Some(b'0'..=b'9') => {}
+                _ => return self.error("unexpected token in number"),
+            }
+        }
         let start = self.position;
-        if matches!(self.peek(), Some(b'-')) {
+        if matches!(self.peek(), Some(b'-')) || (self.ext && matches!(self.peek(), Some(b'+'))) {
             self.position += 1;
+        }
+        if self.ext {
+            let negative = self.bytes.get(start) == Some(&b'-');
+            // `Infinity` and `NaN` are only reachable after the sign has been consumed, so
+            // `-Infinity` and `+NaN` fall out for free — same order as the reference.
+            if self.rest().starts_with("Infinity") {
+                self.position += "Infinity".len();
+                return Ok(Value::Float(if negative {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                }));
+            }
+            if self.rest().starts_with("NaN") {
+                self.position += "NaN".len();
+                // The sign does not survive: `-NaN` is still `NaN`, which is why the
+                // reference's own test only checks `isNaN` for the signed forms.
+                return Ok(Value::Float(f64::NAN));
+            }
+            // Radix prefixes. The reference accepts all three, though its comment only
+            // mentions hexadecimal and octal.
+            if self.bytes.get(self.position) == Some(&b'0') {
+                let radix = match self.bytes.get(self.position + 1) {
+                    Some(b'x' | b'X') => Some(16u32),
+                    Some(b'o' | b'O') => Some(8),
+                    Some(b'b' | b'B') => Some(2),
+                    _ => None,
+                };
+                if let Some(radix) = radix {
+                    self.position += 2;
+                    let digits = self.position;
+                    while self
+                        .peek()
+                        .is_some_and(|byte| (byte as char).is_digit(radix))
+                    {
+                        self.position += 1;
+                    }
+                    if self.position == digits {
+                        return self.error("unexpected token in number");
+                    }
+                    let magnitude = u64::from_str_radix(&self.text[digits..self.position], radix)
+                        .map(|value| value as f64)
+                        .unwrap_or(f64::NAN);
+                    return Ok(Value::Float(if negative { -magnitude } else { magnitude }));
+                }
+            }
         }
         while let Some(byte) = self.peek() {
             match byte {
@@ -679,8 +807,15 @@ impl Parser<'_> {
             })
     }
 
+    /// The text from the current position to the end.
+    fn rest(&self) -> &str {
+        &self.text[self.position.min(self.text.len())..]
+    }
+
     fn string(&mut self) -> Result<String, JsonError> {
-        // The opening quote is already known to be there.
+        // The opening quote is already known to be there. `'` only reaches here in the
+        // extended dialect; the callers check.
+        let separator = self.peek().unwrap_or(b'"');
         self.position += 1;
         let mut out = String::new();
         loop {
@@ -688,7 +823,7 @@ impl Parser<'_> {
                 return self.error("unterminated string");
             };
             match byte {
-                b'"' => {
+                _ if byte == separator => {
                     self.position += 1;
                     return Ok(out);
                 }
@@ -706,7 +841,10 @@ impl Parser<'_> {
                     self.position += 1;
                     let start_of_escape = self.position - 1;
                     match escape {
-                        b'"' => out.push('"'),
+                        // An escaped delimiter, and only the delimiter: `\"` inside a
+                        // single-quoted string is a bad escape in the reference too.
+                        b'"' if separator == b'"' => out.push('"'),
+                        b'\'' if separator == b'\'' => out.push('\''),
                         b'\\' => out.push('\\'),
                         b'/' => out.push('/'),
                         b'b' => out.push('\u{8}'),
@@ -714,6 +852,12 @@ impl Parser<'_> {
                         b'n' => out.push('\n'),
                         b'r' => out.push('\r'),
                         b't' => out.push('\t'),
+                        // `\v` is not a JSON escape; the extended dialect adds it.
+                        b'v' if self.ext => out.push('\u{b}'),
+                        // A backslash before a newline continues the string on the next
+                        // line, dropping both characters. Only `\n`: `\r\n` is not
+                        // handled, matching `json_parse_string`.
+                        b'\n' if self.ext => {}
                         b'u' => {
                             let end = self.position + 4;
                             if end > self.bytes.len() {
@@ -772,6 +916,43 @@ impl Parser<'_> {
         }
     }
 
+    /// A bare identifier used as a property key.
+    ///
+    /// The reference runs this through the full JS identifier tables, so it accepts non-ASCII
+    /// letters. `is_alphanumeric` covers the same ground without pulling those tables into
+    /// the JSON parser; an identifier the two disagree about would have to start with a
+    /// non-ASCII, non-letter character, which no realistic config file does.
+    fn identifier(&mut self) -> Result<String, JsonError> {
+        let start = self.position;
+        while self
+            .text
+            .get(start..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(|_| self.position < self.text.len())
+        {
+            let character = self.text[self.position..]
+                .chars()
+                .next()
+                .expect("the loop condition checked");
+            let keep = if self.position == start {
+                is_identifier_start(character as u32 as u8)
+                    || character.is_alphabetic()
+                    || character == '_'
+                    || character == '$'
+            } else {
+                character.is_alphanumeric() || character == '_' || character == '$'
+            };
+            if !keep {
+                break;
+            }
+            self.position += character.len_utf8();
+        }
+        if self.position == start {
+            return self.error("expected an identifier");
+        }
+        Ok(self.text[start..self.position].to_string())
+    }
+
     fn array(&mut self, interp: &mut Interp<'_>) -> Result<Value, JsonError> {
         self.position += 1;
         let mut elements = Vec::new();
@@ -786,6 +967,14 @@ impl Parser<'_> {
             match self.peek() {
                 Some(b',') => {
                     self.position += 1;
+                    // A trailing comma closes the array in the extended dialect.
+                    if self.ext {
+                        self.skip_whitespace();
+                        if matches!(self.peek(), Some(b']')) {
+                            self.position += 1;
+                            return Ok(Value::Object(interp.new_array(elements)));
+                        }
+                    }
                 }
                 Some(b']') => {
                     self.position += 1;
@@ -807,10 +996,13 @@ impl Parser<'_> {
         }
         loop {
             self.skip_whitespace();
-            if !matches!(self.peek(), Some(b'"')) {
-                return self.error("expected a string key");
-            }
-            let key = self.string()?;
+            let key = match self.peek() {
+                Some(b'"') => self.string()?,
+                // A bare identifier as a key, e.g. `{ z2: null }`.
+                Some(b'\'') if self.ext => self.string()?,
+                Some(byte) if self.ext && is_identifier_start(byte) => self.identifier()?,
+                _ => return self.error("expected a string key"),
+            };
             self.skip_whitespace();
             if !matches!(self.peek(), Some(b':')) {
                 return self.error("expected ':'");
@@ -822,6 +1014,14 @@ impl Parser<'_> {
             match self.peek() {
                 Some(b',') => {
                     self.position += 1;
+                    // A trailing comma closes the object in the extended dialect.
+                    if self.ext {
+                        self.skip_whitespace();
+                        if matches!(self.peek(), Some(b'}')) {
+                            self.position += 1;
+                            return Ok(Value::Object(object));
+                        }
+                    }
                 }
                 Some(b'}') => {
                     self.position += 1;

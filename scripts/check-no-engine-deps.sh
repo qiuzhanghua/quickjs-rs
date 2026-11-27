@@ -41,7 +41,14 @@ fi
 #
 # Kept as an explicit list so adding one is a visible edit to this file rather than a
 # line that appears in Cargo.toml and nowhere else.
-allowed=" libc bytes mio pin-project-lite socket2 tokio windows-link windows-sys "
+# `rustix` brings `bitflags`, `errno`, `libc` and its per-platform syscall tables
+# (`linux-raw-sys`). All of it is the safe-syscall story NFR-6 needs rather than raw
+# `libc` in the host layer, so all of it is listed.
+#
+# One line on purpose: the loop below matches with surrounding spaces, and a newline
+# inside the string silently stopped `windows-sys` from matching.
+allowed=" libc bytes mio pin-project-lite socket2 tokio windows-link windows-sys rustix bitflags errno linux-raw-sys "
+
 for target in "" "--target x86_64-pc-windows-msvc" "--target x86_64-unknown-linux-gnu"; do
     # shellcheck disable=SC2086 # the empty case must expand to no argument at all
     deps=$(cargo tree -p quickjs-host -e normal --prefix none $target 2>/dev/null \

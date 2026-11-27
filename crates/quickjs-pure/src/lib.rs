@@ -523,6 +523,21 @@ impl<'rt> Context<'rt> {
         self.interp().output_sink = Some(sink);
     }
 
+    /// Parse `text` in the extended JSON dialect: comments, unquoted keys, single quotes,
+    /// trailing commas, `+1`/`.1`/`0o10`/`0xa0`, and `Infinity`/`NaN`.
+    ///
+    /// This is what backs `std.parseExtJSON`. It is a separate entry point rather than a
+    /// flag on `JSON.parse` because the two must never share behaviour: a relaxed
+    /// `JSON.parse` would silently accept documents the standard rejects.
+    pub fn parse_ext_json(&mut self, text: &str) -> Result<Value> {
+        let interp = self.interp();
+        match interp.parse_ext_json(text) {
+            Ok(value) => Ok(value),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
     /// Schedule `callback` to run after `delay_ms` milliseconds; returns the timer id.
     pub fn schedule_timer(&mut self, callback: Value, delay_ms: f64) -> i32 {
         self.interp().schedule_timer(callback, delay_ms)

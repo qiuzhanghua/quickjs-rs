@@ -1218,6 +1218,15 @@ impl<'a> Interp<'a> {
     ///
     /// Jobs queued while draining run in the same drain, FIFO, which is what makes
     /// `Promise.resolve().then(f).then(g)` call `f` before `g`.
+    /// Parse `text` in the extended dialect that `std.parseExtJSON` exposes.
+    ///
+    /// Comments, unquoted keys, single quotes, trailing commas, `+` and `.1` numbers,
+    /// `Infinity`/`NaN`, and `0x`/`0o`/`0b` literals — the same relaxations the reference
+    /// gates behind `JS_PARSE_JSON_EXT`. `JSON.parse` does not see any of them.
+    pub fn parse_ext_json(&mut self, text: &str) -> JsResult<Value> {
+        crate::builtins::json::parse_text(self, text, true)
+    }
+
     /// Schedule `callback` to run after `delay_ms` milliseconds, returning its id.
     ///
     /// A negative or `NaN` delay runs as soon as possible rather than being rejected: the

@@ -24,6 +24,16 @@
 
 pub mod eventloop;
 pub mod fds;
+pub mod fdtable;
+// `os` is `cfg(unix)` while it is built on `rustix`: NFR-8 also wants Windows, and the
+// reference's Windows `js_os_*` functions are a different implementation, not a shared
+// one. Rather than half-support Windows with a module that fails at runtime, the module is
+// absent there and the CLI reports `--std` as unsupported on that platform until the
+// `windows-sys` side exists.
+#[cfg(unix)]
+pub mod os;
+pub mod printf;
+pub mod std;
 pub mod timers;
 
 pub use eventloop::{RunError, run_until_idle};
