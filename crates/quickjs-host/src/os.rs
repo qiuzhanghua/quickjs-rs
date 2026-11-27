@@ -153,6 +153,16 @@ fn functions(table: &Shared) -> Vec<(&'static str, u32, Body)> {
     add!("getcwd", 0, os_getcwd);
     add!("isatty", 1, os_isatty);
     add!("getpid", 0, os_getpid);
+    add!("exec", 1, os_exec);
+    add!("waitpid", 2, os_waitpid);
+    add!("kill", 2, os_kill);
+    add!("dup", 1, os_dup);
+    add!("dup2", 2, os_dup2);
+    add!("now", 0, os_now);
+    add!("sleep", 1, os_sleep);
+    add!("sleepAsync", 1, os_sleep_async);
+    add!("ttyGetWinSize", 1, os_tty_get_win_size);
+    add!("ttySetRaw", 1, os_tty_set_raw);
     out
 }
 
@@ -203,6 +213,11 @@ fn constants() -> Vec<(&'static str, i32)> {
         ("SIGTSTP", S::TSTP.as_raw()),
         ("SIGTTIN", S::TTIN.as_raw()),
         ("SIGTTOU", S::TTOU.as_raw()),
+        // `waitpid`'s "do not block" flag, which `test_os_exec()` passes directly.
+        (
+            "WNOHANG",
+            rustix::process::WaitOptions::NOHANG.bits() as i32,
+        ),
         ("SIGUSR1", S::USR1.as_raw()),
         ("SIGUSR2", S::USR2.as_raw()),
     ]
@@ -670,4 +685,433 @@ fn os_getpid(
     Ok(Value::Float(
         rustix::process::getpid().as_raw_nonzero().get() as f64,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Processes: `exec`, `waitpid`, `kill`, `dup`, `dup2`.
+// ---------------------------------------------------------------------------
+
+/// The `stdin`/`stdout`/`stderr` option names, in the order the descriptors are numbered.
+const STD_NAMES: [&str; 3] = ["stdin", "stdout", "stderr"];
+
+/// Read `options[name]` as a Boolean, defaulting when the option is absent.
+///
+/// The reference's `get_bool_option` runs `JS_ToBool` on whatever is there, so `0`, `""`
+/// and `null` all turn an option *off* — `{ block: 0 }` is asynchronous, not blocking.
+fn bool_option(interp: &mut Interp<'_>, options: &Value, name: &str) -> JsResult<Option<bool>> {
+    let Some(object) = options.as_object() else {
+        return Ok(None);
+    };
+    let key = quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new(name));
+    match interp.get_property_key(object, &key)? {
+        None | Some(Value::Undefined) => Ok(None),
+        Some(value) => Ok(Some(value.to_boolean())),
+    }
+}
+
+/// Read `options[name]` as a number when present.
+fn number_option(interp: &mut Interp<'_>, options: &Value, name: &str) -> JsResult<Option<f64>> {
+    let Some(object) = options.as_object() else {
+        return Ok(None);
+    };
+    let key = quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new(name));
+    match interp.get_property_key(object, &key)? {
+        None | Some(Value::Undefined) => Ok(None),
+        Some(value) => Ok(Some(value.to_number())),
+    }
+}
+
+/// Read `options[name]` as a string, distinguishing absent from empty.
+fn string_option(interp: &mut Interp<'_>, options: &Value, name: &str) -> JsResult<Option<String>> {
+    let Some(object) = options.as_object() else {
+        return Ok(None);
+    };
+    let key = quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new(name));
+    match interp.get_property_key(object, &key)? {
+        None | Some(Value::Undefined) => Ok(None),
+        Some(value) => Ok(Some(interp.to_js_string(&value)?)),
+    }
+}
+
+/// `os.exec(args, options?)` — run a program.
+///
+/// Returns the exit code, or a **negative** signal number when the child was killed, or the
+/// pid when `options.block` is false. A program that cannot be started exits 127, which is
+/// what the reference's child does after a failed `execve` — so the caller sees 127 rather
+/// than an exception.
+///
+/// # The options
+///
+/// `stdin`/`stdout`/`stderr` name descriptors this host knows about, which is more
+/// restrictive than the reference: it does `dup2(fd, i)` on whatever number it is given, so
+/// a script could redirect to a descriptor it opened some other way. Here the number has to
+/// be in the shared descriptor table — the same rule `os.read` follows — and an unknown one
+/// makes the child fail to start (exit 127) instead of silently redirecting nowhere.
+fn os_exec(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    table: &Shared,
+) -> JsResult<Value> {
+    // `args` is array-like: the reference reads `length` and then each index, so anything
+    // with those properties works and a plain string is `length`-less (undefined → 0 → the
+    // "invalid number of arguments" error below).
+    let Some(array) = args.first() else {
+        return Err(interp.type_error("invalid number of arguments"));
+    };
+    let count = match array.as_object() {
+        Some(object) => {
+            let key = quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new("length"));
+            match interp.get_property_key(object, &key)? {
+                Some(value) => value.to_number() as i64,
+                None => 0,
+            }
+        }
+        None => 0,
+    };
+    if !(1..=65535).contains(&count) {
+        return Err(interp.type_error("invalid number of arguments"));
+    }
+    let Some(object) = array.as_object() else {
+        return Err(interp.type_error("invalid number of arguments"));
+    };
+    let mut argv: Vec<String> = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let key =
+            quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new(index.to_string()));
+        let value = interp
+            .get_property_key(object, &key)?
+            .unwrap_or(Value::Undefined);
+        argv.push(interp.to_js_string(&value)?);
+    }
+
+    let options = args.get(1).cloned().unwrap_or(Value::Undefined);
+    let block = bool_option(interp, &options, "block")?.unwrap_or(true);
+    let use_path = bool_option(interp, &options, "usePath")?.unwrap_or(true);
+    let file = string_option(interp, &options, "file")?;
+    let cwd = string_option(interp, &options, "cwd")?;
+    // `uid`/`gid` need `setuid`/`setgid`, which are process-wide and unsafe to attempt on a
+    // running interpreter. They are read so an unknown value cannot slip through as "unset",
+    // and refused explicitly rather than silently ignored.
+    if number_option(interp, &options, "uid")?.is_some()
+        || number_option(interp, &options, "gid")?.is_some()
+    {
+        return Err(interp.type_error("os.exec: uid/gid are not supported"));
+    }
+
+    let mut command = std::process::Command::new(file.as_deref().unwrap_or(&argv[0]));
+    if argv.len() > 1 {
+        command.args(&argv[1..]);
+    }
+    if !use_path {
+        // `execve` does not search `PATH`; `Command` does. Naming the program by the exact
+        // path the script gave, with an empty `PATH`, reproduces the no-search behaviour
+        // without a second exec implementation.
+        command.env("PATH", "");
+    }
+    if let Some(directory) = &cwd {
+        command.current_dir(directory);
+    }
+    // `env` replaces the whole environment rather than adding to it, which is what
+    // `build_envp` does in the reference.
+    if let Some(env) = options.as_object() {
+        let key = quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new("env"));
+        if let Some(value) = interp.get_property_key(env, &key)? {
+            if !matches!(value, Value::Undefined) {
+                let Some(entries) = value.as_object() else {
+                    return Err(interp.type_error("env is not an object"));
+                };
+                command.env_clear();
+                for key in entries.own_keys() {
+                    let name = key.to_string_lossy().into_owned();
+                    let property =
+                        quickjs::object::PropertyKey::String(quickjs::value::Wtf8::new(&name));
+                    let Some(field) = interp.get_property_key(entries, &property)? else {
+                        continue;
+                    };
+                    command.env(&name, interp.to_js_string(&field)?);
+                }
+            }
+        }
+    }
+
+    // The three standard descriptors, defaulting to the real ones.
+    let std_fds: [Option<i32>; 3] = [
+        number_option(interp, &options, STD_NAMES[0])?.map(|n| n as i32),
+        number_option(interp, &options, STD_NAMES[1])?.map(|n| n as i32),
+        number_option(interp, &options, STD_NAMES[2])?.map(|n| n as i32),
+    ];
+    // Each redirect is resolved to an owned duplicate before the spawn, where the table is
+    // still borrowable; `Stdio::from` then hands it to the child.
+    let mut redirects: [Option<std::os::fd::OwnedFd>; 3] = [None, None, None];
+    for (index, wanted) in std_fds.iter().enumerate() {
+        let Some(wanted) = *wanted else { continue };
+        let duplicated = table.with(wanted, |fd| rustix::io::dup(fd));
+        let Some(Ok(copy)) = duplicated else {
+            // An unknown descriptor is a child that cannot start, which the reference also
+            // reports as 127 (its `_exit(127)` after a failed `dup2`).
+            return Ok(Value::Int(127));
+        };
+        redirects[index] = Some(copy);
+    }
+    if let Some(input) = redirects[0].take() {
+        command.stdin(std::process::Stdio::from(input));
+    }
+    if let Some(output) = redirects[1].take() {
+        command.stdout(std::process::Stdio::from(output));
+    }
+    if let Some(error) = redirects[2].take() {
+        command.stderr(std::process::Stdio::from(error));
+    }
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        // `fork`/`exec` failing is not an exception in the reference: the child `_exit(127)`s
+        // and the parent reports that as the status.
+        Err(_) => return Ok(Value::Int(127)),
+    };
+    if !block {
+        let pid = child.id() as i32;
+        // The child has to outlive this call for a later `waitpid` to find it. Leaking the
+        // handle leaves the process running and unreaped by Rust, which is exactly what the
+        // script expects: `os.waitpid(pid, …)` is how it is collected.
+        std::mem::forget(child);
+        return Ok(Value::Int(pid));
+    }
+    match child.wait() {
+        Ok(status) => Ok(Value::Int(exit_status_of(status))),
+        Err(_) => Ok(Value::Int(127)),
+    }
+}
+
+/// An exit status as `os.exec` reports it: the code, or `-signal` when killed.
+fn exit_status_of(status: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code,
+        (None, Some(signal)) => -signal,
+        (None, None) => 127,
+    }
+}
+
+/// `os.waitpid(pid, options)` → `[pid, status]`, or `[-errno, 0]` when it fails.
+///
+/// The status is the **raw** `wait` status, so a script tests it with `status & 0x7f` and
+/// `status >> 8` — that is what the reference's own `test_os_exec()` does.
+fn os_waitpid(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let pid = args.first().map_or(-1, |value| value.to_number() as i32);
+    let flags = args.get(1).map_or(0, |value| value.to_number() as u32);
+    let target = rustix::process::Pid::from_raw(pid);
+    let options = rustix::process::WaitOptions::from_bits_truncate(flags);
+    let result = rustix::process::waitpid(target, options);
+    let (reported, status) = match result {
+        Ok(Some((child, status))) => (child.as_raw_nonzero().get(), status.as_raw()),
+        // `WNOHANG` with nothing to report: the reference reports pid 0 and status 0.
+        Ok(None) => (0, 0),
+        Err(error) => (-errno_of(&error), 0),
+    };
+    let elements = vec![Value::Int(reported), Value::Int(status)];
+    Ok(Value::Object(interp.new_array(elements)))
+}
+
+/// `os.kill(pid, signal)` → a bare negative errno on failure.
+fn os_kill(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let _ = interp;
+    let pid = args.first().map_or(0, |value| value.to_number() as i32);
+    let signal = args.get(1).map_or(0, |value| value.to_number() as i32);
+    // `rustix::process::Signal` is a `NonZeroI32` newtype, so it cannot represent the `0`
+    // that `kill(pid, 0)` uses as an existence-and-permission probe; rustix points at
+    // `rustix-libc-wrappers` for that. Rather than take a second dependency (or reach for
+    // `from_raw_unchecked`, whose own docs say it must not be used to send signals), signal
+    // 0 reports EINVAL. Recorded as a gap in `docs/m9-plan.md`; every named signal that
+    // `os.SIG*` exposes works.
+    if signal == 0 {
+        return Ok(Value::Int(-EINVAL));
+    }
+    let result = match rustix::process::Pid::from_raw(pid) {
+        Some(pid) => match rustix::process::Signal::from_named_raw(signal) {
+            Some(signal) => rustix::process::kill_process(pid, signal),
+            // A number outside the named set (a real-time signal, or nonsense) is refused
+            // rather than passed through unchecked.
+            None => return Ok(Value::Int(-EINVAL)),
+        },
+        // A pid of 0 or a negative one means "a process group" to `kill(2)`. `Pid` cannot
+        // hold those, and this host cannot deliver to a group it does not track.
+        None => return Ok(Value::Int(-EINVAL)),
+    };
+    match result {
+        Ok(()) => Ok(Value::Int(0)),
+        Err(error) => Ok(Value::Int(-errno_of(&error))),
+    }
+}
+
+/// `os.dup(fd)` → the new descriptor number, or a negative errno.
+fn os_dup(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    table: &Shared,
+) -> JsResult<Value> {
+    let _ = interp;
+    let fd = args.first().map_or(-1, |value| value.to_number() as i32);
+    let result = table.with(fd, |handle| rustix::io::dup(handle));
+    match result {
+        Some(Ok(copy)) => Ok(Value::Int(table.adopt(copy))),
+        Some(Err(error)) => Ok(Value::Int(-errno_of(&error))),
+        None => Ok(Value::Int(-EBADF)),
+    }
+}
+
+/// `os.dup2(fd, fd2)` → `fd2` on success, or a negative errno.
+///
+/// The target is a descriptor the script already owns, so the table's entry is replaced:
+/// `dup2` closes the old target first, which is what dropping the stored `OwnedFd` does.
+fn os_dup2(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    table: &Shared,
+) -> JsResult<Value> {
+    let _ = interp;
+    let from = args.first().map_or(-1, |value| value.to_number() as i32);
+    let to = args.get(1).map_or(-1, |value| value.to_number() as i32);
+    if !table.contains(to) {
+        return Ok(Value::Int(-EBADF));
+    }
+    let copied = table.with(from, |handle| rustix::io::dup(handle));
+    let copy = match copied {
+        Some(Ok(copy)) => copy,
+        Some(Err(error)) => return Ok(Value::Int(-errno_of(&error))),
+        None => return Ok(Value::Int(-EBADF)),
+    };
+    // `dup2` into a number this table does not own (0/1/2) cannot be honoured, because
+    // closing and replacing the real standard stream is the host's business, not a
+    // script's. `replace` reports that as EBADF rather than pretending.
+    match table.replace(to, copy) {
+        Ok(()) => Ok(Value::Int(to)),
+        Err(errno) => Ok(Value::Int(-errno)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Time and terminals: `now`, `sleep`, `sleepAsync`, `ttyGetWinSize`, `ttySetRaw`.
+// ---------------------------------------------------------------------------
+
+/// `os.now()` — **monotonic** milliseconds, not a wall-clock timestamp.
+///
+/// This is the reference's `get_time_ns()` on `CLOCK_MONOTONIC`, so the number counts from
+/// an unspecified origin (boot, usually) — `qjs --std` reports values like `95607854.675`,
+/// roughly a day of uptime, not milliseconds since 1970. Scripts use it for intervals:
+/// `var t = os.now(); … ; os.now() - t`. A monotonic clock is what makes that correct
+/// across a system clock adjustment.
+fn os_now(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    _args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let _ = interp;
+    Ok(Value::Float(monotonic_ms()))
+}
+
+/// Milliseconds on the process's monotonic clock.
+fn monotonic_ms() -> f64 {
+    // `Instant` is monotonic and has no epoch, which is exactly the contract `os.now()` has.
+    // An `Instant` cannot be built from a fixed origin portably, so the elapsed time since
+    // the first call is what is reported — the *differences* are what scripts measure.
+    use std::sync::OnceLock;
+    static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+    let origin = ORIGIN.get_or_init(std::time::Instant::now);
+    origin.elapsed().as_secs_f64() * 1000.0
+}
+
+/// `os.sleep(ms)` — block for that long.
+fn os_sleep(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let _ = interp;
+    let delay = args.first().map_or(0.0, |value| value.to_number());
+    if delay.is_finite() && delay > 0.0 {
+        std::thread::sleep(std::time::Duration::from_secs_f64(delay / 1000.0));
+    }
+    Ok(Value::Undefined)
+}
+
+/// `os.sleepAsync(ms)` — a promise that resolves after that long.
+///
+/// Built on the engine's own timer queue rather than a second mechanism, so the promise is
+/// resolved by the same event loop that runs `os.setTimeout` and ordering between the two
+/// stays consistent.
+fn os_sleep_async(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    _table: &Shared,
+) -> JsResult<Value> {
+    let delay = args.first().map_or(0.0, |value| value.to_number());
+    interp.sleep_async(delay)
+}
+
+/// `os.ttyGetWinSize(fd)` → `[width, height]`, or `null` when the descriptor is not a tty.
+///
+/// `null` rather than an error, matching the reference: it calls `ioctl(TIOCGWINSZ)` and
+/// returns `JS_NULL` when that fails, which is also what a redirected stream gives.
+fn os_tty_get_win_size(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    table: &Shared,
+) -> JsResult<Value> {
+    let fd = args.first().map_or(-1, |value| value.to_number() as i32);
+    // `tcgetwinsize` only works on a terminal; on anything else the call fails and the
+    // answer is `null`, which is the case a script hits when its output is redirected.
+    let size = table.with(fd, |handle| rustix::termios::tcgetwinsize(handle));
+    match size {
+        Some(Ok(size)) => {
+            let elements = vec![
+                Value::Int(i32::from(size.ws_col)),
+                Value::Int(i32::from(size.ws_row)),
+            ];
+            Ok(Value::Object(interp.new_array(elements)))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// `os.ttySetRaw(fd)` — put the terminal into raw mode.
+///
+/// The reference passes the descriptor to `tty_set_raw`, which clears `ICANON`, `ECHO` and
+/// the signal characters. There is deliberately no way to restore the mode: the reference
+/// does not offer one either (a REPL restores it on exit by holding the old `termios`).
+fn os_tty_set_raw(
+    interp: &mut Interp<'_>,
+    _this: Value,
+    args: &[Value],
+    table: &Shared,
+) -> JsResult<Value> {
+    let fd = args.first().map_or(-1, |value| value.to_number() as i32);
+    let result = table.with(fd, |handle| {
+        let mut termios = rustix::termios::tcgetattr(handle)?;
+        termios.make_raw();
+        rustix::termios::tcsetattr(handle, rustix::termios::OptionalActions::Now, &termios)
+    });
+    let _ = interp;
+    Ok(match result {
+        Some(Ok(())) => Value::Undefined,
+        // The reference ignores the return value, so a non-tty is silently a no-op.
+        _ => Value::Undefined,
+    })
 }

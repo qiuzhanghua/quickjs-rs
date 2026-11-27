@@ -102,6 +102,23 @@ impl FdTable {
         self.inner.borrow_mut().remove(&fd)
     }
 
+    /// Replace the descriptor behind `fd` with `fd_new`, closing the old one.
+    ///
+    /// This is `dup2(3)`: the target is closed first, which is what dropping the stored
+    /// `OwnedFd` does. Only a number this table owns can be replaced — the standard streams
+    /// belong to the process, so a script redirecting fd 1 is refused rather than allowed
+    /// to take the host's own output with it.
+    pub fn replace(&self, fd: i32, replacement: OwnedFd) -> Result<(), i32> {
+        let mut table = self.inner.borrow_mut();
+        match table.get_mut(&fd) {
+            Some(slot) => {
+                *slot = replacement;
+                Ok(())
+            }
+            None => Err(9), // EBADF
+        }
+    }
+
     /// Whether `fd` is one this host can operate on.
     pub fn contains(&self, fd: i32) -> bool {
         self.inner.borrow().contains_key(&fd) || matches!(fd, 0..=2)

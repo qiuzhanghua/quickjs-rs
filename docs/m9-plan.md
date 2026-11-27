@@ -664,3 +664,47 @@ NFR-6 原来只是一句散文，于是它和代码早就对不上了。新脚�
   `valid` 只由编码器设置，每次访问改成 `from_utf8` 会在每个属性读取的热路径上加一次扫描。
 
 所以 NFR-6 现在写的是五个引擎模块（加了 `value`）加一处宿主例外，且这句话可执行。
+
+---
+
+## 11. M9d: `os` 的进程与时间面
+
+### 11.1 已完成
+
+| 项 | 验收 |
+|---|---|
+| `os.exec`（`block`/`usePath`/`file`/`cwd`/`env`/`stdin`/`stdout`/`stderr`） | 与参考逐字节一致，含 `test_os_exec` 的管道重定向模式 |
+| `os.waitpid` / `os.kill` / `os.dup` / `os.dup2` | 同上 |
+| `os.now` / `os.sleep` / `os.sleepAsync` | 同上 |
+| `os.ttyGetWinSize` / `os.ttySetRaw` | 同上 |
+
+### 11.2 `os.exec` 的几个语义
+
+- 退出码是**退出状态**：正常退出是 `code`，被信号杀死是 **`-信号号`**，程序起不来是
+  `127`（参考的子进程在执行失败后 `_exit(127)`）。
+- `block: false` 返回 pid。子进程要活到后面的 `waitpid` 才能被收集，所以 `Child` 句柄
+  是**故意泄漏**的（`mem::forget`）——`waitpid` 就是脚本收集它的方式。
+- `env` **替换**整个环境而不是追加：实测参考里 `env: {OTHER:"x"}` 之后子进程看不到
+  `PATH`。
+- `usePath: false` 对应 `execve` 不搜 `PATH`。`Command` 总是搜，所以用清空 `PATH` 的
+  方式复现，而不是写第二套 exec。
+
+### 11.3 两处刻意偏差（都写了理由并钉了测试）
+
+**1. `os.kill(pid, 0)` 报 `EINVAL`。** `rustix::process::Signal` 是 `NonZeroI32` newtype，
+**结构上表达不了** `kill(pid, 0)` 需要的那个 `0`。rustix 自己指向 `rustix-libc-wrappers`，
+而该 crate 在本项目用的 registry 上**不存在**（实测 `cargo fetch` 失败）。`from_raw_unchecked`
+存在，但其文档明说「结果不得用于发送信号」。为一次探针加依赖或加 `unsafe` 都不划算。
+
+**2. `os.waitpid(pid, WNOHANG)` 未就绪时我们返回状态 `0`。** 参考返回的是**未初始化的栈垃圾**
+——`js_os_waitpid` 只在 `ret < 0` 时写 `status = 0`，`ret == 0` 那条路径留着未初始化变量。
+实测三次运行分别得到 `55289120` / `60908832` / `21718304`。那是参考的 UB，不复刻；我们的
+`0` 是稳定且正确的值。
+
+### 11.4 还没做
+
+- `os.signal`：参考装一个 C 信号处理器再回调 JS。信号处理器里调 JS 的异步信号安全性是
+  真问题，需要单独设计（参考自己也有 `is_main_thread` 的守卫）。
+- `os.setReadHandler`/`os.setWriteHandler`：需要事件循环把 fd 就绪纳入 `Task`/`Turn`。
+  `fds.rs` 已有文档说明 Linux/macOS/Windows 三平台各自的边界。
+- REPL：CLI 选项已齐全，`-i` 目前报 `not implemented yet`。

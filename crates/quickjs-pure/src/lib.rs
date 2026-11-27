@@ -585,6 +585,16 @@ impl<'rt> Context<'rt> {
         self.interp().schedule_timer(callback, delay_ms)
     }
 
+    /// A promise that resolves after `delay_ms` — `os.sleepAsync`.
+    pub fn sleep_async(&mut self, delay_ms: f64) -> Result<Value> {
+        let interp = self.interp();
+        match interp.sleep_async(delay_ms) {
+            Ok(value) => Ok(value),
+            Err(Signal::Throw(value)) => Err(Error::Exception(interp.describe_exception(&value))),
+            Err(Signal::OutOfMemory) => Err(Error::OutOfMemory),
+        }
+    }
+
     /// Cancel a pending timer. `false` when the id is unknown or already fired.
     pub fn cancel_timer(&mut self, id: i32) -> bool {
         self.interp().cancel_timer(id)

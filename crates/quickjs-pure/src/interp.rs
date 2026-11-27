@@ -1068,6 +1068,29 @@ impl<'a> Interp<'a> {
         (promise, Value::Object(resolve), Value::Object(reject))
     }
 
+    /// A promise that resolves after `delay_ms`, which is `os.sleepAsync`.
+    ///
+    /// Built on [`Interp::schedule_timer`] rather than a second queue, so the resolution is
+    /// ordered against `os.setTimeout` by the same event loop. The resolver is stored in the
+    /// timer table, where the collector already scans it.
+    pub fn sleep_async(&mut self, delay_ms: f64) -> JsResult<Value> {
+        let (promise, resolve, _reject) = self.new_promise_capability();
+        let resolve = self.new_host_function(
+            "resolve",
+            1,
+            Box::new(
+                move |interp: &mut Interp<'_>, _this: Value, args: &[Value]| {
+                    let value = args.first().cloned().unwrap_or(Value::Undefined);
+                    interp.call_value(resolve.clone(), Value::Undefined, vec![value])
+                },
+            ),
+        );
+        // The timer keeps the resolver alive: it is a property of the timer entry, and the
+        // timer table is part of what the collector walks.
+        self.schedule_timer(Value::Object(resolve), delay_ms);
+        Ok(Value::Object(promise))
+    }
+
     /// `PromiseResolve(value)`: the value itself when it is already a promise, otherwise a
     /// new promise resolved with it.
     pub fn promise_resolve_value(&mut self, value: Value) -> JsResult<Value> {
