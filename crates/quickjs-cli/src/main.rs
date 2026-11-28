@@ -327,27 +327,11 @@ fn main() -> ExitCode {
     // `js_std_add_helpers` + `--std` do. Only the timer half of `os` exists so far (M9c);
     // the rest arrives with M9d. Scripts that use the missing parts fail where they touch
     // them rather than silently getting `undefined`.
-    if opts.load_std {
-        // One descriptor table for both modules: `std.fdopen(os.pipe()[0], "r")` has to
-        // work, and that is the reference's own `test_os_exec()`.
-        let fds = quickjs_host::fdtable::FdTable::shared();
-        let os = ctx.new_object();
-        if let Err(error) = quickjs_host::timers::install(&mut ctx, &os) {
-            return die(&format!("qjs: cannot install os: {error}"), 1);
-        }
-        #[cfg(unix)]
-        if let Err(error) = quickjs_host::os::install(&mut ctx, &os, &fds) {
-            return die(&format!("qjs: cannot install os: {error}"), 1);
-        }
-        if let Err(error) = ctx.set_global("os", os) {
-            return die(&format!("qjs: cannot mount os: {error}"), 1);
-        }
-        let std = ctx.new_object();
-        if let Err(error) = quickjs_host::std::install(&mut ctx, &std, &fds) {
-            return die(&format!("qjs: cannot install std: {error}"), 1);
-        }
-        if let Err(error) = ctx.set_global("std", std) {
-            return die(&format!("qjs: cannot mount std: {error}"), 1);
+    // The REPL always has `std` and `os` — the reference's `repl.js` imports both, and its
+    // `qjs -i` does not require `--std`.
+    if opts.load_std || opts.interactive || args.is_empty() {
+        if let Err(message) = mount_std_and_os(&mut ctx) {
+            return die(&message, 1);
         }
     }
     // `print` writes straight to stdout, flushed per line, the way the reference does with
@@ -379,10 +363,70 @@ fn main() -> ExitCode {
         return run(&mut ctx, &source, &path);
     }
     if opts.interactive || args.is_empty() {
-        return pending("interactive REPL", "milestone M9");
+        return interactive(&mut ctx);
     }
     ExitCode::SUCCESS
 }
+
+/// Mount `std` and `os` on the global object.
+///
+/// Both share one descriptor table: `std.fdopen(os.pipe()[0], "r")` has to work, and that
+/// is the reference's own `test_os_exec()`.
+fn mount_std_and_os(ctx: &mut quickjs::Context<'_>) -> Result<(), String> {
+    let fds = quickjs_host::fdtable::FdTable::shared();
+    let os = ctx.new_object();
+    quickjs_host::timers::install(ctx, &os)
+        .map_err(|error| format!("qjs: cannot install os: {error}"))?;
+    #[cfg(unix)]
+    quickjs_host::os::install(ctx, &os, &fds)
+        .map_err(|error| format!("qjs: cannot install os: {error}"))?;
+    ctx.set_global("os", os)
+        .map_err(|error| format!("qjs: cannot mount os: {error}"))?;
+    let std = ctx.new_object();
+    quickjs_host::std::install(ctx, &std, &fds)
+        .map_err(|error| format!("qjs: cannot install std: {error}"))?;
+    ctx.set_global("std", std)
+        .map_err(|error| format!("qjs: cannot mount std: {error}"))?;
+    Ok(())
+}
+
+/// The reference's REPL, which is a JavaScript program rather than part of the C host.
+///
+/// `qjs -i` compiles `repl.js` to bytecode with `qjsc -c` and evaluates it, so the line
+/// editor, the syntax colouring and the completion are all the reference's own code. This
+/// does the same thing one step earlier: the vendored source is evaluated directly. What it
+/// needs from the host is `os.setReadHandler`/`os.setWriteHandler`/`os.signal`/`os.ttySetRaw`
+/// and `std.in`, all of which exist by now.
+fn interactive(ctx: &mut quickjs::Context<'_>) -> ExitCode {
+    // Written by `std.puts`, flushed per line, so the prompt appears before the input that
+    // answers it. No sink is installed for the REPL: the terminal is already the output.
+    let result = ctx.eval(REPL_SOURCE);
+    ctx.take_output();
+    let _ = std::io::stdout().flush();
+    if let Err(error) = result {
+        let _ = writeln!(std::io::stderr(), "qjs: {error}");
+        return ExitCode::FAILURE;
+    }
+    match quickjs_host::run_repl(ctx) {
+        Ok(errors) => {
+            ctx.take_output();
+            let _ = std::io::stdout().flush();
+            for error in errors {
+                let _ = writeln!(std::io::stderr(), "{error}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            ctx.take_output();
+            let _ = std::io::stdout().flush();
+            let _ = writeln!(std::io::stderr(), "qjs: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The reference's REPL source, with its two module imports bound to the globals above.
+const REPL_SOURCE: &str = include_str!("repl.js");
 
 /// Run `path` as an ES module.
 ///

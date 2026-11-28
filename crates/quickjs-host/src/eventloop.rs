@@ -162,6 +162,48 @@ fn sleep(delay: std::time::Duration) {
     }
 }
 
+fn has_runnable_work(ctx: &Context<'_>) -> bool {
+    ctx.has_pending_timers_or_jobs()
+}
+
+/// Run the reference's own `repl.js` to completion.
+///
+/// This is [`run_until_idle`] with one extra exit: when the real stdin reaches end of file
+/// and nothing else is pending, the REPL is over. `repl.js` has no end-of-file path — its
+/// read handler reads zero bytes and waits for more — so the reference's REPL blocks
+/// forever on a piped stdin. Reporting the end from the host is the difference between a
+/// usable `qjs -i < file` and a process that never exits.
+///
+/// The turn cap from [`run_until_idle`] still applies, so a script that keeps the REPL
+/// alive on purpose is reported rather than hung.
+pub fn run_repl(ctx: &mut Context<'_>) -> Result<Vec<String>, RunError> {
+    const MAX_TURNS: usize = 1_000_000;
+    let mut turns = 0usize;
+    loop {
+        turns += 1;
+        if turns > MAX_TURNS {
+            return Err(RunError::TimerCallback(format!(
+                "REPL did not go idle after {MAX_TURNS} turns"
+            )));
+        }
+        serve_signals(ctx)?;
+        // Checked before the turn so the last line of a piped file is still evaluated: the
+        // turn that consumes it runs first, and the end is only noticed afterwards.
+        if crate::stdio::stdin_eof() && !has_runnable_work(ctx) {
+            break;
+        }
+        match ctx.run_one_turn().map_err(RunError::Script)? {
+            Turn::Ran => {}
+            Turn::Done => break,
+            Turn::Wait(delay) => sleep(delay),
+            Turn::Poll(timeout) => poll_and_fire(ctx, timeout)?,
+        }
+    }
+    let mut errors = ctx.take_timer_errors();
+    errors.extend(ctx.take_unhandled_rejections());
+    Ok(errors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -132,7 +132,12 @@ pub struct Realm {
     /// `Object.create(null, props)` effectively does) tried to write an internal name and
     /// threw. A symbol key is invisible to `getOwnPropertyNames`, `Object.keys`, `for…in`
     /// and `JSON.stringify`, while remaining an ordinary traced property.
-    pub internal_slots: BTreeMap<&'static str, Value>,
+    ///
+    /// `RefCell` because interning is memoisation rather than observable state: filling the
+    /// cache through a shared borrow is a detail, not a mutation of the realm. That is what
+    /// lets [`Interp::internal_set`] work from `&self`, which `make_error` needs — an error
+    /// built while reporting a failure must not require an exclusive borrow.
+    pub internal_slots: std::cell::RefCell<BTreeMap<&'static str, Value>>,
 
     /// The `Symbol.for` registry: `key -> symbol`.
     ///
@@ -424,6 +429,15 @@ pub(crate) struct FdHandlers {
     /// `os.setWriteHandler`'s callback.
     pub write: Option<Value>,
 }
+
+/// The file name `eval` reports, which the reference does not inherit from the caller.
+///
+/// Kept distinct from [`EVAL_SCRIPT_FILE`] because the two are named separately in the
+/// reference and the names show up in stack traces.
+const EVAL_FILE: &str = "<input>";
+
+/// The file name `std.evalScript` reports.
+const EVAL_SCRIPT_FILE: &str = "<evalScript>";
 
 /// A delay in milliseconds as a `Duration`, clamped to something `Instant` accepts.
 ///
@@ -736,7 +750,12 @@ pub struct Interp<'a> {
     /// A native has no [`Frame`] — it runs on the Rust stack — but the reference's
     /// trace still names it with `(native)` instead of a position, so the names are
     /// tracked separately and stitched into [`Interp::stack_trace`].
-    native_frames: Vec<(String, Gc<JsObject>)>,
+    ///
+    /// The third field is how many bytecode frames were live when the native was entered,
+    /// which is what places it *among* them rather than before all of them. Native
+    /// functions used to be emitted up front on the grounds that they never re-enter
+    /// JavaScript; `std.evalScript` does, so that reasoning no longer holds.
+    native_frames: Vec<(String, Gc<JsObject>, usize)>,
     /// The native function currently executing, for the ones that have to know *which*
     /// function they are — a typed-array constructor reads its element type off itself.
     ///
@@ -772,6 +791,13 @@ pub struct Interp<'a> {
     /// A `Vec` rather than a heap because the queue is short (a script rarely has more than
     /// a handful) and `run_one_turn` has to scan it anyway to find the earliest deadline.
     pub(crate) tasks: Vec<Task>,
+    /// Active `backtrace_barrier` depths: how many bytecode frames were live when the
+    /// barrier'd evaluation started.
+    ///
+    /// A trace is truncated to the frames at or inside the innermost barrier, which is what
+    /// lets a REPL report an error from the line it just evaluated without also reporting
+    /// its own readline loop.
+    trace_barriers: Vec<usize>,
     /// `os.signal` handlers, keyed by signal number.
     ///
     /// Kept here for the same reason as `fd_handlers`: the collector walks these values, so
@@ -847,7 +873,7 @@ impl<'a> Interp<'a> {
                 async_generator_proto: None,
                 symbol_proto: None,
                 symbol_registry: BTreeMap::new(),
-                internal_slots: BTreeMap::new(),
+                internal_slots: std::cell::RefCell::new(BTreeMap::new()),
                 regexp_proto: None,
                 regexp_ctor: None,
                 suppressed_error_proto: None,
@@ -886,6 +912,7 @@ impl<'a> Interp<'a> {
             max_frames: 4096,
             jobs: std::collections::VecDeque::new(),
             tasks: Vec::new(),
+            trace_barriers: Vec::new(),
             signal_handlers: std::collections::BTreeMap::new(),
             fd_handlers: std::collections::BTreeMap::new(),
             next_timer_id: 1,
@@ -1110,6 +1137,66 @@ impl<'a> Interp<'a> {
             Callable::PromiseReject(promise.clone()),
         );
         (promise, Value::Object(resolve), Value::Object(reject))
+    }
+
+    /// `std.evalScript(source, { async: true })`: the completion value delivered through a
+    /// promise, as `{ value: completion }`.
+    ///
+    /// The three cases are the reference's, and they differ on purpose:
+    ///
+    /// * a **syntax** error throws synchronously — `JS_Eval` reports a parse failure as an
+    ///   exception before any promise exists;
+    /// * a **runtime** error rejects the returned promise;
+    /// * success resolves it with `{ value }`, where the value is the script's completion
+    ///   value **literally**. It is not awaited: `std.evalScript("Promise.resolve(7)",
+    ///   {async: true})` answers `{value: <the promise>}`, and only an explicit top-level
+    ///   `await` produces `{value: 7}`. That is the reference's `JS_Eval` with
+    ///   `JS_EVAL_FLAG_ASYNC`, which stores the completion value rather than adopting it.
+    ///
+    /// # What this does not do
+    ///
+    /// The reference's `JS_EVAL_FLAG_ASYNC` also permits **top-level `await`**: the script
+    /// is evaluated in an async context, so `await` outside a function is legal. That needs
+    /// the parser and the suspension machinery to accept a suspended top-level script, and
+    /// is not implemented — such source is a syntax error here. Everything else about the
+    /// flag is reproduced.
+    pub fn eval_in_global_async(&mut self, source: &str, barrier: bool) -> JsResult<Value> {
+        // The barrier goes up before compiling: a *parse* failure is reported with a trace
+        // too, and the reference truncates that one at the same place as a runtime failure.
+        if barrier {
+            let depth = self.frames.len();
+            self.trace_barriers.push(depth);
+        }
+        // Compiled before the promise exists, so a parse failure propagates as a throw
+        // instead of being folded into a rejection.
+        let compiled = match self.compile_global_script(source, EVAL_SCRIPT_FILE) {
+            Ok(compiled) => compiled,
+            Err(error) => {
+                if barrier {
+                    self.trace_barriers.pop();
+                }
+                return Err(error);
+            }
+        };
+        let (promise, resolve, reject) = self.new_promise_capability();
+        let strict = compiled.strict;
+        match self.run_eval_script(compiled, strict) {
+            Ok(value) => {
+                // `{ value }` is a plain object, so resolving with it adopts nothing even
+                // when the completion value is itself a promise.
+                let wrapped = self.new_object(Some(self.realm.object_proto.clone()));
+                self.set_property(&wrapped, "value", value)?;
+                self.call_value(resolve, Value::Undefined, vec![Value::Object(wrapped)])?;
+            }
+            Err(Signal::Throw(error)) => {
+                self.call_value(reject, Value::Undefined, vec![error])?;
+            }
+            Err(Signal::OutOfMemory) => return Err(Signal::OutOfMemory),
+        }
+        if barrier {
+            self.trace_barriers.pop();
+        }
+        Ok(Value::Object(promise))
     }
 
     /// A promise that resolves after `delay_ms`, which is `os.sleepAsync`.
@@ -1518,6 +1605,11 @@ impl<'a> Interp<'a> {
     /// Whether anything is still pending: a microtask or a timer.
     pub fn has_pending_work(&self) -> bool {
         !self.jobs.is_empty() || !self.tasks.is_empty() || !self.fd_handlers.is_empty()
+    }
+
+    /// Whether a timer or a microtask is pending, ignoring descriptor handlers.
+    pub fn has_pending_timers_or_jobs(&self) -> bool {
+        !self.jobs.is_empty() || !self.tasks.is_empty()
     }
 
     /// Run every queued microtask, including ones queued while draining.
@@ -2340,19 +2432,46 @@ impl<'a> Interp<'a> {
     /// for a `Function` body; a *direct* eval that reads a local variable would need
     /// the compiler to hand its variable environment over, which is not implemented.
     pub fn eval_in_global(&mut self, source: &str) -> JsResult<Value> {
+        self.eval_in_global_named(source, EVAL_FILE, false)
+    }
+
+    /// `std.evalScript(source)`: the same evaluation, reported under its own file name.
+    ///
+    /// The reference names the two separately — `eval` shows `<input>`, `std.evalScript`
+    /// shows `<evalScript>` — and the name is visible in every stack trace that passes
+    /// through the code, so they cannot share one constant.
+    pub fn eval_script_in_global(&mut self, source: &str, barrier: bool) -> JsResult<Value> {
+        self.eval_in_global_named(source, EVAL_SCRIPT_FILE, barrier)
+    }
+
+    fn eval_in_global_named(&mut self, source: &str, file: &str, barrier: bool) -> JsResult<Value> {
         // Marked for the duration, so `declare_var_global` knows a `var` from here is an
         // eval-created global binding — configurable, unlike a script's own `var`.
         self.eval_depth += 1;
-        let result = self.eval_in_global_inner(source);
+        if barrier {
+            let depth = self.frames.len();
+            self.trace_barriers.push(depth);
+        }
+        let result = self.eval_in_global_inner(source, file);
+        if barrier {
+            self.trace_barriers.pop();
+        }
         self.eval_depth -= 1;
         result
     }
 
-    fn eval_in_global_inner(&mut self, source: &str) -> JsResult<Value> {
-        // The reference names eval'd code `<input>` rather than inheriting the caller's
-        // file name, and stack traces show it, so `eval("1 + x")` failing reports
-        // `(<input>:1:5)`.
-        const EVAL_FILE: &str = "<input>";
+    fn eval_in_global_inner(&mut self, source: &str, file: &str) -> JsResult<Value> {
+        let compiled = self.compile_global_script(source, file)?;
+        let strict = compiled.strict;
+        self.run_eval_script(compiled, strict)
+    }
+
+    /// Parse and compile `source` as a global script, without running it.
+    ///
+    /// Split out so [`Interp::eval_in_global_async`] can report a syntax error as a throw —
+    /// before a promise exists to reject — while still evaluating in the same eval context
+    /// (direct-eval strictness, `new.target`, `super`).
+    fn compile_global_script(&mut self, source: &str, file: &str) -> JsResult<CompiledFunction> {
         // A *direct* eval inherits the strictness of the code that called it, which is
         // why `eval("x = 1")` in a strict function is a ReferenceError instead of an
         // implicit global. The caller's frame is the innermost one here, because a
@@ -2373,7 +2492,7 @@ impl<'a> Interp<'a> {
             Ok(program) => program,
             Err(error) => {
                 return Err(Signal::Throw(self.syntax_error_at(
-                    EVAL_FILE,
+                    file,
                     error.span.start.line,
                     error.span.start.column,
                     &format!("invalid source: {error}"),
@@ -2387,16 +2506,15 @@ impl<'a> Interp<'a> {
             // position in the source followed by the caller.
             Err(error) => {
                 return Err(Signal::Throw(self.syntax_error_at(
-                    EVAL_FILE,
+                    file,
                     error.span.start.line,
                     error.span.start.column,
                     &error.message,
                 )));
             }
         };
-        compiled.set_filename(EVAL_FILE);
-        let strict = compiled.strict;
-        self.run_eval_script(compiled, strict)
+        compiled.set_filename(file);
+        Ok(compiled)
     }
 
     /// Run an `eval`'d script in the caller's scope.
@@ -4786,7 +4904,8 @@ impl<'a> Interp<'a> {
                 let outer = if frame_less {
                     None
                 } else {
-                    self.native_frames.push((name, function.clone()));
+                    self.native_frames
+                        .push((name, function.clone(), self.frames.len()));
                     Some(self.current_native.replace(function.clone()))
                 };
                 let result = {
@@ -4814,7 +4933,8 @@ impl<'a> Interp<'a> {
                 let outer = if frame_less {
                     None
                 } else {
-                    self.native_frames.push((name, function.clone()));
+                    self.native_frames
+                        .push((name, function.clone(), self.frames.len()));
                     Some(self.current_native.replace(function.clone()))
                 };
                 let result = func(self, this, &args);
@@ -5955,6 +6075,13 @@ impl<'a> Interp<'a> {
             "message",
             Property::with_attributes(self.string(message), true, false),
         );
+        // The internal class, which is what tells a printer this is an error rather than a
+        // plain object with `name` and `message` properties. The constructor path sets it
+        // (`builtins/error.rs`); without it here an engine-thrown `TypeError` printed as
+        // `{ stack: … }` while `new TypeError(...)` printed as `TypeError: …`. It is
+        // literally `"Error"` in both places — the *name* is read from `name`, which is why
+        // a `RangeError` still prints as `RangeError`.
+        self.internal_set(&error, "_class", self.string("Error"));
         // The trace is captured where the error is *made*, which is where the reference
         // captures it too: `JS_ThrowTypeError` and friends call `build_backtrace` on the
         // way out, so a caught engine error already has its stack even if the handler
@@ -8715,8 +8842,8 @@ impl<'a> Interp<'a> {
     ///
     /// Cached on the realm, so every object of a kind shares one key and a slot can be
     /// read back by name.
-    pub fn internal_slot(&mut self, name: &'static str) -> PropertyKey {
-        if let Some(Value::Symbol(symbol)) = self.realm.internal_slots.get(name) {
+    pub fn internal_slot(&self, name: &'static str) -> PropertyKey {
+        if let Some(Value::Symbol(symbol)) = self.realm.internal_slots.borrow().get(name) {
             return PropertyKey::Symbol(symbol.clone());
         }
         let symbol = Gc::new(
@@ -8725,13 +8852,15 @@ impl<'a> Interp<'a> {
         );
         self.realm
             .internal_slots
+            .borrow_mut()
             .insert(name, Value::Symbol(symbol.clone()));
         PropertyKey::Symbol(symbol)
     }
 
     /// Read a hidden slot, or `None` when the object has none of that name.
     pub fn internal_get(&self, object: &Gc<JsObject>, name: &'static str) -> Option<Value> {
-        let Value::Symbol(symbol) = self.realm.internal_slots.get(name)? else {
+        let slots = self.realm.internal_slots.borrow();
+        let Value::Symbol(symbol) = slots.get(name)? else {
             return None;
         };
         object
@@ -8740,7 +8869,7 @@ impl<'a> Interp<'a> {
     }
 
     /// Define a hidden slot.
-    pub fn internal_set(&mut self, object: &Gc<JsObject>, name: &'static str, value: Value) {
+    pub fn internal_set(&self, object: &Gc<JsObject>, name: &'static str, value: Value) {
         let key = self.internal_slot(name);
         object.define_key(&key, Property::with_attributes(value, false, false));
     }
@@ -8918,50 +9047,73 @@ impl<'a> Interp<'a> {
 
     /// [`Interp::stack_trace`] with the `skip` innermost frames left out.
     fn stack_trace_skipping(&self, skip: usize) -> String {
-        let mut out = String::new();
-        let mut skip = skip;
-        // Natives run on the Rust stack, so they sit innermost. They never re-enter
-        // JavaScript, which is what makes it correct to emit them all before the
-        // bytecode frames rather than interleaved.
-        for (name, _) in self.native_frames.iter().rev() {
-            if skip > 0 {
-                skip -= 1;
-                continue;
+        // One ordered list, innermost first, so `skip` counts the same thing whether the
+        // frames it leaves out are native or bytecode. Indices rather than references: a
+        // `Frame` borrows from `self`, and a mixed list of borrows cannot name that lifetime.
+        let depth = self.frames.len();
+        let mut order: Vec<(bool, usize)> = Vec::with_capacity(depth + self.native_frames.len());
+        // A native entered while `at` bytecode frames were live was called *from* the
+        // innermost of those, so it belongs between frame `at` and frame `at - 1`. Natives
+        // entered at the current depth are therefore innermost of all.
+        let push_natives = |order: &mut Vec<(bool, usize)>, wanted: usize| {
+            for (index, (_, _, at)) in self.native_frames.iter().enumerate().rev() {
+                if *at == wanted {
+                    order.push((true, index));
+                }
             }
-            out.push_str("    at ");
-            out.push_str(name);
-            out.push_str(" (native)\n");
+        };
+        push_natives(&mut order, depth);
+        for index in (0..depth).rev() {
+            order.push((false, index));
+            push_natives(&mut order, index);
         }
-        for frame in self.frames.iter().rev() {
-            if skip > 0 {
-                skip -= 1;
-                continue;
-            }
-            let code = &frame.code.code;
-            let file = code.filename.as_deref().unwrap_or("<input>");
-            // The name comes from the function *object*, not from the compiled code:
-            // an anonymous function expression is named by the property it is stored
-            // in (`{valueOf: function(){}}`), which only the object knows.
-            let bound_name = match &frame.callee {
-                Value::Object(object) => {
-                    object
-                        .own_property("name")
-                        .and_then(|property| match property.value {
-                            Some(Value::String(text)) if !text.wtf8().is_empty() => {
-                                Some(text.to_string_lossy().into_owned())
-                            }
-                            _ => None,
-                        })
+        // A `backtrace_barrier` eval hides its caller: keep only what is at or inside the
+        // barrier. Natives entered at exactly the barrier depth are the eval entry point
+        // itself (`evalScript (native)`), and the reference leaves those out too.
+        if let Some(barrier) = self.trace_barriers.last().copied() {
+            order.retain(|(is_native, index)| match is_native {
+                true => *index == usize::MAX || self.native_frames[*index].2 > barrier,
+                false => *index >= barrier,
+            });
+        }
+
+        let mut out = String::new();
+        for (is_native, index) in order.into_iter().skip(skip) {
+            match is_native {
+                true => {
+                    out.push_str("    at ");
+                    out.push_str(&self.native_frames[index].0);
+                    out.push_str(" (native)\n");
                 }
-                _ => None,
-            };
-            out.push_str("    at ");
-            out.push_str(bound_name.as_deref().unwrap_or(&code.name));
-            match code.position_at(frame.at as u32) {
-                Some((line, column)) => {
-                    out.push_str(&format!(" ({file}:{line}:{column})\n"));
+                false => {
+                    let frame = &self.frames[index];
+                    let code = &frame.code.code;
+                    let file = code.filename.as_deref().unwrap_or("<input>");
+                    // The name comes from the function *object*, not from the compiled code:
+                    // an anonymous function expression is named by the property it is stored
+                    // in (`{valueOf: function(){}}`), which only the object knows.
+                    let bound_name = match &frame.callee {
+                        Value::Object(object) => {
+                            object
+                                .own_property("name")
+                                .and_then(|property| match property.value {
+                                    Some(Value::String(text)) if !text.wtf8().is_empty() => {
+                                        Some(text.to_string_lossy().into_owned())
+                                    }
+                                    _ => None,
+                                })
+                        }
+                        _ => None,
+                    };
+                    out.push_str("    at ");
+                    out.push_str(bound_name.as_deref().unwrap_or(&code.name));
+                    match code.position_at(frame.at as u32) {
+                        Some((line, column)) => {
+                            out.push_str(&format!(" ({file}:{line}:{column})\n"));
+                        }
+                        None => out.push_str(&format!(" ({file})\n")),
+                    }
                 }
-                None => out.push_str(&format!(" ({file})\n")),
             }
         }
         out

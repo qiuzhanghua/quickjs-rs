@@ -578,6 +578,31 @@ fn constant_conditions_and_dead_jumps_match_the_reference() {
     );
 }
 
+/// A store, a jump target, then a read of the same variable.
+///
+/// The peephole folds `dup; put_x; drop; get_x` into `set_x`, which is only equivalent
+/// when the `get_x` is reached by falling through. When a jump lands on the `get_x` — the
+/// end of an `if` body, a `switch` case, a loop head — folding it away retargets the jump
+/// onto whatever follows. `return` then ran with an empty stack and the function answered
+/// `undefined`, because the store had already consumed the value it was meant to leave.
+///
+/// This is why `with`/`switch`/`if` all need their own case here: each puts a label in a
+/// different place, and only the one on the `get` was being missed.
+#[test]
+fn a_jump_target_after_a_store_stays_put() {
+    require_oracle!();
+    let cases = [
+        "function f(c){ var p=\"\"; function g(){ p=\"x\"; if(c){ p=\"a\"; } return p; } return g; }",
+        "function f(c){ var p=\"\"; function g(){ p=\"x\"; if(c){ p=\"a\"; } else { p=\"b\"; } return p; } return g; }",
+        "function f(n){ var p=\"\"; function g(){ switch(n){ case 1: p=\"a\"; break; default: p=\"b\"; } return p; } return g; }",
+        "function f(n){ var p=\"\"; function g(){ p=\"s\"; while(n-- > 0){ p+=\"w\"; } return p; } return g; }",
+        // A local rather than a closure variable: the same rule, a different slot.
+        "function f(c){ var p; p=\"x\"; if(c){ p=\"a\"; } return p; }",
+        "function f(c){ var p; p=\"x\"; if(c){ p=\"a\"; } else { p=\"b\"; } return p; }",
+    ];
+    assert_cases("a_jump_target_after_a_store_stays_put", &cases);
+}
+
 /// Assignments, in statement *and* value position.
 ///
 /// The distinction matters: `put_field`/`put_array_el` consume both the object and

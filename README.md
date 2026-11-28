@@ -138,7 +138,7 @@ cargo run -p qjs -- --help    # 与上游 qjs --help 逐字节一致
 | 语法接受性 | `qjsc -c`（编译不执行）退出码 | 104 有效 + **56** 无效 + **38** 模块用例一致 |
 | 声明冲突 | 同上 | **55** 条作用域冲突用例一致（27 拒绝 + 28 接受，标签本身也被校验） |
 | 上游语料 | 同上 | `tests/` 的 **8** 个文件 + `examples/` 的 **1** 个一致（见下） |
-| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | **366** 条用例逐字节比较，0 差异 |
+| 字节码 | `qjsc-dump`（`-DDUMP_BYTECODE=1`）逐 opcode 反汇编 | **372** 条用例逐字节比较，0 差异 |
 | TDZ/作用域 | 同上 + **27** 条不变量测试 | 作用域链、check 操作码、捕获与关闭全部对齐 |
 | break/continue/标签 | 同上 | **20** 条用例一致；跳转目标栈、多层标签、do-while 的 test 与 for 的 update 全对 |
 | switch | 同上 | 18 条用例一致；fallthrough、`default` 任意位置、空 `case` 链全对 |

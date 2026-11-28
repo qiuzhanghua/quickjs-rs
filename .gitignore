@@ -4,3 +4,7 @@ __pycache__/
 # scripts/setup-oracle.sh builds the C reference implementation here. It is a
 # comparison oracle, not vendored source, so it stays out of the tree.
 /oracle
+
+# The reference compiler writes `out.c` into the working directory when it is run
+# without `-o`. Only the disassembly is wanted, so the file is litter.
+/out.c

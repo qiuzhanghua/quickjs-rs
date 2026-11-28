@@ -347,6 +347,13 @@ fn os_read(
     match read {
         Ok(count) => {
             bytes.borrow_mut().bytes[offset..offset + count].copy_from_slice(&chunk[..count]);
+            // Reaching end of file on the process's stdin is what tells the REPL there are
+            // no more lines. It is reported here rather than in `stdin.rs` because `os.read`
+            // reaches descriptor 0 through the descriptor table's own standard-stream path,
+            // so a `std.in` file object never sees the read.
+            if count == 0 && fd == 0 {
+                crate::stdio::note_stdin_eof();
+            }
             Ok(Value::Float(count as f64))
         }
         Err(error) => Ok(Value::Int(-errno_of(&error))),

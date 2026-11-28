@@ -40,4 +40,4 @@ pub mod std;
 pub mod stdio;
 pub mod timers;
 
-pub use eventloop::{RunError, run_until_idle};
+pub use eventloop::{RunError, run_repl, run_until_idle};

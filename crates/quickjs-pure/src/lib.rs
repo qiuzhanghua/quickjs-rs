@@ -657,6 +657,17 @@ impl<'rt> Context<'rt> {
         self.interp.as_ref().is_some_and(Interp::has_pending_work)
     }
 
+    /// Whether a timer or a microtask is pending, ignoring registered descriptors.
+    ///
+    /// A REPL whose stdin is at end of file still has a read handler registered, and that
+    /// handler will keep firing without ever producing another line — so "there is work"
+    /// has to mean something narrower than [`Context::has_pending_work`] there.
+    pub fn has_pending_timers_or_jobs(&self) -> bool {
+        self.interp
+            .as_ref()
+            .is_some_and(Interp::has_pending_timers_or_jobs)
+    }
+
     /// Rejections nobody handled, drained.
     ///
     /// [`Context::eval`] turns these into an error, but an event loop needs them *after*

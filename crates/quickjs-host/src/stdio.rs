@@ -71,6 +71,29 @@ pub struct FileState {
     closed: bool,
 }
 
+thread_local! {
+    /// Whether a read of the real stdin has reached end of file.
+    static STDIN_EOF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the real stdin has hit end of file.
+///
+/// The REPL reads stdin through `os.setReadHandler`, and `repl.js` has no end-of-file path:
+/// it reads zero bytes and waits for more, which never comes. Letting the host notice keeps
+/// the process from spinning — the reference hangs here, and matching a hang is not a
+/// behaviour worth reproducing.
+pub fn stdin_eof() -> bool {
+    STDIN_EOF.with(std::cell::Cell::get)
+}
+
+/// Record that the real stdin has reached end of file.
+///
+/// Called from both read paths — a `std.in` file object and `os.read(0, …)` — because the
+/// REPL uses the second and a script may use the first.
+pub fn note_stdin_eof() {
+    STDIN_EOF.with(|flag| flag.set(true));
+}
+
 enum Kind {
     /// A descriptor this host owns.
     Fd(OwnedFd),
@@ -83,6 +106,15 @@ enum Kind {
     Sink,
     /// The real stderr.
     Stderr,
+    /// The real stdin, borrowed rather than owned.
+    ///
+    /// Borrowing is what makes `fileno()` answer **0**: the reference's `std.in` wraps
+    /// descriptor 0 itself, and holding a `dup` here would report 3 instead — which is a
+    /// silent break, because `repl.js` installs its read handler on
+    /// `os.setReadHandler(std.in.fileno(), …)` and would then wait on a descriptor the
+    /// terminal never writes to. Owning nothing also keeps the existing promise that a
+    /// script closing `std.in` cannot take the process's stdin with it.
+    Stdin,
 }
 
 impl FileState {
@@ -134,6 +166,14 @@ impl FileState {
         }
     }
 
+    /// `std.in`: descriptor 0, borrowed.
+    pub fn stdin() -> Self {
+        FileState {
+            kind: Kind::Stdin,
+            ..FileState::sink()
+        }
+    }
+
     pub fn stderr() -> Self {
         FileState {
             kind: Kind::Stderr,
@@ -152,6 +192,9 @@ impl FileState {
         match &self.kind {
             Kind::Fd(fd) => Some(fd.as_fd()),
             Kind::Child { pipe, .. } => Some(pipe.as_fd()),
+            // `rustix::stdio::stdin` is a `BorrowedFd<'static>`, which is what lets
+            // this outlive the temporary `std::io::stdin()` handle returns.
+            Kind::Stdin => Some(rustix::stdio::stdin()),
             Kind::Sink | Kind::Stderr => None,
         }
     }
@@ -161,6 +204,7 @@ impl FileState {
         match &self.kind {
             Kind::Fd(fd) => fd.as_raw_fd(),
             Kind::Child { pipe, .. } => pipe.as_raw_fd(),
+            Kind::Stdin => 0,
             Kind::Sink => 1,
             Kind::Stderr => 2,
         }
@@ -177,6 +221,12 @@ impl FileState {
         match rustix::io::read(fd, chunk.as_mut_slice()) {
             Ok(0) => {
                 self.eof = true;
+                // Stdin reaching end of file is how a piped REPL says "no more lines".
+                // `repl.js` never unregisters its read handler, so without this the loop
+                // would poll a descriptor that is permanently readable-at-EOF forever.
+                if matches!(self.kind, Kind::Stdin) {
+                    note_stdin_eof();
+                }
                 false
             }
             Ok(count) => {
@@ -235,6 +285,10 @@ impl FileState {
                 emit(interp, &buffered);
                 0
             }
+            Kind::Stdin => {
+                self.error = true;
+                EBADF
+            }
             Kind::Stderr => match std::io::stderr().write_all(&buffered) {
                 Ok(()) => 0,
                 Err(_) => {
@@ -262,7 +316,7 @@ impl FileState {
     fn write(&mut self, interp: &mut Interp<'_>, bytes: &[u8]) -> usize {
         // A sink or stderr has no position and no reason to buffer, so it goes straight
         // out — which is also what keeps the sink's ordering honest against `print`.
-        if matches!(self.kind, Kind::Sink | Kind::Stderr) {
+        if matches!(self.kind, Kind::Sink | Kind::Stderr | Kind::Stdin) {
             self.write_buf.extend_from_slice(bytes);
             return match self.flush(interp) {
                 0 => bytes.len(),

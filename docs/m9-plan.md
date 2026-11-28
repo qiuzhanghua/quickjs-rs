@@ -799,3 +799,100 @@ sparse 的 `built-ins`），不适合在这轮末尾仓促改。**REPL 因此暂
 `disasm-cases.txt` 写一行——`O_APPEND` 只保证偏移更新是原子的，不保证写本身不交错，于是
 一行被拼成了多列。加一把锁、一次 `write_all` 即修。单独跑 `verify-claims.py` 从不复现，
 因为只有 `check.sh` 里的并行度才够。
+
+---
+
+## 13. REPL（参考的 `repl.js` 原样运行）
+
+M9d 结束时 REPL 被一个编译器 bug 挡住。修掉它之后，`qjs -i` 现在跑的是**参考自己的
+`repl.js`**——行编辑器、语法着色、补全、`\h` 帮助全是参考的代码，不是重写的。
+
+### 13.1 编译器 bug（先修的那个）
+
+见 §12.3。修法在 `fold_dup_patterns`：被跳转指向的 `drop`/`get` 不能折叠掉。
+
+`emit_var` 的窥孔把 `dup; put_x; drop; get_x` 折成 `set_x`（存值并留在栈上），只在
+**顺序落下**时等价。当跳转**落在**那条 `get_x` 上（`if` 体结束、`switch` case、循环头），
+删掉它就把跳转重定向到后一条指令，于是 `return` 在空栈上执行——存值那一步已经把值消耗掉了。
+
+危险在于它不报错，只给 `undefined`，所以大量测试碰巧通过（值恰好等于前一条语句留在栈上的
+东西）。这也解释了为什么 `if (true)` 版本"看起来对"。
+
+回归覆盖两层：
+- `crates/quickjs-pure/tests/run.rs` 的 `a_jump_target_after_a_store_is_not_folded_away`
+  （运行时行为，`if`/`switch`/`while` 三种标签位置）
+- `disasm_diff.rs` 的 `a_jump_target_after_a_store_stays_put`（6 条字节码逐字节对拍）
+
+test262：`test/language` +4 修复（`statements/switch/S12.11_A1_T*`），
+`test/built-ins` 零变化，两边都 **-0 回归**。
+
+### 13.2 为跑通 REPL 补的四处
+
+**`std.in.fileno()` 必须是 0。** 原先 `std.in` 持有 `dup(0)`，`fileno()` 报 3。`repl.js` 把
+读处理器装在 `os.setReadHandler(std.in.fileno(), …)` 上，于是等的是一个终端永远不写的描述符
+——打印提示符后永久静默。改成 `Kind::Stdin`：借 `rustix::stdio::stdin()` 的
+`BorrowedFd<'static>`，报告 0，且仍然不拥有它（脚本关 `std.in` 不影响进程 stdin）。
+
+**`std.evalScript` 的 `async` 选项。** 参考的 `JS_EVAL_FLAG_ASYNC` 把完成值走 promise
+送回，形状是 `{value: 完成值}`——**不隐式 await**，`Promise.resolve(7)` 给的是
+`{value: <那个 promise>}` 而不是 `{value: 7}`。三种情况要分开：语法错**同步抛**（promise
+还不存在），运行时错 reject，成功则 resolve `{value}`。
+
+**`backtrace_barrier` 截断栈。** 参考用它让 REPL 只报刚求值的那行、不把 readline 循环也
+报出来。实现为 `trace_barriers` 栈：记录建屏障时的字节码帧深度，出栈时只保留更深的帧。
+屏障必须在**编译前**建立——语法错的栈也要截断。
+
+**native 帧要排在它所属的字节码帧之间。** 原来 `stack_trace` 把所有 native 帧放在最前，
+理由是"native 从不重入 JavaScript"。`std.evalScript` 重入了，这个前提不再成立，于是
+`evalScript (native)` 跑到了它执行的代码上面。`native_frames` 现在记录入栈时的字节码深度，
+`stack_trace_skipping` 按深度交错。顺带把 `skip` 的语义修对了——它原先分别数两种帧，
+合并后才是"最内层 N 帧"。
+
+### 13.3 顺带修掉的两个真 bug
+
+**`std.__printObject` 多了一个换行。** 参考的 `js_std_file_printObject` 就是
+`JS_PrintValue(ctx, js_print_value_write, stdout, …)`，不追加。`repl.js` 每条结果自己再
+`std.puts("\n")`，所以我们这多出来的换行表现为**每条结果后一个空行**。既有测试
+`print_object_adds_a_newline` 断言的正是错的行为，已按参考改正并改名。
+
+**引擎内部抛的错误没有内部类。** `null.x` 的 `TypeError` 打印成 `{ stack: … }`，而
+`new TypeError(…)` 打印成 `TypeError: …`——因为 `make_error` 没设 `_class`，只有构造函数
+路径设了。为此把 `internal_slots` 改成 `RefCell`：驻留是**记忆化**不是可观察状态，用不可变
+借用填缓存是细节，这样 `internal_set` 能在 `&self` 下工作，`make_error` 不必要求独占借用。
+
+### 13.4 与参考的差异
+
+`qjs -i < file` 的输入：
+
+| | 参考 | 这里 |
+|---|---|---|
+| 结果输出 | `2` / `undefined` | 同 |
+| 语法错栈 | `at <evalScript>:1:9` + barrier | 同 |
+| 语法错措辞 | `invalid number literal` | `invalid source: 1:9: invalid number literal` |
+| 管道 stdin 到 EOF | **永久挂死**（跑满超时，CPU 100%） | 干净退出 |
+
+前两项是**纯文本共享**的多行输入副作用——第 2 行开始缓冲区里还留着第 1 行，参考同样如此
+（`1:4`、`1:9` 两个报错位置两边一致）。第三项是缺口，见 §13.5。第四项是**刻意的**：参考在
+EOF 上挂死，我们借 `stdin_eof()` 在"stdin 到 EOF 且没有定时器/微任务"时退出——复刻一个挂死
+不是值得保留的行为。
+
+### 13.5 还没做
+
+**语法错消息措辞。** 参考是 `variable name expected`，我们是
+`invalid source: 1:5: expecting a variable name, got '='`：多一个 `invalid source: L:C: `
+前缀（M4 引入），且措辞本身不同。现有的 `parse_oracle.rs` 只对拍**接受/拒绝**，不验文本，
+所以这件事完全没被跟踪。要对齐得逐条搬 QuickJS 的 `js_parse_error` 串，属独立一轮。
+
+**顶层 `await`。** 参考的 `JS_EVAL_FLAG_ASYNC` 还让 `await` 在顶层合法（脚本在 async 上下文
+里求值）。这需要解析器和挂起机制接受一个可挂起的顶层脚本，未实现——目前是语法错。
+`repl.js` 不依赖它，所以 REPL 不受影响。
+
+**`std.evalScript` 的 `load`/`compile_only` 等其余选项**未实现，脚本触到时报错而非静默。
+
+### 13.6 验收
+
+- `cargo test` 全绿（新增 `std_eval` 6 项、`run.rs` 2 项、`disasm_diff` 1 组 6 例）
+- `cargo clippy -D warnings` / `cargo fmt` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/NFR-7
+- test262 `built-ins` 14907/17822 零变化；`language` 14941→14945（+4，-0）
+- `qjs -i` 跑参考的 `repl.js`，结果输出与参考逐行一致

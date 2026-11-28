@@ -116,14 +116,11 @@ pub fn install(
     ctx.define_hidden(object, "out", out)?;
     let err = new_file(ctx, &proto, FileState::stderr(), &slab)?;
     ctx.define_hidden(object, "err", err)?;
-    // `std.in` reads the real stdin. `dup` gives this host its own descriptor, so a script
-    // closing `std.in` cannot take the process's stdin with it.
-    // Without a usable stdin the property is simply absent, which is the same shape as a
-    // function that has not arrived yet.
-    if let Ok(fd) = rustix::io::dup(std::io::stdin()) {
-        let input = new_file(ctx, &proto, FileState::from_fd(fd, 0), &slab)?;
-        ctx.define_hidden(object, "in", input)?;
-    }
+    // `std.in` is descriptor 0 itself, borrowed rather than duplicated: `fileno()` has to
+    // answer 0, because `repl.js` reads stdin through `os.read(std.in.fileno(), …)` and a
+    // `dup` would report 3 and wait on the wrong descriptor forever.
+    let input = new_file(ctx, &proto, FileState::stdin(), &slab)?;
+    ctx.define_hidden(object, "in", input)?;
     Ok(())
 }
 
@@ -508,9 +505,31 @@ fn js_load_script(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsRe
 /// `options.backtrace_barrier` is accepted and ignored: this engine has no `js_backtrace`
 /// flag to hide frames behind, and a script that passes it is asking for a stack trace
 /// shape, not for different evaluation.
+/// `std.evalScript(source, options?)`.
+///
+/// `options.async` switches to the promise-returning form, which is what the reference's
+/// REPL uses so that one line's failure cannot escape the read handler. `options
+/// .backtrace_barrier` truncates an error's trace at this evaluation, so the REPL reports
+/// the line it evaluated without also reporting its own readline loop.
 fn js_eval_script(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let source = interp.to_js_string(args.first().unwrap_or(&Value::Undefined))?;
-    interp.eval_in_global(&source)
+    let (asynchronous, barrier) = match args.get(1).and_then(|value| value.as_object()) {
+        Some(options) => {
+            let flag = |interp: &mut Interp<'_>, name: &str| -> JsResult<bool> {
+                Ok(match interp.get_property(options, name)? {
+                    Some(value) => value.to_boolean(),
+                    None => false,
+                })
+            };
+            (flag(interp, "async")?, flag(interp, "backtrace_barrier")?)
+        }
+        None => (false, false),
+    };
+    if asynchronous {
+        interp.eval_in_global_async(&source, barrier)
+    } else {
+        interp.eval_script_in_global(&source, barrier)
+    }
 }
 
 /// `std.__sprintObject(value)` — the reference's `JS_PrintValue` as a string.
@@ -520,9 +539,13 @@ fn js_sprint_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> Js
 }
 
 /// `std.__printObject(value)` — the same text written to stdout.
+///
+/// No trailing newline, matching the reference: `js_std_file_printObject` is
+/// `JS_PrintValue(ctx, js_print_value_write, stdout, …)` and nothing else. The callers that
+/// want a line (`repl.js` prints every result this way) add the newline themselves, so
+/// adding one here produced a blank line after each of them.
 fn js_print_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let mut text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
-    text.push('\n');
+    let text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
     stdio::emit(interp, text.as_bytes());
     Ok(Value::Undefined)
 }

@@ -7327,10 +7327,18 @@ fn fold_dup_patterns(insns: &mut [Option<(Opcode, Vec<Op>)>], label_at: &[Option
             insns[index + 1] = None;
             continue;
         }
-        if opcode_at(insns, end) == Some(Opcode::Drop) {
+        // A `drop` or a `get` that is the target of a jump must stay exactly where it is.
+        // Deleting it moves the label's target onto whatever follows, and the code that
+        // jumps there arrives with a different stack than the fall-through path: that is
+        // how `p = "x"; if (c) { p = "a"; } return p;` came to return `undefined` — the
+        // `get_x` the `if` jumped to was folded away, so the jump landed on `return` with
+        // an empty stack. The store had already consumed the value it was supposed to
+        // leave behind.
+        if opcode_at(insns, end) == Some(Opcode::Drop) && !is_label_at(label_at, end) {
             new_op = put_op;
             end += 1;
             if opcode_at(insns, end) == Some(get_form_of(put_op))
+                && !is_label_at(label_at, end)
                 && insns[end]
                     .as_ref()
                     .is_some_and(|(_, operands)| operands.first() == Some(&Op::Slot(slot)))

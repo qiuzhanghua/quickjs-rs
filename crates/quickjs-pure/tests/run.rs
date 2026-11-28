@@ -430,3 +430,84 @@ fn a_throw_in_tail_position_does_not_reuse_the_frame() {
         .expect_err("deep tail recursion overflows");
     assert!(error.to_string().contains("stack"), "{error}");
 }
+
+/// A store, a jump target, then a read of the same closure variable.
+///
+/// This is a regression test for a fold that deleted a jump target. The peephole turns
+/// `dup; put_x; drop; get_x` into `set_x`, which is only equivalent when the `get_x` is
+/// reached by falling through. When a jump lands *on* the `get_x` — an `if` body ending, a
+/// `switch` case, a loop head — deleting it retargets the jump to whatever follows, and
+/// `return` then runs with an empty stack. The store had already consumed the value it was
+/// meant to leave behind, so the function answered `undefined`.
+///
+/// Every expectation below is `qjs -e` on the reference.
+#[test]
+fn a_jump_target_after_a_store_is_not_folded_away() {
+    // Non-constant condition: independent of the (still missing) constant folding, so this
+    // fails if the fold starts deleting label targets again.
+    assert_eq!(
+        eval(
+            r#"
+            var make = function () {
+                var v = "";
+                return function (c) { v = "x"; if (c) { v = "a"; } return v; };
+            };
+            var f = make();
+            print(f(false), f(true), f(false));
+            "#
+        ),
+        "x a x\n"
+    );
+
+    // A `switch` puts its labels on exactly these boundaries, which is where the
+    // upstream suite caught it: test262's `statements/switch/S12.11_A1_T*`.
+    assert_eq!(
+        eval(
+            r#"
+            var make = function () {
+                var v = "";
+                return function (n) {
+                    switch (n) { case 1: v = "one"; break; default: v = "other"; }
+                    return v;
+                };
+            };
+            var f = make();
+            print(f(1), f(2));
+            "#
+        ),
+        "one other\n"
+    );
+
+    // A loop head is the other place a label sits: the store, then the condition re-reads.
+    assert_eq!(
+        eval(
+            r#"
+            var make = function () {
+                var v = "";
+                return function (n) { v = "s"; while (n-- > 0) { v += "w"; } return v; };
+            };
+            var f = make();
+            print(f(0), f(2));
+            "#
+        ),
+        "s sww\n"
+    );
+}
+
+/// The same shape with a *local* rather than a closure variable, which resolves to a
+/// different slot but folds through the same rule.
+#[test]
+fn a_jump_target_after_a_local_store_is_not_folded_away() {
+    assert_eq!(
+        value(
+            r#"
+            (function () {
+                var v = "";
+                function f(c) { v = "x"; if (c) { v = "a"; } return v; }
+                return [f(false), f(true)].join(",");
+            })()
+            "#
+        ),
+        "x,a"
+    );
+}

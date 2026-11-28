@@ -148,12 +148,17 @@ fn the_limits_are_reported() {
     );
 }
 
-/// `__printObject` is `__sprintObject` plus a newline on stdout.
+/// `__printObject` writes exactly what `__sprintObject` returns — and no newline.
+///
+/// The reference's `js_std_file_printObject` is `JS_PrintValue(ctx, js_print_value_write,
+/// stdout, …)` and nothing else. Callers add the line break themselves: `repl.js` prints
+/// every result this way followed by `std.puts("\n")`, so an extra newline here showed up as
+/// a blank line after each result.
 #[test]
-fn print_object_adds_a_newline() {
+fn print_object_writes_no_trailing_newline() {
     let output = run(r#"
         std.__printObject({ a: 1 });
         std.__printObject([1]);
         "#);
-    assert_eq!(output, "{ a: 1 }\n[ 1 ]\n");
+    assert_eq!(output, "{ a: 1 }[ 1 ]");
 }
