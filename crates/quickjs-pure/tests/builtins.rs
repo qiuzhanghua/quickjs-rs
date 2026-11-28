@@ -1879,11 +1879,10 @@ fn using_validates_at_the_declaration() {
     // A non-callable disposer is a `TypeError` too.
     assert_eq!(
         throws("(function () { using x = { [Symbol.dispose]: 1 } })()"),
-        // Known gap: the reference names the frame `<anonymous>` and points at column 35
-        // (the `1`, where the disposer is reached); we leave the name empty and point at
-        // column 26 (the declaration).
+        // Known gap: the reference points at column 35 (the `1`, where the disposer is
+        // reached); we point at column 26 (the declaration).
         "TypeError: dispose method is not a function\n    \
-         at  (<input>:1:26)\n    at <eval> (<input>:1:52)"
+         at <anonymous> (<input>:1:26)\n    at <eval> (<input>:1:52)"
     );
     // The method is snapshotted once, at the declaration: replacing it afterwards does not
     // change what runs.

@@ -169,8 +169,16 @@ impl Redefinition {
 struct Scope {
     /// Whether this is a function/module scope (where `var` lands).
     is_var_scope: bool,
-    /// `var`-declared names.
+    /// `var`-declared names, including ones hoisted through this scope from a block.
     var_names: Vec<String>,
+    /// `var`-declared names written *at this scope level*.
+    ///
+    /// `var_names` is the transitive set (`{ var a; }` puts `a` in the block *and* in the
+    /// enclosing function), which is what the lexical-conflict checks want. This one is
+    /// not transitive, because a module's function-declaration check compares scope *levels*:
+    /// a `var` written inside a block only clashes with a function in that same block, not
+    /// with one at the module's top level.
+    var_names_here: Vec<String>,
     /// `let`/`const`/`class`/`import` names declared directly in this scope.
     lex_names: Vec<String>,
     /// Function-declaration names declared directly in this scope.
@@ -190,6 +198,22 @@ struct Scope {
     /// from the `var` check (`catch (e) { var e; }` is legal, and so is `function f(a){ var
     /// a; }`), which is why `declare_var` looks at neither.
     catch_names: Vec<String>,
+    /// Function-declaration names whose function is a *plain* one — not `async`, not a
+    /// generator.
+    ///
+    /// The sloppy-mode allowance for two function declarations in one block
+    /// (Annex B.3.3.4) covers only the plain kind: the reference requires
+    /// `var_def_type == JS_VAR_DEF_FUNCTION_DECL`, which an `async function` or a generator
+    /// does not use. So `{ function f(){} function f(){} }` is accepted in a sloppy script
+    /// while `{ function f(){} function* f(){} }` is not.
+    plain_fn_names: Vec<String>,
+    /// `import`-declared names.
+    ///
+    /// Recorded in `lex_names` as well, because an import *is* a lexical binding of the
+    /// module. Kept apart because a module-level function declaration conflicting with an
+    /// import is not an error in the reference — its `find_global_var` lookup does not see
+    /// imports — so the module-code check has to be able to tell the two apart.
+    import_names: Vec<String>,
 }
 
 impl Scope {
@@ -197,10 +221,13 @@ impl Scope {
         Scope {
             is_var_scope: false,
             var_names: Vec::new(),
+            var_names_here: Vec::new(),
             lex_names: Vec::new(),
             fn_names: Vec::new(),
             params: Vec::new(),
             catch_names: Vec::new(),
+            plain_fn_names: Vec::new(),
+            import_names: Vec::new(),
         }
     }
 
@@ -208,10 +235,13 @@ impl Scope {
         Scope {
             is_var_scope: true,
             var_names: Vec::new(),
+            var_names_here: Vec::new(),
             lex_names: Vec::new(),
             fn_names: Vec::new(),
             params,
             catch_names: Vec::new(),
+            plain_fn_names: Vec::new(),
+            import_names: Vec::new(),
         }
     }
 }
@@ -531,7 +561,7 @@ impl<'a> Parser<'a> {
     /// lexical declaration, a `var`/function declaration or a simple parameter
     /// *of the same scope*. `var a; { let a; }` is legal, `{ let a; { var a; } }`
     /// is not (the `var` hoists past the `let`, which `declare_var` checks).
-    fn declare_lexical(&mut self, name: &str, span: Span) -> Result<()> {
+    fn declare_lexical(&mut self, name: &str) -> Result<()> {
         let Some(scope) = self.scopes.last() else {
             return Ok(());
         };
@@ -543,9 +573,13 @@ impl<'a> Parser<'a> {
             Some(Redefinition::Lexical)
         } else if scope.params.iter().any(|n| n == name) {
             Some(Redefinition::Parameter)
-        } else if scope.fn_names.iter().any(|n| n == name) {
-            Some(Redefinition::Variable)
-        } else if scope.var_names.iter().any(|n| n == name) {
+        } else if scope.fn_names.iter().any(|n| n == name)
+            || scope.var_names.iter().any(|n| n == name)
+        {
+            // A body-scope function declaration is recorded in both lists, and the
+            // message for either depends on whether the clash is at the global level:
+            // `function a(){} let a;` at the top of a script says "global identifier",
+            // the same two inside a function say "a variable".
             Some(if self.at_top_level_scope() {
                 Redefinition::Global
             } else {
@@ -555,7 +589,7 @@ impl<'a> Parser<'a> {
             None
         };
         if let Some(reason) = reason {
-            return Err(self.duplicate_declaration(reason, span));
+            return Err(self.duplicate_declaration(reason));
         }
         if let Some(scope) = self.scopes.last_mut() {
             scope.lex_names.push(name.to_string());
@@ -565,10 +599,10 @@ impl<'a> Parser<'a> {
 
     /// Declare a `var` or function-declaration name: it hoists to the nearest
     /// function scope, but may not collide with a lexical name on the way up.
-    fn declare_var(&mut self, name: &str, span: Span) -> Result<()> {
+    fn declare_var(&mut self, name: &str) -> Result<()> {
         for scope in self.scopes.iter().rev() {
             if scope.lex_names.iter().any(|n| n == name) {
-                return Err(self.duplicate_declaration(Redefinition::Lexical, span));
+                return Err(self.duplicate_declaration(Redefinition::Lexical));
             }
             if scope.is_var_scope {
                 break;
@@ -584,28 +618,92 @@ impl<'a> Parser<'a> {
                 scope.var_names.push(name.to_string());
             }
         }
+        if let Some(scope) = self.scopes.last_mut()
+            && !scope.var_names_here.iter().any(|n| n == name)
+        {
+            scope.var_names_here.push(name.to_string());
+        }
         Ok(())
     }
 
-    /// Declare a function declaration name.
+    /// Reject a parameter list that binds the same name twice.
     ///
-    /// See [`Scope::fn_names`] for why this is not the same as a `var`.
-    fn declare_function(&mut self, name: &str, span: Span) -> Result<()> {
-        let in_var_scope = self.scopes.last().is_none_or(|s| s.is_var_scope);
-        if !in_var_scope {
-            let clashes = self
+    /// Two questions, answered separately and in the reference's order:
+    ///
+    /// * *Which* duplicate is reported. A name bound inside a destructuring pattern is
+    ///   checked as soon as it is read (`js_parse_destructuring_var`), and so is a plain
+    ///   name once the list is known to contain an `=`; a plain name in a list without one
+    ///   waits for the end. So `function f([a], a, [a])` reports the *third* parameter, not
+    ///   the second — the second is not checked yet when the third is.
+    /// * *Which message*. The early check says `duplicate parameter names`; the final one
+    ///   says `duplicate argument names`, and carries no name.
+    ///
+    /// `plain_is_illegal` is the caller's answer to "are duplicates illegal here at all":
+    /// a sloppy `function f(a, a){}` accepts them (last wins), while a strict or
+    /// non-simple list, an arrow, or a method does not.
+    fn check_duplicate_parameters(&self, params: &[Pattern], plain_is_illegal: bool) -> Result<()> {
+        let has_default = params.iter().any(pattern_has_default);
+        let mut seen: Vec<String> = Vec::new();
+        let mut deferred: Option<Span> = None;
+        for param in params {
+            for (name, span, in_pattern) in parameter_bindings(param) {
+                if seen.iter().any(|seen| seen == &name) {
+                    if has_default || in_pattern {
+                        return Err(self.error_at(
+                            "duplicate parameter names not allowed in this context".to_string(),
+                            span,
+                        ));
+                    }
+                    deferred.get_or_insert(span);
+                }
+                seen.push(name);
+            }
+        }
+        match deferred {
+            Some(span) if plain_is_illegal => Err(self.error_at(
+                "duplicate argument names not allowed in this context".to_string(),
+                span,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Declare a function declaration name in the scope that holds it.
+    ///
+    /// Split in two because the reference checks the two cases in different places, and
+    /// the reported position follows from where the check is: a block-level declaration is
+    /// checked at its *name* (`js_parse_function_decl2` calls `define_var` with the name
+    /// just consumed, before the parameters), a body-level one only once the whole function
+    /// has been parsed. So the block half runs from [`Parser::parse_function`] and this one
+    /// from the call site afterwards, and only one of the two does anything — which one
+    /// depends on the scope the declaration lands in.
+    ///
+    /// A function declaration in a function/script/module *body* behaves like a `var`:
+    /// `function a(){} var a;` and `var a; function a(){}` are both accepted, in either
+    /// mode. It is not quite a `var` though — a later `let a` reports it as "a variable"
+    /// (or "global identifier" at the top level), which is what `fn_names` records:
+    /// `find_var_in_child_scope` in the reference, consulted after the lexical check.
+    fn declare_function(&mut self, name: &str) -> Result<()> {
+        if !self.scopes.last().is_none_or(|scope| scope.is_var_scope) {
+            return Ok(());
+        }
+        // The lexical check is skipped at the top level of a script or module, which is
+        // the reference's "avoid creating a lexical variable in the global scope" branch —
+        // so `let a; function a(){}` there is *accepted*, while the same two inside a
+        // function body are a lexical redefinition. The other order still errors, because
+        // then it is the `let` that does the checking.
+        if !self.at_top_level_scope()
+            && self
                 .scopes
                 .last()
-                .is_some_and(|s| s.lex_names.iter().any(|n| n == name));
-            if clashes {
-                return Err(self.duplicate_declaration(Redefinition::Lexical, span));
-            }
-        } else if let Some(scope) = self.scopes.last_mut() {
+                .is_some_and(|scope| scope.lex_names.iter().any(|n| n == name))
+        {
+            return Err(self.duplicate_declaration(Redefinition::Lexical));
+        }
+        if let Some(scope) = self.scopes.last_mut() {
             if !scope.var_names.iter().any(|n| n == name) {
                 scope.var_names.push(name.to_string());
             }
-        }
-        if let Some(scope) = self.scopes.last_mut() {
             if !scope.fn_names.iter().any(|n| n == name) {
                 scope.fn_names.push(name.to_string());
             }
@@ -613,8 +711,100 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn duplicate_declaration(&self, reason: Redefinition, span: Span) -> SyntaxError {
-        self.error_at(reason.message(), span)
+    /// The at-the-name half of a function declaration: the block-scope check and the
+    /// module-code one.
+    ///
+    /// In a *block* a function declaration is a lexical binding of that block, which is why
+    /// `{ function f(){} var f }` is an early error (test262's
+    /// `block-scope/syntax/redeclaration`) while the same two declarations in a body are
+    /// not. The reference gets there by way of `define_var(JS_VAR_DEF_FUNCTION_DECL)`,
+    /// which sets `is_lexical`.
+    fn declare_block_function(&mut self, name: &str, is_plain: bool) -> Result<()> {
+        // A module is stricter about a function declaration sharing a name with anything
+        // already declared at the same level, and says so with its own message. The
+        // reference has this as a separate check (`js_parse_function_decl2`, "invalid
+        // redefinition of global identifier in module code") that runs at the name, before
+        // everything else, and matches on the *scope level* — so a `var` inside one block
+        // clashes with a function in that same block, and one at the module's top level
+        // does not.
+        if self.module
+            && self.at_top_level_scope()
+            && let Some(scope) = self.scopes.last()
+        {
+            // What can clash is only what the reference keeps in its *global* var table: a
+            // `var` written at this level (wherever that is), and — at the module's own
+            // body — the lexical declarations, which are module variables too. A `let`
+            // inside a block is not, so `{ let a; function a(){} }` in a module reports the
+            // ordinary lexical error instead.
+            let mut taken = scope.var_names_here.iter().any(|existing| existing == name);
+            if scope.is_var_scope {
+                let module_bindings = scope
+                    .lex_names
+                    .iter()
+                    .filter(|existing| !scope.import_names.contains(existing))
+                    .chain(&scope.fn_names);
+                taken |= module_bindings.into_iter().any(|existing| existing == name);
+            }
+            if taken {
+                return Err(self.error_at(
+                    "invalid redefinition of global identifier in module code",
+                    self.current.span,
+                ));
+            }
+        }
+        if self.scopes.last().is_none_or(|scope| scope.is_var_scope) {
+            return Ok(());
+        }
+        let Some(scope) = self.scopes.last() else {
+            return Ok(());
+        };
+        if scope.lex_names.iter().any(|n| n == name) || scope.catch_names.iter().any(|n| n == name)
+        {
+            // Annex B.3.3.4 lets a block re-declare a *function* in sloppy mode, and says
+            // nothing about a lexical binding of any other kind. A second function
+            // declaration is therefore accepted only where the first came from one too.
+            let from_plain_function = scope.plain_fn_names.iter().any(|n| n == name);
+            if !(from_plain_function && is_plain && !self.strict) {
+                return Err(self.duplicate_declaration(Redefinition::Lexical));
+            }
+        } else if scope.var_names.iter().any(|n| n == name) {
+            // A `var` in the same block clashes, and which message is right depends on
+            // where that `var` landed: at the top level it became a global var, and the
+            // reference checks globals separately.
+            let reason = if self.at_top_level_scope() {
+                Redefinition::Global
+            } else {
+                Redefinition::Variable
+            };
+            return Err(self.duplicate_declaration(reason));
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            if !scope.lex_names.iter().any(|n| n == name) {
+                scope.lex_names.push(name.to_string());
+            }
+            if !scope.fn_names.iter().any(|n| n == name) {
+                scope.fn_names.push(name.to_string());
+            }
+            if is_plain && !scope.plain_fn_names.iter().any(|n| n == name) {
+                scope.plain_fn_names.push(name.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// A redefinition error, positioned the way the reference positions one.
+    ///
+    /// `js_parse_error` always uses `s->token.ptr` — the *current* token — so a
+    /// redeclaration points at whatever follows the offending name, not at the name
+    /// itself: `{ let a; let a = 1; }` reports the `=`, and `{ let a; let a; }` reports
+    /// the `;`. Every call site is placed at the point the reference makes the check, so
+    /// the current token here is the same one it would be there.
+    ///
+    /// Known gap: for a destructuring target the reference reports the token after the
+    /// *inner* binding identifier (`let [a] = []` points at the `]`), while our check
+    /// runs once the whole pattern is parsed.
+    fn duplicate_declaration(&self, reason: Redefinition) -> SyntaxError {
+        self.error_at(reason.message(), self.current.span)
     }
 
     /// Whether declarations here belong to the script/module's own top-level scope.
@@ -632,9 +822,9 @@ impl<'a> Parser<'a> {
         pattern.bound_names(&mut names);
         for name in names {
             if is_var {
-                self.declare_var(&name.name, name.span)?;
+                self.declare_var(&name.name)?;
             } else {
-                self.declare_lexical(&name.name, name.span)?;
+                self.declare_lexical(&name.name)?;
             }
         }
         Ok(())
@@ -964,7 +1154,7 @@ impl<'a> Parser<'a> {
             let start = self.current.span.start;
             let func = self.parse_function(FunctionForm::Declaration, false)?;
             if let Some(name) = &func.name {
-                self.declare_function(&name.name, name.span)?;
+                self.declare_function(&name.name)?;
             }
             return Ok(Stmt::new(
                 StmtKind::FuncDecl(Box::new(func)),
@@ -978,7 +1168,7 @@ impl<'a> Parser<'a> {
                 self.bump()?; // async
                 let func = self.parse_function(FunctionForm::Declaration, true)?;
                 if let Some(name) = &func.name {
-                    self.declare_function(&name.name, name.span)?;
+                    self.declare_function(&name.name)?;
                 }
                 return Ok(Stmt::new(
                     StmtKind::FuncDecl(Box::new(func)),
@@ -990,7 +1180,7 @@ impl<'a> Parser<'a> {
             let start = self.current.span.start;
             let class = self.parse_class(false)?;
             if let Some(name) = &class.name {
-                self.declare_lexical(&name.name, name.span)?;
+                self.declare_lexical(&name.name)?;
             }
             return Ok(Stmt::new(
                 StmtKind::ClassDecl(Box::new(class)),
@@ -1210,7 +1400,7 @@ impl<'a> Parser<'a> {
             }
             let func = self.parse_function(FunctionForm::Declaration, false)?;
             if let Some(name) = &func.name {
-                self.declare_function(&name.name, name.span)?;
+                self.declare_function(&name.name)?;
             }
             return Ok(Stmt::new(
                 StmtKind::FuncDecl(Box::new(func)),
@@ -1870,6 +2060,11 @@ impl<'a> Parser<'a> {
         loop {
             let declarator_start = self.current.span.start;
             let target = self.parse_binding_target()?;
+            // Declared here, before the initialiser: the reference calls `js_define_var`
+            // from `js_parse_var`'s `set_val`, which is reached with the name just
+            // consumed, so a redeclaration points at the `=` (or whatever follows)
+            // rather than at the end of the statement.
+            self.declare_pattern(&target, !kind.is_lexical())?;
             // `using` disposes a value, so it binds a name and nothing else: a pattern has
             // no single resource to dispose.
             if kind.is_using() && !matches!(target.unparen_kind(), PatternKind::Ident(_)) {
@@ -1906,7 +2101,6 @@ impl<'a> Parser<'a> {
                     return Err(self.error_at("'let' is not a valid lexical identifier", name.span));
                 }
             }
-            self.declare_pattern(&target, !kind.is_lexical())?;
             declarators.push(Declarator {
                 target,
                 init,
@@ -2141,6 +2335,20 @@ impl<'a> Parser<'a> {
             }
             None
         };
+        // A function declaration in a *block* is a lexical binding of that block, and the
+        // reference checks it right here: `js_parse_function_decl2` calls
+        // `define_var(JS_VAR_DEF_FUNCTION_DECL)` with the name just consumed, so the
+        // reported position is the token that follows it — `(` for `function a(`. The
+        // body-scope case is a different check and happens after the whole function, which
+        // is why it is made at the call site instead.
+        //
+        // Doing it here also means a block-level conflict is found before the body is
+        // parsed, so the body's own errors cannot mask it.
+        if form == FunctionForm::Declaration
+            && let Some(ident) = &name
+        {
+            self.declare_block_function(&ident.name, !is_async && !is_generator)?;
+        }
         let saved = self.ctx;
         self.ctx = FnCtx {
             in_function: true,
@@ -2158,7 +2366,7 @@ impl<'a> Parser<'a> {
         // implicit global is not a declaration.
         let params_result = self.parse_formal_parameters();
         let result = match params_result {
-            Ok(params) => self.parse_function_body(params, is_generator, is_async),
+            Ok(params) => self.parse_function_body(params, false),
             Err(err) => Err(err),
         };
         self.ctx = saved;
@@ -2233,8 +2441,7 @@ impl<'a> Parser<'a> {
     fn parse_function_body(
         &mut self,
         params: Vec<Pattern>,
-        is_generator: bool,
-        is_async: bool,
+        is_method: bool,
     ) -> Result<(Vec<Pattern>, Span, FunctionBody, bool)> {
         let params_span = self.prev_end;
         // Strictness is per function, so the body saves and restores it itself rather
@@ -2287,25 +2494,17 @@ impl<'a> Parser<'a> {
                 Span::new(params_span, params_span),
             ));
         }
-        // Duplicate parameter names: always illegal for non-simple lists and in
-        // strict mode; in sloppy simple lists they are allowed (last wins).
-        if body_strict || !simple_params || is_generator || is_async {
-            let mut seen: Vec<String> = Vec::new();
-            for param in &params {
-                let mut names = Vec::new();
-                param.bound_names(&mut names);
-                for name in names {
-                    if seen.contains(&name.name) {
-                        return Err(self.error_at(
-                            // `argument`, not `parameter`, and no name in the message.
-                            "duplicate argument names not allowed in this context".to_string(),
-                            name.span,
-                        ));
-                    }
-                    seen.push(name.name);
-                }
-            }
-        }
+        // Duplicate parameter names. Where they are illegal at all is the reference's
+        // condition in `js_parse_function_args`: strict mode, a non-simple list, an arrow,
+        // or a method. A plain sloppy `function f(a, a){}` is legal (last wins), and so is
+        // a sloppy generator or `async function` — only an async *method* is covered.
+        //
+        // Which of the two messages is used depends on how the duplicate was reached, and
+        // that is a different question: at *parameter-parse* time the reference checks each
+        // name with `duplicate parameter names`, and it only gets there when the list holds
+        // an `=` anywhere or the name sits inside a destructuring pattern. Everything else
+        // waits for the check above, which says `duplicate argument names`.
+        self.check_duplicate_parameters(&params, body_strict || !simple_params || is_method)?;
         let params_span_value = Span::new(params_span, params_span);
         self.strict = saved_strict;
         self.lexer.set_strict(saved_strict);
@@ -2492,8 +2691,7 @@ impl<'a> Parser<'a> {
             self.top_level = false;
             let result = (|| -> Result<Function> {
                 let params = self.parse_formal_parameters()?;
-                let (params, params_span, body, strict) =
-                    self.parse_function_body(params, is_generator, is_async)?;
+                let (params, params_span, body, strict) = self.parse_function_body(params, true)?;
                 Ok(Function {
                     name: None,
                     params,
@@ -2651,7 +2849,12 @@ impl<'a> Parser<'a> {
                 ImportSpecifier::Namespace(id) => id,
                 ImportSpecifier::Named { local, .. } => local,
             };
-            self.declare_lexical(&local.name, local.span)?;
+            self.declare_lexical(&local.name)?;
+            if let Some(scope) = self.scopes.last_mut()
+                && !scope.import_names.iter().any(|n| n == &local.name)
+            {
+                scope.import_names.push(local.name.clone());
+            }
         }
         Ok(Stmt::new(
             StmtKind::Import(Box::new(ImportDecl {
@@ -3174,26 +3377,10 @@ impl<'a> Parser<'a> {
             return Ok(None);
         };
         // Committed: `=>` has been consumed, so errors from here on are real.
-        // Arrow parameter lists may never repeat a name, in any mode.
-        {
-            let mut seen: Vec<String> = Vec::new();
-            for param in &head.params {
-                let mut names = Vec::new();
-                param.bound_names(&mut names);
-                for name in names {
-                    if seen.contains(&name.name) {
-                        return Err(self.error_at(
-                            format!(
-                                "duplicate argument names not allowed in this context ('{}')",
-                                name.name
-                            ),
-                            name.span,
-                        ));
-                    }
-                    seen.push(name.name);
-                }
-            }
-        }
+        // Arrow parameter lists may never repeat a name, in any mode. The message is the
+        // same one `js_parse_function_args` uses, with no name appended — an earlier
+        // version added ` ('a')`, which the reference does not print.
+        self.check_duplicate_parameters(&head.params, true)?;
         let saved_ctx = self.ctx;
         let saved_loop = self.loop_depth;
         let saved_switch = self.switch_depth;
@@ -4107,7 +4294,7 @@ impl<'a> Parser<'a> {
                     let func_result = (|| -> Result<Function> {
                         let params = self.parse_formal_parameters()?;
                         let (params, params_span, body, strict) =
-                            self.parse_function_body(params, is_generator, is_async)?;
+                            self.parse_function_body(params, true)?;
                         Ok(Function {
                             name: None,
                             params,
@@ -4274,6 +4461,82 @@ enum FunctionForm {
 /// lexical declarations: `function f(a) { let a; }` is an early error, but
 /// `function f({a}) { let a; }` is not (QuickJS behaves the same way, so this
 /// deliberately follows the reference rather than ES2025 §10.2.1).
+/// Whether this parameter is a bare identifier, as opposed to a pattern.
+fn is_plain_identifier(param: &Pattern) -> bool {
+    matches!(param.unparen_kind(), PatternKind::Ident(_))
+}
+
+/// Every name `param` binds, in binding order, tagged with whether it sits inside a
+/// destructuring pattern.
+///
+/// A rest parameter is a pattern only when its target is: `...a` binds like a plain name,
+/// while `...[a]` does not.
+fn parameter_bindings(param: &Pattern) -> Vec<(String, Span, bool)> {
+    fn walk(pattern: &Pattern, in_pattern: bool, out: &mut Vec<(String, Span, bool)>) {
+        match &pattern.kind {
+            PatternKind::Ident(ident) => out.push((ident.name.clone(), ident.span, in_pattern)),
+            PatternKind::Assign { target, default } => {
+                walk(target, in_pattern, out);
+                // A default's own expression can bind nothing, so only the target is walked.
+                let _ = default;
+            }
+            PatternKind::Rest(target) => walk(target, !is_plain_identifier(target), out),
+            PatternKind::Array { .. } | PatternKind::Object { .. } => {
+                let mut names = Vec::new();
+                pattern.bound_names(&mut names);
+                for name in names {
+                    out.push((name.name, name.span, true));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    let in_pattern = !is_plain_identifier(param);
+    walk(param, in_pattern, &mut out);
+    // A pattern's own walk above already flagged its names; a plain identifier or a
+    // defaulted one goes through `walk` directly.
+    if out.is_empty() {
+        let mut names = Vec::new();
+        param.bound_names(&mut names);
+        out.extend(names.into_iter().map(|name| (name.name, name.span, false)));
+    }
+    out
+}
+
+/// Whether any binding in `pattern` carries a default value.
+///
+/// This is the closest stand-in we have for the reference's lookahead: it scans the
+/// parenthesised parameter text for an `=` (`SKIP_HAS_ASSIGNMENT`) *before* parsing it, and
+/// that flag decides which of the two duplicate-name messages a later conflict gets.
+fn pattern_has_default(pattern: &Pattern) -> bool {
+    let element = |element: &Option<PatternElement>| {
+        element.as_ref().is_some_and(|element| match element {
+            PatternElement::Pattern(inner) => pattern_has_default(inner),
+            PatternElement::Property { value, .. } => pattern_has_default(value),
+        })
+    };
+    let rest = |rest: &Option<Box<RestElement>>| {
+        rest.as_ref().is_some_and(|rest| match rest.as_ref() {
+            RestElement::Pattern(inner) => pattern_has_default(inner),
+            RestElement::Member(_) => false,
+        })
+    };
+    match &pattern.kind {
+        PatternKind::Assign { .. } => true,
+        PatternKind::Array {
+            elements,
+            rest: tail,
+        } => elements.iter().any(element) || rest(tail),
+        PatternKind::Object {
+            properties,
+            rest: tail,
+        } => properties.iter().any(element) || rest(tail),
+        PatternKind::Rest(target) => pattern_has_default(target),
+        _ => false,
+    }
+}
+
 fn simple_parameter_names(params: &[Pattern]) -> Vec<String> {
     params
         .iter()
@@ -4289,6 +4552,14 @@ fn simple_parameter_names(params: &[Pattern]) -> Vec<String> {
 fn collect_module_binding(stmt: &Stmt, out: &mut Vec<String>) {
     match &stmt.kind {
         StmtKind::VarDecl(decl) => {
+            // A `using` declaration is a lexical binding of the module's own scope but not
+            // a *module variable*, so it cannot be exported: the reference excludes it from
+            // `add_global_var` and `export {a}` of one reports
+            // `exported variable 'a' does not exist`. Leaving it in this list would make
+            // that export silently succeed.
+            if decl.kind.is_using() {
+                return;
+            }
             for declarator in &decl.declarators {
                 let mut names = Vec::new();
                 declarator.target.bound_names(&mut names);

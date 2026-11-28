@@ -1117,9 +1117,24 @@ impl Compiler {
     }
 
     fn declare(&mut self, name: &str, def: VarDef) -> u32 {
-        if self.cur().is_module && self.cur().current_block == self.cur().body_block {
+        if self.cur().is_module
+            && self.cur().current_block == self.cur().body_block
+            && !matches!(def.kind, VarKind::Using | VarKind::UsingMethod)
+        {
             // Only the body's own block: a `let` inside a module-level `{}` is still an
             // ordinary local of that block, not a module variable.
+            //
+            // A `using` binding is excluded on purpose, and the reference excludes it in
+            // the same place (`var_def_type != JS_VAR_DEF_USING`, with the comment
+            // "'using' variables are currently not exported in modules"): a module-level
+            // `using` is an ordinary *local* of the module body function, not a module
+            // cell. Two things follow, and both are what the reference does — `export {a}`
+            // of a `using` binding is "exported variable 'a' does not exist", and
+            // disposal works, because the disposal epilogue addresses locals by slot.
+            //
+            // The hidden dispose-method variable is excluded for a stronger reason: it is
+            // *always* a local (`add_scope_var` in the reference), and it must sit
+            // immediately after its value so `using_dispose` can find it at `slot + 1`.
             return self.declare_module(name, &def);
         }
         if self.cur().declares_globally(&def) {

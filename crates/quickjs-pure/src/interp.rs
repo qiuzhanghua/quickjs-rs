@@ -9180,8 +9180,23 @@ impl<'a> Interp<'a> {
                         }
                         _ => None,
                     };
+                    // No callee object means the body was entered by the host, so the
+                    // name has to come from the compiled code. Two cases differ:
+                    //
+                    // * an *unnamed* function of any kind — the reference reads the
+                    //   `name` property, finds it empty, and prints `<anonymous>`;
+                    // * a *module* body, which has no `name` property at all: the
+                    //   reference builds that function object with `js_closure2` and
+                    //   never runs `js_function_set_properties` (`js_create_module_bytecode_function`),
+                    //   so a trace reaching it also prints `<anonymous>` — while a
+                    //   *script* body prints `<eval>`, its `name`.
+                    let unnamed = code.name.is_empty() || code.module.is_some();
                     out.push_str("    at ");
-                    out.push_str(bound_name.as_deref().unwrap_or(&code.name));
+                    match bound_name.as_deref() {
+                        Some(name) => out.push_str(name),
+                        None if unnamed => out.push_str("<anonymous>"),
+                        None => out.push_str(&code.name),
+                    }
                     match code.position_at(frame.at as u32) {
                         Some((line, column)) => {
                             out.push_str(&format!(" ({file}:{line}:{column})\n"));

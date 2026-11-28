@@ -1280,3 +1280,153 @@ test262 本身不是这样判的：`run-test262.c` 捕获异常值，比较它�
 - `cargo clippy -D warnings` / `cargo fmt` 干净
 - `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
 - test262：`language` 14972→14987（**+15，-0**）；`built-ins` 14907→14914（**+7，-0**）
+
+---
+
+## 17. 早期错误：重复声明与重复参数
+
+这两族 early error 有一个共同的危险性质：**接受一个本应拒绝的程序是静默的**。多一个绑定、
+少一条报错，在这个程序跑起来之前没有任何东西会抱怨；等它有影响时，症状离原因已经很远
+（`{ function f(){} var f; }` 我们接受，然后 `f` 到底是函数还是 `var` 就取决于猜）。
+
+所以这一轮又是同一个顺序：先把判定做成可执行的差分，再改代码。
+
+### 17.1 差分先立起来
+
+`crates/quickjs-parse/tests/redeclaration.rs`，两张表：
+
+| 表 | 条数 | 比什么 | 判据 |
+|---|---|---|---|
+| `REDECLARATIONS` | 41 | 消息**与位置**（脚本 + 模块各一遍 = 82 项） | `qjsc -c` 的 `SyntaxError` 首行 + `at case.js:L:C` 行 |
+| `DUPLICATE_PARAMETERS` | 24 | 只比消息 | 同上（位置是已知缺口，见 17.7） |
+
+位置只有重复声明这一族能直接比，因为参考的 `js_parse_error` 一律用 `s->token.ptr`——
+**当前 token**——重复声明恰好总是"名字之后的那个 token"，我们只要把检查放在参考做检查的
+地方就自动对上。参数族不行：参考在解析参数表时用 `SKIP_HAS_ASSIGNMENT` 前瞻原始文本里有没有
+`=`，有则在读到每个名字时立刻判重，位置落在 pattern 的内层名字之后（`[a]` 报在 `]`），
+而我们的判定发生在整个 pattern 解析完之后。
+
+改前的账（同一组用例，逐项跑过）：
+
+| | 改前不一致 | 分类 |
+|---|---|---|
+| 重复声明 82 项 | **63** | 36 项只是位置差、21 项我们**接受了非法程序**、6 项消息不同 |
+| 重复参数 24 项 | **18** | 4 项我们**拒了合法程序**（sloppy 的 generator / `async function`）、4 项该查的方法/箭头没查、10 项消息不同 |
+
+改后两表全对。
+
+### 17.2 位置不是"挪一下消息"，是"在对的地方做检查"
+
+36 项位置差全部来自一处：我们原来是**解析完整个声明符之后**才登记名字，参考是**读到名字就
+登记**（`js_parse_var` 的 `set_val` 调 `js_define_var`，此时当前 token 已经是 `=`）。
+于是 `{ let a; let a = 1; }` 参考报在 `=`（1:16），我们报在名字（1:15）。
+
+改法是把 `declare_pattern` 搬到初始化器之前。这不是搬位置，而是搬判定点——初始化器里若有
+别的错，参考也是先报重复声明。
+
+`class` 与块级函数声明的偏差更大（`{ let a; class a{} }`：参考 1:20 的 `{`，我们 1:16），
+同样是"检查发生在名字之后"带来的。
+
+### 17.3 块里的函数声明是词法的，函数体里的像 `var`
+
+参考用一处 `define_var` 分叉表达这件事，判据是 `fd->scope_level == fd->body_scope`：
+
+| 位置 | 形态 | 例子 |
+|---|---|---|
+| 块（`scope_level != body_scope`） | 词法绑定 | `{ function a(){} var a; }` → `invalid redefinition of lexical identifier` |
+| 函数体/脚本/模块体 | 像 `var` | `function f(){ function a(){} var a; }` → 合法 |
+
+我们本来只有后半：`declare_function` 只在最后登记 `var_names`，块内的函数声明**什么都没记**。
+这就是 21 项"我们接受了非法程序"的来源——`{ function a(){} var a; }`、
+`{ function a(){} function* a(){} }` 等等。
+
+现在按参考拆成两半，各自在参考做检查的时刻执行：
+
+- `declare_block_function`——从 `parse_function` 里、名字刚读到时调用；只在**块**作用域做事，
+  并把名字记进 `lex_names`/`fn_names`。
+- `declare_function`——从语句的调用点、整条函数解析完之后调用；只在**体**作用域做事。
+
+两半各做各的，所以 `function a(` 的冲突报在 `(`、体级冲突报在函数末尾，与参考一致。
+
+**Annex B.3.3.4 只覆盖 plain function**：sloppy 下 `{ function a(){} function a(){} }` 合法，
+但 `{ function a(){} function* a(){} }` 不合法——参考要求 `var_def_type == JS_VAR_DEF_FUNCTION_DECL`，
+而 generator / `async function` 用的是 `JS_VAR_DEF_NEW_FUNCTION_DECL`。所以多了一张
+`Scope::plain_fn_names`，记录"plain 的那些"。
+
+### 17.4 三处作用域记账，各不相同
+
+改的过程中撞上三件不能用一张表表达的事：
+
+- **`var` 的名字要记两次。** `var_names` 是**传递**的（`{ var a; }` 把 `a` 放进块**和**外层
+  函数，词法冲突检查要的就是这个集合）；模块的函数声明检查却按作用域**层级**比：块里的
+  `var` 只与**同一个块**里的函数冲突，与模块顶层的函数不冲突。于是新增非传递的
+  `var_names_here`。
+- **`import` 是词法的，但不是模块变量。** 参考的 `find_global_var` 看不到 import，所以在模块里
+  `import {a} from "x"; function a(){}` **不**报错。我们的 `lex_names` 里 import 与 `let` 混在一起，
+  只能再加一张 `import_names` 把它挑出来。
+- **脚本顶层的函数声明不建词法名。** 参考的 `avoid creating a lexical variable in the global
+  scope` 分支：体级的函数声明只进 global var 表，并只在表里**已有**同名项时报错。于是
+  `let a; function a(){}`（脚本）**合法**，而 `function a(){} let a;` 报
+  `invalid redefinition of global identifier`——方向是反的，很容易凭直觉写反。
+
+对应地，模块的同类检查有自己的一条消息（`invalid redefinition of global identifier in module
+code`），且只对**模块变量**生效：41 条里恰好 3 条在模块模式下走到它——`let a; function a(){}`、
+`var a; function a(){}`、`{ var a; function a(){} }`（最后一条能命中，正因为那个 `var` 写在这个
+块里，与函数同层）。模块顶层的 `let` **是**模块变量，所以前两条与脚本里的结论相反。
+
+### 17.5 重复参数：两条消息，两个判定时刻
+
+改前只有一个判定、一条消息，两个方向都错：
+
+**什么时候非法**（参考 `js_parse_function_args`）：strict、列表不简单、箭头、方法。只有
+"sloppy 简单列表的 `function f(a, a){}`"合法——而 `function* f(a, a){}` 与
+`async function f(a, a){}` 也**合法**（参考的条件里没有 generator/async，只有 method）。
+我们原来把 `|| is_generator || is_async` 也算进去了，于是拒了两个合法程序。
+
+**用哪条消息**：参数解析期的早检查说 `duplicate parameter names not allowed in this context`，
+收尾检查说 `duplicate argument names not allowed in this context`（无名字）。早检查只在两种
+情况下才走到——列表里任何位置有 `=`，或名字在解构 pattern 里。这解释了表里成对的条目：
+`function f(a, a){}` 说 `argument`，`function f(a, a = 1){}` 说 `parameter`。
+
+还有一个顺序细节：`function f([a], a, [a]){}` 报的是**第三个**参数，因为第二个（plain，
+且列表无 `=`）要等收尾检查，而第三个在读到时就被早检查抓了。
+
+顺带去掉一处自造措辞：箭头函数的重复参数原本是
+`duplicate argument names not allowed in this context ('a')`，参考不打印那个名字。
+
+### 17.6 顺带修掉的两个真 bug
+
+都是 16.8 登记的，本轮因为它们挡在同一段代码上而一并修掉：
+
+- **模块顶层的 `using` 会让编译器 panic**（`a using binding was declared during hoisting`）。
+  模块顶层声明走模块格（`declare_module`），而 `using` 的释放尾声按**槽位**寻址，两套地址
+  机制不可能对上，于是 hoisting 时找不到槽直接 `expect` 炸掉。参考的 `declare` 排除
+  `using`（`var_def_type != JS_VAR_DEF_USING`，注释 "using variables are currently not
+  exported in modules"），于是模块顶层的 `using` 是体函数的普通局部——释放正常，但不能导出
+  （`export { a }` 报 `exported variable 'a' does not exist`，按链接错误处理，无位置）。这两条
+  各有测试（`module.rs`：正常释放、抛异常时也释放、不能导出）。
+- **栈帧名 `<anonymous>`**：模块体函数对象是 `js_closure2` 建的，参考从没跑过
+  `js_function_set_properties`，所以它**没有** `name` 属性；脚本体则有（`<eval>`）。原来我们在
+  没有 callee 对象时打印编译期的 `code.name`，于是模块帧打了个名字出来。现在按"没有名字"
+  打印 `<anonymous>`。`using` 的 disposer 帧名字也随之对上（位置仍差，见 17.7）。
+
+### 17.7 发现但未修
+
+- **重复参数的位置**：`function f([a], [a]){}` 这类，参考报在 pattern 的内层名字之后，我们报在
+  整个 parameter 之后。要修得把参考的 `SKIP_HAS_ASSIGNMENT` 前瞻也抄过来，并把判重搬进
+  `parse_formal_parameters`。测试里已按"只比消息"写死，缺口写在文件头。
+- **`using` 的 disposer 帧位置**：参考指 `1:35`（调用 disposer 的地方），我们仍指声明处
+  `1:26`。名字已经对上（`<anonymous>`）。
+- 16.8 的其余项不受影响，仍在：`new BigInt(1)` 少一个 native 帧、`eval('super.x')` 的位置、
+  `class A { static { … } }` 编译器不支持、那条不稳定的 TypedArray 用例。
+
+### 17.8 验收
+
+- `cargo test` 全绿（新增 `crates/quickjs-parse/tests/redeclaration.rs` 3 项、
+  `module.rs` +3、`builtins.rs` 一处期望改名）
+- `cargo clippy -D warnings` / `cargo fmt` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 21/21、NFR-6/7
+- test262：`built-ins` 14914/17822 零变化；`language` 15064/23743 零变化（**+0，-0**）。
+  这一轮改的是早期错误，而 test262 里对应的负向用例此前已被别的检查挡住（`block-scope/
+  syntax/redeclaration` 98 条全 PASS，改前也是），所以数字不动是对的——不是没测到，
+  而是这里本来就没有失败项。差分测试覆盖的是"参考与我们逐条一致"，比总数更细。

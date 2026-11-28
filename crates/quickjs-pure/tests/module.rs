@@ -393,3 +393,70 @@ print("after");
         "caught:caught-here\nafter\n"
     );
 }
+
+/// A `using` binding at the top level of a module *is* disposed, at module end.
+///
+/// This was a compiler panic — "a using binding was declared during hoisting" — because
+/// module-level declarations become module cells rather than local slots, and the disposal
+/// epilogue addresses its resources by slot. The reference excludes `using` from the
+/// module-cell path on purpose (`var_def_type != JS_VAR_DEF_USING`, with the comment
+/// "'using' variables are currently not exported in modules"), which makes it an ordinary
+/// local of the module body function. That is what these tests pin: disposal works, in
+/// reverse order, and also when the body throws.
+#[test]
+fn a_module_top_level_using_is_disposed_at_the_end() {
+    assert_eq!(
+        run(&[(
+            "main.js",
+            "using a = { [Symbol.dispose]() { print('dispose a') } };\n\
+             using b = { [Symbol.dispose]() { print('dispose b') } };\n\
+             print('body');\n"
+        )]),
+        "body\ndispose b\ndispose a\n"
+    );
+}
+
+#[test]
+fn a_module_top_level_using_is_disposed_when_the_body_throws() {
+    let text = fails(&[(
+        "main.js",
+        "using a = { [Symbol.dispose]() { print('dispose a') } };\n\
+         throw new Error('x');\n",
+    )]);
+    assert!(text.contains("Error: x"), "unexpected error: {text}");
+}
+
+/// A `using` binding is a local of the module body, so it cannot be exported.
+///
+/// The reference reports a *link* error for this, without a position — our parser makes the
+/// same check itself, so it has to say so explicitly (`SyntaxError::positionless`).
+#[test]
+fn a_using_binding_cannot_be_exported() {
+    assert_eq!(
+        fails(&[(
+            "main.js",
+            "using a = { [Symbol.dispose]() {} };\nexport { a };\n"
+        )]),
+        // The trailing newline is the printer's: an error with an empty `stack` string
+        // still gets the newline that precedes it.
+        "SyntaxError: exported variable 'a' does not exist\n"
+    );
+}
+
+/// The module body function object has no `name`, so a trace reaching it says
+/// `<anonymous>`.
+///
+/// A *script* body says `<eval>`, which is its name. The reference builds the module's
+/// function object with `js_closure2` and never runs `js_function_set_properties`
+/// (`js_create_module_bytecode_function`), so the name property is simply absent.
+#[test]
+fn a_module_body_frame_is_anonymous() {
+    let text = fails(&[(
+        "main.js",
+        "function inner() { throw new Error('x') }\ninner();\n",
+    )]);
+    assert!(
+        text.contains("at <anonymous> (/m/main.js:2:6)"),
+        "expected an anonymous module frame, got: {text}"
+    );
+}

@@ -93,6 +93,34 @@ def array_items(source, name, occurrence=1):
     return items
 
 
+def const_array_body(source, name):
+    """The text between `const <name> … = &[` and the bracket that closes it.
+
+    The redeclaration tables hold tuples rather than bare strings, so `array_items` cannot
+    read them; what is counted here is the number of *rows*, which is also what a test
+    failure reports ("63 of 82 checks disagree").
+    """
+    match = re.search(rf"const {name}\s*(?::[^=]+)?=\s*&?\s*\[", source)
+    if match is None:
+        return None
+    start = match.end()
+    depth = 1
+    index = start
+    while index < len(source) and depth:
+        char = source[index]
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+        index += 1
+    return source[start:index - 1]
+
+
+def rows_starting_with(body, prefix):
+    """How many rows of `body` open with `prefix` (`"` for a string, `("` for a tuple)."""
+    return len(re.findall(rf"^\s*{re.escape(prefix)}", body or "", re.M))
+
+
 def bytecode_counts():
     """Ask the disassembly tests how many cases they actually compared."""
     with tempfile.TemporaryDirectory() as scratch:
@@ -204,6 +232,17 @@ def main():
             f"声明冲突: {len(conflicts)} cases but only {distinct} distinct — "
             f"the same source is listed twice"
         )
+
+    # -- early errors: redeclarations and duplicate parameters --------------
+    redeclaration = read(ROOT / "crates/quickjs-parse/tests/redeclaration.rs")
+    row = readme_row("重复声明")
+    declarations = rows_starting_with(const_array_body(redeclaration, "REDECLARATIONS"), '"')
+    parameters = rows_starting_with(
+        const_array_body(redeclaration, "DUPLICATE_PARAMETERS"), '("')
+    check("重复声明 用例", row[0], declarations)
+    # Every redeclaration source runs twice — once as a script, once as a module.
+    check("重复声明 检查项", row[1], declarations * 2)
+    check("重复参数 用例", row[2], parameters)
 
     # -- the TDZ invariants are a separate file ----------------------------
     tdz = read(ROOT / "crates/quickjs-compile/tests/tdz.rs")
