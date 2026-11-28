@@ -17,12 +17,13 @@
 //!   (`duplicate argument names`).
 //!
 //! Verdicts come from the reference `qjsc -c` (parse and compile only, and its exit status
-//! is a pure accept/reject verdict). Positions are compared for the redeclaration family
-//! only: the reference's `js_parse_error` always points at the *current token*, which for a
+//! is a pure accept/reject verdict). Positions are compared for both families: the
+//! reference's `js_parse_error` always points at the *current token*, which for a
 //! redeclaration is whatever follows the offending name, and our checks now sit at the same
-//! points. The duplicate-parameter family is compared on the message alone, because matching
-//! the position there needs the reference's `SKIP_HAS_ASSIGNMENT` lookahead, which reports
-//! the token after a *pattern's inner* name — a known gap, recorded in `docs/m9-plan.md`.
+//! points. The duplicate-parameter family has *two* checks and they point at two different
+//! places — the early one at the offending *name* (`js_parse_destructuring_var` checks before
+//! `next_token`), the final one at the body's **first token**, because by then the reference
+//! has entered the body. See [`a_duplicate_argument_position_is_the_first_token_of_the_body`].
 
 use js_parse::{parse_module, parse_script};
 use quickjs_conformance::{Engine, locate_qjsc};
@@ -281,20 +282,17 @@ fn duplicate_parameters_match_the_reference() {
     let dir = TempDir::new("params");
     let mut disagreements = Vec::new();
     for (source, kind) in DUPLICATE_PARAMETERS {
-        let parsed = js_parse::parse_script(source);
-        let got = match parsed {
-            Ok(_) => None,
-            Err(error) => Some(error.message),
-        };
+        let got = ours_with_position(source, false);
         // The reference's verdict is the oracle; the table's `kind` only pins which message
         // it must be, so a change in the reference is visible rather than absorbed.
-        let want = reference(&qjsc, &dir, source, false);
+        let want = reference_with_position(&qjsc, &dir, source, false);
+        let message = reference(&qjsc, &dir, source, false);
         let pinned = if kind.is_empty() {
             None
         } else {
             Some(expected_duplicate_message(kind))
         };
-        if want != got || pinned != want {
+        if want != got || pinned != message {
             disagreements.push(format!(
                 "  {source:?}\n    reference: {want:?}\n    ours:      {got:?}\n    \
                  pinned:    {pinned:?}"
@@ -322,4 +320,31 @@ fn a_redeclaration_position_is_the_token_after_the_name() {
     let parsed = parse_script("{ let a; let a = 1; }").expect_err("a redeclaration");
     // `{ let a; let a = 1; }` — the `=` follows the second `a`.
     assert_eq!((parsed.span.start.line, parsed.span.start.column), (1, 16));
+}
+
+/// The final duplicate-parameter check points at the body, not at the name.
+///
+/// The reference runs it once the body has been entered, so `s->token` is the body's first
+/// token: the closing `}` for an empty body, the first statement otherwise, and the
+/// expression for a concise arrow. Every column below was read off `qjsc -c`'s own `at` line.
+#[test]
+fn a_duplicate_argument_position_is_the_first_token_of_the_body() {
+    for (source, column) in [
+        ("'use strict'; function f(a, a){}", 32),
+        // A non-simple list is enough; the body is empty, so the `}` is the first token.
+        ("function f(a, ...a){}", 21),
+        // A concise arrow body: the expression itself.
+        ("(a, a) => 0", 11),
+        // A block body: the first statement, not the `{`.
+        ("(a, a) => { return 1 }", 13),
+        ("({m(a, a){}})", 11),
+        ("class C { m(a, a){ return 1 } }", 20),
+    ] {
+        let error = parse_script(source).expect_err(source);
+        assert_eq!(
+            (error.span.start.line, error.span.start.column),
+            (1, column),
+            "{source}"
+        );
+    }
 }

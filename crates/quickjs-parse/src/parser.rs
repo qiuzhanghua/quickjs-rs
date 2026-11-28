@@ -637,14 +637,24 @@ impl<'a> Parser<'a> {
     ///   the second — the second is not checked yet when the third is.
     /// * *Which message*. The early check says `duplicate parameter names`; the final one
     ///   says `duplicate argument names`, and carries no name.
+    /// * *Where it points*. Both checks use `s->token.ptr`, so the position follows from
+    ///   when they run: the early one fires on the offending name itself, the final one
+    ///   only once the body has been entered, so it points at the body's **first token**
+    ///   (`}` for `function f([a], a, a){}`, `return` for `{ return 1 }`, the expression
+    ///   for `(a, a) => x`). That is what `deferred_at` is.
     ///
     /// `plain_is_illegal` is the caller's answer to "are duplicates illegal here at all":
     /// a sloppy `function f(a, a){}` accepts them (last wins), while a strict or
     /// non-simple list, an arrow, or a method does not.
-    fn check_duplicate_parameters(&self, params: &[Pattern], plain_is_illegal: bool) -> Result<()> {
+    fn check_duplicate_parameters(
+        &self,
+        params: &[Pattern],
+        plain_is_illegal: bool,
+        deferred_at: Span,
+    ) -> Result<()> {
         let has_default = params.iter().any(pattern_has_default);
         let mut seen: Vec<String> = Vec::new();
-        let mut deferred: Option<Span> = None;
+        let mut deferred = false;
         for param in params {
             for (name, span, in_pattern) in parameter_bindings(param) {
                 if seen.iter().any(|seen| seen == &name) {
@@ -654,18 +664,18 @@ impl<'a> Parser<'a> {
                             span,
                         ));
                     }
-                    deferred.get_or_insert(span);
+                    deferred = true;
                 }
                 seen.push(name);
             }
         }
-        match deferred {
-            Some(span) if plain_is_illegal => Err(self.error_at(
+        if deferred && plain_is_illegal {
+            return Err(self.error_at(
                 "duplicate argument names not allowed in this context".to_string(),
-                span,
-            )),
-            _ => Ok(()),
+                deferred_at,
+            ));
         }
+        Ok(())
     }
 
     /// Declare a function declaration name in the scope that holds it.
@@ -2464,6 +2474,10 @@ impl<'a> Parser<'a> {
         let mut prologue = true;
         let mut strict_seen = false;
         self.bump()?; // {
+        // Where the final duplicate-parameter check points: the reference runs it with the
+        // body's first token as `s->token`, so an empty body reports the `}` and
+        // `{ return 1 }` reports the `return`.
+        let body_start = self.current.span;
         self.push_scope(Scope::function(param_names));
         while !self.at_punct(Punct::RBrace) {
             if self.current.is_eof() {
@@ -2504,7 +2518,11 @@ impl<'a> Parser<'a> {
         // name with `duplicate parameter names`, and it only gets there when the list holds
         // an `=` anywhere or the name sits inside a destructuring pattern. Everything else
         // waits for the check above, which says `duplicate argument names`.
-        self.check_duplicate_parameters(&params, body_strict || !simple_params || is_method)?;
+        self.check_duplicate_parameters(
+            &params,
+            body_strict || !simple_params || is_method,
+            body_start,
+        )?;
         let params_span_value = Span::new(params_span, params_span);
         self.strict = saved_strict;
         self.lexer.set_strict(saved_strict);
@@ -3379,8 +3397,15 @@ impl<'a> Parser<'a> {
         // Committed: `=>` has been consumed, so errors from here on are real.
         // Arrow parameter lists may never repeat a name, in any mode. The message is the
         // same one `js_parse_function_args` uses, with no name appended — an earlier
-        // version added ` ('a')`, which the reference does not print.
-        self.check_duplicate_parameters(&head.params, true)?;
+        // version added ` ('a')`, which the reference does not print. The position is the
+        // body's first token: `(a, a) => x` points at the `x`, and `(a, a) => {}` at the
+        // `}`, because the reference has already consumed the `{` by then.
+        let body_start = if self.at_punct(Punct::LBrace) {
+            self.peek()?.span
+        } else {
+            self.current.span
+        };
+        self.check_duplicate_parameters(&head.params, true, body_start)?;
         let saved_ctx = self.ctx;
         let saved_loop = self.loop_depth;
         let saved_switch = self.switch_depth;

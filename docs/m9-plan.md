@@ -1298,13 +1298,22 @@ test262 本身不是这样判的：`run-test262.c` 捕获异常值，比较它�
 | 表 | 条数 | 比什么 | 判据 |
 |---|---|---|---|
 | `REDECLARATIONS` | 41 | 消息**与位置**（脚本 + 模块各一遍 = 82 项） | `qjsc -c` 的 `SyntaxError` 首行 + `at case.js:L:C` 行 |
-| `DUPLICATE_PARAMETERS` | 24 | 只比消息 | 同上（位置是已知缺口，见 17.7） |
+| `DUPLICATE_PARAMETERS` | 24 | 消息**与位置** | 同上 |
 
-位置只有重复声明这一族能直接比，因为参考的 `js_parse_error` 一律用 `s->token.ptr`——
-**当前 token**——重复声明恰好总是"名字之后的那个 token"，我们只要把检查放在参考做检查的
-地方就自动对上。参数族不行：参考在解析参数表时用 `SKIP_HAS_ASSIGNMENT` 前瞻原始文本里有没有
-`=`，有则在读到每个名字时立刻判重，位置落在 pattern 的内层名字之后（`[a]` 报在 `]`），
-而我们的判定发生在整个 pattern 解析完之后。
+位置也是逐项比的。参考的 `js_parse_error` 一律用 `s->token.ptr`——**当前 token**——所以
+"位置"其实只是"检查发生在哪个 token 上"的直接后果，而两族的答案不同：
+
+- **重复声明**：检查在名字刚被消费之后做（`js_define_var`），所以报在"名字之后的那个
+  token"。`{ let a; let a = 1; }` 报在 `=`，`{ let a; let a; }` 报在 `;`。
+- **重复参数**：有**两处**检查，位置各不相同。解析期的早检查（`js_parse_destructuring_var`
+  在 `next_token` 之前调 `js_parse_check_duplicate_parameter`）就报在名字**本身**；收尾
+  检查则已经在函数体里，报在**体的第一个 token**——空体的 `}`、`{ return 1 }` 的
+  `return`、`(a, a) => 0` 的 `0`。
+
+后者一开始被登记成"已知缺口"，理由是要抄参考的 `SKIP_HAS_ASSIGNMENT` 前瞻才能定位。实测
+发现不是：真正要抄的是"收尾检查在 `{` 之后才跑"这一条，前瞻只决定**报哪条消息**。于是改法
+只是给 `check_duplicate_parameters` 多传一个位置：`parse_function_body` 取 `{` 之后的第一个
+token，箭头分支取 `=>` 之后的第一个（若跟的是块，再往后一个）。
 
 改前的账（同一组用例，逐项跑过）：
 
@@ -1313,7 +1322,8 @@ test262 本身不是这样判的：`run-test262.c` 捕获异常值，比较它�
 | 重复声明 82 项 | **63** | 36 项只是位置差、21 项我们**接受了非法程序**、6 项消息不同 |
 | 重复参数 24 项 | **18** | 4 项我们**拒了合法程序**（sloppy 的 generator / `async function`）、4 项该查的方法/箭头没查、10 项消息不同 |
 
-改后两表全对。
+改后两表全对。参数族当时只比了消息；把位置也纳入比较之后又暴露出"收尾检查指在名字上"这一
+处（见 17.1），补完才两族都逐字节对齐。
 
 ### 17.2 位置不是"挪一下消息"，是"在对的地方做检查"
 
@@ -1412,9 +1422,6 @@ code`），且只对**模块变量**生效：41 条里恰好 3 条在模块模�
 
 ### 17.7 发现但未修
 
-- **重复参数的位置**：`function f([a], [a]){}` 这类，参考报在 pattern 的内层名字之后，我们报在
-  整个 parameter 之后。要修得把参考的 `SKIP_HAS_ASSIGNMENT` 前瞻也抄过来，并把判重搬进
-  `parse_formal_parameters`。测试里已按"只比消息"写死，缺口写在文件头。
 - **`using` 的 disposer 帧位置**：参考指 `1:35`（调用 disposer 的地方），我们仍指声明处
   `1:26`。名字已经对上（`<anonymous>`）。
 - 16.8 的其余项不受影响，仍在：`new BigInt(1)` 少一个 native 帧、`eval('super.x')` 的位置、
@@ -1422,7 +1429,7 @@ code`），且只对**模块变量**生效：41 条里恰好 3 条在模块模�
 
 ### 17.8 验收
 
-- `cargo test` 全绿（新增 `crates/quickjs-parse/tests/redeclaration.rs` 3 项、
+- `cargo test` 全绿（新增 `crates/quickjs-parse/tests/redeclaration.rs` 4 项、
   `module.rs` +3、`builtins.rs` 一处期望改名）
 - `cargo clippy -D warnings` / `cargo fmt` 干净
 - `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 21/21、NFR-6/7
