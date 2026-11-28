@@ -134,6 +134,37 @@ impl PrivateEnv {
 }
 
 /// One lexical scope, used for the declaration-conflict early errors.
+/// Which of the reference's four "redefinition" messages a clash produces.
+///
+/// The reference picks between them in `js_parse_error_redecl` (`quickjs.c:25055` onward)
+/// from *where* the colliding binding lives, and the distinction is visible to a script
+/// author, so it is reproduced rather than collapsed into one message:
+///
+/// | colliding binding | message |
+/// |---|---|
+/// | lexical, same scope | `invalid redefinition of lexical identifier` |
+/// | `var` in the top-level scope | `invalid redefinition of global identifier` |
+/// | `var`/function inside a function | `invalid redefinition of a variable` |
+/// | a simple parameter of the same body | `invalid redefinition of parameter name` |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Redefinition {
+    Lexical,
+    Global,
+    Variable,
+    Parameter,
+}
+
+impl Redefinition {
+    fn message(self) -> &'static str {
+        match self {
+            Redefinition::Lexical => "invalid redefinition of lexical identifier",
+            Redefinition::Global => "invalid redefinition of global identifier",
+            Redefinition::Variable => "invalid redefinition of a variable",
+            Redefinition::Parameter => "invalid redefinition of parameter name",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Scope {
     /// Whether this is a function/module scope (where `var` lands).
@@ -151,6 +182,14 @@ struct Scope {
     fn_names: Vec<String>,
     /// Names of *simple* (identifier) parameters, if this is a function body.
     params: Vec<String>,
+    /// Names bound by a `catch` parameter, as a simple identifier.
+    ///
+    /// Kept apart from `params` because the two clash differently: a `let` colliding with a
+    /// function parameter is `invalid redefinition of parameter name`, while one colliding
+    /// with a catch binding is `invalid redefinition of lexical identifier`. Both are exempt
+    /// from the `var` check (`catch (e) { var e; }` is legal, and so is `function f(a){ var
+    /// a; }`), which is why `declare_var` looks at neither.
+    catch_names: Vec<String>,
 }
 
 impl Scope {
@@ -161,6 +200,7 @@ impl Scope {
             lex_names: Vec::new(),
             fn_names: Vec::new(),
             params: Vec::new(),
+            catch_names: Vec::new(),
         }
     }
 
@@ -171,6 +211,7 @@ impl Scope {
             lex_names: Vec::new(),
             fn_names: Vec::new(),
             params,
+            catch_names: Vec::new(),
         }
     }
 }
@@ -436,12 +477,27 @@ impl<'a> Parser<'a> {
         let Some(scope) = self.scopes.last() else {
             return Ok(());
         };
-        let clashes = scope.lex_names.iter().any(|n| n == name)
-            || scope.var_names.iter().any(|n| n == name)
-            || scope.fn_names.iter().any(|n| n == name)
-            || scope.params.iter().any(|n| n == name);
-        if clashes {
-            return Err(self.duplicate_declaration(name, span));
+        // Ordered so the most specific reason wins, matching the reference's check order:
+        // the parameter test comes before the var walk, and a lexical name before both.
+        let reason = if scope.lex_names.iter().any(|n| n == name)
+            || scope.catch_names.iter().any(|n| n == name)
+        {
+            Some(Redefinition::Lexical)
+        } else if scope.params.iter().any(|n| n == name) {
+            Some(Redefinition::Parameter)
+        } else if scope.fn_names.iter().any(|n| n == name) {
+            Some(Redefinition::Variable)
+        } else if scope.var_names.iter().any(|n| n == name) {
+            Some(if self.at_top_level_scope() {
+                Redefinition::Global
+            } else {
+                Redefinition::Variable
+            })
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(self.duplicate_declaration(reason, span));
         }
         if let Some(scope) = self.scopes.last_mut() {
             scope.lex_names.push(name.to_string());
@@ -454,7 +510,7 @@ impl<'a> Parser<'a> {
     fn declare_var(&mut self, name: &str, span: Span) -> Result<()> {
         for scope in self.scopes.iter().rev() {
             if scope.lex_names.iter().any(|n| n == name) {
-                return Err(self.duplicate_declaration(name, span));
+                return Err(self.duplicate_declaration(Redefinition::Lexical, span));
             }
             if scope.is_var_scope {
                 break;
@@ -484,7 +540,7 @@ impl<'a> Parser<'a> {
                 .last()
                 .is_some_and(|s| s.lex_names.iter().any(|n| n == name));
             if clashes {
-                return Err(self.duplicate_declaration(name, span));
+                return Err(self.duplicate_declaration(Redefinition::Lexical, span));
             }
         } else if let Some(scope) = self.scopes.last_mut() {
             if !scope.var_names.iter().any(|n| n == name) {
@@ -499,11 +555,17 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn duplicate_declaration(&self, name: &str, span: Span) -> SyntaxError {
-        self.error_at(
-            format!("identifier '{name}' has already been declared"),
-            span,
-        )
+    fn duplicate_declaration(&self, reason: Redefinition, span: Span) -> SyntaxError {
+        self.error_at(reason.message(), span)
+    }
+
+    /// Whether declarations here belong to the script/module's own top-level scope.
+    ///
+    /// This is what splits the reference's `global identifier` message from
+    /// `a variable`: a `var` recorded in the outermost var scope is a global var, and one
+    /// inside a function is an ordinary variable.
+    fn at_top_level_scope(&self) -> bool {
+        self.scopes.iter().rposition(|scope| scope.is_var_scope) == Some(0)
     }
 
     /// Declare every name bound by a pattern.
@@ -620,7 +682,11 @@ impl<'a> Parser<'a> {
         if self.eat_punct(p)? {
             Ok(())
         } else {
-            Err(self.unexpected())
+            // `expecting ';'`, the reference's `js_parse_expect`. It formats the expected
+            // token with `%c`, so only single-character punctuators can be named this way —
+            // and every call site here passes one, which is why this is the reference's set
+            // exactly: `( ) { } [ ] ; :`.
+            Err(self.error(format!("expecting '{}'", p.as_str())))
         }
     }
 
@@ -640,9 +706,19 @@ impl<'a> Parser<'a> {
         Ok(false)
     }
 
+    /// `unexpected token in expression: '<token text>'` — the reference's message when a
+    /// primary expression was expected and the token cannot start one.
+    ///
+    /// The token's text is its **raw source slice**, not a description: `js_parse_error(s,
+    /// "unexpected token in expression: '%.*s'", s->buf_ptr - s->token.ptr, s->token.ptr)`.
+    /// That is why end of input prints as `''` and a string literal prints with its quotes.
     fn unexpected(&self) -> SyntaxError {
+        let source = self.lexer.source();
+        let start = self.current.span.start.offset as usize;
+        let end = self.current.span.end.offset as usize;
+        let text = source.get(start..end).unwrap_or("");
         SyntaxError::new(
-            format!("unexpected token: {}", self.current.kind.describe()),
+            format!("unexpected token in expression: '{text}'"),
             self.current.span,
         )
     }
@@ -676,10 +752,9 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 Ok(Ident { name, span })
             }
-            _ => Err(self.error(format!(
-                "expecting a variable name, got {}",
-                self.current.kind.describe()
-            ))),
+            // The reference has no "got X" suffix: `js_parse_error(s, "variable name
+            // expected")`. The token is already the error position.
+            _ => Err(self.error("variable name expected")),
         }
     }
 
@@ -711,10 +786,9 @@ impl<'a> Parser<'a> {
     fn check_binding_name(&self, name: &str, span: Span) -> Result<()> {
         self.check_identifier(name, span)?;
         if self.strict && (name == "eval" || name == "arguments") {
-            return Err(self.error_at(
-                format!("invalid use of '{name}' as a binding in strict mode"),
-                span,
-            ));
+            // One message for both, and it names neither: `js_parse_error(s, "invalid
+            // variable name in strict mode")`.
+            return Err(self.error_at("invalid variable name in strict mode", span));
         }
         if self.strict && name == "let" {
             return Err(self.error_at(
@@ -1237,7 +1311,12 @@ impl<'a> Parser<'a> {
                         // `for (var x = 1 in y)` is legacy in sloppy mode only.
                         if is_of || kind.is_lexical() || self.strict {
                             return Err(self.error_at(
-                                "for-in/of loop variable declaration may not have an initializer",
+                                if is_of {
+                                    // The reference formats `%s` with the loop kind.
+                                    "a declaration in the head of a for-of loop can't have an initializer"
+                                } else {
+                                    "a declaration in the head of a for-in loop can't have an initializer"
+                                },
                                 declarator.span,
                             ));
                         }
@@ -1446,7 +1525,7 @@ impl<'a> Parser<'a> {
                     ..
                 }) => {
                     if let Some(scope) = self.scopes.last_mut() {
-                        scope.params.push(id.name.clone());
+                        scope.catch_names.push(id.name.clone());
                     }
                     self.parse_catch_body()
                 }
@@ -1488,7 +1567,7 @@ impl<'a> Parser<'a> {
         let start = self.current.span.start;
         let span = self.current.span;
         if !self.ctx.in_function {
-            return Err(self.error_at("invalid return statement outside of a function", span));
+            return Err(self.error_at("return not in a function", span));
         }
         self.bump()?;
         let argument = if self.at_punct(Punct::Semicolon)
@@ -1536,7 +1615,7 @@ impl<'a> Parser<'a> {
                 Some(label) => {
                     if !is_break && label.kind != LabelKind::Iteration {
                         return Err(self.error_at(
-                            format!("continue must be inside of a loop (label '{}')", ident.name),
+                            format!("continue must be inside loop (label '{}')", ident.name),
                             ident.span,
                         ));
                     }
@@ -1545,11 +1624,11 @@ impl<'a> Parser<'a> {
             Some(ident)
         } else {
             if !is_break && self.loop_depth == 0 {
-                return Err(self.error_at("continue must be inside of a loop", keyword_span));
+                return Err(self.error_at("continue must be inside loop", keyword_span));
             }
             if is_break && self.loop_depth == 0 && self.switch_depth == 0 && self.labels.is_empty()
             {
-                return Err(self.error_at("break must be inside of a loop or switch", keyword_span));
+                return Err(self.error_at("break must be inside loop or switch", keyword_span));
             }
             None
         };
@@ -1568,7 +1647,7 @@ impl<'a> Parser<'a> {
         let start = self.current.span.start;
         let span = self.current.span;
         if self.strict {
-            return Err(self.error_at("invalid 'with' statement in strict mode", span));
+            return Err(self.error_at("invalid keyword: with", span));
         }
         self.bump()?; // with
         self.expect_punct(Punct::LParen)?;
@@ -1671,7 +1750,7 @@ impl<'a> Parser<'a> {
             };
             if init.is_none() && require_init {
                 if kind == VarDeclKind::Const {
-                    return Err(self.error("missing initializer in const declaration"));
+                    return Err(self.error("missing initializer for const variable"));
                 }
                 if kind.is_using() {
                     return Err(self.error("missing initializer in using declaration"));
@@ -1766,7 +1845,7 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let target = self.parse_binding_target()?;
                 if self.at_punct(Punct::Comma) {
-                    return Err(self.error("rest element must be last"));
+                    return Err(self.error("rest element must be the last one"));
                 }
                 rest = Some(Box::new(RestElement::Pattern(target)));
                 break;
@@ -1800,7 +1879,7 @@ impl<'a> Parser<'a> {
                 let target = self.parse_binding_target()?;
                 rest = Some(Box::new(RestElement::Pattern(target)));
                 if self.at_punct(Punct::Comma) {
-                    return Err(self.error("rest element must be last"));
+                    return Err(self.error("rest element must be the last one"));
                 }
                 break;
             }
@@ -1894,7 +1973,9 @@ impl<'a> Parser<'a> {
                 let ident = self.expect_ident()?;
                 Ok(PropName::Private(ident))
             }
-            _ => Err(self.error("expecting a property name")),
+            // `js_parse_property_name` in the reference: an object literal or a class
+            // member whose name is not an identifier, string, number or computed key.
+            _ => Err(self.error("invalid property name")),
         }
     }
 
@@ -1919,7 +2000,7 @@ impl<'a> Parser<'a> {
             Some(ident)
         } else {
             if form == FunctionForm::Declaration {
-                return Err(self.error("expecting a function name"));
+                return Err(self.error("function name expected"));
             }
             None
         };
@@ -1968,18 +2049,38 @@ impl<'a> Parser<'a> {
             }
             if self.at_punct(Punct::Ellipsis) {
                 self.bump()?;
+                // The rest parameter's own binding needs the same check: `function f(...)`
+                // is a missing parameter, not a malformed one.
+                if !(self.current.kind.is_identifier()
+                    || self.at_punct(Punct::LBracket)
+                    || self.at_punct(Punct::LBrace))
+                {
+                    return Err(self.error("missing formal parameter"));
+                }
                 let target = self.parse_binding_target()?;
                 if matches!(target.unparen_kind(), PatternKind::Assign { .. }) {
-                    return Err(self.error_at("rest parameter may not have a default", target.span));
+                    return Err(
+                        self.error_at("rest element cannot have a default value", target.span)
+                    );
                 }
                 params.push(Pattern::new(
                     PatternKind::Rest(Box::new(target.clone())),
                     target.span,
                 ));
+                // A rest parameter ends the list, so the only thing that may follow is
+                // `)`. The reference simply asks for it: `js_parse_expect(s, ')')`.
                 if self.at_punct(Punct::Comma) {
-                    return Err(self.error("rest parameter must be last"));
+                    return Err(self.error("expecting ')'"));
                 }
                 break;
+            }
+            // A token that cannot begin a binding pattern is a missing parameter, not a
+            // malformed one: `js_parse_error(s, "missing formal parameter")`.
+            if !(self.current.kind.is_identifier()
+                || self.at_punct(Punct::LBracket)
+                || self.at_punct(Punct::LBrace))
+            {
+                return Err(self.error("missing formal parameter"));
             }
             let param = self.parse_binding_element()?;
             self.check_parameter(&param)?;
@@ -2048,7 +2149,8 @@ impl<'a> Parser<'a> {
         let body_strict = self.strict;
         if strict_seen && !simple_params {
             return Err(self.error_at(
-                "'use strict' directive is not allowed with non-simple parameters",
+                // The reference spells the directive with double quotes inside the message.
+                "\"use strict\" not allowed in function with default or destructuring parameter",
                 Span::new(params_span, params_span),
             ));
         }
@@ -2062,7 +2164,8 @@ impl<'a> Parser<'a> {
                 for name in names {
                     if seen.contains(&name.name) {
                         return Err(self.error_at(
-                            format!("duplicate parameter name '{}'", name.name),
+                            // `argument`, not `parameter`, and no name in the message.
+                            "duplicate argument names not allowed in this context".to_string(),
                             name.span,
                         ));
                     }
@@ -2094,7 +2197,7 @@ impl<'a> Parser<'a> {
             }
         } else {
             if !is_expression {
-                return Err(self.error("expecting a class name"));
+                return Err(self.error("class statement requires a name"));
             }
             None
         };
@@ -2110,9 +2213,9 @@ impl<'a> Parser<'a> {
         let mut seen_constructor = false;
         let result = (|| -> Result<()> {
             while !self.at_punct(Punct::RBrace) {
-                if self.current.is_eof() {
-                    return Err(self.unexpected());
-                }
+                // No end-of-input guard here: `class A {` must report `invalid property
+                // name`, which is what falls out of asking for the element's name. An
+                // early `unexpected()` would pre-empt that with a vaguer message.
                 if self.eat_punct(Punct::Semicolon)? {
                     continue;
                 }
@@ -2209,7 +2312,9 @@ impl<'a> Parser<'a> {
             if let Some(env) = self.private.last_mut() {
                 if !env.declare(&ident.name, accessor) {
                     return Err(self.error_at(
-                        format!("duplicate private name '#{}'", ident.name),
+                        // The reference words this without the name:
+                        // `js_parse_error(s, "private class field is already defined")`.
+                        "private class field is already defined".to_string(),
                         ident.span,
                     ));
                 }
@@ -2273,15 +2378,21 @@ impl<'a> Parser<'a> {
             if is_static {
                 if let PropName::Literal(PropKey::Str(name)) = &key {
                     if name == "prototype" {
-                        return Err(self.error_at("invalid method name 'prototype'", func.span));
+                        return Err(self.error_at("invalid method name", func.span));
                     }
                 }
             }
             if kind == MethodKind::Get && !func.params.is_empty() {
-                return Err(self.error_at("getter must have no arguments", func.span));
+                return Err(self.error_at(
+                    "invalid number of arguments for getter or setter",
+                    func.span,
+                ));
             }
             if kind == MethodKind::Set && func.params.len() != 1 {
-                return Err(self.error_at("setter must have exactly one argument", func.span));
+                return Err(self.error_at(
+                    "invalid number of arguments for getter or setter",
+                    func.span,
+                ));
             }
             return Ok(ClassElement::Method {
                 key,
@@ -2394,7 +2505,7 @@ impl<'a> Parser<'a> {
             return Err(self.unexpected());
         }
         let TokenKind::String(source) = self.current.kind.clone() else {
-            return Err(self.error("expecting a module name string"));
+            return Err(self.error("string expected"));
         };
         self.bump()?;
         let attributes = self.parse_import_attributes()?;
@@ -2472,7 +2583,9 @@ impl<'a> Parser<'a> {
                     span,
                 }))
             }
-            _ => Err(self.error("expecting an export name")),
+            // `export {a as}`: the alias may be an identifier or a string, and the
+            // reference names both (`js_parse_error(s, "identifier or string expected")`).
+            _ => Err(self.error("identifier or string expected")),
         }
     }
 
@@ -2489,7 +2602,7 @@ impl<'a> Parser<'a> {
                 return Err(self.error("expecting 'from' after 'export *'"));
             }
             let TokenKind::String(source) = self.current.kind.clone() else {
-                return Err(self.error("expecting a module name string"));
+                return Err(self.error("string expected"));
             };
             self.bump()?;
             let attributes = self.parse_import_attributes()?;
@@ -2606,7 +2719,7 @@ impl<'a> Parser<'a> {
             }
             if has_from {
                 let TokenKind::String(value) = self.current.kind.clone() else {
-                    return Err(self.error("expecting a module name string"));
+                    return Err(self.error("string expected"));
                 };
                 self.bump()?;
                 source = Some(value);
@@ -2671,7 +2784,9 @@ impl<'a> Parser<'a> {
                         }
                         Some(ArrayElement::Spread(expr)) => {
                             if index + 1 != count {
-                                return Err(self.error_at("rest element must be last", expr.span));
+                                return Err(
+                                    self.error_at("rest element must be the last one", expr.span)
+                                );
                             }
                             rest = Some(Box::new(self.expr_to_rest(*expr, kind)?));
                         }
@@ -2695,7 +2810,9 @@ impl<'a> Parser<'a> {
                     match property {
                         ObjectProperty::Spread(expr) => {
                             if index + 1 != count {
-                                return Err(self.error_at("rest element must be last", expr.span));
+                                return Err(
+                                    self.error_at("rest element must be the last one", expr.span)
+                                );
                             }
                             rest = Some(Box::new(self.expr_to_rest(*expr, kind)?));
                         }
@@ -2776,7 +2893,12 @@ impl<'a> Parser<'a> {
                 Pattern::new(PatternKind::Invalid(Box::new(Expr::new(other, span))), span),
             ),
             _ if kind == TargetKind::Binding => Err(self.error_at("invalid binding pattern", span)),
-            _ => Err(self.error_at("invalid destructuring target", span)),
+            // Inside an object or array literal being reinterpreted as a pattern the
+            // reference says `invalid destructuring target`; a non-reference at the top
+            // level of an assignment says `invalid assignment left-hand side`. `nested` is
+            // exactly that distinction — `[1] = 2` is the first, `1 = 2` the second.
+            _ if nested => Err(self.error_at("invalid destructuring target", span)),
+            _ => Err(self.error_at("invalid assignment left-hand side", span)),
         }
     }
 
@@ -3163,9 +3285,10 @@ impl<'a> Parser<'a> {
             let argument = self.parse_unary()?;
             if op == UnaryOp::Delete && self.strict {
                 if let ExprKind::Ident(ident) = &argument.unparen().kind {
-                    return Err(
-                        self.error_at("cannot delete a variable in strict mode", ident.span)
-                    );
+                    return Err(self.error_at(
+                        "cannot delete a direct reference in strict mode",
+                        ident.span,
+                    ));
                 }
             }
             let expr = Expr::at_operator(
@@ -3178,7 +3301,8 @@ impl<'a> Parser<'a> {
             );
             if self.at_punct(Punct::StarStar) {
                 return Err(self.error(
-                    "unexpected token '**': a unary expression may not be the base of '**'",
+                    // The reference's wording, from `js_parse_error` in the `**` check.
+                    "unparenthesized unary expression can't appear on the left-hand side of '**'",
                 ));
             }
             return Ok(expr);
@@ -3258,13 +3382,17 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    /// The operand of `++`/`--`, which must be a plain reference.
+    ///
+    /// Its own message, not the assignment one: the reference rejects `++1` and `1++` with
+    /// `js_parse_error(s, "invalid increment/decrement operand")`.
     fn check_simple_target(&self, expr: &Expr) -> Result<()> {
         match &expr.unparen().kind {
             ExprKind::Ident(_) => Ok(()),
             ExprKind::Member {
                 optional: false, ..
             } => Ok(()),
-            _ => Err(self.error_at("invalid assignment left-hand side", expr.span)),
+            _ => Err(self.error_at("invalid increment/decrement operand", expr.span)),
         }
     }
 
@@ -3392,11 +3520,10 @@ impl<'a> Parser<'a> {
             self.bump()?;
             let ident = self.expect_ident()?;
             if !self.private.iter().any(|env| env.contains(&ident.name)) {
+                // The reference names the field and nothing else:
+                // `js_parse_error(s, "undefined private field '#%s'")`.
                 return Err(self.error_at(
-                    format!(
-                        "private field '#{}' must be declared in an enclosing class",
-                        ident.name
-                    ),
+                    format!("undefined private field '#{}'", ident.name),
                     ident.span,
                 ));
             }
@@ -3416,7 +3543,10 @@ impl<'a> Parser<'a> {
                     span,
                 }))
             }
-            _ => Err(self.error("expecting a property name")),
+            // After `.` or `?.` the reference says "expecting field name", not
+            // "invalid property name" — it is `js_parse_error(s, "expecting field name")`
+            // at the member-access site.
+            _ => Err(self.error("expecting field name")),
         }
     }
 
@@ -3426,7 +3556,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(Punct::Dot) {
             self.bump()?;
             if !self.at_ident("target") {
-                return Err(self.error("expecting 'target' after 'new.'"));
+                return Err(self.error("expecting target"));
             }
             if !self.ctx.in_function {
                 return Err(self.error("invalid use of 'new.target' outside of a function"));
@@ -3657,7 +3787,7 @@ impl<'a> Parser<'a> {
         if self.at_punct(Punct::LParen) {
             if !self.ctx.in_derived_constructor {
                 return Err(self.error_at(
-                    "invalid use of 'super' in a non-derived constructor",
+                    "super() is only valid in a derived class constructor",
                     self.span_from(start),
                 ));
             }
@@ -3668,10 +3798,18 @@ impl<'a> Parser<'a> {
             ));
         }
         if !self.ctx.in_method {
-            return Err(self.error_at(
-                "invalid use of 'super' outside of a method",
-                self.span_from(start),
-            ));
+            // Three messages, told apart by what follows `super`:
+            //   `super` alone        -> invalid use of 'super'
+            //   `super.x`, `super[x]` -> 'super' is only valid in a method
+            //   `super()`            -> handled above
+            // A bare `super` never reaches the member-access code, so the reference names
+            // it on its own.
+            let message = if self.at_punct(Punct::Dot) || self.at_punct(Punct::LBracket) {
+                "'super' is only valid in a method"
+            } else {
+                "invalid use of 'super'"
+            };
+            return Err(self.error_at(message, self.span_from(start)));
         }
         Ok(Expr::new(ExprKind::SuperProp, self.span_from(start)))
     }
@@ -3872,13 +4010,16 @@ impl<'a> Parser<'a> {
                                 ));
                             }
                             if kind == MethodKind::Get && !func.params.is_empty() {
-                                return Err(
-                                    self.error_at("getter must have no arguments", func.span)
-                                );
+                                return Err(self.error_at(
+                                    "invalid number of arguments for getter or setter",
+                                    func.span,
+                                ));
                             }
                             if kind == MethodKind::Set && func.params.len() != 1 {
-                                return Err(self
-                                    .error_at("setter must have exactly one argument", func.span));
+                                return Err(self.error_at(
+                                    "invalid number of arguments for getter or setter",
+                                    func.span,
+                                ));
                             }
                             match kind {
                                 MethodKind::Get => PropertyKind::Get,
@@ -3905,7 +4046,7 @@ impl<'a> Parser<'a> {
                             proto_count += 1;
                             if proto_count > 1 {
                                 return Err(self.error_at(
-                                    "duplicate __proto__ fields are not allowed in object literals",
+                                    "duplicate __proto__ property name",
                                     self.span_from(property_start),
                                 ));
                             }
@@ -4157,7 +4298,9 @@ fn build_binary(op: BinOp, left: Expr, right: Expr, span: Span, op_pos: Position
             };
             if mixes(&left, op) || mixes(&right, op) {
                 return Err(SyntaxError::new(
-                    "cannot mix '??' with '&&' or '||' without parentheses",
+                    // The reference has no quotes in this one; the parenthesised form is the only
+                    // way to write it, which the message states rather than implies.
+                    "cannot mix ?? with && or ||",
                     span,
                 ));
             }

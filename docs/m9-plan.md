@@ -896,3 +896,132 @@ EOF 上挂死，我们借 `stdin_eof()` 在"stdin 到 EOF 且没有定时器/微
 - `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/NFR-7
 - test262 `built-ins` 14907/17822 零变化；`language` 14941→14945（+4，-0）
 - `qjs -i` 跑参考的 `repl.js`，结果输出与参考逐行一致
+
+---
+
+## 14. 语法错消息措辞对齐
+
+### 14.1 先量化，再动手
+
+`parse_oracle.rs` 只对拍**接受/拒绝**，不验文本——所以措辞完全没被测量。用
+`test262/test/language` 全量跑了一遍（每个文件按它自己的 script/module 模式解析）：
+
+| | 对齐率 |
+|---|---|
+| 动手前 | **2.3%**（93/4055） |
+| 对齐后 | **44.5%** |
+
+动手前有 408 类不同形状。全部是我们自创的字符串：参考说 `variable name expected`，我们说
+`expecting a variable name, got '='`；参考说 `unexpected token in expression: ';'`，我们说
+`unexpected token: ';'`。
+
+### 14.2 参考的两条通用消息
+
+搞清楚这两条是大部分工作的前提：
+
+**`unexpected token in expression: '%.*s'`** —— 参考只有**这一条**通用 token 消息，而且
+`%.*s` 是 token 的**原始源码切片**（`s->buf_ptr - s->token.ptr`），不是描述。所以文件结束
+打印成 `''`，字符串字面量连着引号一起打印。我们原来是 `unexpected token: <描述>`，两者都不同。
+
+**`expecting '%c'`** —— `js_parse_expect` 用 `%c` 格式化期望的 token，所以只能表达单字符
+标点。我们的 `expect_punct` 站点恰好全是单字符（`( ) { } [ ] ; :`），因此可以纯机械对齐。
+
+顺带把 `unexpected()` 的语义收紧：它原来在两种意图下混用（"期望某个标点"和"期望一个主表达式"）。
+`expect_punct` 现在走 `expecting '<c>'`，`unexpected()` 只剩后者。
+
+### 14.3 对齐的消息
+
+机械措辞（纯字符串，无逻辑变更）：`variable name expected`、`function name expected`、
+`class statement requires a name`、`invalid property name`（对象字面量／类成员）与
+`expecting field name`（`.` 之后，参考是两条不同的消息）、`expecting target`、
+`missing initializer for const variable`、`invalid number of arguments for getter or setter`、
+`return not in a function`、`break must be inside loop or switch`、
+`continue must be inside loop`、`invalid method name`、`private class field is already defined`、
+`invalid number literal`、`unexpected end of string`／`end of regexp`、
+`malformed escape sequence in string literal`、`invalid keyword: with`、
+`cannot delete a direct reference in strict mode`、`duplicate __proto__ property name`、
+`duplicate argument names not allowed in this context`、`undefined private field '#x'`、
+`invalid variable name in strict mode`、
+`"use strict" not allowed in function with default or destructuring parameter`、
+`cannot mix ?? with && or ||`、`invalid increment/decrement operand`、
+`missing formal parameter`、`identifier or string expected`、`string expected`、
+`unparenthesized unary expression can't appear on the left-hand side of '**'`。
+
+### 14.4 三处需要改判定，不只是改字符串
+
+**重定义的四条消息。** 参考按冲突绑定**在哪里**分四种：同作用域的 lexical →
+`invalid redefinition of lexical identifier`；顶层 `var` → `... of global identifier`；
+函数内的 `var`/函数声明 → `... of a variable`；同体的简单形参 →
+`... of parameter name`。20 个探针确认了边界（包括 `{ { var x; let x; } }` 是 global 而
+`function f(){ { var x; let x; } }` 是 variable）。实现为 `Redefinition` 枚举 + 
+`at_top_level_scope()`。
+
+顺带发现 catch 参数被塞进了 `params` 字段，于是 `try{}catch(e){let e;}` 会报
+`parameter name`——参考走 lexical 分支。拆出独立的 `catch_names` 字段，同时保住
+`catch (e) { var e; }` 的豁免。
+
+**赋值目标的两条消息。** `1 = 2` 是 `invalid assignment left-hand side`，`[1] = 2` 是
+`invalid destructuring target`——区别就是"是否在对象/数组字面量被当作模式重解释的过程中"，
+即函数里已有的 `nested` 标志。`++1` 又是第三条：`invalid increment/decrement operand`。
+
+**`super` 的三条消息。** 裸 `super` → `invalid use of 'super'`；`super.x`／`super[0]` →
+`'super' is only valid in a method`；`super()` →
+`super() is only valid in a derived class constructor`。按 `super` 后面跟什么区分。
+
+### 14.5 测出来的东西（不止措辞）
+
+差分测试在写的过程中抓出三处我原本没注意的分歧：
+
+- `class A {` 报 `unexpected token in expression: ''` —— 类体循环里有个过早的 EOF 守卫，
+  挡在"期望属性名"之前。去掉后 `class A {`、`class A { x` 都给出参考的
+  `invalid property name`，而 `class A { [`、`class A { m() {` 仍然是
+  `unexpected token in expression`，与参考一致。
+- `function f(` / `function f(1)` / `function f(...)` 报 `variable name expected` —— 参考说
+  `missing formal parameter`。`function f(...a,)` 则是 `expecting ')'`（rest 参数后
+  只能跟 `)`）。
+- 未声明的私有字段：`this.#x` 参考只说 `undefined private field '#x'`，不解释"必须在封闭类
+  中声明"。
+
+### 14.6 刻意的差异
+
+**`do {}`（缺 `while`）**：参考输出 `expecting '<U+FFFD>'`。`js_parse_expect` 用 `%c` 打印
+期望的 token，而 `TOK_WHILE` 装不进一个字节，于是消息里是一个**非法 UTF-8 字节**。参考自己的
+源码在那行上方就写着 `XXX: dump token correctly in all cases`。复刻损坏的输出不值得。
+这条在测试里单独标为 `UNPINNABLE`——参与比较，但不钉住参考文本。
+
+### 14.7 还没做
+
+- **两套重名消息**：参考有 `duplicate parameter names`（`js_parse_check_duplicate_parameter`）
+  和 `duplicate argument names`（`js_parse_function_args`）两条，走哪条取决于哪条扫描路径先
+  撞上。实测 `function f(a, a = 1)` 和 `function f(a, [a])` 是前者，
+  `function f({a}, a)` 和 `function f(a,a){"use strict"}` 是后者。要对齐得镜像它的两次扫描。
+- **rest 元素的 `= ` 家族**：`[...a = 1] = b` 参考说 `rest element must be the last one`，
+  `[...{a} = 1] = b` 说 `rest element cannot have a default value`。同样是路径依赖，试改一次
+  没触发，已撤回。
+- **`await` / `yield` 上下文**：`async function f(){ await = 1 }` 参考报的是
+  `unexpected token in expression: '='`（即它把 `await` 当普通标识符走到更后面），我们在更早
+  的位置报 `unexpected 'await' identifier in an async function`。诊断顺序差异。
+- **接受性缺口 3 处**（不是措辞）：未 tagged 模板里的非法转义我们接受、`class A { get
+  constructor(){} }` 我们接受、`constructor(){ super; }` 我们接受。都在测试里登记。
+
+### 14.8 新增的测试
+
+`crates/quickjs-parse/tests/parse_wording.rs`，5 个测试：
+
+- `syntax_error_wording_matches_the_reference` —— 87 条语料，逐条比对两边的消息。
+  没登记的差异**失败**，登记的差异**仍然差异**（开始一致也失败，逼着列表缩短）。
+- `module_error_wording_matches_the_reference` —— 模块模式的单独一组。
+- `the_recorded_expectations_still_match_the_reference` —— 语料里钉的期望文本必须仍是参考的；
+  参考更新导致改词时，失败的是这条而不是差分测试静默通过。
+- `every_declared_difference_is_actually_run` —— 登记项必须有语料，否则理由会变成注释。
+- `the_corpus_has_no_duplicates` —— 防止复制粘贴让一个用例藏在它的孪生后面。
+
+两张登记表分开：`KNOWN_DIFFERENCES`（措辞，改一个字符串的活）与
+`KNOWN_ACCEPTANCE_GAPS`（一方接受一方拒绝，缺一个检查的活）。
+
+### 14.9 验收
+
+- `cargo test` 全绿（新增 `parse_wording` 5 项）；`clippy -D warnings`／`fmt` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
+- test262：`built-ins` 14907/17822 **零变化**；`language` +4 **零回归**
+- 措辞对齐率 2.3% → 44.5%

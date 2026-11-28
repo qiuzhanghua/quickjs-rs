@@ -362,7 +362,8 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 self.bump();
                 let escaped =
-                    char::from_u32(self.scan_unicode_escape_body(start)?).unwrap_or('\u{fffd}');
+                    char::from_u32(self.scan_unicode_escape_body(start, EscapeContext::Ident)?)
+                        .unwrap_or('\u{fffd}');
                 let ok = if first {
                     is_id_start(escaped)
                 } else {
@@ -577,7 +578,7 @@ impl<'a> Lexer<'a> {
             match self.peek_char() {
                 Some('_') => {
                     if count == 0 || last_was_separator {
-                        return Err(self.error("invalid numeric separator", start));
+                        return Err(self.error("invalid number literal", start));
                     }
                     last_was_separator = true;
                     self.bump();
@@ -592,7 +593,7 @@ impl<'a> Lexer<'a> {
             }
         }
         if last_was_separator {
-            return Err(self.error("invalid numeric separator", start));
+            return Err(self.error("invalid number literal", start));
         }
         Ok(count)
     }
@@ -617,7 +618,7 @@ impl<'a> Lexer<'a> {
         self.pending_high_surrogate = None;
         loop {
             let Some(c) = self.peek_char() else {
-                return Err(self.error("unterminated string literal", start));
+                return Err(self.error("unexpected end of string", start));
             };
             if c == quote {
                 self.bump();
@@ -625,7 +626,7 @@ impl<'a> Lexer<'a> {
                 return Ok(TokenKind::String(out));
             }
             if is_line_terminator(c) {
-                return Err(self.error("unterminated string literal", start));
+                return Err(self.error("unexpected end of string", start));
             }
             if c == '\\' {
                 self.bump();
@@ -644,7 +645,7 @@ impl<'a> Lexer<'a> {
     ///
     /// Returning the raw value rather than a `char` is what lets the caller pair a
     /// high half with the low half that follows it.
-    fn scan_unicode_escape_body(&mut self, start: Position) -> Result<u32> {
+    fn scan_unicode_escape_body(&mut self, start: Position, context: EscapeContext) -> Result<u32> {
         if self.peek_char() == Some('{') {
             self.bump();
             let mut value: u32 = 0;
@@ -659,21 +660,21 @@ impl<'a> Lexer<'a> {
                         value = value
                             .checked_mul(16)
                             .and_then(|v| v.checked_add(c.to_digit(16).expect("hex digit")))
-                            .ok_or_else(|| self.error("malformed Unicode escape", start))?;
+                            .ok_or_else(|| self.bad_unicode_escape(context, start))?;
                         if value > 0x10FFFF {
-                            return Err(self.error("malformed Unicode escape", start));
+                            return Err(self.bad_unicode_escape(context, start));
                         }
                         digits += 1;
                         self.bump();
                     }
-                    _ => return Err(self.error("malformed Unicode escape", start)),
+                    _ => return Err(self.bad_unicode_escape(context, start)),
                 }
             }
             if digits == 0 {
-                return Err(self.error("malformed Unicode escape", start));
+                return Err(self.bad_unicode_escape(context, start));
             }
             if value > 0x10ffff {
-                return Err(self.error("code point out of range", start));
+                return Err(self.bad_unicode_escape(context, start));
             }
             return Ok(value);
         }
@@ -684,7 +685,7 @@ impl<'a> Lexer<'a> {
                     value = value * 16 + c.to_digit(16).expect("hex digit");
                     self.bump();
                 }
-                _ => return Err(self.error("malformed Unicode escape", start)),
+                _ => return Err(self.bad_unicode_escape(context, start)),
             }
         }
         Ok(value)
@@ -750,7 +751,7 @@ impl<'a> Lexer<'a> {
         context: EscapeContext,
     ) -> Result<()> {
         let Some(c) = self.bump() else {
-            return Err(self.error("unterminated string literal", start));
+            return Err(self.error("unexpected end of string", start));
         };
         match c {
             'n' => out.push('\n'),
@@ -800,7 +801,7 @@ impl<'a> Lexer<'a> {
                 out.push(char::from_u32(value).expect("value <= 0xff"));
             }
             'u' => {
-                let unit = self.scan_unicode_escape_body(start)?;
+                let unit = self.scan_unicode_escape_body(start, context)?;
                 self.push_code_unit(out, unit);
             }
             c if is_line_terminator(c) => {
@@ -854,12 +855,26 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    /// The error for a `\u` escape that cannot be decoded.
+    fn bad_unicode_escape(&self, context: EscapeContext, start: Position) -> LexError {
+        match context {
+            // One wording, because the reference has one: both a string literal and a
+            // template escape fail in `lre_parse_escape` and report the same message.
+            EscapeContext::String | EscapeContext::Template => {
+                self.error("malformed escape sequence in string literal", start)
+            }
+            EscapeContext::Ident => self.error("malformed Unicode escape", start),
+        }
+    }
+
     fn invalid_escape(&self, context: EscapeContext, start: Position) -> LexError {
         match context {
-            EscapeContext::String => self.error("invalid escape sequence in string literal", start),
-            EscapeContext::Template => {
-                self.error("invalid escape sequence in template literal", start)
+            // The reference reports a template escape failure with the *string* wording:
+            // both go through `lre_parse_escape`, which has one message.
+            EscapeContext::String | EscapeContext::Template => {
+                self.error("malformed escape sequence in string literal", start)
             }
+            EscapeContext::Ident => self.error("malformed Unicode escape", start),
         }
     }
 
@@ -894,7 +909,7 @@ impl<'a> Lexer<'a> {
         let kind;
         loop {
             let Some(c) = self.peek_char() else {
-                return Err(self.error("unterminated template literal", chunk_start));
+                return Err(self.error("unexpected end of string", chunk_start));
             };
             match c {
                 '`' => {
@@ -976,10 +991,10 @@ impl<'a> Lexer<'a> {
         let mut in_class = false;
         loop {
             let Some(c) = self.peek_char() else {
-                return Err(self.error("unterminated regexp literal", start));
+                return Err(self.error("unexpected end of regexp", start));
             };
             if is_line_terminator(c) {
-                return Err(self.error("unterminated regexp literal", start));
+                return Err(self.error("unexpected end of regexp", start));
             }
             match c {
                 '\\' => {
@@ -990,7 +1005,7 @@ impl<'a> Lexer<'a> {
                             pattern.push(next);
                             self.bump();
                         }
-                        _ => return Err(self.error("unterminated regexp literal", start)),
+                        _ => return Err(self.error("unexpected end of regexp", start)),
                     }
                 }
                 '[' => {
@@ -1030,13 +1045,18 @@ impl<'a> Lexer<'a> {
     }
 }
 
-/// Which literal an escape sequence belongs to; the two differ in their error
-/// handling (invalid escapes are fatal in strings, `cooked = undefined` in
-/// tagged templates).
+/// How a `\u` escape is being scanned, which decides the message a bad one produces.
+///
+/// The reference has exactly one wording for string and template escapes —
+/// `malformed escape sequence in string literal` — because both go through
+/// `lre_parse_escape`. An identifier's escape is scanned by a different path and never
+/// reaches that message; the reference rejects `var \u{ZZ} = 1` with `variable name
+/// expected` instead, so this variant keeps our own wording for that case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EscapeContext {
     String,
     Template,
+    Ident,
 }
 
 fn is_line_terminator(c: char) -> bool {

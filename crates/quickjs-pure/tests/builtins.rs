@@ -1698,7 +1698,7 @@ fn eval_inherits_the_callers_super() {
     // Outside a method there is no home object, so `super.x` stays a syntax error.
     assert_eq!(
         throws("eval('super.x')"),
-        "SyntaxError: invalid source: 1:1: invalid use of 'super' outside of a method"
+        "SyntaxError: invalid source: 1:1: 'super' is only valid in a method"
     );
 }
 

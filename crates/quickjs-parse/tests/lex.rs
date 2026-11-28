@@ -232,10 +232,10 @@ fn bigint_literals() {
 
 #[test]
 fn numeric_separator_errors() {
-    assert_eq!(error_message("1__0"), "invalid numeric separator");
-    assert_eq!(error_message("1_"), "invalid numeric separator");
-    assert_eq!(error_message("0x_1"), "invalid numeric separator");
-    assert_eq!(error_message("1._5"), "invalid numeric separator");
+    assert_eq!(error_message("1__0"), "invalid number literal");
+    assert_eq!(error_message("1_"), "invalid number literal");
+    assert_eq!(error_message("0x_1"), "invalid number literal");
+    assert_eq!(error_message("1._5"), "invalid number literal");
 }
 
 #[test]
@@ -298,14 +298,20 @@ fn strict_mode_rejects_octal_escapes() {
 
 #[test]
 fn unterminated_strings() {
-    assert_eq!(error_message("\"abc"), "unterminated string literal");
-    assert_eq!(error_message("\"a\nb\""), "unterminated string literal");
+    assert_eq!(error_message("\"abc"), "unexpected end of string");
+    assert_eq!(error_message("\"a\nb\""), "unexpected end of string");
     assert_eq!(
         error_message("\"\\x4\""),
-        "invalid escape sequence in string literal"
+        "malformed escape sequence in string literal"
     );
-    assert_eq!(error_message(r#""\u{110000}""#), "malformed Unicode escape");
-    assert_eq!(error_message(r#""\u{}""#), "malformed Unicode escape");
+    assert_eq!(
+        error_message(r#""\u{110000}""#),
+        "malformed escape sequence in string literal"
+    );
+    assert_eq!(
+        error_message(r#""\u{}""#),
+        "malformed escape sequence in string literal"
+    );
 }
 
 // -- templates ------------------------------------------------------------
@@ -396,7 +402,7 @@ fn template_line_continuation() {
 
 #[test]
 fn unterminated_template() {
-    assert_eq!(error_message("`abc"), "unterminated template literal");
+    assert_eq!(error_message("`abc"), "unexpected end of string");
 }
 
 // -- regular expressions --------------------------------------------------
@@ -435,7 +441,7 @@ fn unterminated_regex() {
     let slash = lexer.next_token().expect("slash");
     assert_eq!(
         lexer.re_scan_regex(slash.span.start).unwrap_err().message,
-        "unterminated regexp literal"
+        "unexpected end of regexp"
     );
 }
 
