@@ -1699,13 +1699,13 @@ fn eval_inherits_the_callers_super() {
         ),
         "true\n"
     );
-    // Outside a method there is no home object, so `super.x` stays a syntax error.
+    // Outside a method there is no home object, so `super.x` stays a syntax error, and the
+    // position is the `.` — the reference consumes `super` before it checks.
     assert_eq!(
         throws("eval('super.x')"),
-        // Bare message, with the position on the stack rather than in it. Known gap: the
-        // reference points at column 6 (the `.x`), we point at column 1.
+        // Bare message, with the position on the stack rather than in it.
         "SyntaxError: 'super' is only valid in a method\n    \
-         at <input>:1:1\n    at <eval> (<input>:1:5)"
+         at <input>:1:6\n    at <eval> (<input>:1:5)"
     );
 }
 
@@ -1879,10 +1879,12 @@ fn using_validates_at_the_declaration() {
     // A non-callable disposer is a `TypeError` too.
     assert_eq!(
         throws("(function () { using x = { [Symbol.dispose]: 1 } })()"),
-        // Known gap: the reference points at column 35 (the `1`, where the disposer is
-        // reached); we point at column 26 (the declaration).
+        // The position is the `.` of `Symbol.dispose`, not the declaration: the reference
+        // records a source position for a member access and for nothing else in this
+        // body, so the `using_dispose` epilogue — which records none of its own — inherits
+        // the last one written.
         "TypeError: dispose method is not a function\n    \
-         at <anonymous> (<input>:1:26)\n    at <eval> (<input>:1:52)"
+         at <anonymous> (<input>:1:35)\n    at <eval> (<input>:1:52)"
     );
     // The method is snapshotted once, at the declaration: replacing it afterwards does not
     // change what runs.
@@ -2765,13 +2767,22 @@ fn bigint_conversion_is_exact_or_refuses() {
     }
     // A fraction has no exact bigint form, so it is a `RangeError` rather than a truncation.
     assert!(throws("BigInt(1.5)").starts_with("RangeError"));
-    // A bigint is a primitive, so there is no wrapper to construct.
-    // Known gap: the reference also names `at BigInt (native)` above the `<eval>` frame,
-    // because it enters a native constructor before rejecting it. We reject before pushing
-    // one.
+    // A bigint is a primitive, so there is no wrapper to construct — but `BigInt` *is*
+    // constructible as far as `[[Construct]]` is concerned (the reference registers it with
+    // `JS_CFUNC_constructor_or_func`), and the refusal happens inside the native function.
+    // That is why the trace has an `at BigInt (native)` frame above the caller.
     assert_eq!(
         throws("new BigInt(1)"),
-        "TypeError: BigInt is not a constructor\n    at <eval> (<input>:1:11)"
+        "TypeError: BigInt is not a constructor\n    at BigInt (native)\n    \
+         at <eval> (<input>:1:11)"
+    );
+    // The message names `new.target`, not the callee: a subclass constructed through
+    // `super()` reports its own name. Its frame sits at the class body's closing `}`
+    // because a class that writes no constructor still gets one, created at that token.
+    assert_eq!(
+        throws("class B extends BigInt {}; new B(1)"),
+        "TypeError: B is not a constructor\n    at BigInt (native)\n    \
+         at B (<input>:1:25)\n    at <eval> (<input>:1:33)"
     );
     assert_eq!(
         eval("print((255n).toString(16), BigInt.asIntN(8, 128n))"),

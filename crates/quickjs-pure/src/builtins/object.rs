@@ -241,7 +241,7 @@ fn value_of(interp: &mut Interp<'_>, this: Value, _args: &[Value]) -> JsResult<V
 
 fn has_own_property(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsResult<Value> {
     let object = this_object(interp, &this)?;
-    let key = interp.property_key(&arg(args, 0));
+    let key = interp.property_key(&arg(args, 0))?;
     // `[[GetOwnProperty]]`, not a peek at the property table: a proxy answers this with
     // its `getOwnPropertyDescriptor` trap, and it may still be holding a `TypeError` for
     // a handler that lied about a fixed property.
@@ -256,7 +256,7 @@ fn has_own_property(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
 /// shadows or replaces `hasOwnProperty`, which is the whole reason it exists.
 fn has_own(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
     let object = interp.object_from(&arg(args, 0))?;
-    let key = interp.property_key_checked(&arg(args, 1))?;
+    let key = interp.property_key(&arg(args, 1))?;
     Ok(Value::Bool(
         interp.object_get_own_property(&object, &key)?.is_some(),
     ))
@@ -346,7 +346,7 @@ fn group_by(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<V
             vec![value.clone(), Value::Int(index)],
         )?;
         // `ToPropertyKey`, so a symbol key stays a symbol and `1` becomes `"1"`.
-        let key = interp.property_key_checked(&key)?;
+        let key = interp.property_key(&key)?;
         let bucket = match result.own_property_key(&key) {
             Some(existing) => existing.value.unwrap_or(Value::Undefined),
             None => {
@@ -383,7 +383,7 @@ fn lookup_accessor(
     want_getter: bool,
 ) -> JsResult<Value> {
     let object = interp.object_from(&this)?;
-    let key = interp.property_key_checked(&arg(args, 0))?;
+    let key = interp.property_key(&arg(args, 0))?;
     let mut current = Some(object);
     // Bounded: a proxy could answer `getPrototypeOf` with a cycle, and `for…in` over the
     // same object has the same problem.
@@ -427,7 +427,7 @@ fn define_accessor(
     if !matches!(&function, Value::Object(object) if object.is_callable()) {
         return Err(interp.type_error("not a function"));
     }
-    let key = interp.property_key_checked(&arg(args, 0))?;
+    let key = interp.property_key(&arg(args, 0))?;
     // Annex B.2.2.2: unspecified attributes default to `true`, unlike
     // `Object.defineProperty`, and the *other* half of an existing accessor is preserved.
     let existing = interp.object_get_own_property(&object, &key)?;
@@ -819,7 +819,7 @@ pub fn define_property_on(
     object: &Gc<JsObject>,
     args: &[Value],
 ) -> JsResult<bool> {
-    let key = interp.property_key(&arg(args, 1));
+    let key = interp.property_key(&arg(args, 1))?;
     let Value::Object(descriptor) = arg(args, 2) else {
         return Err(interp.type_error("property descriptor must be an object"));
     };
@@ -1129,7 +1129,7 @@ fn get_own_property_descriptor(
     let Value::Object(object) = &target else {
         return Err(interp.type_error("target is not an object"));
     };
-    let key = interp.property_key(&arg(args, 1));
+    let key = interp.property_key(&arg(args, 1))?;
     let Some(property) = interp.object_get_own_property(object, &key)? else {
         return Ok(Value::Undefined);
     };
@@ -1290,7 +1290,7 @@ fn from_entries(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResu
                 return Err(interp.type_error("not an object"));
             };
             let key = interp.get_property(&pair, "0")?.unwrap_or(Value::Undefined);
-            let key = interp.property_key_checked(&key)?;
+            let key = interp.property_key(&key)?;
             let value = interp.get_property(&pair, "1")?.unwrap_or(Value::Undefined);
             Ok((key, value))
         })();

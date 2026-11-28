@@ -3768,7 +3768,7 @@ impl<'a> Interp<'a> {
     /// plain property read off `proto` would lose that.
     fn super_read(&mut self, receiver: &Value, proto: &Value, key: &Value) -> JsResult<Value> {
         let start = self.require_object(proto)?;
-        let key = self.propkey(key);
+        let key = self.propkey(key)?;
         // `super.x` on a null prototype (a class extending `null`) resolves to nothing.
         if matches!(proto, Value::Null) {
             return Ok(Value::Undefined);
@@ -3798,7 +3798,7 @@ impl<'a> Interp<'a> {
         value: Value,
     ) -> JsResult<()> {
         let target = self.require_object(receiver)?;
-        let key = self.propkey(key);
+        let key = self.propkey(key)?;
         if !matches!(proto, Value::Null)
             && let Some((owner, property)) = lookup_key(&self.require_object(proto)?, &key)
         {
@@ -4420,7 +4420,7 @@ impl<'a> Interp<'a> {
         let list = self.list_from_array_like(&result, true)?;
         let mut keys: Vec<PropertyKey> = Vec::with_capacity(list.len());
         for value in list {
-            let key = self.propkey(&value);
+            let key = self.propkey(&value)?;
             if keys.contains(&key) {
                 return Err(self.type_error(format!(
                     "proxy 'ownKeys' returned the duplicate key '{key}'"
@@ -5998,22 +5998,6 @@ impl<'a> Interp<'a> {
                     )),
                 };
             }
-            // A function can opt out of `[[Construct]]` outright. `Symbol` does: there is
-            // no wrapper object to build, and `new Symbol()` is a `TypeError` naming it.
-            if object
-                .own_property("_not_a_constructor")
-                .and_then(|property| property.value)
-                .is_some_and(|value| value.to_boolean())
-            {
-                let name = object
-                    .own_property("name")
-                    .and_then(|property| property.value)
-                    .map(|value| value.to_js_string())
-                    .unwrap_or_default();
-                return Err(Signal::Throw(
-                    self.make_error("TypeError", &format!("{name} is not a constructor")),
-                ));
-            }
             // A generator function has no `[[Construct]]`, and the reference names it in
             // the message: `new (function* G(){})()` reports "G is not a constructor".
             if object.with(|data| match &data.kind {
@@ -6111,9 +6095,17 @@ impl<'a> Interp<'a> {
         };
         // `new.target` inside the body is the constructor that was written, so a bound
         // function's target sees itself rather than the bound wrapper.
-        self.pending_new_target = Some(new_target);
-        let result = self.call_value(callee, this.clone(), args)?;
-        self.pending_new_target = None;
+        //
+        // The save/restore is not cosmetic: a constructor that *throws* leaves through the
+        // `?`, so assigning `None` after the call would be skipped and the failed
+        // `new.target` would stay visible to every later native call. The symptom was a
+        // native constructor refusing a plain call — `var s = Symbol(); new
+        // FinalizationRegistry(1)` (which throws) followed by `Symbol()` reported
+        // "FinalizationRegistry is not a constructor".
+        let outer_new_target = self.pending_new_target.replace(new_target);
+        let result = self.call_value(callee, this.clone(), args);
+        self.pending_new_target = outer_new_target;
+        let result = result?;
         // A constructor that returns an object overrides `this`; any other return
         // value (including `undefined`) is ignored.
         Ok(match result {
@@ -7074,7 +7066,7 @@ impl<'a> Interp<'a> {
             GetArrayEl | GetArrayEl2 | GetArrayEl3 => {
                 let key = self.pop();
                 let object = self.pop();
-                let key = self.propkey(&key);
+                let key = self.propkey(&key)?;
                 let value = self.read_field_key(&object, &key)?;
                 if matches!(op, GetArrayEl2 | GetArrayEl3) {
                     self.push(object);
@@ -7099,7 +7091,7 @@ impl<'a> Interp<'a> {
                 let value = self.pop();
                 let key = self.pop();
                 let object = self.pop();
-                let key = self.propkey(&key);
+                let key = self.propkey(&key)?;
                 self.write_field_key(&object, &key, value)?;
             }
             DefineField => {
@@ -7130,7 +7122,7 @@ impl<'a> Interp<'a> {
                 let value = self.pop();
                 let key_value = self.pop();
                 let object = self.peek(0);
-                let key = self.propkey(&key_value);
+                let key = self.propkey(&key_value)?;
                 self.write_field_key(&object, &key, value)?;
                 self.push(key_value);
             }
@@ -7239,7 +7231,7 @@ impl<'a> Interp<'a> {
                 // `parent ctor key -> ctor proto key`: the computed name stays put so
                 // `define_field`-style consumers can still read it.
                 let key = self.pop();
-                let name = self.propkey_of(&key).to_string_lossy().into_owned();
+                let name = self.propkey_of(&key)?.to_string_lossy().into_owned();
                 let (ctor, proto) = self.define_class(&name, b)?;
                 self.push(ctor);
                 self.push(Value::Object(proto));
@@ -7264,7 +7256,7 @@ impl<'a> Interp<'a> {
                 let function = self.pop();
                 let key = self.pop();
                 let object = self.pop();
-                let key = self.propkey(&key);
+                let key = self.propkey(&key)?;
                 self.set_function_name(&function, &key_with_accessor_prefix(&key.to_string(), a));
                 if let Some(array) = object.as_object() {
                     define_function_property(array, &key, function, a);
@@ -7292,7 +7284,7 @@ impl<'a> Interp<'a> {
                 // and stringifying here would turn `{[Symbol("b")]: 2}` into an
                 // ordinary `"Symbol(b)"` property.
                 let value = self.pop();
-                let key = match self.propkey(&value) {
+                let key = match self.propkey(&value)? {
                     PropertyKey::Symbol(symbol) => Value::Symbol(symbol),
                     PropertyKey::String(text) => self.string_wtf8(text),
                 };
@@ -7306,7 +7298,7 @@ impl<'a> Interp<'a> {
             SetNameComputed => {
                 let key = self.peek(1);
                 let function = self.peek(0);
-                let name = self.propkey_of(&key).to_string_lossy().into_owned();
+                let name = self.propkey_of(&key)?.to_string_lossy().into_owned();
                 self.set_function_name(&function, &name);
             }
 
@@ -7498,7 +7490,7 @@ impl<'a> Interp<'a> {
                 // non-configurable property answers `false` and stays.
                 let key = self.pop();
                 let target = self.pop();
-                let key = self.propkey(&key);
+                let key = self.propkey(&key)?;
                 let text_label = key.as_str().unwrap_or("").to_string();
                 let deleted = match &target {
                     Value::Object(object) => {
@@ -8178,30 +8170,45 @@ impl<'a> Interp<'a> {
     ///
     /// A symbol is returned as itself, never stringified — that is what keeps
     /// `o[sym]` and `o["Symbol(a)"]` apart. Everything else becomes its string form.
-    fn propkey(&mut self, value: &Value) -> PropertyKey {
+    fn propkey(&mut self, value: &Value) -> JsResult<PropertyKey> {
         match value {
-            Value::Symbol(symbol) => PropertyKey::Symbol(symbol.clone()),
-            _ => PropertyKey::String(self.propkey_of(value)),
+            Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol.clone())),
+            // An object key runs `ToPropertyKey`, which is `ToPrimitive` *then* a symbol
+            // check: a wrapper whose `toString` answers a symbol makes a symbol key, not
+            // the string `"Symbol()"`. Going through `propkey_of` here would stringify it.
+            Value::Object(_) => match self.to_primitive(value.clone(), Hint::String)? {
+                Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol)),
+                Value::String(text) => Ok(PropertyKey::String(text.wtf8().clone())),
+                other => Ok(PropertyKey::String(crate::value::Wtf8::new(
+                    other.to_js_string(),
+                ))),
+            },
+            _ => Ok(PropertyKey::String(self.propkey_of(value)?)),
         }
     }
 
     /// `ToPropertyKey` for the callers that can only use a string key.
-    fn propkey_of(&mut self, value: &Value) -> crate::value::Wtf8 {
+    ///
+    /// Fallible on purpose: an object key runs `ToPrimitive`, and that can throw —
+    /// `{ toString(){ throw new Error('ts') } }` used as a template substitution is a
+    /// throw, not `[object Object]`. Swallowing it made `` `${o}` `` report the string
+    /// `[object Object]` and carry on, which is the worst kind of wrong answer: the
+    /// program continues with a value nobody asked for.
+    fn propkey_of(&mut self, value: &Value) -> JsResult<crate::value::Wtf8> {
         use crate::value::Wtf8;
-        match value {
+        Ok(match value {
             // A string key keeps its code units. Going through a lossy `String` would make
             // `o["\uD800"]` and `o["\uFFFD"]` the same property.
             Value::String(text) => text.wtf8().clone(),
             Value::Int(_) | Value::Float(_) => Wtf8::new(number_to_string(value.to_number())),
             // An object key runs `ToPropertyKey`, which needs `ToPrimitive` first;
             // falling back to its `ToString` would print `[object Object]`.
-            Value::Object(_) => match self.to_primitive(value.clone(), Hint::String) {
-                Ok(Value::String(text)) => text.wtf8().clone(),
-                Ok(other) => Wtf8::new(other.to_js_string()),
-                Err(_) => Wtf8::new("[object Object]"),
+            Value::Object(_) => match self.to_primitive(value.clone(), Hint::String)? {
+                Value::String(text) => text.wtf8().clone(),
+                other => Wtf8::new(other.to_js_string()),
             },
             other => Wtf8::new(other.to_js_string()),
-        }
+        })
     }
 
     // -- object operations used by instructions -----------------------------
@@ -8314,9 +8321,11 @@ impl<'a> Interp<'a> {
 
     /// `ToPropertyKey` for a builtin that takes a key argument.
     ///
-    /// Distinct from [`Interp::propkey`], which is `fn`-private to the instruction
-    /// loop; the builtins reach this one.
-    pub fn property_key(&mut self, value: &Value) -> PropertyKey {
+    /// Fallible: a key whose `toString` throws has to propagate that error, both for
+    /// `Reflect.get({}, {toString(){ throw 1 }})` (`return-abrupt-from-property-key`) and
+    /// for a template substitution. This used to answer `"[object Object]"` on a throw,
+    /// which made `` `${o}` `` and the like carry on with a value nobody asked for.
+    pub fn property_key(&mut self, value: &Value) -> JsResult<PropertyKey> {
         self.propkey(value)
     }
 
@@ -8360,25 +8369,6 @@ impl<'a> Interp<'a> {
             return Err(self.range_error("invalid array length"));
         }
         Ok(number as u32)
-    }
-
-    /// `ToPropertyKey` that can fail.
-    ///
-    /// [`Interp::property_key`] swallows a throwing `ToPrimitive` and answers
-    /// `"[object Object]"`, which is fine for a bytecode operand that has already been
-    /// coerced but wrong for `Reflect.get`, where a key whose `toString` throws has to
-    /// propagate that error (`return-abrupt-from-property-key`).
-    pub fn property_key_checked(&mut self, value: &Value) -> JsResult<PropertyKey> {
-        use crate::value::Wtf8;
-        match value {
-            Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol.clone())),
-            _ => match self.to_primitive(value.clone(), Hint::String)? {
-                Value::String(text) => Ok(PropertyKey::String(text.wtf8().clone())),
-                // A `ToPrimitive` that lands on a symbol is a symbol key, not `String(sym)`.
-                Value::Symbol(symbol) => Ok(PropertyKey::Symbol(symbol)),
-                other => Ok(PropertyKey::String(Wtf8::new(other.to_js_string()))),
-            },
-        }
     }
 
     /// A [`PropertyKey`] as the `Value` a script sees — what `Reflect.ownKeys` and
@@ -8507,7 +8497,7 @@ impl<'a> Interp<'a> {
                 self.make_error("TypeError", "cannot use 'in' on a non-object"),
             ));
         };
-        let key = self.propkey(key);
+        let key = self.propkey(key)?;
         // `in` is `[[HasProperty]]`, over the whole chain and through a proxy's `has`
         // trap. One implementation, so an array's derived `length` and its inherited holes
         // cannot be right in one caller and wrong in another.
@@ -8615,7 +8605,7 @@ impl<'a> Interp<'a> {
         {
             for index in 0..length {
                 if let Some(value) = list.array_get(index) {
-                    excluded.push(self.propkey_of(&value));
+                    excluded.push(self.propkey_of(&value)?);
                 }
             }
         }
@@ -8895,6 +8885,38 @@ impl<'a> Interp<'a> {
     /// Whether this call is a construction, i.e. `new.target` is defined.
     pub fn is_constructing(&self) -> bool {
         self.pending_new_target.is_some()
+    }
+
+    /// The `TypeError` a constructor too primitive to have a wrapper raises.
+    ///
+    /// `BigInt` and `Symbol` are *constructors* as far as `[[Construct]]` is concerned —
+    /// the reference creates both with `JS_CFUNC_constructor_or_func` — and the refusal
+    /// happens inside the native function, which is why the trace carries an
+    /// `at BigInt (native)` frame. The message names `new.target`, not the callee: a
+    /// `class B extends BigInt {}` constructed as `new B(1)` reports `B is not a
+    /// constructor`, and an unnamed one reports the leading space of `" is not a
+    /// constructor"` because the reference formats the empty name as it is.
+    ///
+    /// It is also the answer for a `new.target` that cannot be named at all — not a
+    /// function, or a throwing `name` getter — where the reference falls back to the bare
+    /// `not a constructor`.
+    pub fn not_a_constructor_error(&mut self) -> Signal {
+        let target = self.pending_new_target.clone().unwrap_or(Value::Undefined);
+        self.not_a_constructor_error_for(target)
+    }
+
+    /// The same `TypeError` for an explicit target, for the callers that check
+    /// `IsConstructor` themselves — `Reflect.construct` does, on its third argument.
+    pub fn not_a_constructor_error_for(&mut self, target: Value) -> Signal {
+        let target = match target {
+            Value::Object(target) if target.is_callable() => target,
+            _ => return self.type_error("not a constructor"),
+        };
+        let name = match self.get_property(&target, "name") {
+            Ok(Some(value)) => value.to_js_string(),
+            _ => return self.type_error("not a constructor"),
+        };
+        self.type_error(format!("{name} is not a constructor"))
     }
 
     /// Whether the pending `new.target` needs its own `prototype` honoured by the constructor.

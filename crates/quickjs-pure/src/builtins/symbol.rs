@@ -54,8 +54,6 @@ pub fn install(interp: &mut Interp<'_>) {
     let function_proto = interp.realm.function_proto.clone();
 
     let constructor = interp.new_native_constructor("Symbol", 0, constructor);
-    // `Symbol` has no `[[Construct]]`, and `construct` reads this flag to say so.
-    constructor.define("_not_a_constructor", Property::data(Value::Bool(true)));
     constructor.set_proto(Some(function_proto));
 
     let proto = interp.new_object(Some(object_proto));
@@ -127,7 +125,17 @@ pub fn symbol_value(interp: &Interp<'_>, symbol: JsSymbol) -> Value {
 ///
 /// Never constucts: `new Symbol()` is a `TypeError`. The description is optional and
 /// converted with `ToString`, so `Symbol(1)` is `Symbol(1)`.
+/// `Symbol([description])`.
+///
+/// `new Symbol()` is refused *inside* the function, not before it: the reference registers
+/// `Symbol` as a `JS_CFUNC_constructor_or_func`, so `[[Construct]]` necessarily succeeds
+/// and the native function throws with `new.target`'s name. Rejecting earlier — the way
+/// this used to — produced the same message but dropped the `at Symbol (native)` frame
+/// from the trace.
 fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    if interp.is_constructing() {
+        return Err(interp.not_a_constructor_error());
+    }
     let description = match args.first() {
         None | Some(Value::Undefined) => None,
         Some(value) => Some(interp.checked_to_string(value)?),

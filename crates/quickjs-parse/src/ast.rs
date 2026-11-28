@@ -375,6 +375,16 @@ pub struct Class {
     pub elements: Vec<ClassElement>,
     /// Source range.
     pub span: Span,
+    /// The closing `}` of the body.
+    ///
+    /// A class that writes no constructor still gets one, and the reference creates that
+    /// synthetic function *at* the closing brace: `js_parse_class_default_ctor` runs with
+    /// the `}` as its current token and hands `s->token.ptr` to `js_new_function_def`. The
+    /// position is the function's own `source_pos`, which is the first entry of its
+    /// line table — so `class B extends BigInt {}` constructed as `new B(1)` reports its
+    /// frame at the `}`, not at `class`. `span.end` cannot stand in: it is one *past* the
+    /// brace, and the brace may be the last character of a line.
+    pub body_end: Position,
 }
 
 /// One member of a class body.
@@ -672,7 +682,10 @@ impl Expr {
     pub fn is_anonymous_function_definition(&self) -> bool {
         match &self.kind {
             ExprKind::Function(f) => f.name.is_none() && !f.is_arrow,
-            ExprKind::Arrow(_) => false,
+            // An arrow is anonymous by construction — it has no name of its own to
+            // write — and still takes one from the binding: `var f = () => {}` leaves
+            // `f.name === "f"`, which is what a stack frame prints.
+            ExprKind::Arrow(_) => true,
             ExprKind::Class(c) => c.name.is_none(),
             _ => false,
         }

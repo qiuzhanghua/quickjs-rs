@@ -18,12 +18,7 @@ pub fn install(interp: &mut Interp<'_>) {
     // `Proxy` is a function you call with `new`, but it has no `prototype` property:
     // proxies inherit from their *target's* prototype, so there is nothing for one to
     // sit on.
-    constructor.define(
-        "_not_a_constructor",
-        Property::with_attributes(Value::Bool(false), false, false),
-    );
     define_method(&constructor, "revocable", 2, revocable, interp);
-
     let global = interp.realm.global.clone();
     global.define(
         "Proxy",

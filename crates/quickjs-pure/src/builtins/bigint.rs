@@ -21,11 +21,6 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
         "prototype",
         Property::with_attributes(Value::Object(proto.clone()), false, false),
     );
-    // `new BigInt()` has no wrapper object to build, so `[[Construct]]` is refused by name.
-    constructor.define(
-        "_not_a_constructor",
-        Property::with_attributes(Value::Bool(true), false, false),
-    );
     define_method(&constructor, "asIntN", 2, as_int_n, interp);
     define_method(&constructor, "asUintN", 2, as_uint_n, interp);
 
@@ -45,7 +40,16 @@ pub fn install(interp: &mut Interp<'_>, object_proto: &Gc<JsObject>) {
 }
 
 /// `BigInt(value)`, which converts a number, a string or a boolean exactly.
+///
+/// `new BigInt(1)` is refused here rather than before the call, which is what the
+/// reference does: `BigInt` is registered as a `JS_CFUNC_constructor_or_func`, so
+/// `[[Construct]]` exists and the native function is the one that says no. The
+/// difference is observable in the trace — the frame `at BigInt (native)` is there
+/// exactly because the call was entered.
 fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
+    if interp.is_constructing() {
+        return Err(interp.not_a_constructor_error());
+    }
     match arg(args, 0) {
         Value::BigInt(big) => Ok(Value::BigInt(big)),
         Value::Bool(flag) => Ok(interp.bigint(BigInt::from_i64(if flag { 1 } else { 0 }))),

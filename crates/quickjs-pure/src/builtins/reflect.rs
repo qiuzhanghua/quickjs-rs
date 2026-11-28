@@ -71,13 +71,21 @@ fn construct(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<
     // instance's prototype, which is the whole point of the three-argument form — it is how
     // a subclass is built without calling its constructor. Dropping it made
     // `Object.getPrototypeOf(Reflect.construct(C, [], D))` answer `C.prototype`.
+    //
+    // The `IsConstructor` check covers only the *supplied* third argument, which is exactly
+    // where the reference puts it. With two arguments the constructor is whatever the
+    // target is, and a non-constructor target is refused by `[[Construct]]` instead —
+    // the same `TypeError`, but reached one layer deeper, so its frame is not ours to
+    // invent here.
     let new_target = match args.get(2) {
-        None | Some(Value::Undefined) => target.clone(),
-        Some(candidate) => candidate.clone(),
+        Some(Value::Undefined) | None => target.clone(),
+        Some(candidate) => {
+            if !matches!(candidate, Value::Object(o) if o.is_constructor()) {
+                return Err(interp.not_a_constructor_error_for(candidate.clone()));
+            }
+            candidate.clone()
+        }
     };
-    if !matches!(&new_target, Value::Object(o) if o.is_constructor()) {
-        return Err(interp.type_error("Reflect.construct newTarget is not a constructor"));
-    }
     interp.construct(target, new_target, rest)
 }
 
@@ -137,7 +145,7 @@ fn get(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     // string turned every `Reflect.get(o, sym)` into a read of `""`, and `proxy_get`
     // forwards through this function, so a Proxy's `get` trap appeared to return
     // `undefined` for `Symbol.iterator` even when the trap answered with a function.
-    let key = interp.property_key_checked(&arg(args, 1))?;
+    let key = interp.property_key(&arg(args, 1))?;
     Ok(interp
         .get_property_key(&object, &key)?
         .unwrap_or(Value::Undefined))
@@ -148,7 +156,7 @@ fn set(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.set target is not an object"));
     };
-    let key = interp.property_key_checked(&arg(args, 1))?;
+    let key = interp.property_key(&arg(args, 1))?;
     interp.set_property_with_key(
         &object,
         &key,
@@ -166,7 +174,7 @@ fn has(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value>
     // `[[HasProperty]]`, which walks the prototype chain and asks a Proxy's `has` trap.
     // The hand-rolled version here only looked at own properties and an array index, so
     // `Reflect.has({}, "toString")` and every symbol key answered `false`.
-    let key = interp.property_key_checked(&arg(args, 1))?;
+    let key = interp.property_key(&arg(args, 1))?;
     Ok(Value::Bool(interp.has_own_or_inherited(&object, &key)?))
 }
 
@@ -197,7 +205,7 @@ fn get_own_property_descriptor(
     let Some(object) = target.as_object().cloned() else {
         return Err(interp.type_error("Reflect.getOwnPropertyDescriptor target is not an object"));
     };
-    let key = interp.property_key_checked(&arg(args, 1))?;
+    let key = interp.property_key(&arg(args, 1))?;
     let Some(property) = interp.object_get_own_property(&object, &key)? else {
         return Ok(Value::Undefined);
     };

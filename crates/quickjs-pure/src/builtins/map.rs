@@ -302,7 +302,7 @@ fn set_record(interp: &mut Interp<'_>, value: &Value) -> JsResult<SetRecord> {
     let Some(object) = value.as_object().cloned() else {
         return Err(interp.type_error("the argument is not a set-like object"));
     };
-    let key = interp.property_key(&interp.string("size"));
+    let key = interp.property_key(&interp.string("size"))?;
     let size = interp.get_property_key(&object, &key)?;
     let size = match size {
         None | Some(Value::Undefined) => {
@@ -310,13 +310,13 @@ fn set_record(interp: &mut Interp<'_>, value: &Value) -> JsResult<SetRecord> {
         }
         Some(value) => interp.to_js_number(&value)?,
     };
-    let key = interp.property_key(&interp.string("has"));
+    let key = interp.property_key(&interp.string("has"))?;
     let has = interp.get_property_key(&object, &key)?;
     let has = match has {
         Some(value) if value.as_object().is_some_and(|object| object.is_callable()) => value,
         _ => return Err(interp.type_error("the argument's has property is not callable")),
     };
-    let key = interp.property_key(&interp.string("keys"));
+    let key = interp.property_key(&interp.string("keys"))?;
     let keys = interp.get_property_key(&object, &key)?;
     let keys = match keys {
         Some(value) if value.as_object().is_some_and(|object| object.is_callable()) => value,

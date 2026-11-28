@@ -1207,6 +1207,13 @@ impl Compiler {
         match &stmt.kind {
             StmtKind::Empty | StmtKind::Debugger => {}
             StmtKind::Expr(expr) => {
+                // The statement's first token is a position the reference records: an
+                // expression statement is the `hasexpr:` arm of `js_parse_statement`,
+                // which calls `emit_source_pos(s, s->token.ptr)` before parsing it. That
+                // is why an error from a construct with no position of its own (`[...it]`
+                // with a throwing iterator, `` `${x}` ``) reports the statement's start.
+                let saved = self.cur().cur_pos;
+                self.state().cur_pos = Some(expr.span.start);
                 // An expression statement's value is thrown away — except in a
                 // script, where it becomes the program's result. `assign` reads this
                 // and clears it, so a nested assignment still produces a value.
@@ -1222,6 +1229,9 @@ impl Compiler {
                 } else {
                     self.emit(Opcode::Drop, &[]);
                 }
+                // Restored last: the trailing `drop` is part of the statement, and in the
+                // reference it simply inherits whatever the expression last recorded.
+                self.state().cur_pos = saved;
             }
             StmtKind::Block(body) => {
                 // The block's declarations were hoisted with its enclosing
@@ -3519,7 +3529,29 @@ impl Compiler {
     /// restore the `add` in `a + b` would inherit `b`'s position instead of the `+`.
     fn expr(&mut self, expr: &Expr) -> Result<(), SyntaxError> {
         let saved = self.cur().cur_pos;
-        self.state().cur_pos = Some(expr.op_pos.unwrap_or(expr.span.start));
+        // Only the node kinds the reference calls `emit_source_pos` for record a position:
+        // the operator a node exists for, and a variable *read*, which the reference
+        // positions at the identifier itself (`case TOK_IDENT: … do_get_var:
+        // emit_source_pos(s, source_ptr)`). Everything else — a literal, an object or array
+        // start, a parenthesised group, an anonymous function expression — leaves the
+        // previous position in place, because a table entry the reference never writes is
+        // one we must not write either: the instruction that inherits a position (the
+        // `using` epilogue, a template's `to_propkey`, a `super()` call) would otherwise
+        // report a more recent token than the reference does.
+        let pos = expr.op_pos.or(match &expr.kind {
+            ExprKind::Ident(ident) => Some(ident.span.start),
+            _ => None,
+        });
+        match pos {
+            Some(pos) => self.state().cur_pos = Some(pos),
+            // A node the reference records nothing for: its own instructions stay
+            // unpositioned, so they inherit whatever was written last — which is what an
+            // `emit_source_pos`-less stretch of the reference's bytecode does. Keeping the
+            // enclosing position instead would blame them on a token the reference has not
+            // reached yet: a spread's `iterator_open` reports the expression it follows, and
+            // a template's `to_propkey` the interpolation.
+            None => self.state().cur_pos = None,
+        }
         // Note a direct `eval` call before compiling it, because the *whole* function
         // is affected: an eval can name any binding the function declares, so every one
         // of them has to live in a cell for a closure it creates to capture it.
@@ -4780,37 +4812,42 @@ impl Compiler {
                 }
             )
         });
-        self.compile_synthetic_function("", true, class.span, |compiler| {
-            if has_heritage {
-                // A derived constructor's `this` does not exist until `super()` returns,
-                // so it starts in the dead zone and `init_ctor` fills it.
-                compiler.declare("this", VarDef::lexical("this"));
-                compiler.emit(
-                    Opcode::SetLocUninitialized,
-                    &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
-                );
-                compiler.emit(Opcode::InitCtor, &[]);
-                compiler.emit(
-                    Opcode::PutLocCheckInit,
-                    &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
-                );
-            } else {
-                compiler.begin_this_local();
-                compiler.emit(Opcode::CheckCtor, &[]);
-            }
-            if has_fields {
-                compiler.call_field_initialiser();
-            }
-            // A derived constructor returns `this`, the object `super()` built. Without
-            // this the implicit constructor fell through to `return_undef`, and `new B()`
-            // handed back the empty object `construct` had made instead of the one the
-            // parent constructor initialised.
-            if has_heritage {
-                compiler.emit_var(VarAction::Get, "this");
-                compiler.emit(Opcode::Return, &[]);
-            }
-            Ok(())
-        })
+        self.compile_synthetic_function(
+            "",
+            true,
+            Span::new(class.body_end, class.body_end),
+            |compiler| {
+                if has_heritage {
+                    // A derived constructor's `this` does not exist until `super()` returns,
+                    // so it starts in the dead zone and `init_ctor` fills it.
+                    compiler.declare("this", VarDef::lexical("this"));
+                    compiler.emit(
+                        Opcode::SetLocUninitialized,
+                        &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
+                    );
+                    compiler.emit(Opcode::InitCtor, &[]);
+                    compiler.emit(
+                        Opcode::PutLocCheckInit,
+                        &[Op::Slot(Slot::Loc(compiler.cur().vars.len() as u32 - 1))],
+                    );
+                } else {
+                    compiler.begin_this_local();
+                    compiler.emit(Opcode::CheckCtor, &[]);
+                }
+                if has_fields {
+                    compiler.call_field_initialiser();
+                }
+                // A derived constructor returns `this`, the object `super()` built. Without
+                // this the implicit constructor fell through to `return_undef`, and `new B()`
+                // handed back the empty object `construct` had made instead of the one the
+                // parent constructor initialised.
+                if has_heritage {
+                    compiler.emit_var(VarAction::Get, "this");
+                    compiler.emit(Opcode::Return, &[]);
+                }
+                Ok(())
+            },
+        )
     }
 
     /// Emit the call to `<class_fields_init>`, guarded by an `undefined` test.
@@ -7755,7 +7792,18 @@ fn assemble(
     // Keep only the offsets where the position actually changes: a run of
     // instructions on one line is one table entry, and the runtime binary searches
     // the table for the frame's pc.
-    let mut positions: Vec<LineCol> = Vec::new();
+    //
+    // The table always starts at pc 0 with the *function's own* position, because the
+    // reference's `compute_pc2line_info` seeds it that way: `dbuf_put_leb128(&s->pc2line,
+    // last_line_num)` from `fd->source_pos`, the token the function definition starts at
+    // (`function`, `async`, a method's property name). An instruction before the first
+    // recorded operator therefore reports the function's own start, which is what makes a
+    // `using` epilogue with a plain initialiser report `1:2` rather than nothing at all.
+    let mut positions: Vec<LineCol> = vec![LineCol {
+        pc: 0,
+        line: state.line,
+        column: state.column,
+    }];
     let mut last: Option<Position> = None;
     for (index, span) in spans.iter().enumerate() {
         let Some(pos) = *span else { continue };
@@ -7763,6 +7811,10 @@ fn assemble(
             continue;
         }
         last = Some(pos);
+        if pos.line == state.line && pos.column == state.column {
+            // Already the seed entry above.
+            continue;
+        }
         positions.push(LineCol {
             pc: offsets[index] as u32,
             line: pos.line,

@@ -139,7 +139,7 @@ fn install_error_cause(
         // A primitive options object installs nothing rather than throwing.
         return Ok(());
     };
-    let key = interp.property_key(&interp.string("cause"));
+    let key = interp.property_key(&interp.string("cause"))?;
     if !interp.has_own_or_inherited(&options, &key)? {
         return Ok(());
     }

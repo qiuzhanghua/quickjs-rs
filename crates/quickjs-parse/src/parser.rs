@@ -2576,12 +2576,16 @@ impl<'a> Parser<'a> {
         })();
         self.private.pop();
         result?;
+        // The `}` itself, before it is consumed: a class with no written constructor gets
+        // a synthetic one created *at* this token (see [`Class::body_end`]).
+        let body_end = self.current.span.start;
         self.bump()?; // }
         Ok(Class {
             name,
             super_class,
             elements,
             span: self.span_from(start),
+            body_end,
         })
     }
 
@@ -3958,12 +3962,16 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Expr::new(
+        // `new C` with no argument list: the reference emits its position at the token
+        // *after* the constructor (`emit_source_pos(s, s->token.ptr)` for "new operator on
+        // an object"), not at the `new`.
+        Ok(Expr::at_operator(
             ExprKind::New {
                 callee: Box::new(callee),
                 arguments,
             },
             self.span_from(start),
+            self.current.span.start,
         ))
     }
 
@@ -4118,17 +4126,26 @@ impl<'a> Parser<'a> {
     fn parse_super(&mut self) -> Result<Expr> {
         let start = self.current.span.start;
         self.bump()?;
+        // Every error below is reported at the token *after* `super`, because the reference
+        // consumes the keyword before it looks at what follows (`case TOK_SUPER:
+        // next_token(s); …`) and `js_parse_error` always points at the current token. So
+        // `super.x` reports the `.`, `super()` the `(`, and a bare `super` the token that
+        // ends the expression.
+        let after = self.current.span;
         if self.at_punct(Punct::LParen) {
             if !self.ctx.in_derived_constructor {
                 return Err(self.error_at(
                     "super() is only valid in a derived class constructor",
-                    self.span_from(start),
+                    after,
                 ));
             }
+            // A `super()` call is positioned on its `(` like any other call: the reference
+            // reaches the same `emit_source_pos(op_token_ptr)` on the way to `apply`.
             let arguments = self.parse_arguments()?;
-            return Ok(Expr::new(
+            return Ok(Expr::at_operator(
                 ExprKind::SuperCall(arguments),
                 self.span_from(start),
+                after.start,
             ));
         }
         if !self.ctx.in_method {
@@ -4143,7 +4160,7 @@ impl<'a> Parser<'a> {
             } else {
                 "invalid use of 'super'"
             };
-            return Err(self.error_at(message, self.span_from(start)));
+            return Err(self.error_at(message, after));
         }
         Ok(Expr::new(ExprKind::SuperProp, self.span_from(start)))
     }
