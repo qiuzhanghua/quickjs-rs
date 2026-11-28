@@ -151,7 +151,7 @@ C（rquickjs 兼容）暂不纳入范围，只在公共 API 设计上避免明�
 - 错误：`Result<T, Exception>`；`Exception` 可 `catch` 成 Rust 错误或重新抛出。
 - 验收：公共 API 0 `unsafe`；`#![deny(unsafe_op_in_unsafe_fn)]`；文档示例全部 doctest 通过。
 
-### FR-13 C ABI 兼容层（`quickjs-capi`，feature `c-api`，M12）
+### FR-13 C ABI 兼容层（`quickjs-capi`，feature `c-api`，M15）
 - 导出 `quickjs.h` 的 233 个符号（`extern "C"`），`JSValue` 按上游当前平台布局（64 位 NaN boxing 或 tag+union）实现。
 - 目的：让现有 C/其他语言绑定（如 `quickjs-ng` 用户、Go/Python 绑定）可直接链接替换。
 - 代价：值表示被 ABI 绑死 → 放在独立 crate，内部用 `Value ↔ JSValue` 转换，仅牺牲少量性能。
@@ -232,7 +232,7 @@ crates/
   quickjs-pure/        # ★ 公共 API（Runtime/Context/Value/ClassDef/module!），lib 名 `quickjs`
   quickjs-cli/         # CLI + REPL，bin 名 `qjs`
   quickjs-aot/         # AOT 编译器（qjsc 等价）
-  quickjs-capi/        # C ABI 兼容层（M12）
+  quickjs-capi/        # C ABI 兼容层（M15）
   quickjs-conformance/ # 差分测试 harness（dev，与 C 版 qjs 对拍，不发布）
 
 包名一律带 `quickjs-` 前缀，lib/二进制名保持短名（`js_gc`、`js_parse`、
@@ -270,10 +270,11 @@ crates/
 | M7 | 正则引擎 + Unicode 表 | 🟡 `\p{…}` 已补到 606/613；缺 `RegExp.escape`、lookbehind、`v` 模式字符串属性 |
 | M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView/弱引用一族已完成；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
 | ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ 不做：单线程引擎，`wait` 无法真阻塞、`notify` 无等待者 |
-| **M9** | **`std`/`os`/事件循环 + CLI + REPL** | ⬜ **下一项**：`test_std.js`、CLI 选项矩阵。Worker 随 `Atomics` 一起不做 |
-| M10 | 字节码 AOT（qjsc 等价）+ BJSON | 产物可执行且输出一致 |
-| M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | microbench ≥ 0.5× C 版 |
-| M12 | C ABI 兼容层（`quickjs-capi`，233 个符号） | 上游 `examples/*.c`、`tests/bjson.c` 链接后运行一致 |
+| M9 ✅ | `std`/`os`/事件循环 + CLI + REPL | 已完成：`test_std.js`、CLI 选项矩阵、`qjs -i` 跑参考的 `repl.js`。Worker 随 `Atomics` 一起不做 |
+| **M10** | **语言收尾：私有类元素 `#x` + test262 尺子 + 早期错误收口** | ⬜ **下一项**：`language` 里 3451 条私有元素用例逐条翻绿；拆解见 [`m10-plan.md`](m10-plan.md) |
+| M11 | 字节码 AOT（qjsc 等价）+ BJSON | 产物可执行且输出一致。**顺延自原 M10**：语言跑不动时 AOT 只是打包一个跑不动的引擎 |
+| M12 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole）+ 资源限制（`--memory-limit`/`--stack-size` 真正生效） | microbench ≥ 0.5× C 版；NFR-3/NFR-5 |
+| M15 | C ABI 兼容层（`quickjs-capi`，233 个符号） | 上游 `examples/*.c`、`tests/bjson.c` 链接后运行一致。**编号跳过 M13/M14**：那两位是已取消的 Temporal/Intl，不复用 |
 | ~~M13~~ | ~~Temporal（tzdata + ISO 日历，9 个类型）~~ | ❌ 不做：4624 条用例，与"能嵌入使用"无关 |
 | ~~M14~~ | ~~Intl / ECMA-402（CLDR 子集）~~ | ❌ 不做：需要 CLDR 数据，与零依赖前提冲突 |
 
@@ -306,7 +307,7 @@ dtoa ~2k、std ~6k、CLI/REPL ~3k、Intl ~10k / Temporal ~12k、C ABI 层 ~4k。
 
 | # | 决策点 | 结论 | 影响 |
 |---|---|---|---|
-| 1 | API 形态 | **方案 A**：惯用 Rust API 为主（`Runtime`/`Context`/`Value`/`ClassDef`/`module!`），C ABI 兼容层做独立 crate（M12） | 核心表示不被 C 布局绑死；ABI 层只做值转换 |
+| 1 | API 形态 | **方案 A**：惯用 Rust API 为主（`Runtime`/`Context`/`Value`/`ClassDef`/`module!`），C ABI 兼容层做独立 crate（M15） | 核心表示不被 C 布局绑死；ABI 层只做值转换 |
 | 2 | 功能范围 | **全量**：核心 ES2025 + 模块 + BigInt/TypedArray/Atomics/WeakRef，**含 Temporal 与 Intl（ECMA-402/CLDR）** | Temporal/Intl 排 M13/M14，独立数据 crate + feature，不阻塞主线 |
 | 3 | 字节码 | **自有稳定格式**（magic + version + 稳定序列化），不与 C 版二进制互通；保留 `write_object`/`read_object` 语义与 qjsc AOT | opcode 布局可自由优化；不能直接执行 C 版编译产物 |
 | 4 | GC 路线 | **`Rc` + 循环回收**（引用计数 + trial-deletion cycle collector），确定性释放，对齐上游语义 | `Gc<T>`/`WeakGc<T>`/finalizer 必须在 M0 先落地并单测 |
@@ -354,7 +355,7 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 | `RegExp.escape`、lookbehind、`v` 模式字符串属性 | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{Basic_Emoji}` 报 `invalid Unicode property`（`\p{ASCII_Hex_Digit}` 等单码点属性已可用） | M7 |
 | 通用语法错误的输出格式 | 已带 `SyntaxError:` 前缀，但仍缺参考的 `at file:line:col` 位置行 | 未排期 |
 | `Function.prototype.toString` | 用户函数返回 `[native code]` 而非源码文本 | 未排期 |
-| 字符串拼接 | O(n²)，大循环慢 | M11 |
+| 字符串拼接 | O(n²)，大循环慢 | M12 |
 
 `Iterator` helpers、`Array.fromAsync`、`DataView`、TypedArray 的数组方法/迭代、`Set` 的七个
 集合方法、`decodeURI`/`encodeURI`/`escape`/`unescape`、`AggregateError` 以及弱引用一族
@@ -384,7 +385,7 @@ M4 交付后，标准库第一波可用：`Object.keys`、`[1,2,3].map(x=>x*2)`�
 遗留待定（不阻塞 M0–M3）：
 
 - 是否要求 `wasm32` 目标（影响 `std::thread` 与 `Atomics` 设计）。
-- `qjsc` 产物形态：M10 先做「生成 Rust 源 + `cargo build`」，自建 ELF/Mach-O 包装器列为 stretch。
+- `qjsc` 产物形态：M11 先做「生成 Rust 源 + `cargo build`」，自建 ELF/Mach-O 包装器列为 stretch。
 
 
 ---

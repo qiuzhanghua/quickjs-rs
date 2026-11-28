@@ -83,10 +83,17 @@ for crate in "${ORDER[@]}"; do
     # Scoped to `[dependencies]`-like sections and stopping at `[dev-dependencies]`:
     # a dev-dependency may name a path alone, because cargo strips dev-dependencies from
     # the published manifest, so `quickjs-conformance` is legitimately versionless.
-    # Not `grep -q … | grep -v …`: `-q` prints nothing, so the second `grep` never saw a
-    # line and this check could not fire at all. It has to be a filter that still prints.
-    if sed -nE '/^\[dev-dependencies\]/q
-                /^[[:space:]]*quickjs-[a-z]+ = \{ path/ { /version/!p }' "$manifest" | grep -q .; then
+    #
+    # Twice rewritten. First it was `grep -q … | grep -v …`, which could never fire: `-q`
+    # prints nothing, so the second `grep` never saw a line. Then it was one `sed -nE`
+    # script with a newline inside it, which GNU sed accepts and BSD sed rejects with
+    # "extra characters at the end of p command" — the failure went to stderr, the pipe's
+    # status came from `grep`, and the check silently stopped running on macOS. `awk` has
+    # no such dialect split: `^\[dev-dependencies\]` ends the scan, and END reports
+    # whether anything offending was seen.
+    if awk '/^\[dev-dependencies\]/ { exit }
+            /^[[:space:]]*quickjs-[a-z]+ = \{ path/ && !/version/ { bad = 1 }
+            END { exit(bad ? 0 : 1) }' "$manifest"; then
         echo "  $crate: a path dependency has no version" >&2
         exit 1
     fi

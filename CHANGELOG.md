@@ -2,6 +2,207 @@
 
 本项目的版本号只表达**可用性边界**，不表达与上游 QuickJS 的功能对等度。
 
+## v0.7.0 — 2026-11-28
+
+**这一版抬的是"能不能被嵌入使用"，不是"语言覆盖面"。** v0.6.1 之前它只能在命令行里跑
+自包含脚本：没有文件、没有环境变量、没有定时器，`--std` 报 `not implemented yet`。现在
+`qjs --std` 跑的是参考实现那一整套宿主 API，`qjs -i` 跑的是**参考自己的 `repl.js`**。
+
+**为什么是 minor。** 改了已发布的 `pub` 项，没有兼容写法：
+
+| 变更 | 从 | 到 |
+|---|---|---|
+| `Interp::property_key` | `&Value -> PropertyKey` | `&Value -> JsResult<PropertyKey>` |
+| `Class`（AST） | — | 新增字段 `body_end` |
+| `ClassElement::StaticBlock` | `{ body, span }` | `{ body, body_start, span }` |
+
+`property_key` 那条是**修 bug 必须的**：它原来把 `ToPrimitive` 抛出的异常吞掉、换成
+`[object Object]` 继续算，于是 `Object.hasOwn(obj, {toString(){throw 1}})` 得到 `false`
+而不是抛出。要让它能抛，签名就得能返回错误。AST 两处是位置信息的修正，见「栈帧」一节。
+
+| 能力 | v0.6.1 | v0.7.0 |
+|---|---|---|
+| `std` / `os` 宿主模块 | 不存在，`--std` 报错 | `std` 文件对象（17 方法）、`printf`、`parseExtJSON`、环境变量、`loadFile`；`os` 文件/目录/进程/时间/终端面，`setTimeout`/`setReadHandler` |
+| 事件循环 | 不存在 | timer + 微任务排空，`os.setTimeout` 按参考的形状（**没有** `setInterval`） |
+| REPL | 不存在 | `qjs -i` 跑参考的 `repl.js`：行编辑、着色、补全、`\h` |
+| class 静态块 `static { … }` | 编译器报错 | 可用，含 `super.x` 与 `super.x = v` |
+| 语法错措辞与参考一致率 | 2.3%（93/4055） | **44.5%** |
+| test262 `built-ins` | 14907/17822（83.6%） | **14921/17822（83.7%）** |
+| test262 `language` | — | **15144/23743（63.8%）** |
+| 引擎依赖（NFR-7） | 零依赖 | 仍零依赖：`tokio`/`rustix` 只进 `quickjs-host` |
+
+`built-ins` 只涨 14 例，因为这一版的工作几乎都在 `language/` 与宿主层：两个 class 目录
+1904→1946、1728→1749（**+63，-0**），`language` 总计 **+80**。
+
+### 加：`std`/`os` 宿主模块与事件循环（M9）
+
+新增 `quickjs-host` crate，等价于参考实现的 `quickjs-libc.c`：它坐在引擎**旁边**而不是
+里面。`tokio`（timer + fd 就绪）与 `rustix`（syscall 的安全封装）只允许出现在这一层，
+NFR-7 的断言守着引擎那侧的 `cargo tree` 必须为空。
+
+验收基准是参考自己的 `tests/test_std.js`，方法是拿同一个探针脚本跑 `qjs --std` 并与参考
+**逐字节**比对。逐个函数对下来，有三件事是猜不中的：
+
+**`os` 的失败约定有两套，不是一套。** 二元组返回 `[value, 正 errno]`
+（`stat`/`lstat`/`readlink`/`realpath`/`readdir`/`getcwd`/`utimes`），裸值返回**负** errno
+（`open`/`close`/`seek`/`read`/`write`/`mkdir`/`remove`/`rename`/`chdir`）。第一版写成一致
+的一套，31 条用例错了 13 条。另有两处不规则：`isatty` 返回裸 Boolean，`pipe` 返回裸
+`[r, w]`。都不是笔误，是参考本来的形状。
+
+**`std.parseExtJSON` 不能用 `serde`。** 实测它对扩展方言需要的 12 项特性**全部拒绝**
+（注释、行注释、裸键、尾逗号、单引号、`+1`、`0o10`、`0xa0`、`Infinity`、`NaN`、`.1`、
+换行续行）——serde 实现的是 JSON 的严格**子集**，这里要的是**超集**。参考的做法也不是
+"预处理成标准 JSON 再解析"，而是同一个解析器加 `JS_PARSE_JSON_EXT` 标志位，所以照做：
+`Parser` 加 `ext: bool`，每处放宽各自门控。这样 `JSON.parse` 保持严格，两条路径共享同一套
+错误位置。顺带修掉一个预存在 bug：`JSON.parse("+1")` 和 `JSON.parse(".1")` 一直是成功的。
+
+**`os` 里一个 `unsafe` 都没有。** 把脚本给的 fd 数字变回描述符本来需要
+`BorrowedFd::borrow_raw`（`unsafe`），解法是一张 `fdtable`：宿主持有 `OwnedFd`，只把数字
+交给脚本，读写走 `OwnedFd::as_fd()`。副作用是"宿主不持有的 fd 报 EBADF"，结论与参考真去
+`read(999)` 拿到的相同。
+
+**`os.setInterval` 不存在，而且不能加。** 浏览器心智会让人反射性地加上它，但参考里
+`grep -c setInterval quickjs-libc.c` 是 0。加了它等于给引擎一个参考产不出来的 timer，
+差分测试根本没有东西可比。
+
+### 加：REPL——跑参考的 `repl.js`，不重写
+
+`qjs -i` 加载的是参考仓库里 `repl.js` 的原文，行编辑、语法着色、补全、`\h` 帮助全是它的
+代码。为此补了四处引擎能力，每一处都是被 REPL 逼出来的：
+
+- **`std.evalScript` 的 `async` 选项**：参考用 `JS_EVAL_FLAG_ASYNC` 把完成值走 promise
+  送回，形状是 `{value: …}` 且**不隐式 await**；语法错同步抛（promise 还不存在）、运行时错
+  reject、成功则 resolve。
+- **`backtrace_barrier` 截断栈**：让 REPL 只报刚求值那行，不把 readline 循环也报出来。
+  屏障必须在**编译前**建立——语法错的栈也要截断。
+- **native 帧要按深度交错**：原来的 `stack_trace` 把所有 native 帧排在最前，理由是
+  "native 从不重入 JavaScript"。`std.evalScript` 重入了，前提不再成立。
+- **`std.in.fileno()` 必须是 0**：原先 `std.in` 持有 `dup(0)` 并报 3，而 `repl.js` 把读
+  处理器装在 `os.setReadHandler(std.in.fileno(), …)` 上，于是等的是一个终端永不写入的
+  描述符——打印提示符后永久静默。
+
+一处**刻意**与参考不同：管道 stdin 到 EOF 时参考会挂死（CPU 100%），我们干净退出。复刻一个
+挂死不是值得保留的行为。
+
+### 修：一个静默给错的窥孔（`dup; put; drop; get` → `set`）
+
+REPL 曾被它挡住。`emit_var` 的窥孔把 `dup; put_x; drop; get_x` 折成 `set_x`，只在**顺序
+落下**时等价。当跳转**落在**那条 `get_x` 上（`if` 体结束、`switch` case、循环头），删掉它
+就把跳转重定向到后一条指令，于是 `return` 在空栈上执行。
+
+危险在于它不报错，只给 `undefined`，所以大量测试碰巧通过——值恰好等于前一条语句留在栈上的
+东西。修法：被跳转指向的 `drop`/`get` 不能折叠。回归覆盖两层：`run.rs` 断言运行时行为
+（`if`/`switch`/`while` 三种标签位置），`disasm_diff.rs` 用 6 条字节码逐字节对拍。
+
+### 修：栈帧位置
+
+参考只在少数算子处 `emit_source_pos`：成员选择、调用、赋值、二元/一元运算、
+`return`/`throw`、变量**读取**。我们原来给每个表达式节点都记一条，多出来的条目污染了位置
+继承——`using` 的处置尾声没有自己的位置，于是继承到最后一条记录，报 `1:26`（声明处）而不是
+`1:35`（`{ [Symbol.dispose]: 1 }` 里那个 `.`）。
+
+三处配套修正：位置表从 pc 0 起就播种函数自身的定义位置（`compute_pc2line_info` 用
+`fd->source_pos`），否则无自写位置的函数退化成 `(file)`；无显式构造器时合成构造器建在类体
+的 `}` 上（`js_parse_class_default_ctor` 拿 `s->token.ptr`），于是 `1:25` 而非 `1:1`——这
+就是 `Class::body_end` 的来由；`super` 的错误位置是关键字**之后**的 token（参考先
+`next_token` 再检查）。
+
+### 修：两处 native 构造器行为
+
+`BigInt`/`Symbol` 在参考里是 `JS_CFUNC_constructor_or_func`：`[[Construct]]` **存在**，
+拒绝发生在原生函数**内部**，所以栈里有 `at BigInt (native)`。我们原来在进入之前就拒了，
+少一个帧；错误名也要按 `new.target` 取（`class B extends BigInt{}; new B(1)` →
+`B is not a constructor`）。
+
+同时修掉一处真实的状态泄漏：`construct()` 里 `pending_new_target` 用 `?` 提前返回时不还原，
+构造失败之后**所有** native 调用都被误判为"在构造中"。症状是 `var s=Symbol(); new
+FinalizationRegistry(1)`（抛错）之后 `Symbol()` 报 `FinalizationRegistry is not a
+constructor`。
+
+### 加：class 静态块
+
+静态块不是类的成员，是一段在类定义走到它时立刻执行的语句。参考把它编成一个函数塞进**静态
+字段初始化器**里调用，所以真正的改动是让初始化器也能装语句、并按源码顺序交错
+（`static a = 1; static { this.a = 2 }` 与反序结果不同，不能拆成两个 pass）。
+
+静态块函数在参考里没有 `this`/`new.target`/`arguments`，`super` 有但 home object 没有
+——这正好是**箭头函数**的形状，所以编译端就编成箭头。途中挖出两个早已存在的 bug：
+
+- **`super` 在箭头里一直就是错的**：`super_base()` 一律发 `special_object 4`，对箭头压出来
+  是 `null`，于是 `class C extends B { n(){ return () => super.m() } }` 抛
+  `cannot read property 'm' of null`。按参考的 `resolve_pseudo_var` 补了 `<home_object>`
+  局部（与 `this`/`new.target` 完全同构）。
+- **`get_super_value` 的栈效应是 3 进 1 出，我们做成了 3 进 2 出**：`receiver` 读了没消费，
+  多出来的 `this` 正好落在调用指令找函数的位置，于是 `print(super.p)` 报
+  `class constructors must be invoked with 'new'`。它只在结果被消费的位置可见
+  （`return super.x` 把结果留在上面，谁也碰不到残留），所以长期没被发现。
+
+`super.x = v` 顺带可用（`insert4` + `put_super_value`；复合与逻辑赋值先 `to_propkey` +
+`dup3`，保证计算键只求值一次），运行时补了 `insert4`/`dup3`。早期错误一并按参考对齐：
+`return` 报 `return in a static initializer block`、`arguments` 被禁、`await` 在块内是保留字
+（但在箭头体内不是——参考那个"向上找祖先"的循环在箭头体就断了）、`super()` 不许、
+`new.target` 合法且为 `undefined`、`var` 合法（参考不实现 spec 那条禁令）。
+
+### 加：顶层 `await`、语法错措辞对齐、早期错误对齐
+
+三层都先把判定做成可执行的差分，再改代码：
+
+- **顶层 `await`**：`JS_EVAL_FLAG_ASYNC` 的可挂起脚本，`parse_suspensible_script` +
+  `compile_script_suspensible`。
+- **语法错措辞**：`parse_oracle.rs` 只对拍接受/拒绝、不验文本，所以措辞完全没被测量过——
+  动手前对齐率 **2.3%**（93/4055），408 类不同形状。关键发现是参考只有**一条**通用 token
+  消息，且 `%.*s` 是 token 的**原始源码切片**（文件结束打印 `''`，字符串连引号一起打印），
+  不是描述。对齐后 **44.5%**。
+- **早期错误**：重复声明四条消息按冲突绑定**在哪里**分开（同作用域 lexical / 顶层 `var` /
+  函数内 `var` / 同体简单形参）；重复参数两条消息、两个判定时刻（参数解析期 vs 收尾）。
+
+这三族都属于"接受一个本应拒绝的程序"这类静默错误，所以判据都是**消息 + 位置**逐条与参考一致。
+
+### 修：`scripts/publish.sh` 的一个检查在 macOS 上从来没跑过
+
+"path 依赖必须带 version" 那条检查写成了多行 `sed -nE`：GNU sed 接受，BSD sed 报
+`extra characters at the end of p command`。报错进 stderr，管道状态取自后面的 `grep`，
+于是**在 macOS 上这条检查静默失效**——而这正是它两代前被重写的原因（上一代是
+`grep -q … | grep -v …`，`-q` 不打印任何东西，第二个 `grep` 永远看不到行）。改成 `awk`：
+没有方言差异，并用"故意写坏一个 manifest"验证了两个方向都能触发。
+
+### 顺带：`TEST262_SIGNATURES=1` 现在给出每个失败形状的一个例子
+
+之前只有计数。"245 Expected SameValue(" 是个没人能动手的数字——要找一个实例得重跑几分钟
+套件。加一行的成本，换掉的是这一次选型里的全部猜测：`import defer` 那 93 条、
+module 测试缺 harness 那 163 条，都是这个改动当场指出来的。
+
+### 测量：`language` 的 8599 条失败长什么样
+
+下一阶段做什么不该由里程碑清单的下一行决定，所以先量（拆解见
+[`docs/m10-plan.md`](docs/m10-plan.md)）：
+
+| 条数 | 是什么 |
+|---|---|
+| **3451** | 私有类元素 `#x`——编译器明确报"不支持" |
+| 1180 | "应抛未抛"（`Test262Error`/`TypeError`/`SyntaxError`/`ReferenceError` 四个签名） |
+| 303 | 期望解析期 `SyntaxError`，我们接受了 |
+| 163 | `ReferenceError: 'assert' is not defined`——**我们 runner 的问题**，模块测试没拿到 harness |
+| 106 | 模块 fixture 路径重定向没做——同上 |
+| 91 | 解构形式的 catch 参数，编译器没实现 |
+| 93 | `import defer`——**参考实现也没有这个提案**，不跳过的理由见 m10-plan §3.3 |
+
+结论：**私有类元素一个人占 40%**，所以下一步是语言收尾，AOT/BJSON 顺延为 M11。
+
+### 验收
+
+- `cargo test` 全绿；`cargo fmt` / `cargo clippy -D warnings` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 21/21、NFR-6/NFR-7
+- test262 `built-ins` 14907→**14921**/17822（83.7%），逐用例差分 **+14 / -0**
+- test262 `language` **15144**/23743（63.8%）
+- `qjs --help` / 用法错误与参考逐字节一致；`qjs --std` 的探针脚本逐字节一致
+- `qjs -i` 跑参考的 `repl.js`，结果输出逐行一致
+
+**已知缺口**（都是响亮失败）：私有类字段 `#x`（编译器报错；它是 `language` 失败里最大的单一
+来源，3454/8599）、`--memory-limit`/`--stack-size` 解析了但仍不生效、resizable
+`ArrayBuffer`、`RegExp.escape`/lookbehind/`v` 模式的 emoji 字符串属性、
+`Function.prototype.toString` 返回 `[native code]`。
+
 ## v0.6.1 — 2026-11-27
 
 **这一版的主要成果不是"多修了几个测试"，而是把账算对了。**

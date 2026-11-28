@@ -1,6 +1,6 @@
 # M9 拆解：`std`/`os` 宿主模块 + 事件循环 + CLI/REPL
 
-状态：**M9a/M9b 已完成/M9c 已完成**（提交见 git log），M9b 剩余与 M9d 待开工
+状态：**M9 全部完成**（M9a/M9b/M9c/M9d，提交见 git log），随 v0.7.0 发布
 验收基准：参考实现 `tests/test_std.js` 通过、CLI 选项矩阵与 `qjs.c` 一致。
 `tests/test_rw_handler.js` **不在验收范围内**——fd 多路已决定不做（见 2.2）。
 
@@ -373,7 +373,7 @@ API 和 `test_rw_handler.js`，**不挡住 REPL**——REPL 不需要在一堆 f
 
 **M9a 必须先做且不可并行**，其余三个之间 M9b 与 M9c 可以并行（各自只需要 M9a）。
 
-`--memory-limit`/`--stack-size` 建议单独列成 M9e 或并入 M11，它们和"能嵌入使用"
+`--memory-limit`/`--stack-size` 建议单独列成 M9e 或并入性能那一步，它们和"能嵌入使用"
 这个可用性边界关系不大，是另一个方向（防失控）的问题。
 
 ---

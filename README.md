@@ -4,20 +4,23 @@
 目标：不依赖 C 代码即可构建，功能/语义等价，可替换现有 quickjs 使用场景（嵌入式脚本、CLI 解释器、AOT 编译）。
 
 - 📄 需求分析：[`docs/requirements.md`](docs/requirements.md)（v0.5，关键决策已确认）
-- 🧭 下一项 M9 的拆解：[`docs/m9-plan.md`](docs/m9-plan.md)（`std`/`os` + 事件循环 + CLI/REPL，含三个待拍板的决定）
-- 📌 当前版本：**v0.6.1** —— 标准库补到位，test262 可运行用例通过率 42.7% → 83.6%：
-  class、解构、generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、
-  循环导入、`import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、
-  TypedArray（`DataView`、29 个数组方法中的 28 个、`Symbol.iterator`）、`Iterator` helpers、
+- 🧭 M9 的拆解与验收：[`docs/m9-plan.md`](docs/m9-plan.md)（`std`/`os` + 事件循环 + CLI/REPL，已完成）
+- 🗺️ 下一项 M10 的拆解：[`docs/m10-plan.md`](docs/m10-plan.md)
+- 📌 当前版本：**v0.7.0** —— **可以被嵌入使用了**：`qjs --std` 跑参考那一整套 `std`/`os`
+  宿主 API（文件、目录、进程、环境变量、`printf`、`parseExtJSON`、定时器、fd 就绪），
+  `qjs -i` 跑参考自己的 `repl.js`。语言与标准库此前已到位：class（含 `static { }`）、解构、
+  generator、`Proxy`、`Promise`/async、`for await`；ES 模块（`import`/`export`、循环导入、
+  `import()`、JSON/text 模块）；`RegExp`、`Symbol`、`Map`/`Set`、`BigInt`、TypedArray
+  （`DataView`、29 个数组方法中的 28 个、`Symbol.iterator`）、`Iterator` helpers、
   `Array.fromAsync`
-- 🚧 当前进度：**M0–M6 已完成**；M7（正则引擎 + Unicode 表）起未开始
+- 🚧 当前进度：**M0–M6、M9 已完成**；M7/M8 各有残留，M10 起未开始（见下里程碑表）
 - 📄 变更记录：[`CHANGELOG.md`](CHANGELOG.md)
 
 ## 已确认决策
 
 | 决策点 | 结论 |
 |---|---|
-| API 形态 | 惯用 Rust API 为主；C ABI 兼容层做独立 crate（M12） |
+| API 形态 | 惯用 Rust API 为主；C ABI 兼容层做独立 crate（M15） |
 | 功能范围 | 全量：核心 ES2025 + Temporal + Intl（ECMA-402/CLDR，独立 feature） |
 | 字节码 | 自有稳定格式，不与 C 版二进制互通；保留 qjsc AOT |
 | GC | `Rc` + 循环回收（引用计数 + trial-deletion），确定性释放 |
@@ -38,10 +41,11 @@
 | M8 | BigInt / TypedArray / ArrayBuffer / WeakRef | 🟡 BigInt/TypedArray/DataView 可用，`WeakMap`/`WeakSet`/`WeakRef`/`FinalizationRegistry` 已补；缺 resizable `ArrayBuffer` 与 `TypedArray` 个别方法 |
 | ~~M8.5~~ | ~~`Atomics` / `SharedArrayBuffer`~~ | ❌ **不做**（见下） |
 | ~~M9.5~~ | ~~`os.setReadHandler`/`setWriteHandler`~~ | ❌ **不做**（见下） |
-| **M9** | **`std`/`os` 宿主模块 + 事件循环（timer）+ CLI + REPL** | ⬜ **下一项**（拆解见 [`docs/m9-plan.md`](docs/m9-plan.md)；不含 fd 多路） |
-| M10 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
-| M11 | 性能优化（内联缓存、NaN boxing、字符串 rope、peephole） | ⬜ |
-| M12 | C ABI 层 | ⬜ |
+| **M9** | **`std`/`os` 宿主模块 + 事件循环（timer）+ CLI + REPL** | ✅ 拆解与验收见 [`docs/m9-plan.md`](docs/m9-plan.md) |
+| **M10** | **语言收尾：私有类元素 `#x`、test262 尺子、早期错误收口** | ⬜ **下一项**（拆解见 [`docs/m10-plan.md`](docs/m10-plan.md)；AOT 顺延的理由也在那里） |
+| M11 | 字节码 AOT（qjsc 等价）+ BJSON | ⬜ |
+| M12 | 性能优化（内联缓存、NaN boxing、rope、peephole）+ 资源限制（`--memory-limit`/`--stack-size`） | ⬜ |
+| M15 | C ABI 层 | ⬜（编号跳过 M13/M14：那是已取消的 Temporal/Intl，不复用） |
 | ~~M13~~ | ~~`Temporal`~~ | ❌ **不做**（见下） |
 | ~~M14~~ | ~~`Intl`~~ | ❌ **不做**（见下） |
 
@@ -78,15 +82,16 @@ scripts/check.sh             提交前的门禁：fmt + clippy -D warnings + tes
 
 包名带 `quickjs-` 前缀是因为 `quickjs` / `qjs` / `quickjs-rs` 在 crates.io 上
 已被他人占用；lib 名与二进制名保持短名，`use quickjs::…` 与 `qjs` 命令不变。
-**已发布到 crates.io（v0.6.1）**：`quickjs-pure` 是门面
+**已发布到 crates.io（v0.7.0）**：`quickjs-pure` 是门面
 crate（lib 名仍是 `quickjs`），`quickjs-gc`/`quickjs-parse`/`quickjs-regexp`/
-`quickjs-compile` 是其依赖。`quickjs-cli` 与
-`quickjs-conformance` 标了 `publish = false`，分别因为会跟 C 版 `qjs` 抢命令名、以及
-只是 dev-dependency。用法：
+`quickjs-compile` 是其依赖。`quickjs-host`（`std`/`os`/事件循环）、`quickjs-cli` 与
+`quickjs-conformance` 标了 `publish = false`：宿主层依赖 `tokio`/`rustix`，不该被
+"零依赖引擎"的使用者连带拉进来；另外两个分别因为会跟 C 版 `qjs` 抢命令名、以及只是
+dev-dependency。用法：
 
 ```toml
 [dependencies]
-quickjs = { package = "quickjs-pure", version = "0.6" }
+quickjs = { package = "quickjs-pure", version = "0.7" }
 ```
 
 语言与标准库：`Object`、`Function`、`Array`、`String`、`Number`、`Boolean`、`Math`、
@@ -98,15 +103,17 @@ quickjs = { package = "quickjs-pure", version = "0.6" }
 
 | 缺口 | 行为 |
 |---|---|
-| `std`/`os` 宿主模块、事件循环、Worker（M9） | `--std` 报 `not implemented yet`；`setTimeout` 未定义 |
-| `--memory-limit` / `--stack-size` | 报 `not implemented yet`（此前接受即忽略，等于假的安全） |
+| 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported`。**这是 `language` 失败里最大的单一来源：3454/8599** |
+| `--memory-limit` / `--stack-size` | 解析后报 `not implemented yet`（此前接受即忽略，等于假的安全） |
+| AOT（`qjsc` 等价）与 BJSON（M11） | 不存在；`std.evalBinary` 未定义 |
 | `Atomics`/`SharedArrayBuffer`（M8） | `undefined`；相关用例按 feature 跳过 |
 | `RegExp.escape`、lookbehind、`v` 模式的 emoji 字符串属性（M7） | `RegExp.escape` 为 `undefined`；lookbehind 报 `lookbehind and named groups are not supported`；`\p{Basic_Emoji}` 报 `invalid Unicode property`（`\p{ASCII_Hex_Digit}` 等单码点属性已可用） |
 | resizable `ArrayBuffer`（`rab.resize`） | `undefined`，test262 里 76 条据此失败 |
-| 私有类字段 `#x`（M5 残留） | 编译器报 `private class fields are not supported` |
 | `Uint8Array.prototype.toSpliced`  等个别方法 | 为 `undefined`（TypedArray 的 29 个数组方法里已有 28 个） |
-| 通用语法错误的输出格式 | 我们 `<file>: <line>: <col>: <msg>`，参考 `SyntaxError: <msg>` + `at` 行 |
 | `Function.prototype.toString` | 用户函数返回 `[native code]` 而不是源码文本 |
+
+`std`/`os` 宿主模块、事件循环、REPL、class 静态块、语法错措辞与位置、`error.stack` 的
+位置都已到位——它们不在上表里。
 
 `Iterator` helpers、`Array.fromAsync`、`DataView`、TypedArray 的数组方法与迭代
 都已可用——它们不在上表里。

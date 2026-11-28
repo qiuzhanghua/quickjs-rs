@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -32,10 +32,10 @@ categories = ["development-tools"]
 # 同步不是可选的：`^0.2` 解析不到 0.3.0，而 `quickjs-compile` 用到了比已发布的
 # `quickjs-parse 0.2.0` 更新的 API，抬 minor 却漏改这里，`scripts/publish.sh` 的
 # dry-run 就会拉回旧 parse 去编译新 compile，报一堆"方法不存在"。
-quickjs-gc = { path = "crates/quickjs-gc", version = "0.6" }
-quickjs-parse = { path = "crates/quickjs-parse", version = "0.6" }
-quickjs-regexp = { path = "crates/quickjs-regexp", version = "0.6" }
-quickjs-compile = { path = "crates/quickjs-compile", version = "0.6" }
-quickjs-pure = { path = "crates/quickjs-pure", version = "0.6" }
+quickjs-gc = { path = "crates/quickjs-gc", version = "0.7" }
+quickjs-parse = { path = "crates/quickjs-parse", version = "0.7" }
+quickjs-regexp = { path = "crates/quickjs-regexp", version = "0.7" }
+quickjs-compile = { path = "crates/quickjs-compile", version = "0.7" }
+quickjs-pure = { path = "crates/quickjs-pure", version = "0.7" }
 # 仅 dev 使用，不上传，因此不需要版本约束。
 quickjs-conformance = { path = "crates/quickjs-conformance" }

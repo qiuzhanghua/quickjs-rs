@@ -55,7 +55,7 @@ checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
 
 [[package]]
 name = "quickjs-cli"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "quickjs-conformance",
  "quickjs-host",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "quickjs-compile"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "quickjs-conformance",
  "quickjs-parse",
@@ -73,15 +73,15 @@ dependencies = [
 
 [[package]]
 name = "quickjs-conformance"
-version = "0.6.1"
+version = "0.7.0"
 
 [[package]]
 name = "quickjs-gc"
-version = "0.6.1"
+version = "0.7.0"
 
 [[package]]
 name = "quickjs-host"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "libc",
  "quickjs-pure",
@@ -92,14 +92,14 @@ dependencies = [
 
 [[package]]
 name = "quickjs-parse"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "quickjs-conformance",
 ]
 
 [[package]]
 name = "quickjs-pure"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "quickjs-compile",
  "quickjs-gc",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "quickjs-regexp"
-version = "0.6.1"
+version = "0.7.0"
 
 [[package]]
 name = "rustix"

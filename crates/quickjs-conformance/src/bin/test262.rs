@@ -190,6 +190,19 @@ impl Test {
             "uint8array-base64",
             // A duplicate group name across alternatives is rejected; the proposal allows it.
             "regexp-duplicate-named-groups",
+            // Two module-syntax proposals that neither engine has — measured, because
+            // the answer decides whether to skip them and the answer was "no".
+            //
+            // `import defer * as ns from "x"` and `import source x from "x"` both die at
+            // the same token in `qjs` 2026-06-04 as they do here (`from clause expected`
+            // at 1:14 / 1:15), so 252 and 243 tests respectively have no oracle. Listing
+            // either feature here is still wrong, and the numbers say why:
+            // skipping `source-phase-imports` removed 243 *passing* tests
+            // (15144 → 14901) and skipping `import-defer` removed 93 more — most of both
+            // sets are negative tests that demand the syntax be rejected, which a blanket
+            // refusal satisfies honestly. That is the `regexp-modifiers` argument, and it
+            // wins here too: a failing positive test is information about the proposal,
+            // a vanished passing test is information about nothing.
         ];
         for feature in &self.features {
             if MISSING_FEATURES.contains(&feature.as_str()) {
@@ -885,8 +898,18 @@ fn main() {
         let mut rows: Vec<(String, usize)> = signatures.into_iter().collect();
         rows.sort_by_key(|row| std::cmp::Reverse(row.1));
         println!("\n-- most common failure shapes:");
+        // One example per shape: a count says how much a shape is worth, an example says
+        // what to look at. Without it "245 Expected SameValue(" is a number nobody can act
+        // on, and finding an instance means re-running the suite for minutes.
+        let mut example: BTreeMap<String, &str> = BTreeMap::new();
+        for (name, detail) in &failures {
+            example.entry(signature(detail)).or_insert(name.as_str());
+        }
         for (shape, count) in rows.iter().take(30) {
             println!("  {count:6}  {shape}");
+            if let Some(name) = example.get(shape) {
+                println!("            e.g. {name}");
+            }
         }
     }
     if !failures.is_empty() {

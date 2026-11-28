@@ -313,13 +313,13 @@ fn main() -> ExitCode {
     if opts.memory_limit.is_some() {
         return pending(
             "--memory-limit",
-            "milestone M9; the limit is not enforced yet",
+            "milestone M12 (performance and resource limits); the limit is not enforced yet",
         );
     }
     if opts.stack_size.is_some() {
         return pending(
             "--stack-size",
-            "milestone M9; the limit is not enforced yet",
+            "milestone M12 (performance and resource limits); the limit is not enforced yet",
         );
     }
 
