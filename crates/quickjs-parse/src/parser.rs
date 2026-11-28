@@ -59,7 +59,7 @@ struct Snapshot<'a> {
 }
 
 /// Context of the function currently being parsed.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct FnCtx {
     in_function: bool,
     in_generator: bool,
@@ -68,6 +68,34 @@ struct FnCtx {
     in_method: bool,
     /// Inside a derived class constructor: `super()` is legal.
     in_derived_constructor: bool,
+    /// Inside a class static block's own body. Two rules hang off it: `return` is an
+    /// early error, and `await` is a reserved word even though the block is not async.
+    ///
+    /// Deliberately *not* inherited by anything nested: a function declared in a static
+    /// block has its own `return`, and the reference stops looking for an enclosing async
+    /// function at the first frame that is not an arrow's parameter list — so `await` is
+    /// an ordinary name again one level in.
+    in_static_block: bool,
+    /// Whether the `arguments` identifier may be referenced here. False in a class field
+    /// initialiser and in a static block, and inherited by arrows, which have no
+    /// `arguments` of their own to offer.
+    arguments_allowed: bool,
+}
+
+impl Default for FnCtx {
+    fn default() -> FnCtx {
+        FnCtx {
+            in_function: false,
+            in_generator: false,
+            in_async: false,
+            in_method: false,
+            in_derived_constructor: false,
+            in_static_block: false,
+            // Outside a class body `arguments` is never the parser's business; the
+            // enclosing function decides what it means.
+            arguments_allowed: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1047,7 +1075,9 @@ impl<'a> Parser<'a> {
     ///   the module's own top level — so `function f(){ var await = 1 }` in a module is
     ///   an error while the same function in a script is not.
     fn await_is_reserved(&self) -> bool {
-        self.ctx.in_async || self.module
+        // A static block is not async, but `await` is still not an identifier there —
+        // the reference spells the rule out by name (`func_has_ancestor_kind`).
+        self.ctx.in_async || self.module || self.ctx.in_static_block
     }
 
     /// Reject words that may not appear as an `IdentifierReference` here.
@@ -1073,6 +1103,22 @@ impl<'a> Parser<'a> {
             // even inside a plain function, which is where this message comes from —
             // `function f(){ await 1 }` in a module is a keyword used as a name.
             return Err(self.error_at("unexpected 'await' keyword", span));
+        }
+        Ok(())
+    }
+
+    /// `arguments` is not a name a class field initialiser or a static block may use.
+    ///
+    /// Both run in a function whose `arguments` the class never defined, so the reference
+    /// bans the reference outright rather than letting it resolve to the enclosing one —
+    /// `class C { x = arguments }` is a `SyntaxError`, not the caller's arguments. Only a
+    /// *reference* is affected: a function written inside either still has its own.
+    fn check_arguments_reference(&self, name: &str, span: Span) -> Result<()> {
+        if name == "arguments" && !self.ctx.arguments_allowed {
+            return Err(self.error_at(
+                "'arguments' identifier is not allowed in class field initializer",
+                span,
+            ));
         }
         Ok(())
     }
@@ -1906,6 +1952,12 @@ impl<'a> Parser<'a> {
         if !self.ctx.in_function {
             return Err(self.error_at("return not in a function", span));
         }
+        if self.ctx.in_static_block {
+            // A static block is written as a block, not a function: `return` has nowhere
+            // to go. The reference checks this before it consumes the keyword, so the
+            // error sits on `return` itself.
+            return Err(self.error_at("return in a static initializer block", span));
+        }
         self.bump()?;
         let argument = if self.at_punct(Punct::Semicolon)
             || self.at_punct(Punct::RBrace)
@@ -2366,6 +2418,8 @@ impl<'a> Parser<'a> {
             in_async: is_async,
             in_method: false,
             in_derived_constructor: false,
+            in_static_block: false,
+            arguments_allowed: true,
         };
         let saved_top = self.top_level;
         self.top_level = false;
@@ -2589,6 +2643,61 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `static { … }`, with `static` already consumed and `{` the current token.
+    ///
+    /// The body is parsed in a context of its own. It is written as a block, but the
+    /// reference compiles it as a function, and every early error below follows from
+    /// that: `this` is the class, `super.x` resolves against the class's home object, but
+    /// `super()` is not a thing a static block can do and `return` has no function to
+    /// return from.
+    fn parse_static_block(&mut self, start: Position) -> Result<ClassElement> {
+        let saved = self.ctx;
+        let saved_top = self.top_level;
+        self.ctx = FnCtx {
+            in_function: true,
+            in_generator: false,
+            in_async: false,
+            // `super.x` is legal in a static block: its home object is the class.
+            in_method: true,
+            in_derived_constructor: false,
+            in_static_block: true,
+            arguments_allowed: false,
+        };
+        self.top_level = false;
+        // A class body is strict, so everything in it is — including a static block. The
+        // restore is unconditional, unlike a `"use strict"` directive's, because the block
+        // cannot opt out of what the class already decided. `enter_strict` cannot fail
+        // here (it only objects to an octal literal, and nothing has been scanned yet), but
+        // it is spelled as a saved result so the context is restored either way.
+        let saved_strict = self.strict;
+        let enter = self.enter_strict();
+        // A `break` or `continue` cannot escape a static block, so the label and loop
+        // counters start empty.
+        let saved_loop = self.loop_depth;
+        let saved_switch = self.switch_depth;
+        let saved_labels = std::mem::take(&mut self.labels);
+        self.loop_depth = 0;
+        self.switch_depth = 0;
+        let body_start = self.current.span.start;
+        let body = match enter {
+            Ok(()) => self.parse_block(),
+            Err(error) => Err(error),
+        };
+        self.strict = saved_strict;
+        self.lexer.set_strict(saved_strict);
+        self.ctx = saved;
+        self.top_level = saved_top;
+        self.loop_depth = saved_loop;
+        self.switch_depth = saved_switch;
+        self.labels = saved_labels;
+        let body = body?;
+        Ok(ClassElement::StaticBlock {
+            body,
+            body_start,
+            span: self.span_from(start),
+        })
+    }
+
     fn parse_class_element(
         &mut self,
         has_super: bool,
@@ -2606,23 +2715,11 @@ impl<'a> Parser<'a> {
                     | TokenKind::Punct(Punct::RBrace)
             );
             if is_modifier {
-                if matches!(peek.kind, TokenKind::Punct(Punct::LBrace)) {
-                    self.bump()?; // static
-                    let body = self.parse_block()?;
-                    return Ok(ClassElement::StaticBlock {
-                        body,
-                        span: self.span_from(start),
-                    });
-                }
                 self.bump()?; // static
-                is_static = true;
                 if self.at_punct(Punct::LBrace) {
-                    let body = self.parse_block()?;
-                    return Ok(ClassElement::StaticBlock {
-                        body,
-                        span: self.span_from(start),
-                    });
+                    return self.parse_static_block(start);
                 }
+                is_static = true;
             }
         }
 
@@ -2708,6 +2805,8 @@ impl<'a> Parser<'a> {
                 in_async: is_async,
                 in_method: true,
                 in_derived_constructor: kind == MethodKind::Constructor && has_super,
+                in_static_block: false,
+                arguments_allowed: true,
             };
             let saved_top = self.top_level;
             self.top_level = false;
@@ -2769,10 +2868,29 @@ impl<'a> Parser<'a> {
                 return Err(self.error("classes may not have a static property named 'prototype'"));
             }
         }
-        let value = if self.eat_punct(Punct::Eq)? {
-            Some(Box::new(self.parse_assignment(true)?))
-        } else {
-            None
+        // The initialiser is its own function — it runs per instance, or once for a
+        // static field, with the class's home object — so it gets its own context. That
+        // is what makes `super.x` legal in a field but `arguments` and `super()` not.
+        let saved = self.ctx;
+        let saved_top = self.top_level;
+        self.ctx = FnCtx {
+            in_function: true,
+            in_generator: false,
+            in_async: false,
+            in_method: true,
+            in_derived_constructor: false,
+            in_static_block: false,
+            arguments_allowed: false,
+        };
+        self.top_level = false;
+        let value = self
+            .eat_punct(Punct::Eq)?
+            .then(|| self.parse_assignment(true));
+        self.ctx = saved;
+        self.top_level = saved_top;
+        let value = match value {
+            Some(value) => Some(Box::new(value?)),
+            None => None,
         };
         // Fields are terminated by `;`, `}` or a line break.
         self.semicolon()?;
@@ -3421,6 +3539,11 @@ impl<'a> Parser<'a> {
             in_async: head.is_async,
             in_method: saved_ctx.in_method,
             in_derived_constructor: saved_ctx.in_derived_constructor,
+            // An arrow is not a static block, so it gets its own `return` and `await` is
+            // an ordinary name again — but it has no `arguments` of its own, so the ban
+            // travels with it.
+            in_static_block: false,
+            arguments_allowed: saved_ctx.arguments_allowed,
         };
         self.loop_depth = 0;
         self.switch_depth = 0;
@@ -4041,6 +4164,7 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(name) => {
                 let span = self.current.span;
                 self.check_identifier(&name, span)?;
+                self.check_arguments_reference(&name, span)?;
                 self.bump()?;
                 Ok(Expr::new(ExprKind::Ident(Ident { name, span }), span))
             }
@@ -4330,6 +4454,8 @@ impl<'a> Parser<'a> {
                         in_async: is_async,
                         in_method: true,
                         in_derived_constructor: false,
+                        in_static_block: false,
+                        arguments_allowed: true,
                     };
                     let saved_top = self.top_level;
                     self.top_level = false;

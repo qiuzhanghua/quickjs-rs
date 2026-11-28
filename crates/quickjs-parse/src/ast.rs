@@ -418,6 +418,9 @@ pub enum ClassElement {
     StaticBlock {
         /// Block body.
         body: Vec<Stmt>,
+        /// Position of the opening `{`, which is where the reference puts the function it
+        /// compiles the body into — the seed for the block's line table.
+        body_start: Position,
         /// Source range.
         span: Span,
     },

@@ -1266,8 +1266,8 @@ test262 本身不是这样判的：`run-test262.c` 捕获异常值，比较它�
 - **`using` 的 disposer 帧**：参考 `at <anonymous> (f.js:1:35)`，我们 `at  (f.js:1:26)`
   —— 函数名空、位置指向声明而非释放点。
 - **`eval('super.x')` 的位置**：参考 `1:6`，我们 `1:1`。
-- **`class A { static { … } }`**：编译器还不支持静态块（`static blocks are not supported
-  by the compiler yet`）。参考允许 `using` 在静态块里。
+- **`class A { static { … } }`**：编译器曾不支持静态块（`static blocks are not supported
+  by the compiler yet`）。**已在 §18 实现**。
 - **模块顶层 `using` 会让编译器 panic**（§15.6 已记，仍在）。
 - **一个偶发失败**：`TypedArray/prototype/copyWithin/coerced-values-end-detached-prototype.js`
   在一次完整 `built-ins` 跑里 FAIL，之后单独跑 6 次、完整跑 2 次都 PASS。该用例分配
@@ -1424,8 +1424,7 @@ code`），且只对**模块变量**生效：41 条里恰好 3 条在模块模�
 
 - **`using` 的 disposer 帧位置**：参考指 `1:35`（调用 disposer 的地方），我们仍指声明处
   `1:26`。名字已经对上（`<anonymous>`）。
-- 16.8 的其余项不受影响，仍在：`new BigInt(1)` 少一个 native 帧、`eval('super.x')` 的位置、
-  `class A { static { … } }` 编译器不支持、那条不稳定的 TypedArray 用例。
+- 16.8 的其余项不受影响，仍在：`new BigInt(1)` 少一个 native 帧、`eval('super.x')` 的位置、那条不稳定的 TypedArray 用例。（`class A { static { … } }` 编译器不支持这一项已由 §18 修掉。）
 
 ### 17.8 验收
 
@@ -1437,3 +1436,201 @@ code`），且只对**模块变量**生效：41 条里恰好 3 条在模块模�
   这一轮改的是早期错误，而 test262 里对应的负向用例此前已被别的检查挡住（`block-scope/
   syntax/redeclaration` 98 条全 PASS，改前也是），所以数字不动是对的——不是没测到，
   而是这里本来就没有失败项。差分测试覆盖的是"参考与我们逐条一致"，比总数更细。
+
+## 18. class 静态块（`static { … }`）
+
+一句话概括：静态块**不是一个成员**，是一段在类定义走到它时立刻执行的语句。参考把它编成
+一个函数、塞进静态字段初始化器里调用——所以"实现静态块"实际上是"让静态字段初始化器也能
+装语句"，而这条线索牵出了四件事：静态块自己的作用域、它继承来的 `this`/`super`、
+`super.x = v` 的赋值形态，以及一组只属于块内作用域的早期错误。
+
+### 18.1 参考的字节码形状
+
+`class C { static a = 1; static { this.b = 2 } static c = 3 }`：
+
+```
+function: <null>            ← 静态字段初始化器（1:1）
+  locals: 0: var this
+  opcodes:
+        push_this / put_loc0 this
+        get_loc0 this / push_1 / define_field a
+        fclosure8 0             ← 静态块本身
+        get_loc0 0: this
+        swap
+        call_method 0
+        drop
+        get_loc0 this / push_3 / define_field c
+        return_undef
+
+function: <null>            ← 静态块（`{` 的位置）
+  closure vars: 0: var this [loc0]
+  opcodes:
+        get_var_ref0 0: this / push_2 2 / put_field b / return_undef
+```
+
+三处细节都不是随便选的：
+
+1. **静态块和静态字段共用同一个初始化器**，所以两者按源码顺序交错。分成两个 pass 会让
+   `static { this.a = 1 }; static a = 2` 与反过来的写法得到同一个结果，而参考里它们是不同的。
+2. **静态块函数没有 `this`**：`has_this_binding = FALSE`，`this` 从初始化器闭包进来。
+   这也是它为什么能是一个**普通函数**却表现得像箭头——它没有自己的 `this`、`new.target`、
+   `arguments`，三者全部向上取。
+3. **`super` 的 home object 也从初始化器来**（`has_home_object = FALSE`，
+   `super_allowed = TRUE`）：块自己身上没有 `[[HomeObject]]`，读到的是初始化器的。
+   初始化器有（`set_home_object` 由 `call_method` 之前那条指令放的），于是 `super.x` 落在
+   父类的**静态**那一侧。
+
+到此为止都是照抄形状，真正的坑在下面两条。
+
+### 18.2 我们这边：`super` 在 arrow 里从来就是错的
+
+照第 3 条写代码时发现，`super_base()` 一律发 `special_object 4`（当前函数的 home object）。
+对方法没问题，对**箭头**是错的——箭头没有 home object，压出来是 `null`，
+`get_super` 拿到 `null` 的 prototype，于是：
+
+```js
+class B { m(){ return 5 } }
+class C extends B { n(){ return () => super.m() } }
+new C().n()          // TypeError: cannot read property 'm' of null
+```
+
+这个问题在静态块之前就存在，只是没人写过"方法里套箭头再 `super`"。参考的机制是
+`resolve_pseudo_var`：没有 `has_this_binding` 的函数拿不到 `<home_object>` 局部，名字按普通
+变量往外找，最终落到最近一个有 home object 的祖先，由它在函数入口 `special_object 4` +
+`put_loc` 填一次。
+
+这里照这个机制补了 `needs_home_object_local`，和 `this`/`new.target` 完全同构
+（`provide_*_local` + `prepend_initialiser`）。副产物是上面那段代码现在返回 `5`。
+
+### 18.3 我们这边：`get_super_value` 多留了一个槽
+
+顺手对拍 `print(super.p)` 时炸出 `TypeError: class constructors must be invoked with 'new'`，
+栈顶第一帧是**类的构造函数**。原因不在静态块：
+
+```rust
+// 改前
+let key = self.pop();
+let proto = self.pop();
+let receiver = self.peek(0);   // ← 读，没消费
+self.push(value);              // 于是 this 留在了栈上
+```
+
+`get_super_value` 的栈效应是 **3 进 1 出**（参考 `sp[-3] = val; sp -= 2`），我们做成了
+3 进 2 出。这个泄漏之所以长期没被发现，是因为它只在"结果被消费"的位置可见：
+
+- `return super.x` / `super.x;`：结果在上面，多出来的 `this` 在下面，谁也碰不到；
+- `print(super.x)`：调用指令按 `func, this, args…` 找，于是 `this`（也就是类）被当成函数调了。
+
+改成 `pop` 之后 `print(super.p)` 与参考一致。**这是本轮最值钱的一处**：静默的栈错位。
+
+### 18.4 `super.x = v`：三进四出，`insert4` 复制一份
+
+在此之前 `super.x = 1` 直接报 `this expression form is not supported by the compiler yet`
+（`assign` 对 `PatternKind::Member` 的 object 调 `expr`，而 `SuperProp` 不是能求值的表达式）。
+参考的写法是先把四个值一起凑齐再交给 `put_super_value`：
+
+| 形态 | 指令 |
+|---|---|
+| `super.a = v` | `this home get_super a v insert4 put_super_value` |
+| `super[k] = v` | 同上，键不做 `to_propkey`（由 `put_super_value` 自己转一次） |
+| `super.a += v` | `… to_propkey dup3 get_super_value v add insert4 put_super_value` |
+| `super.a \|\|= v` | `… to_propkey dup3 get_super_value dup if_true L drop v insert4 put_super_value goto E L: nip nip nip E:` |
+
+`insert4` 的语义是 `this obj prop a -> a this obj prop a`——**复制**一份 a 放到栈底再转一圈，
+所以 `put_super_value` 吃掉四个之后还留着赋值表达式的值。运行时里 `insert4`/`dup3` 此前都没实现
+（`dup3 is not implemented yet`），一并补上。
+
+有一处细节值得记：既然值留在了栈上，语句意义上那个 `drop` **不能**由 `assign_super` 自己发。
+第一次就是多发了一条——`insert4` 保住了值，`assign` 又发一条 `drop`，表达式语句再发一条，
+于是每条 `super.a = 1;` 后面跟两个 `drop`。正确的分工是跟普通成员存储相反的那一侧：
+`put_field` 消费值（置 `no_value`），`put_super_value` 保留值（什么都不做），由语句统一收尾。
+
+### 18.5 早期错误：块是块，不是函数
+
+参考在这条路径上有两个开关：`func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT`，以及
+`has_this_binding/has_arguments_binding = FALSE`。落到语法上：
+
+| 写法 | 结果 | 为什么 |
+|---|---|---|
+| `return` | `return in a static initializer block` | 写在块里，没有函数可返回 |
+| `arguments` | `'arguments' identifier is not allowed in class field initializer` | 继承自初始化器的禁令 |
+| `await x` / 裸 `await` | `unexpected 'await' keyword` | 块不是 async，但 `await` 在这里是保留字 |
+| `super()` | `super() is only valid in a derived class constructor` | 块不是构造函数 |
+| `super.x` | 合法 | home object 是类 |
+| `new.target` | 合法，值为 `undefined` | 块是被 `call_method` 调的，不是 `new` 出来的 |
+| `var a` | **合法**，是块函数的局部 | 参考不实现 spec 里那条禁令（见 18.8） |
+| `yield` | `unexpected 'yield' keyword` | 块是 strict，`yield` 是保留字 |
+
+`await` 这条要说清楚，因为它的判定位置很反直觉：`update_token_ident` 里
+`func_has_ancestor_kind` 对 `CLASS_STATIC_INIT` 特殊返回 TRUE，所以 `await` 被转成关键字，
+到了 `js_parse_unary` 又因为 `func_kind` 不是 ASYNC 而报"unexpected"。而那个"向上找祖先"
+的循环在**箭头函数体**那一层就断了，所以：
+
+```js
+class C { static { await } }          // SyntaxError
+class C { static { () => await } }    // 合法：await 只是普通标识符
+```
+
+这两条都在差分测试里。
+
+`arguments` 这条顺带修了一个早就存在的洞：**实例字段初始值里**的 `arguments` 我们原来也是放行的
+（`class C { x = arguments }` 返回 undefined，参考报 SyntaxError）。根因是字段初始值表达式
+根本没有自己的解析上下文，直接沿用了外层函数的——`super.x` 在字段里也因同一个原因报
+`'super' is only valid in a method`。现在字段初始值有自己的 `FnCtx`
+（`in_method: true`、`arguments_allowed: false`），两条都对齐了，
+`class B { static m(){…} } class C extends B { static x = super.m() }` 开始工作。
+
+### 18.6 差分先立起来，然后发现 class 从来没被字节码对拍过
+
+按惯例新开 `crates/quickjs-cli/tests/static_blocks.rs`（9 组、整进程输出 + 退出码对拍，含栈帧
+里每一列）。这是本轮的主网。
+
+字节码那一层则撞了墙：`disasm_diff.rs` 里**一条 `class` 用例都没有**。写进去才发现问题不在
+静态块——同一个类的构造函数和字段初始化器在**父函数常量池里是兄弟**，而参考是**惰性**创建初始化器
+（第一个静态字段/静态块出现时才建），我们则在遍历类体之前就把构造函数编完了。于是两者在 dump
+里的**先后顺序相反**，整体文本比较必然失败。继续试还暴露出另外几处与静态块无关的分歧：
+
+- 参考的构造函数无条件发 `get_var_ref_check <class_fields_init>; dup; if_false …`，我们只在
+  "有实例字段"时才发（`<class_fields_init>` 为 `undefined` 时那串指令只是空转，所以行为一样，
+  字节码不一样）；
+- 参考按需要决定构造函数用 `push_const` 还是 `fclosure`，我们一律 `fclosure`；
+- 收尾的 `close_loc` 选哪个槽、`var_ref_count` 的算法也不同。
+
+（只剩最后这一条还有具体例子：18.2 那个 `push_this` 重复的问题在本轮顺手修掉了——
+字段初始化器既由 `begin_this_local` 显式建 `this`，又会被 `provide_this_local` 补一次入口
+初始化，于是入口出现两次 `push_this / put_loc0 this`；加一个 `has_this_prologue` 标记后与
+参考一致。）
+
+这些都属于"把 class 的编译整体对齐参考"，是独立一轮的工作量，所以**没有**把 class 用例塞进
+`disasm_diff`——塞进去只会得到一条长期红的测试，或者一条被削到没有意义的测试。静态块的字节码
+本轮是**手工**逐条对过参考 dump 的（18.1、18.4 那两张表就是这么来的）；作为一个局部校验，
+把 22 条静态块用例逐个函数体（忽略函数先后顺序）与参考 dump 对比，除上面那两条与静态块
+无关的分歧外全部一致。自动化的那一层留作欠账。
+
+### 18.7 验收
+
+- `cargo test` 全绿（新增 `crates/quickjs-cli/tests/static_blocks.rs` 9 项）；
+  `cargo fmt` / `cargo clippy -D warnings` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 21/21、NFR-6/7
+- test262 `built-ins`：14921/17822 **零变化**（`built-ins` 里本来就没有静态块用例，不动的才是对的）
+- test262 `language/statements/class`：1904 → **1946**（+42，-0）
+- test262 `language/expressions/class`：1728 → **1749**（+21，-0）
+- 把 `test/language/**/class/*static-init*.js`（30 条）单拎出来跑：**29/30**
+  （唯一失败是 `static-init-scope-private.js`，卡在私有字段，见 18.8）
+
+### 18.8 发现但未修
+
+- **私有字段**：`static-init-scope-private.js`、以及所有 `#x` 用例，仍未实现。
+- **`var` 在静态块里**：spec 规定 `ClassStaticBlockStatementList` 里不许 `var`，参考**不检查**
+  （`class C { static { var a = 1 } }` 两边都通过）。本轮跟参考，不跟 spec——这个项目的一致性
+  基准是参考实现。
+- **strict 模式下删除不可配置属性不报错**：`function f(){ "use strict"; delete Object.prototype }`
+  参考抛 `TypeError: could not delete property`，我们静默通过。与静态块无关，写测试时撞上的。
+- **顶层直接 eval 里的 `new.target`**：`eval("new.target")` 在脚本顶层，参考报
+  `new.target only allowed within functions`，我们返回 `undefined`（参考把
+  `new_target_allowed` 沿直接 eval 传下去，我们没有）。
+- **参考的 `yield` 措辞**：strict 下参考说 `unexpected 'yield' keyword`，我们说
+  `invalid use of strict mode reserved word 'yield'`。位置一致，措辞不一致。
+- **class 的字节码还没有自动对拍**（见 18.6）。
+- 16.8 的其余项仍在：`new BigInt(1)` 少一个 native 帧、`using` disposer 帧位置、
+  那条不稳定的 TypedArray 用例。

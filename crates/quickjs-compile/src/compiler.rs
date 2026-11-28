@@ -38,6 +38,30 @@ use js_parse::ast::{self, *};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Label(u32);
 
+/// The name of the hidden local that carries a function's `[[HomeObject]]` for `super`.
+///
+/// The reference calls the variable `home_object` and prints it as `"<home_object>"`, which
+/// is why the brackets are part of the name; nothing a program writes can collide with it.
+const HOME_OBJECT: &str = "<home_object>";
+
+/// One step of a class's initialisation, in source order.
+///
+/// A static block is not a member the class keeps — it is a run of statements that executes
+/// at the point the class definition reaches it — so it belongs *inside* the initialiser
+/// function rather than alongside the fields as a separate pass. Merging the two is what
+/// makes `static a = 1; static {}` and `static {}; static a = 1` order-sensitive in the
+/// same way the reference is.
+enum StaticInitItem<'a> {
+    /// `static x = value`, or `x = value` for the instance half.
+    Field(&'a PropName, Option<&'a Expr>),
+    /// `static { … }`
+    Block {
+        body: &'a [Stmt],
+        /// Position of the `{`, which is where the reference puts the function.
+        body_start: Position,
+    },
+}
+
 /// The `var_block` sentinel for a binding that lives at function scope.
 ///
 /// It has to be a value a *real* block key can never take. Block keys are source
@@ -464,6 +488,16 @@ struct FnState {
     needs_arguments_local: bool,
     /// The same, for `new.target`.
     needs_new_target_local: bool,
+    /// Whether the body already opens by filling a `this` local, which
+    /// [`Compiler::begin_this_local`] does for a constructor and a field initialiser.
+    has_this_prologue: bool,
+    /// The same, for `<home_object>`: the object `super` resolves against.
+    ///
+    /// An arrow and a static block have no home object of their own — only the method or
+    /// initialiser they were written in does — so `super.x` inside one is a read of the
+    /// enclosing function's `[[HomeObject]]`. The value is materialised into a local there
+    /// by `special_object 4`, the same way `this` is.
+    needs_home_object_local: bool,
     /// Hidden locals of the `with` blocks currently open, innermost last.
     with_names: Vec<String>,
     /// Set while a with-guard is being emitted, so the guard's own accesses are not
@@ -603,6 +637,8 @@ impl FnState {
             needs_this_local: false,
             needs_arguments_local: false,
             needs_new_target_local: false,
+            has_this_prologue: false,
+            needs_home_object_local: false,
             with_names: Vec::new(),
             emitting_with_guard: false,
             self_name: None,
@@ -2088,7 +2124,7 @@ impl Compiler {
     /// Give the function a local `this`, for an arrow inside it to capture.
     fn provide_this_local(&mut self) {
         let current = self.stack.len() - 1;
-        if !self.stack[current].needs_this_local {
+        if !self.stack[current].needs_this_local || self.stack[current].has_this_prologue {
             return;
         }
         if !self.stack[current]
@@ -2103,6 +2139,29 @@ impl Compiler {
             Insn::Fixed {
                 op: Opcode::PushThis,
                 operands: vec![],
+            },
+        );
+    }
+
+    /// Give the function a local `<home_object>`, for an arrow or a static block inside it
+    /// to read through `super`.
+    fn provide_home_object_local(&mut self) {
+        let current = self.stack.len() - 1;
+        if !self.stack[current].needs_home_object_local {
+            return;
+        }
+        if !self.stack[current]
+            .vars
+            .iter()
+            .any(|var| var.name == HOME_OBJECT)
+        {
+            self.declare_hidden_local(HOME_OBJECT, VarKind::Normal);
+        }
+        self.prepend_initialiser(
+            HOME_OBJECT,
+            Insn::Fixed {
+                op: Opcode::SpecialObject,
+                operands: vec![Op::Int(4)],
             },
         );
     }
@@ -4724,8 +4783,29 @@ impl Compiler {
     /// prototype but calls it with the receiver.
     fn super_base(&mut self) {
         self.this_expression();
-        self.emit(Opcode::SpecialObject, &[Op::Int(4)]);
+        self.home_object();
         self.emit(Opcode::GetSuper, &[]);
+    }
+
+    /// `[[HomeObject]]` as `super` sees it.
+    ///
+    /// A method, a constructor and a field initialiser each carry one — `set_home_object`
+    /// put it there — so for them the special object *is* the answer. An arrow and a
+    /// static block have none: they read the enclosing function's, which has to be
+    /// materialised into a local, exactly as `this` is for an arrow.
+    ///
+    /// The name matches what the reference stores, so the disassembly agrees; it is not a
+    /// name any program can write.
+    fn home_object(&mut self) {
+        if !self.cur().is_arrow {
+            self.emit(Opcode::SpecialObject, &[Op::Int(4)]);
+            return;
+        }
+        if let Some(target) = self.enclosing_function() {
+            self.state_at(target).needs_home_object_local = true;
+            self.declare_at(target, HOME_OBJECT);
+        }
+        self.emit_var(VarAction::Get, HOME_OBJECT);
     }
 
     /// `super(args)`: construct the parent class and adopt the result as `this`.
@@ -4762,6 +4842,11 @@ impl Compiler {
         self.declare_hidden_local("this", VarKind::Normal);
         self.emit(Opcode::PushThis, &[]);
         self.emit_var(VarAction::Put, "this");
+        // The store is already at the top of the body, so `provide_this_local` has
+        // nothing left to prepend. Without this the initialiser ended up with
+        // `push_this; put_loc0 this` twice whenever the class also held a field
+        // initialiser whose body read `this` through an arrow.
+        self.state().has_this_prologue = true;
     }
 
     /// Compile a constructor the class wrote.
@@ -4867,45 +4952,116 @@ impl Compiler {
         self.emit(Opcode::Drop, &[]);
     }
 
-    /// The function that defines one class's fields on `this`.
+    /// The function that defines one class's fields on `this`, and runs its static blocks.
     ///
     /// `define_field` rather than `put_field`: a field is an own property created
     /// without consulting a setter on the prototype, so `class C { set x(v){} }` with an
     /// `x = 1` field must not call the setter.
+    ///
+    /// One function serves the whole class: it is called once per instance (or once, for
+    /// the static half) and walks the members in source order. Static blocks are compiled
+    /// into the same function because they *are* part of the same sequence — `static a =
+    /// 1; static { }` and `static { this.a = 1 }; static a = 2` leave `a` holding
+    /// different values, so the two kinds cannot be split apart.
     fn compile_field_initialiser(
         &mut self,
-        fields: &[(&PropName, Option<&Expr>)],
+        items: &[StaticInitItem<'_>],
         span: Span,
     ) -> Result<CompiledFunction, SyntaxError> {
         self.compile_synthetic_function("", true, span, |compiler| {
             compiler.begin_this_local();
-            for (key, value) in fields {
-                compiler.emit_var(VarAction::Get, "this");
-                match value {
-                    Some(value) => compiler.expr(value)?,
-                    None => compiler.emit(Opcode::Undefined, &[]),
-                }
-                match key {
-                    PropName::Literal(literal) => {
-                        let text = compiler.property_key_text(literal, span)?;
-                        compiler.emit(Opcode::DefineField, &[Op::Atom(Atom::from_text(&text))]);
-                    }
-                    PropName::Computed(index) => {
-                        compiler.expr(index)?;
-                        compiler.emit(Opcode::DefineArrayEl, &[]);
+            for item in items {
+                match item {
+                    StaticInitItem::Field(key, value) => {
+                        compiler.emit_var(VarAction::Get, "this");
+                        match value {
+                            Some(value) => compiler.expr(value)?,
+                            None => compiler.emit(Opcode::Undefined, &[]),
+                        }
+                        match key {
+                            PropName::Literal(literal) => {
+                                let text = compiler.property_key_text(literal, span)?;
+                                compiler
+                                    .emit(Opcode::DefineField, &[Op::Atom(Atom::from_text(&text))]);
+                            }
+                            PropName::Computed(index) => {
+                                compiler.expr(index)?;
+                                compiler.emit(Opcode::DefineArrayEl, &[]);
+                                compiler.emit(Opcode::Drop, &[]);
+                            }
+                            PropName::Private(_) => {
+                                return Err(SyntaxError::new(
+                                    "private class fields are not supported by the compiler yet",
+                                    span,
+                                ));
+                            }
+                        }
                         compiler.emit(Opcode::Drop, &[]);
                     }
-                    PropName::Private(_) => {
-                        return Err(SyntaxError::new(
-                            "private class fields are not supported by the compiler yet",
-                            span,
-                        ));
+                    StaticInitItem::Block { body, body_start } => {
+                        let block = compiler.compile_static_block(body, *body_start)?;
+                        let index = compiler.push_constant(Constant::Function(Box::new(block)));
+                        // `this fclosure`, so `call_method` finds the receiver below the
+                        // callee: the block runs with `this` bound to the class.
+                        compiler.emit(Opcode::Fclosure, &[Op::Const(index)]);
+                        compiler.emit_var(VarAction::Get, "this");
+                        compiler.emit(Opcode::Swap, &[]);
+                        compiler.emit(Opcode::CallMethod, &[Op::Int(0)]);
+                        // Nothing the block evaluates is wanted; its effects are the point.
+                        compiler.emit(Opcode::Drop, &[]);
                     }
                 }
-                compiler.emit(Opcode::Drop, &[]);
             }
             Ok(())
         })
+    }
+
+    /// Compile a `static { … }` body into the function the class calls for it.
+    ///
+    /// Shaped like an arrow, because that is the one function form with no `this`,
+    /// `new.target` or `arguments` of its own: all three reach the enclosing static
+    /// initialiser, and through it the class. `arguments` never gets that far — the parser
+    /// rejects the reference — but `this` and `super` both depend on it.
+    ///
+    /// The body is hoisted like a function body's, because the reference parses it as one:
+    /// `var` inside a block is a local of the block's function, not of whatever encloses
+    /// the class.
+    fn compile_static_block(
+        &mut self,
+        body: &[Stmt],
+        body_start: Position,
+    ) -> Result<CompiledFunction, SyntaxError> {
+        let mut state = FnState::new(String::new(), FunctionKind::Normal);
+        // Class bodies are strict, so a static block is too.
+        state.strict = true;
+        // The one property that makes this an arrow: nothing of its own to bind `this` to,
+        // so `this` and `super` come from the initialiser that calls it.
+        state.is_arrow = true;
+        state.created_in_block = self.cur().current_block;
+        state.with_names = self.cur().with_names.clone();
+        state.line = body_start.line;
+        state.column = body_start.column;
+        let depth = self.stack.len();
+        self.stack.push(state);
+        let body_key = body_start.offset as u64;
+        self.push_block(body_key, NO_PARENT);
+        self.state().body_block = body_key;
+        let result = (|| {
+            self.hoist(body, body_key)?;
+            self.emit_scope_enter(body_key);
+            for statement in body {
+                self.stmt(statement)?;
+            }
+            if self.end_is_reachable() {
+                self.emit(Opcode::ReturnUndef, &[]);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.stack.truncate(depth);
+            return result.map(|()| unreachable!());
+        }
+        Ok(self.finish_current())
     }
 
     /// Compile a class, leaving the constructor on the stack when `keep`.
@@ -4991,8 +5147,8 @@ impl Compiler {
 
         // Instance fields and static fields are two different functions: the first runs
         // per instance from the constructor, the second runs once, here.
-        let mut instance_fields: Vec<(&PropName, Option<&Expr>)> = Vec::new();
-        let mut static_fields: Vec<(&PropName, Option<&Expr>)> = Vec::new();
+        let mut instance_fields: Vec<StaticInitItem<'_>> = Vec::new();
+        let mut static_items: Vec<StaticInitItem<'_>> = Vec::new();
         for element in &class.elements {
             match element {
                 ClassElement::Method {
@@ -5058,17 +5214,17 @@ impl Compiler {
                         ));
                     }
                     if *is_static {
-                        static_fields.push((field_key, value.as_deref()));
+                        static_items.push(StaticInitItem::Field(field_key, value.as_deref()));
                     } else {
-                        instance_fields.push((field_key, value.as_deref()));
+                        instance_fields.push(StaticInitItem::Field(field_key, value.as_deref()));
                     }
                 }
-                ClassElement::StaticBlock { span, .. } => {
-                    return Err(SyntaxError::new(
-                        "static blocks are not supported by the compiler yet",
-                        *span,
-                    ));
-                }
+                ClassElement::StaticBlock {
+                    body, body_start, ..
+                } => static_items.push(StaticInitItem::Block {
+                    body,
+                    body_start: *body_start,
+                }),
             }
         }
 
@@ -5100,8 +5256,8 @@ impl Compiler {
         if let Some(name) = &name {
             self.emit_var(VarAction::SetInit, name);
         }
-        if !static_fields.is_empty() {
-            let initialiser = self.compile_field_initialiser(&static_fields, class.span)?;
+        if !static_items.is_empty() {
+            let initialiser = self.compile_field_initialiser(&static_items, class.span)?;
             let index = self.push_constant(Constant::Function(Box::new(initialiser)));
             self.emit(Opcode::Dup, &[]);
             self.emit(Opcode::Fclosure, &[Op::Const(index)]);
@@ -5504,6 +5660,13 @@ impl Compiler {
                 Ok(())
             }
             PatternKind::Member(member) => {
+                // `super.x = v` is not a store through a value: it starts at the home
+                // object's prototype but writes to `this`, so it goes through
+                // `put_super_value` rather than `put_field`. The receiver, prototype, key
+                // and value are handed over together.
+                if matches!(member.object.unparen().kind, ExprKind::SuperProp) {
+                    return self.assign_super(member, op, value);
+                }
                 // A store is blamed on the selector punctuator (`.` or `[`), the same
                 // token a load is blamed on — the reference records `put_field obj.a`
                 // at the `.`, so a setter that throws reports that column and not the
@@ -5624,6 +5787,82 @@ impl Compiler {
                 target.span,
             )),
         }
+    }
+
+    /// `super.x = v`, `super[k] = v`, and their compound and logical forms.
+    ///
+    /// The stack has to carry four values — receiver, prototype, key, value — because
+    /// `put_super_value` takes them together; the receiver is what makes a setter found on
+    /// the prototype run with `this`, and the key has to survive until the store, which is
+    /// why a compound form converts it to a property key once and `dup3`s rather than
+    /// evaluating it twice.
+    fn assign_super(
+        &mut self,
+        member: &MemberPattern,
+        op: AssignOp,
+        value: &Expr,
+    ) -> Result<(), SyntaxError> {
+        let saved = self.cur().cur_pos;
+        self.state().cur_pos = member.op_pos.or(Some(member.span.start));
+        self.super_base();
+        match &member.property {
+            MemberProp::Ident(property) => self.emit(
+                Opcode::PushAtomValue,
+                &[Op::Atom(Atom::from_text(&property.name))],
+            ),
+            MemberProp::Computed(index) => self.expr(index)?,
+            MemberProp::Private(_) => {
+                return Err(SyntaxError::new(
+                    "private fields are not supported by the compiler yet",
+                    member.span,
+                ));
+            }
+        }
+        match op {
+            AssignOp::Assign => {
+                // The key is only converted once, by `put_super_value` itself, so a
+                // computed key's `toString` runs exactly once.
+                self.expr(value)?;
+                self.emit(Opcode::Insert4, &[]);
+                self.emit(Opcode::PutSuperValue, &[]);
+            }
+            AssignOp::And | AssignOp::Or | AssignOp::Coalesce => {
+                let (keep_label, end) = (self.new_label(), self.new_label());
+                self.emit(Opcode::ToPropkey, &[]);
+                self.emit(Opcode::Dup3, &[]);
+                self.emit(Opcode::GetSuperValue, &[]);
+                self.emit(Opcode::Dup, &[]);
+                self.emit_logical_test(op);
+                self.emit_jump(logical_jump(op), keep_label, &[]);
+                self.emit(Opcode::Drop, &[]);
+                self.expr(value)?;
+                self.emit(Opcode::Insert4, &[]);
+                self.emit(Opcode::PutSuperValue, &[]);
+                self.emit_jump(Opcode::Goto, end, &[]);
+                self.place_label(keep_label);
+                // The prototype and the key are still under the value that was read.
+                self.emit(Opcode::Nip, &[]);
+                self.emit(Opcode::Nip, &[]);
+                self.emit(Opcode::Nip, &[]);
+                self.place_label(end);
+            }
+            _ => {
+                self.emit(Opcode::ToPropkey, &[]);
+                self.emit(Opcode::Dup3, &[]);
+                self.emit(Opcode::GetSuperValue, &[]);
+                self.expr(value)?;
+                self.emit(compound_opcode(op), &[]);
+                self.emit(Opcode::Insert4, &[]);
+                self.emit(Opcode::PutSuperValue, &[]);
+            }
+        }
+        // No `drop` here for a discarded value. `insert4` keeps a copy of the value, so it
+        // is still on the stack when the store finishes, and the expression statement is
+        // what disposes of it — the same arrangement as `put_field`, reached from the other
+        // side: there the store consumes the value (`no_value`), here it leaves it
+        // (`keep` already false, so nothing tells the statement otherwise).
+        self.state().cur_pos = saved;
+        Ok(())
     }
 
     /// The test a logical assignment applies to the current value.
@@ -6122,6 +6361,7 @@ impl Compiler {
         self.provide_arguments();
         self.provide_this_local();
         self.provide_new_target_local();
+        self.provide_home_object_local();
         self.provide_self_name();
         self.materialize_eval_sites();
         self.capture_everything_for_eval();

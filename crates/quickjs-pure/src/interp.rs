@@ -6387,6 +6387,23 @@ impl<'a> Interp<'a> {
                 let value = self.peek(0);
                 self.push(value);
             }
+            Dup2 => {
+                // `a b -> a b a b`
+                let b = self.peek(0);
+                let a = self.peek(1);
+                self.push(a);
+                self.push(b);
+            }
+            Dup3 => {
+                // `a b c -> a b c a b c`, which is how a super store keeps the receiver,
+                // prototype and key while reading the current value through them.
+                let c = self.peek(0);
+                let b = self.peek(1);
+                let a = self.peek(2);
+                self.push(a);
+                self.push(b);
+                self.push(c);
+            }
             Swap => {
                 // `a b -> b a`
                 let bottom = self.pop();
@@ -6446,6 +6463,21 @@ impl<'a> Interp<'a> {
                 let key = self.pop();
                 let object = self.pop();
                 self.push(value.clone());
+                self.push(object);
+                self.push(key);
+                self.push(value);
+            }
+            Insert4 => {
+                // `this obj prop a -> a this obj prop a`
+                //
+                // `put_super_value` consumes all four and yields nothing, so the copy
+                // underneath is what leaves the assignment an expression value.
+                let value = self.pop();
+                let key = self.pop();
+                let object = self.pop();
+                let receiver = self.pop();
+                self.push(value.clone());
+                self.push(receiver);
                 self.push(object);
                 self.push(key);
                 self.push(value);
@@ -7204,9 +7236,15 @@ impl<'a> Interp<'a> {
             GetSuperValue => {
                 // `receiver proto key -> value`, searching from `proto` but reporting to
                 // `receiver`, which is what `super.g` must do for a getter to see `this`.
+                //
+                // Three values in, one out: the receiver is *consumed*, not left under the
+                // result. Leaving it there was invisible for `super.x` in `return` or
+                // statement position (the result is what gets popped) and corrupted the
+                // frame everywhere else — `print(super.x)` left the class where the call
+                // opcode looks for the receiver and called the class itself.
                 let key = self.pop();
                 let proto = self.pop();
-                let receiver = self.peek(0);
+                let receiver = self.pop();
                 let value = self.super_read(&receiver, &proto, &key)?;
                 self.push(value);
             }
