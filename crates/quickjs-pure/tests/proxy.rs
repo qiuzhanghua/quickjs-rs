@@ -212,11 +212,12 @@ print(kind(() => Object.keys(new Proxy({}, {ownKeys: () => ["a", "a"]}))));
 fn a_bad_handler_or_target_is_refused_at_construction() {
     assert_eq!(
         throws("new Proxy(1, {})"),
-        "TypeError: proxy target must be an object"
+        // One message for both arguments, as the reference has: it does not say which.
+        "TypeError: not an object\n    at Proxy (native)\n    at <eval> (<input>:1:10)"
     );
     assert_eq!(
         throws("new Proxy({}, null)"),
-        "TypeError: proxy handler must be an object"
+        "TypeError: not an object\n    at Proxy (native)\n    at <eval> (<input>:1:10)"
     );
     // A trap that is present but not callable is refused when it fires, not treated as
     // "no trap" — silently falling back would hide the bug in the handler.

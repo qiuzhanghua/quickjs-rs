@@ -1150,3 +1150,133 @@ OP_return
 - `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
 - test262：`built-ins` 14907/17822 零变化；`language` 14945→14972（**+27，-0**），
   含 `module-code/top-level-await/*` 与 `class-name-ident-await-module` 等
+
+---
+
+## 16. CLI 的未捕获错误输出
+
+三件事，各自错在不同地方。判据都是 `qjs <file>` 的 stderr 逐字节对拍。
+
+### 16.1 抛出的值要用打印器，不是 `ToString`
+
+参考报未捕获异常走 `js_std_dump_error`，它三行、最后一行是
+`JS_PrintValue(ctx, …, stderr)` —— 就是 `std.__printObject` 背后那个打印器。我们用的
+是 `ToString`，于是：
+
+| `throw` | 参考 | 修前 |
+|---|---|---|
+| `"s"` | `"s"` | `s` |
+| `{a:1}` | `{ a: 1 }` | `[object Object]` |
+| `[1,2]` | `[ 1, 2 ]` | `1,2` |
+| `Symbol("y")` | `Symbol("y")` | `Symbol(y)` |
+| `new Error("b")` | `Error: b` + 栈 | `Error: b` |
+
+15 条探针（含循环引用、`Map`/`Set`、函数、`BigInt`）现在全部一致。
+
+顺带解决了**打印器该住在哪**这个问题：参考的 `JS_PrintValue` 在**引擎**（`quickjs.c`）
+里，host 只是包了 `std.__printObject`。所以 `print.rs` 从 `quickjs-host` 搬到了
+`quickjs-pure`（它本来就只依赖引擎，NFR-7 的"依赖闭包为空"不受影响）。这样
+`describe_exception` 才能用它 —— 之前留在 host 里，是因为只有 `std` 需要它。
+
+### 16.2 语法错：消息在前，位置单独一行
+
+参考：
+
+```
+SyntaxError: variable name expected
+    at c.js:1:5
+```
+
+我们：
+
+```
+c.js: SyntaxError: 1:5: variable name expected
+```
+
+文件名在参考不放东西的位置，位置在参考放文件名的位置。`invalid source: L:C:` 前缀是
+M4 留下的（§13.5 已登记），本轮一并去掉 —— 位置本来就已写在 `fileName`/
+`lineNumber`/`columnNumber` 和栈帧上。
+
+修在 `Error::syntax`：`SyntaxError: <message>` 加（有位置时）`    at <file>:<line>:<col>`。
+CLI 不再加 `{filename}: ` 前缀。
+
+### 16.3 有一类错误参考不给位置
+
+`export {a}` 而不存在 `a`：参考输出 `SyntaxError: exported variable 'a' does not exist`
+——**没有** `at` 行，也没有末尾空行之外的东西。因为它在 `js_resolve_module` 里报，解析
+早已成功。我们是在解析器里做这个检查（手上正好有已声明名字的集合），所以得显式说明
+"按链接错误报"：`SyntaxError` 新增 `positionless` 字段与 `.positionless()` 构造器。
+
+### 16.4 空栈仍要换行
+
+`print_error` 原来按"栈非空"决定要不要换行，参考按 `JS_IsString(stack)`。两者只在
+**空字符串**上不同 —— 而无 JS 帧时建的错误（模块链接错误就是）正好栈是空串。于是参考
+打两行（`SyntaxError: msg` + 空行），我们打一行。改为"是不是字符串"后一致。
+
+### 16.5 顺带修掉的真 bug
+
+探针暴露的、都不是本轮引入的：
+
+- **`new Proxy({}, 1)` 我们接受**。参考一律 `TypeError: not an object`。原实现只拒
+  `null`，数字/字符串/`undefined` 全放行。且措辞从
+  `proxy target must be an object`/`proxy handler must be an object` 改为参考的单条
+  `not an object`（参考不说哪个参数错了）。
+- **未声明名字的 `ReferenceError` 少引号**：参考 `'x' is not defined`，我们 `x is not defined`。
+- **`BigInt(1.5)` 与 `BigInt(NaN)` 共用一条消息**：参考分开成
+  `cannot convert to BigInt: not an integer` 与 `cannot convert NaN or Infinity to BigInt`。
+- **TypedArray 窗口的错误分类**：`invalid offset` 与 `invalid length` 不是同一分支。
+  参考在没有第三参数时查 `offset > byteLength`（`invalid offset`）以及整 buffer 长度能否
+  被元素大小整除（`invalid length`）；有第三参数时只查 `offset + len*size > byteLength`
+  （`invalid length`）。原来合并成一个 `||`，导致四种情况错三种。
+- **`using` 直接写在 `case`/`default` 的语句表里**要报
+  `using declaration is not allowed in this context`。这一条是我上一轮把顶层检查从
+  `top_level` 改成"作用域深度 == 1"时放出来的回归 —— 块内的 `using` 应当放行，Clause 的
+  语句表里不行。新增 `in_case_clause` 标志，并在进入块/函数体时清掉。
+
+### 16.6 测试
+
+- `crates/quickjs-cli/tests/uncaught.rs`（5 项）：抛出的值是打印而非字符串化（16 条）、
+  错误带栈（11 条，含子类 `name`、自定义 `toString`、未处理 rejection）、语法错带位置
+  （7 条）、`-e` 下命名为 `<cmdline>`（4 条）、模块链接错误无位置。全部走
+  `Case::script`/`Case::eval` 与参考二进制逐字节比对，stderr 也算。
+- `crates/quickjs-pure/tests/builtins.rs` 与 `proxy.rs`：11 处期望补上栈行。这些期望原先
+  钉的是"无栈"，即我们旧行为的记录，不是参考的输出。其中 3 处参考与我们仍不同（
+  `new BigInt(1)` 少一个 native 帧、`eval('super.x')` 位置差 5 列、`using` 的 disposer
+  帧名与位置），按我们的实际输出钉住并注明缺口。
+
+### 16.7 test262 运行器：负例改按抛出值判定
+
+这一轮让 11 个 `line-terminators/comment-*` 从通过变成"参考也过不了"：它们
+`throw new Test262Error()`，而参考把普通对象打成 `{ message: "" }` —— `Test262Error`
+一个字都不出现。运行器原先用 `stderr.contains("Test262Error")` 判定，靠的正是我们那条
+（错误的）`ToString`。
+
+test262 本身不是这样判的：`run-test262.c` 捕获异常值，比较它的构造器名。所以运行器改为
+对 `negative: runtime` 的用例包一层 `try`/`catch`，打一行
+`Test262:Threw:<构造器名>`，判定时优先看这行。只对非 `raw` 的脚本用例生效（模块会把
+源文本变成非模块，`raw` 没有 harness 保证它是脚本）；这类用例整体预期会抛，额外的块作用域
+观察不到。
+
+跑完后 `statements/using` 里暴露出真 bug 4 个（§16.5 最后一条），修完
+`language` 净 +15 / -0。
+
+### 16.8 发现但未修
+
+- **`new BigInt(1)` 少一个 `at BigInt (native)` 帧**：我们在进入 native 构造器之前就拒了。
+- **`using` 的 disposer 帧**：参考 `at <anonymous> (f.js:1:35)`，我们 `at  (f.js:1:26)`
+  —— 函数名空、位置指向声明而非释放点。
+- **`eval('super.x')` 的位置**：参考 `1:6`，我们 `1:1`。
+- **`class A { static { … } }`**：编译器还不支持静态块（`static blocks are not supported
+  by the compiler yet`）。参考允许 `using` 在静态块里。
+- **模块顶层 `using` 会让编译器 panic**（§15.6 已记，仍在）。
+- **一个偶发失败**：`TypedArray/prototype/copyWithin/coerced-values-end-detached-prototype.js`
+  在一次完整 `built-ins` 跑里 FAIL，之后单独跑 6 次、完整跑 2 次都 PASS。该用例分配
+  10000 元素数组并分离 buffer，并行 8 个 job 下有地址空间/时序压力。目前不接受为已知失败，
+  只记录：它不稳定。
+
+### 16.9 验收
+
+- `cargo test` 全绿（新增 `uncaught.rs` 5 项）
+- `cargo clippy -D warnings` / `cargo fmt` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
+- test262：`language` 14972→14987（**+15，-0**）；`built-ins` 14907→14914（**+7，-0**）

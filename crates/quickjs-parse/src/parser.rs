@@ -265,6 +265,12 @@ pub struct Parser<'a> {
     /// Whether the token currently held by the parser contains an Annex B octal
     /// literal or escape (checked again when strictness is switched on).
     current_legacy_octal: bool,
+    /// Whether the statement list being parsed is a `case`/`default` clause body.
+    ///
+    /// `using` is allowed in a block, a `for` head, a function body or a class static
+    /// block, and nowhere else — in particular not *directly* in a clause's
+    /// `StatementList`, which is what this flag distinguishes from an ordinary block.
+    in_case_clause: bool,
     /// Current recursion depth, and the limit that turns it into a
     /// `SyntaxError` instead of a stack overflow.
     depth: u32,
@@ -427,6 +433,7 @@ impl<'a> Parser<'a> {
             private: Vec::new(),
             top_level: true,
             current_legacy_octal,
+            in_case_clause: false,
             depth: 0,
             max_depth: DEFAULT_MAX_DEPTH,
 
@@ -498,9 +505,11 @@ impl<'a> Parser<'a> {
         let pending = std::mem::take(&mut self.pending_exports);
         for (name, span) in pending {
             if !declared.contains(&name) {
-                return Err(
-                    self.error_at(format!("exported variable '{name}' does not exist"), span)
-                );
+                // The reference makes this check in `js_resolve_module`, after parsing, so
+                // it prints no position. See `SyntaxError::positionless`.
+                return Err(self
+                    .error_at(format!("exported variable '{name}' does not exist"), span)
+                    .positionless());
             }
         }
         Ok(())
@@ -1031,6 +1040,16 @@ impl<'a> Parser<'a> {
                     self.span_from(start),
                 ));
             }
+            // A `case`/`default` clause is a statement list with nothing to end it, so a
+            // `using` there has no disposal point either. This is a separate early error
+            // from the one above: it applies inside a function too, where the scope depth
+            // is not 1.
+            if self.in_case_clause {
+                return Err(self.error_at(
+                    "using declaration is not allowed in this context",
+                    self.span_from(start),
+                ));
+            }
             let decl = self.parse_var_decl(VarDeclKind::Using, false, true)?;
             self.semicolon()?;
             return Ok(Stmt::new(StmtKind::VarDecl(decl), self.span_from(start)));
@@ -1247,7 +1266,12 @@ impl<'a> Parser<'a> {
     fn parse_block(&mut self) -> Result<Vec<Stmt>> {
         self.expect_punct(Punct::LBrace)?;
         self.push_scope(Scope::block());
+        // A block *inside* a `case` clause is a block, so `using` is legal there: the
+        // early error is about a `using` sitting directly in the clause's statement list.
+        let saved_in_case = self.in_case_clause;
+        self.in_case_clause = false;
         let result = self.parse_block_body();
+        self.in_case_clause = saved_in_case;
         self.pop_scope();
         let body = result?;
         self.bump()?; // }
@@ -1562,16 +1586,27 @@ impl<'a> Parser<'a> {
             };
             self.expect_punct(Punct::Colon)?;
             let mut body = Vec::new();
+            let saved_in_case = self.in_case_clause;
+            self.in_case_clause = true;
             while !self.at_punct(Punct::RBrace)
                 && !self.at_keyword(Keyword::Case)
                 && !self.at_keyword(Keyword::Default)
             {
                 if self.current.is_eof() {
+                    self.in_case_clause = saved_in_case;
                     self.switch_depth -= 1;
                     return Err(self.unexpected());
                 }
-                body.push(self.parse_statement_list_item()?);
+                match self.parse_statement_list_item() {
+                    Ok(stmt) => body.push(stmt),
+                    Err(error) => {
+                        self.in_case_clause = saved_in_case;
+                        self.switch_depth -= 1;
+                        return Err(error);
+                    }
+                }
             }
+            self.in_case_clause = saved_in_case;
             cases.push(SwitchCase {
                 test,
                 body,
@@ -2210,6 +2245,10 @@ impl<'a> Parser<'a> {
         if !self.at_punct(Punct::LBrace) {
             return Err(self.unexpected());
         }
+        // A function body is one of the places a `using` may live, so a function defined
+        // inside a `case` clause starts with a clean slate for that check.
+        let saved_in_case = self.in_case_clause;
+        self.in_case_clause = false;
         let param_names = simple_parameter_names(&params);
         let simple_params = params
             .iter()
@@ -2270,6 +2309,7 @@ impl<'a> Parser<'a> {
         let params_span_value = Span::new(params_span, params_span);
         self.strict = saved_strict;
         self.lexer.set_strict(saved_strict);
+        self.in_case_clause = saved_in_case;
         Ok((
             params,
             params_span_value,

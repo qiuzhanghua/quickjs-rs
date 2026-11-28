@@ -295,6 +295,37 @@ const ADDRESS_SPACE_LIMIT_KB: usize = 512 * 1024;
 /// since the work is dominated by the minority of hangs, which are wall clock.
 const MAX_DEFAULT_JOBS: usize = 8;
 
+/// Marks the constructor name of the value a `negative: runtime` test threw.
+///
+/// test262 judges those by the thrown *value*, not by what a runner prints: run-test262.c
+/// catches the exception and compares `error.constructor.name` with `negative.type`. This
+/// runner only sees a child process's output, so the name has to be printed — and it
+/// cannot be recovered from the printed exception, because the reference writes an object
+/// the way `JS_PrintValue` does (`throw new Test262Error()` prints `{ message: "" }`, and
+/// `Test262Error` appears nowhere). The wrapper that prints this line is added only for
+/// `negative: runtime` tests, where the whole file is expected to throw, so the extra
+/// block scope cannot be observed.
+const THREW: &str = "Test262:Threw:";
+
+/// Wrap a `negative: runtime` test so the constructor name of what it threw is reported.
+///
+/// The appended single line of output is the only way this runner can see the value;
+/// see [`THREW`]. `var` stays script-scoped inside a `try` block, so a test that inspects
+/// its own globals observes no difference — and these tests throw before they get the
+/// chance. Deliberately not applied to modules (the source would stop being a module) or
+/// to `raw` tests (no harness, so nothing guarantees the file is a plain script).
+fn wrap_to_report_throw(source: &str) -> String {
+    format!(
+        "try {{\n{source}\n}} catch (thrown) {{\n\
+         \x20 var name = (thrown !== null && typeof thrown === \"object\")\n\
+         \x20   ? (thrown.constructor && thrown.constructor.name) || \"\"\n\
+         \x20   : typeof thrown;\n\
+         \x20 print(\"{THREW}\" + name);\n\
+         \x20 throw thrown;\n\
+         }}\n"
+    )
+}
+
 /// How a test that was still running at the deadline is recorded.
 ///
 /// Separate from `Fail` on purpose: a hang means the engine failed to break out of a loop
@@ -463,7 +494,15 @@ impl Runner {
                 source.push_str(HOST_OBJECT);
                 source.push_str(harness);
             }
-            source.push_str(&test.source);
+            // A `negative: runtime` test is judged on *what it threw*, which a child
+            // process can only report by printing. See [`THREW`].
+            let reports_throw = matches!(&test.negative, Some((phase, _)) if phase == "runtime")
+                && !test.flags.iter().any(|flag| flag == "raw");
+            if reports_throw {
+                source.push_str(&wrap_to_report_throw(&test.source));
+            } else {
+                source.push_str(&test.source);
+            }
         }
         if let Err(error) = std::fs::write(&path, source) {
             return Outcome::Unsupported(format!("cannot write test source: {error}"));
@@ -615,7 +654,10 @@ fn judge(test: &Test, code: i32, stdout: &str, stderr: &str, is_module: bool) ->
                 ));
             }
             let all = format!("{stderr}\n{stdout}");
-            if all.contains(kind.as_str()) {
+            // The printed exception is what the reference writes, which for a test-defined
+            // error names nothing (`{ message: "" }`). `negative: runtime` is defined on the
+            // thrown *value*, so the wrapper's marker is consulted first.
+            if all.contains(kind.as_str()) || all.contains(&format!("{THREW}{kind}")) {
                 Outcome::Pass
             } else {
                 let detail = all

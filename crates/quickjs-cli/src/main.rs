@@ -130,10 +130,16 @@ fn run(ctx: &mut quickjs::Context<'_>, source: &str, filename: &str) -> ExitCode
             }
         },
         Err(error @ quickjs::Error::Syntax(_)) => {
-            // Compile errors are reported before anything runs, with the constructor name
-            // in front: the reference prints `SyntaxError: …`, and the conformance runner
-            // relies on that word to tell a parse-time rejection from a runtime throw.
-            let _ = writeln!(std::io::stderr(), "{filename}: {error}");
+            // Compile errors are reported before anything runs, and `Error` already
+            // renders them the reference's way — `SyntaxError: <message>`, then
+            // `    at <file>:<line>:<col>` when there is a position. Nothing is added
+            // here: an earlier version prefixed the file name, which put it where the
+            // reference puts nothing while the position sat inside the message.
+            //
+            // The `SyntaxError` word itself matters beyond cosmetics: the conformance
+            // runner classifies a `negative:` test by the constructor name it finds.
+            let _ = filename;
+            let _ = writeln!(std::io::stderr(), "{error}");
             ExitCode::from(1)
         }
         Err(error) => {

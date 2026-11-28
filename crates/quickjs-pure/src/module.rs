@@ -240,22 +240,19 @@ impl<'a> Interp<'a> {
                 )));
             }
         };
+        // Same shape as a script's compile error: the message, then `at <file>:<line>:<col>`
+        // unless the reference reports this one without a position. The file name is *not*
+        // part of the message — it belongs on the `at` line only.
         let program = match js_parse::parse_module(source) {
             Ok(program) => program,
             Err(error) => {
-                return Err(Signal::Throw(self.make_error(
-                    "SyntaxError",
-                    &format!("{}: {}", loaded.name, error.message),
-                )));
+                return Err(Signal::Throw(self.syntax_error_plain(&error, &loaded.name)));
             }
         };
         let mut code = match js_compile::compile_module(&program) {
             Ok(code) => code,
             Err(error) => {
-                return Err(Signal::Throw(self.make_error(
-                    "SyntaxError",
-                    &format!("{}: {}", loaded.name, error.message),
-                )));
+                return Err(Signal::Throw(self.syntax_error_plain(&error, &loaded.name)));
             }
         };
         code.set_filename(&loaded.name);

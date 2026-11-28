@@ -33,7 +33,6 @@ pub mod fdtable;
 // `windows-sys` side exists.
 #[cfg(unix)]
 pub mod os;
-pub mod print;
 pub mod printf;
 pub mod signal;
 pub mod std;

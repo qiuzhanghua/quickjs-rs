@@ -53,8 +53,13 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
         // truncation — silently dropping the fraction would be the wrong kind of lossy.
         Value::Int(value) => Ok(interp.bigint(BigInt::from_i64(value as i64))),
         Value::Float(value) => {
-            if !value.is_finite() || value.fract() != 0.0 {
-                return Err(interp.range_error("cannot convert a non-integer to a BigInt"));
+            // Two messages, not one: the reference separates "no exact bigint form"
+            // from "no value at all".
+            if !value.is_finite() {
+                return Err(interp.range_error("cannot convert NaN or Infinity to BigInt"));
+            }
+            if value.fract() != 0.0 {
+                return Err(interp.range_error("cannot convert to BigInt: not an integer"));
             }
             Ok(interp.bigint(BigInt::from_f64_truncated(value)))
         }

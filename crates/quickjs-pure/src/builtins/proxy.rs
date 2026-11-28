@@ -32,16 +32,20 @@ pub fn install(interp: &mut Interp<'_>) {
 }
 
 /// The target and handler arguments, checked.
+///
+/// Both must be objects, and both fail the same way — the reference has one
+/// `JS_ThrowTypeError(ctx, "not an object")` for the whole `create_proxy` path, so the
+/// message does not say *which* argument was wrong. Checking only `null` let a primitive
+/// handler through, which then made every trap read fail later with a message about a
+/// missing method rather than about the constructor's argument.
 fn target_and_handler(interp: &mut Interp<'_>, args: &[Value]) -> JsResult<(Gc<JsObject>, Value)> {
     let target = arg(args, 0);
     let Value::Object(target) = target else {
-        return Err(interp.type_error("proxy target must be an object"));
+        return Err(interp.type_error("not an object"));
     };
     let handler = arg(args, 1);
-    // A primitive handler would make every trap read fail later with a confusing message;
-    // the spec refuses it here, where the script can still tell what it did wrong.
-    if matches!(handler, Value::Null) {
-        return Err(interp.type_error("proxy handler must be an object"));
+    if !matches!(handler, Value::Object(_)) {
+        return Err(interp.type_error("not an object"));
     }
     Ok((target, handler))
 }

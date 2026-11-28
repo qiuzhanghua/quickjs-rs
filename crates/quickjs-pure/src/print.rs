@@ -27,8 +27,8 @@
 
 use std::fmt::Write as _;
 
-use quickjs::object::PropertyKey;
-use quickjs::{Gc, Interp, JsObject, JsResult, Value};
+use crate::object::PropertyKey;
+use crate::{Gc, Interp, JsObject, JsResult, Value};
 
 /// How deep objects are expanded before they print as `[ClassName]`.
 const MAX_DEPTH: usize = 2;
@@ -297,8 +297,8 @@ impl Printer<'_, '_> {
             // there is no `n` suffix.
             let big = matches!(
                 element,
-                quickjs::builtins::typedarray::ElementType::BigInt64
-                    | quickjs::builtins::typedarray::ElementType::BigUint64
+                crate::builtins::typedarray::ElementType::BigInt64
+                    | crate::builtins::typedarray::ElementType::BigUint64
             );
             for index in 0..shown {
                 comma.before(&mut self.out);
@@ -330,7 +330,7 @@ impl Printer<'_, '_> {
         // full property reads rather than own-property lookups — the reference's
         // `get_prop_string` runs the same lookup, getters included.
         let read = |interp: &mut Interp<'_>, name: &str| -> String {
-            let key = PropertyKey::String(quickjs::value::Wtf8::new(name));
+            let key = PropertyKey::String(crate::value::Wtf8::new(name));
             match interp.get_property_key(object, &key) {
                 Ok(Some(value)) => value.to_js_string(),
                 _ => String::new(),
@@ -344,8 +344,19 @@ impl Printer<'_, '_> {
             self.out.push_str(": ");
             self.out.push_str(&message);
         }
-        let stack = read(self.interp, "stack");
-        if !stack.is_empty() {
+        // The reference tests `JS_IsString(stack)`, not emptiness: an error built with no
+        // JavaScript frames has an empty trace and still gets the newline, which is why a
+        // module link error prints a blank line where testing emptiness printed none.
+        // A script that sets `stack` to a non-string gets no newline, and `None` here is
+        // that case.
+        let stack = {
+            let key = PropertyKey::String(crate::value::Wtf8::new("stack"));
+            match self.interp.get_property_key(object, &key) {
+                Ok(Some(Value::String(text))) => Some(text.to_string_lossy().to_string()),
+                _ => None,
+            }
+        };
+        if let Some(stack) = stack {
             self.out.push('\n');
             self.out.push_str(stack.trim_end_matches('\n'));
         }
@@ -359,10 +370,10 @@ impl Printer<'_, '_> {
         let length = object.array_length().unwrap_or(0);
         let mut present: Vec<usize> = Vec::new();
         for index in 0..length {
-            let key = PropertyKey::String(quickjs::value::Wtf8::new(index.to_string()));
+            let key = PropertyKey::String(crate::value::Wtf8::new(index.to_string()));
             // A dense array keeps its elements in a vector, not in the property table, so
             // the property lookup alone finds nothing.
-            if quickjs::object::own_property_including_array(object, &key).is_some() {
+            if crate::object::own_property_including_array(object, &key).is_some() {
                 present.push(index);
             }
         }
@@ -380,7 +391,7 @@ impl Printer<'_, '_> {
                 return Ok(());
             }
             comma.before(&mut self.out);
-            let key = PropertyKey::String(quickjs::value::Wtf8::new(index.to_string()));
+            let key = PropertyKey::String(crate::value::Wtf8::new(index.to_string()));
             if sparse {
                 let _ = write!(self.out, "{index}: ");
             }

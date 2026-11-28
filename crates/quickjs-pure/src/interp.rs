@@ -2787,6 +2787,28 @@ impl<'a> Interp<'a> {
     /// `lineNumber` and `columnNumber` on the object (a SpiderMonkey convention the
     /// reference borrows), which is how a script reads the position without parsing
     /// the trace.
+    /// A `SyntaxError` object for a `js_parse`/`js_compile` failure.
+    ///
+    /// The message is bare and the position goes on `stack`/`fileName`/`lineNumber`/
+    /// `columnNumber`, which is how the reference prints one. A positionless error
+    /// (`SyntaxError::positionless`) gets neither the trace line nor the position fields —
+    /// the reference raises it from `js_resolve_module`, where there is no position.
+    pub(crate) fn syntax_error_plain(
+        &mut self,
+        error: &js_parse::SyntaxError,
+        file: &str,
+    ) -> Value {
+        if error.positionless {
+            return self.make_error("SyntaxError", &error.message);
+        }
+        self.syntax_error_at(
+            file,
+            error.span.start.line,
+            error.span.start.column,
+            &error.message,
+        )
+    }
+
     fn syntax_error_at(&mut self, file: &str, line: u32, column: u32, message: &str) -> Value {
         let blamed = format!("    at {file}:{line}:{column}\n{}", self.stack_trace());
         let value = self.make_error("SyntaxError", message);
@@ -5272,7 +5294,7 @@ impl<'a> Interp<'a> {
             return Ok(Value::Undefined);
         }
         let Some(object) = value.as_object() else {
-            return Err(self.type_error("value is not disposable: it is not an object"));
+            return Err(self.type_error("not an object"));
         };
         let mut method = if await_form {
             let found = self.get_property_key(
@@ -6275,7 +6297,7 @@ impl<'a> Interp<'a> {
     }
 
     fn throw_reference(&self, name: &str) -> Signal {
-        Signal::Throw(self.make_error("ReferenceError", &format!("{name} is not defined")))
+        Signal::Throw(self.make_error("ReferenceError", &format!("'{name}' is not defined")))
     }
 
     // -- the instruction loop -----------------------------------------------
@@ -9065,20 +9087,24 @@ impl<'a> Interp<'a> {
 
     /// How an uncaught exception is reported.
     ///
-    /// The reference reports a pending exception through `JS_PrintValue`, which ends
-    /// up calling the thrown value's `toString`, so `throw new TypeError("x")` prints
-    /// `TypeError: x`. Reading `name`/`message` off the object directly got this wrong
-    /// two ways: `name` usually lives on the prototype rather than on the instance, and
-    /// a thrown non-error object was not consulted at all, coming out as
-    /// `[object Object]`. Routing through `ToString` keeps every case on one path and
-    /// honours a user-defined `toString`, as the reference does.
+    /// The reference reports a pending exception with `JS_PrintValue`, the *printer*, not
+    /// with `ToString` — `js_std_dump_error` is three lines that end in
+    /// `JS_PrintValue(stderr, …)`. The difference is visible for every value that is not
+    /// already a string: `throw "s"` prints with its quotes, `throw {a:1}` prints
+    /// `{ a: 1 }`, `throw [1,2]` prints `[ 1, 2 ]`, and an error prints its stack.
     ///
-    /// A `toString` that throws must not take the reporter down with it, so that case
-    /// falls back to the type-level rendering. The reference's printer also walks into
-    /// plain objects (`throw 1, {a:1}` prints `{ a: 1 }`); that formatting is a gap
-    /// shared with `console.log`.
+    /// `ToString` was the wrong primitive here — it is what `error.message` is for, not
+    /// what a reporter is for. An earlier note claimed `JS_PrintValue` "ends up calling
+    /// `toString`"; it does call it, but only for objects of a class it does not know how
+    /// to walk, and never for errors, arrays or plain objects.
+    ///
+    /// A printer that fails must not take the reporter down with it, so that case falls
+    /// back to the `ToString` rendering.
     pub fn describe_exception(&mut self, value: &Value) -> String {
-        self.to_js_string(value).unwrap_or_else(|_| display(value))
+        match crate::print::sprint(self, value) {
+            Ok(text) => text,
+            Err(_) => self.to_js_string(value).unwrap_or_else(|_| display(value)),
+        }
     }
 
     /// The current call stack, formatted the way `qjs` prints `error.stack`.

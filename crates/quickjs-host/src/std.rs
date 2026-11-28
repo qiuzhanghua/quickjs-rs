@@ -534,7 +534,7 @@ fn js_eval_script(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsRe
 
 /// `std.__sprintObject(value)` — the reference's `JS_PrintValue` as a string.
 fn js_sprint_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
+    let text = quickjs::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
     Ok(interp.string(text))
 }
 
@@ -545,7 +545,7 @@ fn js_sprint_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> Js
 /// want a line (`repl.js` prints every result this way) add the newline themselves, so
 /// adding one here produced a blank line after each of them.
 fn js_print_object(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResult<Value> {
-    let text = crate::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
+    let text = quickjs::print::sprint(interp, args.first().unwrap_or(&Value::Undefined))?;
     stdio::emit(interp, text.as_bytes());
     Ok(Value::Undefined)
 }

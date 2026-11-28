@@ -55,6 +55,11 @@ pub mod builtins;
 pub mod interp;
 pub mod module;
 pub mod object;
+/// The reference's `JS_PrintValue`, which lives in the *engine* (`quickjs.c`) and not in
+/// the host library. `std.__printObject` is a one-line wrapper over it, and so is the
+/// reporting of an uncaught exception — which is why this belongs here rather than in
+/// `quickjs-host`.
+pub mod print;
 // The engine lives in its own crate so that `quickjs-compile` can validate a `/…/u`
 // literal at parse time without depending on this one.
 pub use quickjs_regexp as regexp;
@@ -81,6 +86,29 @@ pub enum Error {
     OutOfMemory,
     /// The runtime exceeded its stack limit (`--stack-size`).
     StackOverflow,
+}
+
+impl Error {
+    /// A compile error, rendered the way the reference prints one.
+    ///
+    /// `SyntaxError: <message>` and, when the error has a position,
+    /// `    at <file>:<line>:<column>` on the next line. The reference gets this shape
+    /// from `js_std_dump_error` printing an exception object whose `stack` is those two
+    /// lines; we have no object yet (nothing has run), so the text is built directly.
+    ///
+    /// A parse error is not "`file: SyntaxError: L:C: message`", which is what the CLI
+    /// used to print: that put the file name where the reference puts nothing, and the
+    /// position where the reference puts the file name.
+    fn syntax(error: &js_parse::SyntaxError, file: &str) -> Error {
+        if error.positionless {
+            Error::Syntax(error.message.clone())
+        } else {
+            Error::Syntax(format!(
+                "{}\n    at {}:{}:{}",
+                error.message, file, error.span.start.line, error.span.start.column
+            ))
+        }
+    }
 }
 
 impl std::fmt::Display for Error {
@@ -360,10 +388,12 @@ impl<'rt> Context<'rt> {
     /// The value is reported the way `qjs -e` reports it: a string for anything the
     /// script leaves on the stack, and nothing at all for `undefined`.
     pub fn eval(&mut self, source: &str) -> Result<Value> {
-        let program =
-            js_parse::parse_script(source).map_err(|error| Error::Syntax(error.to_string()))?;
-        let mut code = js_compile::compile_script(&program)
-            .map_err(|error| Error::Syntax(error.message.clone()))?;
+        let program = js_parse::parse_script(source).map_err(|error| {
+            Error::syntax(&error, self.script_name.as_deref().unwrap_or("<input>"))
+        })?;
+        let mut code = js_compile::compile_script(&program).map_err(|error| {
+            Error::syntax(&error, self.script_name.as_deref().unwrap_or("<input>"))
+        })?;
         // Position information travels with the code, but the file name is the host's
         // to supply — the parser never sees it.
         code.set_filename(self.script_name.as_deref().unwrap_or("<input>"));

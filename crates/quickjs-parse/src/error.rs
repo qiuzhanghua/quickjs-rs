@@ -14,6 +14,16 @@ pub struct SyntaxError {
     pub message: String,
     /// Where the error happened.
     pub span: Span,
+    /// Whether the reference reports this error *without* a position.
+    ///
+    /// Almost every syntax error is printed as `SyntaxError: <message>` followed by
+    /// `    at <file>:<line>:<column>`. A handful are not, and the difference is not
+    /// cosmetic: the reference raises them from `js_resolve_module`, after parsing has
+    /// succeeded, so there is no position to give —
+    /// `export {a}` with no `a` prints a bare `SyntaxError: exported variable 'a' does
+    /// not exist`. Our parser makes that check itself (it has the declared names in
+    /// hand), so it has to say "report me like a link error" explicitly.
+    pub positionless: bool,
 }
 
 impl LexError {
@@ -22,7 +32,16 @@ impl LexError {
         LexError {
             message: message.into(),
             span,
+            positionless: false,
         }
+    }
+
+    /// Mark this error as one the reference reports without a position.
+    ///
+    /// See [`SyntaxError::positionless`].
+    pub fn positionless(mut self) -> LexError {
+        self.positionless = true;
+        self
     }
 
     /// 1-based line of the error.

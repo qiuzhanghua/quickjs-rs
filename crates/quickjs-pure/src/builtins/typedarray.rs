@@ -645,20 +645,33 @@ fn view_constructor(interp: &mut Interp<'_>, this: Value, args: &[Value]) -> JsR
                 .expect("checked by the guard above");
             let total = storage.borrow().bytes.len();
             let byte_offset = to_index(interp, &arg(args, 1), "byte offset")?;
+            // Misalignment is always `invalid offset`, but the two bounds failures are not
+            // the same error and do not even happen in the same branch. Reading
+            // `js_typed_array_constructor` in the reference:
+            //
+            // * no length given  -> `offset > byte_length` is `invalid offset`;
+            // * a length given    -> the *sum* `offset + len * size` is checked, and the
+            //   failure is `invalid length`. There is no separate `offset > byte_length`
+            //   test on that path, so `(buf16, 20, 1)` says `invalid length`.
             if byte_offset % element.size() != 0 {
-                return Err(interp.range_error("byte offset is not aligned"));
-            }
-            if byte_offset > total {
-                return Err(interp.range_error("byte offset is out of range"));
+                return Err(interp.range_error("invalid offset"));
             }
             let available = (total - byte_offset) / element.size();
             // No third argument means "the rest of the buffer", which is different from
             // `undefined` meaning 0 — hence a length check rather than a nullish one.
             let length = if args.len() < 3 || matches!(arg(args, 2), Value::Undefined) {
+                if byte_offset > total {
+                    return Err(interp.range_error("invalid offset"));
+                }
+                // The remainder of the buffer has to be a whole number of elements:
+                // `04 00 00 00 05` is not a `Uint32Array` and cannot be one.
+                if total % element.size() != 0 {
+                    return Err(interp.range_error("invalid length"));
+                }
                 available
             } else {
                 let requested = to_index(interp, &arg(args, 2), "length")?;
-                if requested > available {
+                if byte_offset + requested * element.size() > total {
                     return Err(interp.range_error("invalid length"));
                 }
                 requested
