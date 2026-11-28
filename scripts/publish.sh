@@ -17,6 +17,15 @@
 #  * `~/.cargo/config.toml` replaces the `crates-io` source with a mirror. cargo
 #    refuses to publish through a replaced source, so every upload names
 #    `--registry crates-io` — which targets the real registry, not the mirror.
+#
+# That second point was only half handled for a long time. `--registry crates-io` names
+# the real registry for the *upload*, but dependency resolution still reads the index
+# named by `[source.crates-io]`, which is the mirror. Publishing 0.7.0 failed exactly
+# there: `quickjs-compile` wants `quickjs-parse = "^0.7"`, crates.io had it (published a
+# minute earlier), the mirror did not, and cargo reported "candidate versions found
+# which didn't match: 0.6.1, 0.6.0, …". The mirror lags by design; the registry the
+# crate has to satisfy does not. So the dry-run and the upload both run under a
+# CARGO_HOME with no source replacement — see `clean_cargo_home` below.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -42,6 +51,26 @@ ORDER=(quickjs-gc quickjs-parse quickjs-regexp quickjs-compile quickjs-pure)
 # recognise the state it was built to tolerate.
 dependency_not_published() {
     grep -qE "no matching package named|failed to select a version for the requirement"
+}
+
+# A CARGO_HOME whose `config.toml` has no `[source.crates-io]` replacement, so cargo
+# resolves dependencies against the real index. Only the credentials come along: the
+# registry cache is deliberately *not* shared, because a cached mirror index is the thing
+# being avoided.
+clean_cargo_home() {
+    home="${CARGO_HOME:-$HOME/.cargo}"
+    scratch=$(mktemp -d)
+    if [[ -f "$home/credentials.toml" ]]; then
+        cp "$home/credentials.toml" "$scratch/credentials.toml"
+    fi
+    if [[ -f "$home/config.toml" ]]; then
+        # Everything except the `[source.crates-io]` section: its single `replace-with`
+        # key, plus whatever else a future cargo puts there. A leftover `[source.mirror]`
+        # is harmless, because nothing points at it any more.
+        awk '/^\[/ { skip = ($0 ~ /^\[source\.crates-io\]/) } !skip' \
+            "$home/config.toml" > "$scratch/config.toml"
+    fi
+    printf '%s' "$scratch"
 }
 
 upload=0
@@ -100,6 +129,14 @@ for crate in "${ORDER[@]}"; do
     printf '  %-18s %s\n' "$crate" "$version"
 done
 
+# From here on cargo must see crates.io itself, not the mirror. The cleanup trap lives
+# here and not inside the function: a command substitution runs in a subshell, so a trap
+# set there would be discarded with it and the directory would leak.
+PUBLISH_HOME=$(clean_cargo_home)
+trap 'rm -rf "$PUBLISH_HOME"' EXIT
+CARGO_HOME=$PUBLISH_HOME
+export CARGO_HOME
+
 echo "== package"
 for crate in "${ORDER[@]}"; do
     # `--no-verify` here: verification builds the tarball, which needs the earlier
@@ -128,6 +165,8 @@ for crate in "${ORDER[@]}"; do
         fi
     done
 done
+
+
 
 echo "== dry-run (this is what a real publish verifies)"
 for crate in "${ORDER[@]}"; do

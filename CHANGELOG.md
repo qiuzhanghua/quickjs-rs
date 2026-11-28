@@ -158,13 +158,23 @@ constructor`。
 
 这三族都属于"接受一个本应拒绝的程序"这类静默错误，所以判据都是**消息 + 位置**逐条与参考一致。
 
-### 修：`scripts/publish.sh` 的一个检查在 macOS 上从来没跑过
+### 修：`scripts/publish.sh` 的两处"检查在，但拦不住"
 
-"path 依赖必须带 version" 那条检查写成了多行 `sed -nE`：GNU sed 接受，BSD sed 报
-`extra characters at the end of p command`。报错进 stderr，管道状态取自后面的 `grep`，
-于是**在 macOS 上这条检查静默失效**——而这正是它两代前被重写的原因（上一代是
-`grep -q … | grep -v …`，`-q` 不打印任何东西，第二个 `grep` 永远看不到行）。改成 `awk`：
-没有方言差异，并用"故意写坏一个 manifest"验证了两个方向都能触发。
+**一、一个检查在 macOS 上从来没跑过。** "path 依赖必须带 version" 那条检查写成了多行
+`sed -nE`：GNU sed 接受，BSD sed 报 `extra characters at the end of p command`。报错进
+stderr，管道状态取自后面的 `grep`，于是**在 macOS 上这条检查静默失效**——而这正是它两代前
+被重写的原因（上一代是 `grep -q … | grep -v …`，`-q` 不打印任何东西，第二个 `grep` 永远看
+不到行）。改成 `awk`：没有方言差异，并用"故意写坏一个 manifest"验证了两个方向都能触发。
+
+**二、`--registry crates-io` 只解决了一半问题。** 脚本注释一直写着"这台机器把
+`crates-io` 换成了镜像，所以发布时点名 `--registry crates-io`"。但那个参数只改**上传**目标，
+**依赖解析**仍然读 `[source.crates-io]` 指的索引，也就是镜像。0.7.0 就是在这里挂的：
+`quickjs-compile` 要 `quickjs-parse = "^0.7"`，crates.io 一分钟前已经有了，镜像还没有，
+于是 `candidate versions found which didn't match: 0.6.1, 0.6.0, …`。镜像本来就落后，
+而上架要满足的是 crates.io。现在整段打包/预检/上传都在一个**没有源替换**的临时
+`CARGO_HOME` 里跑（只带 `credentials.toml`）：修完之后 `cargo package` 与
+`publish --dry-run` 对五个 crate 全部 `ok`，修之前 compile/pure 两个是
+`skipped (a dependency is not published yet)`——**一条永远不会红的预检，正是它会放过的错误**。
 
 ### 顺带：`TEST262_SIGNATURES=1` 现在给出每个失败形状的一个例子
 
