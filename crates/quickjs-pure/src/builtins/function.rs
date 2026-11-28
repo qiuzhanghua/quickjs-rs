@@ -82,9 +82,8 @@ fn constructor(interp: &mut Interp<'_>, _this: Value, args: &[Value]) -> JsResul
         .collect();
     let params = params.join(",");
     let source = format!("(function({params}) {{{body}}})");
-    let program = js_parse::parse_script(&source).map_err(|error| {
-        Signal::Throw(interp.make_error("SyntaxError", &format!("invalid function body: {error}")))
-    })?;
+    let program = js_parse::parse_script(&source)
+        .map_err(|error| Signal::Throw(interp.make_error("SyntaxError", &error.message.clone())))?;
     let compiled = js_compile::compile_script(&program)
         .map_err(|error| Signal::Throw(interp.make_error("SyntaxError", &error.message)))?;
     // The script's own last expression is the function literal, so running it yields

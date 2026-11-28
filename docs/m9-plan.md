@@ -883,9 +883,7 @@ EOF 上挂死，我们借 `stdin_eof()` 在"stdin 到 EOF 且没有定时器/微
 前缀（M4 引入），且措辞本身不同。现有的 `parse_oracle.rs` 只对拍**接受/拒绝**，不验文本，
 所以这件事完全没被跟踪。要对齐得逐条搬 QuickJS 的 `js_parse_error` 串，属独立一轮。
 
-**顶层 `await`。** 参考的 `JS_EVAL_FLAG_ASYNC` 还让 `await` 在顶层合法（脚本在 async 上下文
-里求值）。这需要解析器和挂起机制接受一个可挂起的顶层脚本，未实现——目前是语法错。
-`repl.js` 不依赖它，所以 REPL 不受影响。
+**顶层 `await`。** 已完成，见 §15。
 
 **`std.evalScript` 的 `load`/`compile_only` 等其余选项**未实现，脚本触到时报错而非静默。
 
@@ -1025,3 +1023,130 @@ EOF 上挂死，我们借 `stdin_eof()` 在"stdin 到 EOF 且没有定时器/微
 - `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
 - test262：`built-ins` 14907/17822 **零变化**；`language` +4 **零回归**
 - 措辞对齐率 2.3% → 44.5%
+
+---
+
+## 15. 顶层 `await`（可挂起脚本）
+
+### 15.1 参考只做了一件事
+
+参考的相关代码只有一行（`quickjs.c:38570`）：
+
+```c
+if (m != NULL || (flags & JS_EVAL_FLAG_ASYNC)) {
+    fd->in_function_body = TRUE;
+    fd->func_kind = JS_FUNC_ASYNC;
+}
+```
+
+所以**模块体**和 `evalScript(…, {async:true})` 走的是同一条路：程序自己的函数是 async。
+`await` 的所有规则都从 `fd->func_kind & JS_FUNC_ASYNC` 派生，没有第二套开关。
+
+把这个对应到我们已经有的结构上，就是一个字段：`FnCtx::in_async`。它本来就描述"当前
+正在解析的函数"，所以 `Parser::new` 里 `in_async = module`，可挂起脚本再置 true 即可。
+原来分散在四处的 `(self.module && self.top_level)` 判定随之全部收敛成 `self.ctx.in_async`。
+
+注意它**不是** `in_function`：`return 1` 与 `new.target` 在可挂起脚本顶层仍然报错，与普通
+脚本完全一样。这两条有单独的测试（`the_flag_does_not_make_the_body_a_function`），因为
+"让 await 合法"和"变成函数"很容易被混为一谈。
+
+### 15.2 编译端：`{value}` 包装
+
+参考在 `js_parse_program` 收尾时，对 `!is_module && func_kind == JS_FUNC_ASYNC` 的脚本发出：
+
+```
+OP_object
+OP_dup
+OP_get_loc <ret>
+OP_put_field value
+OP_return
+```
+
+（源码注释：*"wrap the return value in an object so that promises can be safely returned"*）。
+没有这层包装，用完成值去 resolve 一个 promise 会**采用**它：`evalScript("Promise.resolve(7)")`
+会得到 `7` 而不是 `{value: <promise>}`，只有显式 `await` 才解包。这与 REPL 打印 promise 而
+非其值是同一条规则。
+
+`compile_script_suspensible` 除此之外与 `compile_script` 一致（脚本仍然报完成值），只是
+`kind = Async`。字节码形状在 `suspensible_script.rs` 里按指令序列钉住。
+
+### 15.3 运行时：body 变协程
+
+`run_eval_script` 末尾原本直接 `execute`；现在 async 体走 `run_async_body`，返回 promise
+而不是值。`this` 必须继续传（全局 eval 的 `this` 是全局对象，`this === globalThis` 为 true）。
+`eval_in_global_async` 也不再自己包一层 promise——async 体产出的那个就是参考返回的那个。
+
+### 15.4 `await` 的三种上下文
+
+这一轮把 `await` 的位置规则按参考的模型重排了。参考的模型是**两层**：
+
+1. **是不是关键字**：`in_async || module`。所以模块里**任意深度**（包括普通函数体内）
+   `await` 都不是标识符——`function f(){ var await = 1 }` 在模块里是语法错，在脚本里不是。
+2. **能不能当算符**：只有 `in_async`。模块的普通函数体内它是关键字但不能 await，参考为此
+   专门有一条 `unexpected 'await' keyword`。
+
+顺手修掉的三处（都是探针发现的，不是猜的）：
+
+- **`await` 的"看下一个 token 再说"启发式是错的。** 原来 `await;`、`f(await)`、`await .x`
+  会退回成标识符引用，因为启发式把 `)` `]` `}` `,` `;` `:` `=` `.` `[` 当作"不可能开始
+  表达式"。参考在 `TOK_AWAIT` 上无条件 `next_token` + `js_parse_unary`，所以这些一律报
+  *操作数* 的错（`unexpected token in expression: ';'`）。去掉启发式后 12 条探针全对。
+- **`await: 1` 不是标签。** 标签路径原本先抢下 `await` 再报 `variable name expected`。
+  在算符位置上应当落到表达式路径；只在"仅因 module 而保留"的那一侧才报
+  `unexpected 'await' keyword`。
+- **`function f(await){}` 在模块里是 `missing formal parameter`**，不是 `variable name
+  expected`：参考根本没见过 `await` 作为标识符 token，所以走的是"形参缺失"分支。
+
+`await_contexts.rs` 把三种上下文 × 30 条源码（87 项检查）与参考逐条比对。
+
+### 15.5 顺带修掉的运行时消息
+
+探针顺带暴露了三条**运行时抛出**的语法错与参考不同（都属于上一轮"措辞"那一族）：
+
+| 场景 | 参考 `e.message` | 修前 |
+|---|---|---|
+| `eval("1 +")` | `unexpected token in expression: ''` | `invalid source: 1:4: unexpected token in expression: ''` |
+| `new Function("1 +")` | `unexpected token in expression: '}'` | `invalid function body: 1:17: …` |
+| `JSON.parse("{]")` | `expecting property name` | `expected a string key` |
+
+`invalid source: L:C: ` 前缀是 M4 留下的：位置本来已经写在 `fileName`/`lineNumber`/
+`columnNumber` 和栈帧上，参考的 `message` 是裸的。去掉后 `e.message` 与参考一致，
+`e.stack` 早就一致。
+
+### 15.6 发现但未修（与本轮无关，先登记）
+
+- **`arguments` 在全局 eval 里存在。** `std.evalScript("arguments")` 与
+  `evalScript` 体内的 `eval("arguments")`，参考都抛 `'arguments' is not defined`，我们在
+  调用者帧存在时给出一个空的类数组。正确做法是把 `arguments` 建模成调用者变量环境里的
+  普通绑定（`eval(b)` 把被调者当值传，连 callsite 探测也答不出来）。比这一轮大，已留注释。
+- **模块顶层的 `using` 会让编译器 panic**（`a using binding was declared during hoisting`）。
+  这是 panic 不是错误消息，应当单独修；`await using` 在模块顶层正常。
+- **`new Function` 的语法错位置**：参考报 `fileName = <input>`、`lineNumber = 4`，并在栈里
+  有 `at <input>:4:1`；我们没有任何位置。原因是两边生成的包装源码布局不同，报我们自己的
+  位置会更糟，所以只对齐了 message。
+- **`a = { await }`**：参考 `expecting ':'`，我们 `unexpected 'await' identifier…`。对象字面量
+  简写路径的问题，与 `await` 本身无关。
+
+### 15.7 新增的测试
+
+- `crates/quickjs-parse/tests/await_contexts.rs` —— 3 种上下文 × 30 条源码 = 87 项检查，
+  全部差分参考。可挂起脚本这一列通过 `qjs --std` 跑一个 `evalScript(source, {async:true})`
+  的探针取得（`qjsc` 只有 `--script`/`--module`，没有 async eval 入口）。
+  另有 `the_flag_does_not_make_the_body_a_function`：`return`/`new.target`/`super()` 在
+  加 flag 前后必须报同一条消息。
+- `crates/quickjs-compile/tests/suspensible_script.rs` —— 4 项：kind 是 async、
+  收尾五条指令 `object; dup; get_loc0; put_field; return` 的序列、普通脚本不带包装、
+  `await` 编译成 `await` 指令。
+- `crates/quickjs-host/tests/std_eval.rs` +5 项（共 11）：顶层 `await` 合法、promise 不被
+  采用而是被包装、全局 receiver 与全局 `var`、`await` 真让出事件循环并与其它 job 的
+  先后顺序一致、无 flag 时非法。
+- `parse_wording.rs` 去掉了 `async function f() { await = 1 }` 这条登记——本轮改动让它
+  自动对齐了（差分测试自己报的"登记的差异已一致"）。
+
+### 15.8 验收
+
+- `cargo test` 全绿（新增 2 个测试文件、`std_eval` +5）
+- `cargo clippy -D warnings` / `cargo fmt` 干净
+- `scripts/check.sh` 全绿：lang-diff 80/85、realworld 2/2、verify-claims 18/18、NFR-6/7
+- test262：`built-ins` 14907/17822 零变化；`language` 14945→14972（**+27，-0**），
+  含 `module-code/top-level-await/*` 与 `class-name-ident-await-module` 等

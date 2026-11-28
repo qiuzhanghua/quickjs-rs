@@ -291,6 +291,18 @@ pub fn parse_module(src: &str) -> Result<Program> {
     Parser::new(src, true)?.parse_program()
 }
 
+/// Parse `src` as a `Script` whose top level is the body of an `async` function.
+///
+/// This is the reference's `JS_EVAL_FLAG_ASYNC`, which `std.evalScript` sets from
+/// `{async: true}`. The flag buys exactly one thing: top-level `await` becomes an
+/// operator, because the program's own function is an `async` one. It does *not* make the
+/// top level a function — `return` stays an error and `new.target` stays unavailable — so
+/// the compiled body still reports its completion value the way a script does, wrapped in
+/// `{value}` so that a promise is not adopted on the way out.
+pub fn parse_suspensible_script(src: &str) -> Result<Program> {
+    Parser::new_suspensible(src)?.parse_program()
+}
+
 /// Parse `src` as a `Script` whose code is strict from the first token.
 ///
 /// This is what a *direct* `eval` needs: the eval'd code inherits strictness from the
@@ -340,6 +352,21 @@ pub fn parse_eval_script_in(src: &str, strict: bool, context: EvalContext) -> Re
     parser.parse_program()
 }
 
+/// Parse `src` as the suspensible (async) form of a *global* eval body.
+///
+/// Two differences from [`parse_eval_script_in`], both from the same place in the
+/// reference: a global eval is not a function body (`new_target_allowed`,
+/// `super_allowed` and `super_call_allowed` are all false), and `JS_EVAL_FLAG_ASYNC`
+/// makes the body `async`. So `new.target` and `super` stay out of reach while `await`
+/// does not.
+pub fn parse_suspensible_global_eval(src: &str, strict: bool) -> Result<Program> {
+    let mut parser = Parser::new_suspensible(src)?;
+    if strict {
+        parser.enter_strict()?;
+    }
+    parser.parse_program()
+}
+
 /// Parse `src` as a single `Expression` (used by tests and by `eval`-like entry
 /// points that need the expression grammar only).
 pub fn parse_expression(src: &str) -> Result<Expr> {
@@ -353,7 +380,26 @@ pub fn parse_expression(src: &str) -> Result<Expr> {
 
 impl<'a> Parser<'a> {
     /// Create a parser over `src`. A module is always strict.
+    ///
+    /// The program's own function is an `async` one for a module, so its top level may
+    /// `await`. That is set here rather than at each `await` site: [`Parser::ctx`]
+    /// describes the function currently being parsed, and the reference keys every
+    /// `await` rule off the same thing (`fd->func_kind & JS_FUNC_ASYNC`).
     pub fn new(src: &'a str, module: bool) -> Result<Parser<'a>> {
+        Parser::with_modes(src, module, false)
+    }
+
+    /// Create a parser whose program *is* the body of an `async` function.
+    ///
+    /// This is the reference's `JS_EVAL_FLAG_ASYNC`: a script compiled with it may use
+    /// top-level `await`, exactly as a module body may. It is not the same as being inside
+    /// a function — `return` is still an error, `new.target` is still unavailable — so
+    /// `in_function` stays false.
+    pub fn new_suspensible(src: &'a str) -> Result<Parser<'a>> {
+        Parser::with_modes(src, false, true)
+    }
+
+    fn with_modes(src: &'a str, module: bool, async_body: bool) -> Result<Parser<'a>> {
         let mut lexer = Lexer::new(src);
         lexer.set_strict(module);
         let current = lexer.next_token()?;
@@ -371,7 +417,10 @@ impl<'a> Parser<'a> {
             strict: module,
             module,
             allow_in: true,
-            ctx: FnCtx::default(),
+            ctx: FnCtx {
+                in_async: module || async_body,
+                ..FnCtx::default()
+            },
             loop_depth: 0,
             switch_depth: 0,
             labels: Vec::new(),
@@ -747,6 +796,11 @@ impl<'a> Parser<'a> {
     fn expect_ident(&mut self) -> Result<Ident> {
         match self.current.kind.clone() {
             TokenKind::Ident(name) => {
+                // A *name* position: `await` is a token there, not an identifier, so the
+                // reference never gets as far as complaining about it by name.
+                if name == "await" && self.await_is_reserved() {
+                    return Err(self.error("variable name expected"));
+                }
                 let span = self.current.span;
                 self.check_identifier(&name, span)?;
                 self.bump()?;
@@ -756,6 +810,35 @@ impl<'a> Parser<'a> {
             // expected")`. The token is already the error position.
             _ => Err(self.error("variable name expected")),
         }
+    }
+
+    /// Whether the current token can begin a formal parameter.
+    ///
+    /// A token that cannot is a *missing* parameter rather than a malformed one, which is
+    /// the reference's `missing formal parameter`. `await` counts as missing where it is
+    /// reserved: the reference never sees it as an identifier, so it never gets to the
+    /// name check that would say `variable name expected`.
+    fn at_formal_parameter(&self) -> bool {
+        if self.at_punct(Punct::LBracket) || self.at_punct(Punct::LBrace) {
+            return true;
+        }
+        match &self.current.kind {
+            TokenKind::Ident(name) => !(name == "await" && self.await_is_reserved()),
+            _ => false,
+        }
+    }
+
+    /// Whether `await` cannot be written as a name here.
+    ///
+    /// Two separate reasons, and the reference reaches them from two different places:
+    ///
+    /// * the enclosing function is `async`, where `await` is a keyword rather than an
+    ///   identifier (`fd->func_kind & JS_FUNC_ASYNC`);
+    /// * the code is module code, where `await` is reserved at *every* depth — not just
+    ///   the module's own top level — so `function f(){ var await = 1 }` in a module is
+    ///   an error while the same function in a script is not.
+    fn await_is_reserved(&self) -> bool {
+        self.ctx.in_async || self.module
     }
 
     /// Reject words that may not appear as an `IdentifierReference` here.
@@ -775,8 +858,12 @@ impl<'a> Parser<'a> {
                 span,
             ));
         }
-        if self.ctx.in_async && name == "await" {
-            return Err(self.error_at("unexpected 'await' identifier in an async function", span));
+        if name == "await" && self.await_is_reserved() {
+            // `await` never reaches the identifier path where it is a keyword: in an async
+            // function it is an operator, and in module code at *any* depth it is reserved
+            // even inside a plain function, which is where this message comes from —
+            // `function f(){ await 1 }` in a module is a keyword used as a name.
+            return Err(self.error_at("unexpected 'await' keyword", span));
         }
         Ok(())
     }
@@ -838,7 +925,9 @@ impl<'a> Parser<'a> {
         if self.can_insert_semicolon() {
             return Ok(());
         }
-        Err(self.unexpected())
+        // Not `unexpected()`: the reference's `js_parse_expect_semi` names what it wanted
+        // (`expecting ';'`), which is why `1 2` says so rather than describing the `2`.
+        Err(self.error("expecting ';'"))
     }
 
     // -- statements --------------------------------------------------------
@@ -919,17 +1008,11 @@ impl<'a> Parser<'a> {
         }
         // `await using x = …` is one declaration; `await` is only a keyword here when the
         // enclosing code may await at all, which is the same rule `await` expressions use.
-        if self.at_ident("await")
-            && (self.ctx.in_async || self.module)
-            && self.await_using_follows()?
-        {
+        if self.at_ident("await") && self.ctx.in_async && self.await_using_follows()? {
             let start = self.current.span.start;
-            if self.top_level && !self.module {
-                return Err(self.error_at(
-                    "using declaration is not allowed at the top level of a script",
-                    self.span_from(start),
-                ));
-            }
+            // No top-level rejection here, unlike a plain `using`: the reference's check
+            // lives on the `using` path only (`fd->is_eval && scope_level == body_scope`),
+            // while `await using` reaches a branch that does not ask.
             self.bump()?; // await
             let decl = self.parse_var_decl_with_keyword(VarDeclKind::AwaitUsing, "using")?;
             self.semicolon()?;
@@ -937,10 +1020,12 @@ impl<'a> Parser<'a> {
         }
         if self.at_ident("using") && self.using_starts_declaration()? {
             let start = self.current.span.start;
-            // A script's top level has no block to end, so there would be nowhere to
-            // dispose. The reference rejects it for the same reason; a module, whose
-            // top level *is* a scope, does not.
-            if self.top_level && !self.module {
+            // A script's *own* scope has no block to end, so there would be nowhere to
+            // dispose. The reference asks `scope_level == body_scope`: the program's scope
+            // itself, not a block nested inside it — `{ using y = 1 }` is legal there and
+            // disposes at the closing brace. A module's top level *is* a scope, so it does
+            // not ask at all.
+            if self.scopes.len() == 1 && !self.module {
                 return Err(self.error_at(
                     "using declaration is not allowed at the top level of a script",
                     self.span_from(start),
@@ -1133,10 +1218,27 @@ impl<'a> Parser<'a> {
             return Err(self.error("'export' can only appear at the top level of a module"));
         }
         // Labelled statement.
-        if matches!(self.current.kind, TokenKind::Ident(_)) {
-            let peek = self.peek()?;
-            if matches!(peek.kind, TokenKind::Punct(Punct::Colon)) {
-                return self.parse_labeled();
+        if let TokenKind::Ident(name) = &self.current.kind {
+            // `await` is not a `LabelIdentifier` in module code, and where it is an
+            // operator it is not an identifier at all — `await: 1` in a suspensible body
+            // is an `await` expression whose operand is missing, not a label.
+            if name == "await" && self.await_is_reserved() {
+                if !self.ctx.in_async {
+                    // Reserved because this is module code, but not an operator: the
+                    // reference has a message for exactly this case.
+                    let peek = self.peek()?;
+                    if matches!(peek.kind, TokenKind::Punct(Punct::Colon)) {
+                        return Err(self.error("unexpected 'await' keyword"));
+                    }
+                }
+                // Where `await` *is* an operator it is not an identifier at all, so
+                // `await: 1` is an `await` expression with a missing operand. Falling
+                // through leaves that to the expression parser, which says so.
+            } else {
+                let peek = self.peek()?;
+                if matches!(peek.kind, TokenKind::Punct(Punct::Colon)) {
+                    return self.parse_labeled();
+                }
             }
         }
         self.parse_expression_statement()
@@ -1256,7 +1358,7 @@ impl<'a> Parser<'a> {
 
     fn parse_for_inner(&mut self, start: Position) -> Result<Stmt> {
         let mut is_await = false;
-        if self.at_ident("await") && (self.ctx.in_async || (self.module && self.top_level)) {
+        if self.at_ident("await") && self.ctx.in_async {
             let peek = self.peek()?;
             if matches!(peek.kind, TokenKind::Punct(Punct::LParen)) && !peek.newline_before {
                 is_await = true;
@@ -1281,7 +1383,7 @@ impl<'a> Parser<'a> {
         } else if self.at_ident("using") && self.using_starts_for_head()? {
             Some(VarDeclKind::Using)
         } else if self.at_ident("await")
-            && (self.ctx.in_async || self.module)
+            && self.ctx.in_async
             && self.await_using_starts_for_head()?
         {
             self.bump()?; // await, leaving `using` as the keyword
@@ -2051,10 +2153,7 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 // The rest parameter's own binding needs the same check: `function f(...)`
                 // is a missing parameter, not a malformed one.
-                if !(self.current.kind.is_identifier()
-                    || self.at_punct(Punct::LBracket)
-                    || self.at_punct(Punct::LBrace))
-                {
+                if !self.at_formal_parameter() {
                     return Err(self.error("missing formal parameter"));
                 }
                 let target = self.parse_binding_target()?;
@@ -2074,12 +2173,7 @@ impl<'a> Parser<'a> {
                 }
                 break;
             }
-            // A token that cannot begin a binding pattern is a missing parameter, not a
-            // malformed one: `js_parse_error(s, "missing formal parameter")`.
-            if !(self.current.kind.is_identifier()
-                || self.at_punct(Punct::LBracket)
-                || self.at_punct(Punct::LBrace))
-            {
+            if !self.at_formal_parameter() {
                 return Err(self.error("missing formal parameter"));
             }
             let param = self.parse_binding_element()?;
@@ -3328,31 +3422,19 @@ impl<'a> Parser<'a> {
                 op_pos,
             ));
         }
-        // `await` in async contexts (and at a module's top level).
-        if self.at_ident("await") && (self.ctx.in_async || (self.module && self.top_level)) {
-            let peek = self.peek()?;
-            let starts_expression = !matches!(
-                peek.kind,
-                TokenKind::Punct(Punct::RParen)
-                    | TokenKind::Punct(Punct::RBracket)
-                    | TokenKind::Punct(Punct::RBrace)
-                    | TokenKind::Punct(Punct::Comma)
-                    | TokenKind::Punct(Punct::Semicolon)
-                    | TokenKind::Punct(Punct::Colon)
-                    | TokenKind::Punct(Punct::Eq)
-                    | TokenKind::Punct(Punct::Arrow)
-                    | TokenKind::Punct(Punct::Dot)
-                    | TokenKind::Punct(Punct::QuestionDot)
-                    | TokenKind::Punct(Punct::LBracket)
-            ) && !peek.newline_before;
-            if starts_expression {
-                self.bump()?;
-                let argument = self.parse_unary()?;
-                return Ok(Expr::new(
-                    ExprKind::Await(Box::new(argument)),
-                    self.span_from(start),
-                ));
-            }
+        // `await` wherever the enclosing function is `async`, operator or not.
+        //
+        // There is no "unless the next token rules it out" case: the reference reaches
+        // `TOK_AWAIT` and consumes it unconditionally, so `await;` and `f(await)` report
+        // the *operand* as unexpected rather than treating `await` as an identifier. That
+        // is why this asks nothing about what follows.
+        if self.at_ident("await") && self.ctx.in_async {
+            self.bump()?;
+            let argument = self.parse_unary()?;
+            return Ok(Expr::new(
+                ExprKind::Await(Box::new(argument)),
+                self.span_from(start),
+            ));
         }
         let expr = self.parse_lhs_expression()?;
         // Postfix increment/decrement (no line break allowed before the operator).
@@ -3559,7 +3641,7 @@ impl<'a> Parser<'a> {
                 return Err(self.error("expecting target"));
             }
             if !self.ctx.in_function {
-                return Err(self.error("invalid use of 'new.target' outside of a function"));
+                return Err(self.error("new.target only allowed within functions"));
             }
             self.bump()?;
             return Ok(Expr::new(ExprKind::NewTarget, self.span_from(start)));

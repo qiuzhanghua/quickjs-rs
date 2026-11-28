@@ -648,6 +648,11 @@ impl FnState {
 /// The compiler's entry point.
 pub struct Compiler {
     module: bool,
+    /// Whether the program itself is the body of an `async` function.
+    ///
+    /// This is the reference's `JS_EVAL_FLAG_ASYNC`: the body may `await`, and its
+    /// completion value is wrapped so a returned promise is not adopted.
+    async_body: bool,
     /// Enclosing functions, outermost first. The last entry is the current one.
     stack: Vec<FnState>,
 }
@@ -655,6 +660,18 @@ pub struct Compiler {
 /// Compile a script.
 pub fn compile_script(program: &Program) -> Result<CompiledFunction, SyntaxError> {
     Compiler::new(false).compile(program)
+}
+
+/// Compile a script whose top level is the body of an `async` function.
+///
+/// The body is an ordinary script in every other way — it still reports a completion value
+/// — but the value is wrapped in `{value}` and the function's kind is `Async`, so running
+/// it answers a promise instead of a value. The wrapper is what keeps that promise from
+/// being *adopted*: `await 1` completes with `1`, and the reference resolves to
+/// `{value: 1}` rather than to `1` — the same shape `std.evalScript(…, {async: true})`
+/// documents.
+pub fn compile_script_suspensible(program: &Program) -> Result<CompiledFunction, SyntaxError> {
+    Compiler::for_suspensible_script().compile(program)
 }
 
 /// Compile a module.
@@ -667,6 +684,16 @@ impl Compiler {
     pub fn new(module: bool) -> Compiler {
         Compiler {
             module,
+            async_body: false,
+            stack: Vec::new(),
+        }
+    }
+
+    /// Create a compiler for a script whose top level is an `async` function body.
+    fn for_suspensible_script() -> Compiler {
+        Compiler {
+            module: false,
+            async_body: true,
             stack: Vec::new(),
         }
     }
@@ -739,6 +766,21 @@ impl Compiler {
             if self.cur().has_await {
                 self.state().kind = FunctionKind::Async;
             }
+        } else if self.async_body {
+            // An async body reports its completion value the same way, but through an
+            // object: the function answers a promise, and resolving that promise *with*
+            // the completion value would adopt a promise completion instead of reporting
+            // it. `{value}` is what makes `evalScript("Promise.resolve(7)", {async:true})`
+            // resolve to `{value: <promise>}` rather than to `7`.
+            //
+            // The shape is the reference's, byte for byte (`quickjs.c`: "wrap the return
+            // value in an object so that promises can be safely returned").
+            self.emit(Opcode::Object, &[]);
+            self.emit(Opcode::Dup, &[]);
+            self.emit(Opcode::GetLoc, &[Op::Slot(Slot::Loc(0))]);
+            self.emit(Opcode::PutField, &[Op::Atom(Atom::from_text("value"))]);
+            self.emit(Opcode::Return, &[]);
+            self.state().kind = FunctionKind::Async;
         } else {
             // The program's value is whatever the last expression statement stored in
             // the hidden `<ret>` local; `put_loc0`/`get_loc0` folding turns the common

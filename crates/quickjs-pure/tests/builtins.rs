@@ -1698,7 +1698,9 @@ fn eval_inherits_the_callers_super() {
     // Outside a method there is no home object, so `super.x` stays a syntax error.
     assert_eq!(
         throws("eval('super.x')"),
-        "SyntaxError: invalid source: 1:1: 'super' is only valid in a method"
+        // Bare message: the position is on `fileName`/`lineNumber`/the stack, as in the
+        // reference — `eval("super.x")` there has `message` == this and no prefix.
+        "SyntaxError: 'super' is only valid in a method"
     );
 }
 

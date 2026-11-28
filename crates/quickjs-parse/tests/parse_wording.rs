@@ -72,11 +72,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          binding name. Both describe the same truncated `var {`",
     ),
     (
-        "async function f() { await = 1 }",
-        "we reject the assignment to `await` as an early error; the reference reports the \
-         `=` as an unexpected token",
-    ),
-    (
         "do {}",
         "the reference emits `expecting '<U+FFFD>'`: `js_parse_expect` formats the expected \
          token with `%c` and `TOK_WHILE` does not fit in a byte, so the message carries an \
@@ -134,6 +129,11 @@ const CORPUS: &[Case] = &[
     ("throw", Some("unexpected token in expression: ''")),
     ("var a = ;", Some("unexpected token in expression: ';'")),
     ("a ?? b || c", Some("expecting ';'")),
+    // A missing semicolon names what was wanted, not what was found — easy to miss,
+    // because most statements end at a newline and never reach the check.
+    ("1 2", Some("expecting ';'")),
+    ("a b", Some("expecting ';'")),
+    ("x = 1 2", Some("expecting ';'")),
     // -- expected punctuator -------------------------------------------------
     ("({a:1", Some("expecting '}'")),
     ("a ? b", Some("expecting ':'")),

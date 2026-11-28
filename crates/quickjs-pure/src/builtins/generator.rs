@@ -264,9 +264,7 @@ fn generator_function_constructor(
         };
         let source = format!("({prefix}({params}) {{{body}}})");
         let program = js_parse::parse_script(&source).map_err(|error| {
-            crate::interp::Signal::Throw(
-                interp.make_error("SyntaxError", &format!("invalid function body: {error}")),
-            )
+            crate::interp::Signal::Throw(interp.make_error("SyntaxError", &error.message))
         })?;
         let compiled = js_compile::compile_script(&program).map_err(|error| {
             crate::interp::Signal::Throw(interp.make_error("SyntaxError", &error.message))

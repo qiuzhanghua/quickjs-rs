@@ -1001,7 +1001,7 @@ impl Parser<'_> {
                 // A bare identifier as a key, e.g. `{ z2: null }`.
                 Some(b'\'') if self.ext => self.string()?,
                 Some(byte) if self.ext && is_identifier_start(byte) => self.identifier()?,
-                _ => return self.error("expected a string key"),
+                _ => return self.error("expecting property name"),
             };
             self.skip_whitespace();
             if !matches!(self.peek(), Some(b':')) {

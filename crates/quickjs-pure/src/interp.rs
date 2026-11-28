@@ -1169,7 +1169,7 @@ impl<'a> Interp<'a> {
         }
         // Compiled before the promise exists, so a parse failure propagates as a throw
         // instead of being folded into a rejection.
-        let compiled = match self.compile_global_script(source, EVAL_SCRIPT_FILE) {
+        let compiled = match self.compile_global_script(source, EVAL_SCRIPT_FILE, true) {
             Ok(compiled) => compiled,
             Err(error) => {
                 if barrier {
@@ -1178,6 +1178,17 @@ impl<'a> Interp<'a> {
                 return Err(error);
             }
         };
+        // An async body answers its own promise, and that promise is what the reference
+        // hands back — the same object, not a wrapper around it. Its resolution value is
+        // the `{value}` object the compiled epilogue built.
+        if compiled.kind.is_async() {
+            let strict = compiled.strict;
+            let promise = self.run_eval_script(compiled, strict)?;
+            if barrier {
+                self.trace_barriers.pop();
+            }
+            return Ok(promise);
+        }
         let (promise, resolve, reject) = self.new_promise_capability();
         let strict = compiled.strict;
         match self.run_eval_script(compiled, strict) {
@@ -1881,9 +1892,10 @@ impl<'a> Interp<'a> {
         &mut self,
         code: Gc<CompiledCode>,
         env: Gc<ClosureEnv>,
+        this: Value,
     ) -> JsResult<Value> {
         let promise = self.new_promise();
-        let coroutine = self.new_coroutine_from(code, env, Value::Undefined, Vec::new())?;
+        let coroutine = self.new_coroutine_from(code, env, this, Vec::new())?;
         if let Err(Signal::Throw(reason)) =
             self.drive_async(&coroutine, &promise, ResumeKind::Start, Value::Undefined)
         {
@@ -2461,7 +2473,7 @@ impl<'a> Interp<'a> {
     }
 
     fn eval_in_global_inner(&mut self, source: &str, file: &str) -> JsResult<Value> {
-        let compiled = self.compile_global_script(source, file)?;
+        let compiled = self.compile_global_script(source, file, false)?;
         let strict = compiled.strict;
         self.run_eval_script(compiled, strict)
     }
@@ -2471,7 +2483,12 @@ impl<'a> Interp<'a> {
     /// Split out so [`Interp::eval_in_global_async`] can report a syntax error as a throw —
     /// before a promise exists to reject — while still evaluating in the same eval context
     /// (direct-eval strictness, `new.target`, `super`).
-    fn compile_global_script(&mut self, source: &str, file: &str) -> JsResult<CompiledFunction> {
+    fn compile_global_script(
+        &mut self,
+        source: &str,
+        file: &str,
+        async_body: bool,
+    ) -> JsResult<CompiledFunction> {
         // A *direct* eval inherits the strictness of the code that called it, which is
         // why `eval("x = 1")` in a strict function is a ReferenceError instead of an
         // implicit global. The caller's frame is the innermost one here, because a
@@ -2487,19 +2504,35 @@ impl<'a> Interp<'a> {
             // constructor at all: the caller frame's `this` is already built.
             in_derived_constructor: false,
         };
-        let parsed = js_parse::parse_eval_script_in(source, strict, context);
+        // A *global* eval is not a function body: `new.target` and `super` are out of
+        // reach there. Its `{async: true}` form differs in the other direction — the body
+        // may `await` — so the two flags are independent and the reference sets both from
+        // the eval type rather than from the caller.
+        let parsed = if async_body {
+            js_parse::parse_suspensible_global_eval(source, strict)
+        } else {
+            js_parse::parse_eval_script_in(source, strict, context)
+        };
         let program = match parsed {
             Ok(program) => program,
             Err(error) => {
+                // The message is bare: the position lives in `fileName`,
+                // `lineNumber`, `columnNumber` and the stack frame above, which is where
+                // the reference puts it. An `invalid source: L:C: ` prefix made
+                // `e.message` differ from the reference while the stack already agreed.
                 return Err(Signal::Throw(self.syntax_error_at(
                     file,
                     error.span.start.line,
                     error.span.start.column,
-                    &format!("invalid source: {error}"),
+                    &error.message,
                 )));
             }
         };
-        let mut compiled = match js_compile::compile_script(&program) {
+        let mut compiled = match if async_body {
+            js_compile::compile_script_suspensible(&program)
+        } else {
+            js_compile::compile_script(&program)
+        } {
             Ok(compiled) => compiled,
             // A construct the compiler does not handle yet is reported the same way a
             // parse error is: it happens before anything runs, so the trace is the
@@ -2637,6 +2670,15 @@ impl<'a> Interp<'a> {
 
         // The caller's `arguments`, as an array-like. Reading `length` and the indexed
         // elements is all the spec's ordinary uses need.
+        //
+        // Known divergence: this is bound for a *global* eval too, where there is no
+        // caller and the reference throws `'arguments' is not defined`. Deciding properly
+        // needs "does the calling frame have an `arguments` of its own", which is not
+        // recorded anywhere the runtime can see — the caller of a direct eval has one, a
+        // script or eval body does not, and `eval(b)` passes the callee as a value so even
+        // the call-site detection does not answer it. Modelled as a binding in the caller's
+        // variable environment, this would fall out; that is a larger change than the one
+        // this comment is attached to.
         let arguments = Value::Object(self.new_array(passed));
 
         // Only a *strict* eval gets a variable environment of its own. A sloppy one
@@ -2681,7 +2723,14 @@ impl<'a> Interp<'a> {
         let closure_vars = compiled.code.closure_vars.clone();
         let env = self.global_env(&closure_vars);
         let callee = Value::Undefined;
-        let result = self.execute(compiled, env, this, Vec::new(), callee);
+        // An async body does not run here: it becomes a coroutine and answers a promise,
+        // which is what makes `await` legal in it. `this` still has to be the caller's
+        // (for a global eval, the global object), because `this` is not part of `await`.
+        let result = if compiled.code.kind.is_async() {
+            self.run_async_body(compiled, env, this)
+        } else {
+            self.execute(compiled, env, this, Vec::new(), callee)
+        };
         self.eval_scope = previous_scope;
         self.eval_arguments = previous_arguments;
         self.eval_with = previous_with;

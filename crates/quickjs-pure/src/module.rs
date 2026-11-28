@@ -741,7 +741,7 @@ impl<'a> Interp<'a> {
         let async_body = code.code.kind.is_async();
         self.module_stack.push(name);
         let result = if async_body {
-            self.run_async_body(code, env)
+            self.run_async_body(code, env, Value::Undefined)
                 .and_then(|promise| self.await_module_promise(promise))
         } else {
             self.execute(code, env, Value::Undefined, Vec::new(), Value::Undefined)

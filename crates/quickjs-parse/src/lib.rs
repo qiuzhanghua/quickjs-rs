@@ -41,7 +41,7 @@ pub use error::{LexError, ParseError, Result, SyntaxError};
 pub use lexer::Lexer;
 pub use parser::{
     EvalContext, Parser, parse_eval_script, parse_eval_script_in, parse_expression, parse_module,
-    parse_script, parse_script_strict,
+    parse_script, parse_script_strict, parse_suspensible_global_eval, parse_suspensible_script,
 };
 
 /// Parser configuration constants and helpers.
